@@ -1550,7 +1550,7 @@ async fn run_gateway_webhook_agentic(
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
-    if config.autonomy.level != zeroclaw_config::schema::AutonomyLevel::Full {
+    if config.autonomy.level != zeroclaw_config::autonomy::AutonomyLevel::Full {
         let excluded = &config.autonomy.non_cli_excluded_tools;
         if !excluded.is_empty() {
             tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
@@ -1628,7 +1628,7 @@ async fn run_gateway_webhook_agentic(
             &config.agent.tool_filter_groups,
             message,
         );
-    if config.autonomy.level != zeroclaw_config::schema::AutonomyLevel::Full {
+    if config.autonomy.level != zeroclaw_config::autonomy::AutonomyLevel::Full {
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
