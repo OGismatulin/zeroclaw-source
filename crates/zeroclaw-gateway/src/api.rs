@@ -1662,6 +1662,7 @@ mod tests {
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 

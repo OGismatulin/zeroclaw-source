@@ -36,6 +36,7 @@ use axum::{
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use tokio::sync::Mutex as TokioMutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -325,6 +326,12 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     }
 }
 
+/// Per-session webhook conversation history. In-memory only, lost on restart.
+pub(crate) struct WebhookSessionState {
+    session_id: String,
+    history: Vec<ChatMessage>,
+}
+
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -384,6 +391,9 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// In-memory webhook conversation history per session.
+    /// Protected by async mutex to serialize concurrent webhook requests.
+    pub(crate) webhook_session: Arc<TokioMutex<Option<WebhookSessionState>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -931,6 +941,7 @@ pub async fn run_gateway(
         } else {
             None
         },
+        webhook_session: Arc::new(TokioMutex::new(None)),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1378,6 +1389,287 @@ async fn run_gateway_chat_with_tools(
     .await
 }
 
+/// Agentic webhook chat that preserves gateway auth/idempotency flow while
+/// executing the full tool loop with persistent per-session history.
+async fn run_gateway_webhook_agentic(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let config = state.config.lock().clone();
+    let observer: Arc<dyn zeroclaw_runtime::observability::Observer> =
+        Arc::from(zeroclaw_runtime::observability::create_observer(
+            &config.observability,
+        ));
+    let runtime: Arc<dyn platform::RuntimeAdapter> =
+        Arc::from(platform::create_runtime(&config.runtime)?);
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let approval_manager =
+        zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(&config.autonomy);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let (
+        mut tools_registry,
+        delegate_handle,
+        _reaction_handle,
+        _channel_map_handle,
+        _ask_user_handle,
+        _escalate_handle,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&state.mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None, // canvas_store
+    );
+    if let Some(f) = zeroclaw_runtime::agent::loop_::PERIPHERAL_TOOLS_FN.get() {
+        let peripheral_tools = f(config.peripherals.clone()).await.unwrap_or_default();
+        tools_registry.extend(peripheral_tools);
+    }
+
+    // ── Wire MCP tools (non-fatal) ──────────────────────────────
+    let mut deferred_section = String::new();
+    let mut activated_handle: Option<
+        std::sync::Arc<std::sync::Mutex<tools::ActivatedToolSet>>,
+    > = None;
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                if config.mcp.deferred_loading {
+                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    deferred_section =
+                        tools::build_deferred_tools_section(&deferred_set);
+                    let activated_set = std::sync::Arc::new(std::sync::Mutex::new(
+                        tools::ActivatedToolSet::new(),
+                    ));
+                    activated_handle = Some(std::sync::Arc::clone(&activated_set));
+                    tools_registry.push(Box::new(tools::ToolSearchTool::new(
+                        deferred_set,
+                        activated_set,
+                    )));
+                } else {
+                    let names = registry.tool_names();
+                    for name in names {
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                std::sync::Arc::new(tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if let Some(ref handle) = delegate_handle {
+                                handle.write().push(std::sync::Arc::clone(&wrapper));
+                            }
+                            tools_registry
+                                .push(Box::new(tools::ArcToolRef(wrapper)));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Webhook MCP registry failed: {e:#}");
+            }
+        }
+    }
+
+    let skills =
+        zeroclaw_runtime::skills::load_skills_with_config(&config.workspace_dir, &config);
+    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+
+    let provider_name = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("openrouter");
+    let model_name = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider_runtime_options =
+        zeroclaw_providers::provider_runtime_options_from_config(&config);
+    let provider: Box<dyn Provider> =
+        zeroclaw_providers::create_routed_provider_with_options(
+            provider_name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+
+    let mut tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands."),
+        ("file_read", "Read file contents."),
+        ("file_write", "Write file contents."),
+        ("memory_store", "Save to memory."),
+        ("memory_recall", "Search memory."),
+        ("memory_forget", "Delete a memory entry."),
+        (
+            "model_routing_config",
+            "Configure default model, scenario routing, and delegate agents.",
+        ),
+        ("screenshot", "Capture a screenshot."),
+        ("image_info", "Read image metadata."),
+    ];
+    if matches!(
+        config.skills.prompt_injection_mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) {
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        ));
+    }
+    if config.browser.enabled {
+        tool_descs.push(("browser_open", "Open approved URLs in browser."));
+    }
+    if config.composio.enabled {
+        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if config.autonomy.level != zeroclaw_config::schema::AutonomyLevel::Full {
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        }
+    }
+
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let native_tools = provider.supports_native_tools();
+    let mut system_prompt =
+        zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
+            &config.workspace_dir,
+            &model_name,
+            &tool_descs,
+            &skills,
+            Some(&config.identity),
+            bootstrap_max_chars,
+            Some(&config.autonomy),
+            native_tools,
+            config.skills.prompt_injection_mode,
+            config.agent.compact_context,
+            config.agent.max_system_prompt_chars,
+        );
+    if !native_tools {
+        system_prompt.push_str(
+            &zeroclaw_runtime::agent::loop_::build_tool_instructions(&tools_registry, None),
+        );
+    }
+    if !deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&deferred_section);
+    }
+
+    let mem_context = zeroclaw_runtime::agent::loop_::build_context(
+        state.mem.as_ref(),
+        message,
+        config.memory.min_relevance_score,
+        session_id,
+    )
+    .await;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let enriched = if mem_context.is_empty() {
+        format!("[{now}] {message}")
+    } else {
+        format!("{mem_context}[{now}] {message}")
+    };
+
+    // ── Lock session (serializes concurrent webhook requests for this daemon) ──
+    let mut session_guard = state.webhook_session.lock().await;
+
+    let mut history = match session_guard.take() {
+        // Same session — reuse history
+        Some(mut ws) if session_id.is_some_and(|id| id == ws.session_id) => {
+            // Update system prompt (tools/skills/memory may have changed)
+            if ws.history.first().is_some_and(|m| m.role == "system") {
+                ws.history[0] = ChatMessage::system(&system_prompt);
+            } else {
+                ws.history.insert(0, ChatMessage::system(&system_prompt));
+            }
+            ws.history
+        }
+        // Different session or first request — fresh history
+        _ => vec![ChatMessage::system(&system_prompt)],
+    };
+
+    // Append current user message
+    history.push(ChatMessage::user(&enriched));
+
+    let mut excluded_tools =
+        zeroclaw_runtime::agent::loop_::compute_excluded_mcp_tools(
+            &tools_registry,
+            &config.agent.tool_filter_groups,
+            message,
+        );
+    if config.autonomy.level != zeroclaw_config::schema::AutonomyLevel::Full {
+        excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
+    }
+
+    // Run tool loop (lock held — concurrent requests wait)
+    let result = zeroclaw_runtime::agent::loop_::agent_turn(
+        provider.as_ref(),
+        &mut history,
+        &tools_registry,
+        observer.as_ref(),
+        provider_name,
+        &model_name,
+        config.default_temperature,
+        true,
+        "webhook",
+        None,
+        &config.multimodal,
+        config.agent.max_tool_iterations,
+        Some(&approval_manager),
+        &excluded_tools,
+        &config.agent.tool_call_dedup_exempt,
+        activated_handle.as_ref(),
+        None,
+    )
+    .await;
+
+    // Trim history to prevent unbounded growth
+    zeroclaw_runtime::agent::loop_::trim_history(
+        &mut history,
+        config.agent.max_history_messages,
+    );
+
+    // Save history back (even on tool loop error — partial context is useful)
+    let sid = session_id.unwrap_or_default().to_owned();
+    *session_guard = Some(WebhookSessionState {
+        session_id: sid,
+        history,
+    });
+
+    result
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -1513,7 +1805,7 @@ async fn handle_webhook(
         },
     );
 
-    match run_gateway_chat_simple(&state, message).await {
+    match run_gateway_webhook_agentic(&state, message, session_id.as_deref()).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state.observer.record_event(
@@ -2408,6 +2700,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2480,6 +2773,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2878,6 +3172,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -2958,6 +3253,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let headers = HeaderMap::new();
@@ -3050,6 +3346,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let response = handle_webhook(
@@ -3114,6 +3411,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -3183,6 +3481,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -3257,6 +3556,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -3328,6 +3628,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
         };
 
         let mut headers = HeaderMap::new();

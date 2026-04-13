@@ -23,7 +23,7 @@ pub type PeripheralToolsFn = Box<
 >;
 
 /// Peripheral tools factory, injected by the binary when hardware feature is on.
-static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::OnceLock::new();
+pub static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::OnceLock::new();
 
 /// Register the peripheral tools factory. Called once at startup by the binary.
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
@@ -205,7 +205,7 @@ where
 /// based on `tool_filter_groups` and the user message.
 ///
 /// Returns an empty `Vec` when `groups` is empty (no filtering).
-fn compute_excluded_mcp_tools(
+pub fn compute_excluded_mcp_tools(
     tools_registry: &[Box<dyn Tool>],
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
@@ -323,7 +323,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
 /// Core memories are exempt from time decay (evergreen).
-async fn build_context(
+pub async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
