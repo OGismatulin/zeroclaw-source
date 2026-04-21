@@ -1393,6 +1393,9 @@ async fn run_gateway_chat_with_tools(
 /// executing the full tool loop with persistent per-session history.
 async fn run_gateway_webhook_agentic(
     state: &AppState,
+    provider: &dyn Provider,
+    provider_name: &str,
+    model_name: &str,
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -1500,27 +1503,6 @@ async fn run_gateway_webhook_agentic(
         zeroclaw_runtime::skills::load_skills_with_config(&config.workspace_dir, &config);
     tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
 
-    let provider_name = config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_from_config(&config);
-    let provider: Box<dyn Provider> =
-        zeroclaw_providers::create_routed_provider_with_options(
-            provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &provider_runtime_options,
-        )?;
-
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -1566,7 +1548,7 @@ async fn run_gateway_webhook_agentic(
     let mut system_prompt =
         zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
             &config.workspace_dir,
-            &model_name,
+            model_name,
             &tool_descs,
             &skills,
             Some(&config.identity),
@@ -1634,12 +1616,12 @@ async fn run_gateway_webhook_agentic(
 
     // Run tool loop (lock held — concurrent requests wait)
     let result = zeroclaw_runtime::agent::loop_::agent_turn(
-        provider.as_ref(),
+        provider,
         &mut history,
         &tools_registry,
         observer.as_ref(),
         provider_name,
-        &model_name,
+        model_name,
         config.default_temperature,
         true,
         "webhook",
@@ -1670,10 +1652,114 @@ async fn run_gateway_webhook_agentic(
     result
 }
 
-/// Webhook request body
-#[derive(serde::Deserialize)]
+/// Single source of truth for webhook `body.model` override.
+/// Pairs each allowed model with the provider that must handle it.
+/// Extending this list requires rebuild + deploy; keep it short and deliberate.
+const MODEL_ALLOWLIST: &[(&str, &str)] = &[
+    ("glm-5-turbo", "zai"),
+    ("glm-5.1", "zai"),
+    ("gpt-5.4", "openai-codex"),
+    ("gpt-5.4-mini", "openai-codex"),
+];
+
+fn resolve_provider_for_model(model: &str) -> Option<&'static str> {
+    MODEL_ALLOWLIST
+        .iter()
+        .find(|(m, _)| *m == model)
+        .map(|(_, p)| *p)
+}
+
+fn allowlist_model_names() -> Vec<&'static str> {
+    MODEL_ALLOWLIST.iter().map(|(m, _)| *m).collect()
+}
+
+/// Classification result for the optional `body.model` field.
+/// Pure logic, no I/O — delegates provider creation to the caller.
+#[derive(Debug)]
+pub(crate) enum ModelSelection {
+    /// No override — caller uses daemon default provider/model.
+    Default,
+    /// Validated override — caller must create the named provider with this model.
+    Override {
+        model: String,
+        provider: &'static str,
+    },
+    /// Explicit empty/whitespace `model` — 400 invalid_model.
+    InvalidEmpty,
+    /// Non-empty but not in MODEL_ALLOWLIST — 400 unknown_model.
+    Unknown {
+        requested: String,
+        available: Vec<&'static str>,
+    },
+}
+
+pub(crate) fn classify_model_selection(raw: Option<&str>) -> ModelSelection {
+    match raw {
+        None => ModelSelection::Default,
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return ModelSelection::InvalidEmpty;
+            }
+            match resolve_provider_for_model(trimmed) {
+                Some(provider) => ModelSelection::Override {
+                    model: trimmed.to_string(),
+                    provider,
+                },
+                None => ModelSelection::Unknown {
+                    requested: trimmed.to_string(),
+                    available: allowlist_model_names(),
+                },
+            }
+        }
+    }
+}
+
+/// Builds a fresh provider for the per-request override path.
+/// Uses an empty model_routes slice so explicit override fully bypasses
+/// scenario routing (spec §4.5 precedence rule).
+fn build_override_provider(
+    config: &zeroclaw_config::schema::Config,
+    provider_name: &str,
+    model_name: &str,
+) -> anyhow::Result<Box<dyn Provider>> {
+    let empty_routes: &[zeroclaw_config::schema::ModelRouteConfig] = &[];
+    let provider_runtime_options =
+        zeroclaw_providers::provider_runtime_options_from_config(config);
+    zeroclaw_providers::create_routed_provider_with_options(
+        provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        empty_routes,
+        model_name,
+        &provider_runtime_options,
+    )
+}
+
+/// Wraps the active provider used for a single webhook turn.
+/// Default path shares `state.provider` (no rebuild); override path owns a fresh Box.
+enum ActiveProvider {
+    Shared(Arc<dyn Provider>),
+    Owned(Box<dyn Provider>),
+}
+
+impl ActiveProvider {
+    fn as_ref_dyn(&self) -> &dyn Provider {
+        match self {
+            Self::Shared(arc) => arc.as_ref(),
+            Self::Owned(bx) => bx.as_ref(),
+        }
+    }
+}
+
+/// Webhook request body.
+/// `model` is optional: absent → daemon default provider/model.
+#[derive(serde::Deserialize, Default)]
 pub struct WebhookBody {
     pub message: String,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1782,36 +1868,93 @@ async fn handle_webhook(
             .await;
     }
 
-    let provider_label = state
-        .config
-        .lock()
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-    let model_label = state.model.clone();
+    // ── Resolve active provider/model for THIS request ──
+    // Default path: reuse state.provider (Arc built at daemon startup, no rebuild).
+    // Override path: build a fresh provider with empty model_routes so explicit
+    // selection fully bypasses scenario routing (spec §4.5).
+    let config_snapshot = state.config.lock().clone();
+    let (active, provider_name, model_name): (ActiveProvider, String, String) =
+        match classify_model_selection(webhook_body.model.as_deref()) {
+            ModelSelection::Default => {
+                let name = config_snapshot
+                    .default_provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let model = state.model.clone();
+                (ActiveProvider::Shared(state.provider.clone()), name, model)
+            }
+            ModelSelection::Override { model, provider: provider_static } => {
+                match build_override_provider(&config_snapshot, provider_static, &model) {
+                    Ok(p) => (
+                        ActiveProvider::Owned(p),
+                        provider_static.to_string(),
+                        model,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Webhook: failed to init override provider {provider_static}: {e:#}"
+                        );
+                        let err = serde_json::json!({
+                            "error": format!(
+                                "failed to initialize provider '{provider_static}'"
+                            ),
+                            "error_code": "provider_initialization_failed",
+                            "provider": provider_static,
+                            "model": model,
+                        });
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+                    }
+                }
+            }
+            ModelSelection::InvalidEmpty => {
+                let err = serde_json::json!({
+                    "error": "model must not be empty",
+                    "error_code": "invalid_model",
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            }
+            ModelSelection::Unknown { requested, available } => {
+                let err = serde_json::json!({
+                    "error": format!("unknown model '{requested}'"),
+                    "error_code": "unknown_model",
+                    "requested_model": requested,
+                    "available_models": available,
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            }
+        };
     let started_at = Instant::now();
 
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
-            provider: provider_label.clone(),
-            model: model_label.clone(),
+            provider: provider_name.clone(),
+            model: model_name.clone(),
         },
     );
     state.observer.record_event(
         &zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
-            provider: provider_label.clone(),
-            model: model_label.clone(),
+            provider: provider_name.clone(),
+            model: model_name.clone(),
             messages_count: 1,
         },
     );
 
-    match run_gateway_webhook_agentic(&state, message, session_id.as_deref()).await {
+    match run_gateway_webhook_agentic(
+        &state,
+        active.as_ref_dyn(),
+        &provider_name,
+        &model_name,
+        message,
+        session_id.as_deref(),
+    )
+    .await
+    {
         Ok(response) => {
             let duration = started_at.elapsed();
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
+                    provider: provider_name.clone(),
+                    model: model_name.clone(),
                     duration,
                     success: true,
                     error_message: None,
@@ -1824,15 +1967,19 @@ async fn handle_webhook(
             );
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
+                    provider: provider_name.clone(),
+                    model: model_name.clone(),
                     duration,
                     tokens_used: None,
                     cost_usd: None,
                 },
             );
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({
+                "response": response,
+                "model": model_name,
+                "provider": provider_name,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1841,8 +1988,8 @@ async fn handle_webhook(
 
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
+                    provider: provider_name.clone(),
+                    model: model_name.clone(),
                     duration,
                     success: false,
                     error_message: Some(sanitized.clone()),
@@ -1861,8 +2008,8 @@ async fn handle_webhook(
                 });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
+                    provider: provider_name,
+                    model: model_name,
                     duration,
                     tokens_used: None,
                     cost_usd: None,
@@ -2636,11 +2783,99 @@ mod tests {
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
         assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap().message, "hello");
+        let body = parsed.unwrap();
+        assert_eq!(body.message, "hello");
+        assert!(body.model.is_none());
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn webhook_body_accepts_optional_model_field() {
+        let with_model = r#"{"message": "hi", "model": "gpt-5.4"}"#;
+        let parsed: WebhookBody = serde_json::from_str(with_model).unwrap();
+        assert_eq!(parsed.message, "hi");
+        assert_eq!(parsed.model.as_deref(), Some("gpt-5.4"));
+
+        let null_model = r#"{"message": "hi", "model": null}"#;
+        let parsed: WebhookBody = serde_json::from_str(null_model).unwrap();
+        assert!(parsed.model.is_none());
+    }
+
+    #[test]
+    fn model_allowlist_resolves_known_models() {
+        assert_eq!(resolve_provider_for_model("glm-5-turbo"), Some("zai"));
+        assert_eq!(resolve_provider_for_model("glm-5.1"), Some("zai"));
+        assert_eq!(resolve_provider_for_model("gpt-5.4"), Some("openai-codex"));
+        assert_eq!(resolve_provider_for_model("gpt-5.4-mini"), Some("openai-codex"));
+    }
+
+    #[test]
+    fn model_allowlist_rejects_unknown_model() {
+        assert_eq!(resolve_provider_for_model("gpt-typo"), None);
+        assert_eq!(resolve_provider_for_model(""), None);
+        // case-sensitive by design
+        assert_eq!(resolve_provider_for_model("GLM-5-Turbo"), None);
+    }
+
+    #[test]
+    fn classify_model_selection_none_returns_default() {
+        assert!(matches!(classify_model_selection(None), ModelSelection::Default));
+    }
+
+    #[test]
+    fn classify_model_selection_valid_returns_override() {
+        match classify_model_selection(Some("gpt-5.4")) {
+            ModelSelection::Override { model, provider } => {
+                assert_eq!(model, "gpt-5.4");
+                assert_eq!(provider, "openai-codex");
+            }
+            other => panic!("expected Override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_model_selection_empty_or_whitespace_rejects() {
+        assert!(matches!(
+            classify_model_selection(Some("")),
+            ModelSelection::InvalidEmpty
+        ));
+        assert!(matches!(
+            classify_model_selection(Some("   ")),
+            ModelSelection::InvalidEmpty
+        ));
+        assert!(matches!(
+            classify_model_selection(Some("\t\n")),
+            ModelSelection::InvalidEmpty
+        ));
+    }
+
+    #[test]
+    fn classify_model_selection_unknown_reports_available_list() {
+        match classify_model_selection(Some("xyz")) {
+            ModelSelection::Unknown { requested, available } => {
+                assert_eq!(requested, "xyz");
+                assert!(available.contains(&"gpt-5.4"));
+                assert!(available.contains(&"glm-5-turbo"));
+                assert!(available.contains(&"glm-5.1"));
+                assert!(available.contains(&"gpt-5.4-mini"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_model_selection_trims_before_matching() {
+        // leading/trailing spaces must not cause "unknown"
+        match classify_model_selection(Some("  gpt-5.4  ")) {
+            ModelSelection::Override { model, provider } => {
+                assert_eq!(model, "gpt-5.4");
+                assert_eq!(provider, "openai-codex");
+            }
+            other => panic!("expected Override after trim, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3180,6 +3415,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            model: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -3193,6 +3429,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            model: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -3260,6 +3497,7 @@ mod tests {
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            model: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -3273,6 +3511,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            model: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -3355,6 +3594,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
@@ -3426,6 +3666,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
@@ -3493,6 +3734,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                model: None,
             })),
         )
         .await
@@ -4067,5 +4309,158 @@ mod tests {
         ));
         let err = require_localhost(&peer).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// Builds a minimal AppState suitable for body.model validation tests.
+    /// Pairing disabled, no secret hash, NoopObserver. Caller provides provider+memory.
+    fn fresh_model_test_state(
+        provider: Arc<dyn Provider>,
+        memory: Arc<dyn Memory>,
+        config: Config,
+    ) -> AppState {
+        let model_label = config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "test-model".into());
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: model_label,
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            webhook_session: Arc::new(TokioMutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_without_model_returns_state_provider_and_model_in_body() {
+        // F1/F4 regression: handler MUST reuse state.provider for default path
+        // (no per-request create_routed_provider_with_options), and success body
+        // MUST carry both model and provider from config/state.
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let mut config = Config::default();
+        config.default_provider = Some("mock-default".to_string());
+        config.default_model = Some("mock-default-model".to_string());
+
+        let state = fresh_model_test_state(provider, memory, config);
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                model: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["model"], "mock-default-model");
+        assert_eq!(json["provider"], "mock-default");
+        assert!(json["response"].is_string());
+        // Critical: MockProvider was actually invoked via state.provider,
+        // proving no per-request provider was built for the default path.
+        assert!(provider_impl.calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_unknown_model_with_400() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = fresh_model_test_state(provider, memory, Config::default());
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hi".into(),
+                model: Some("gpt-typo".into()),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error_code"], "unknown_model");
+        assert_eq!(json["requested_model"], "gpt-typo");
+        let available = json["available_models"]
+            .as_array()
+            .expect("available_models must be an array");
+        assert!(available.iter().any(|v| v == "gpt-5.4"));
+        assert!(available.iter().any(|v| v == "glm-5-turbo"));
+        // Agent loop not entered — provider never called.
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_whitespace_model_with_400() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = fresh_model_test_state(provider, memory, Config::default());
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hi".into(),
+                model: Some("   ".into()),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["error_code"], "invalid_model");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 }
