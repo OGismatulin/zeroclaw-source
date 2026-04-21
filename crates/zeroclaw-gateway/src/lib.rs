@@ -337,6 +337,11 @@ pub(crate) struct WebhookSessionState {
 pub struct AppState {
     pub config: Arc<Mutex<Config>>,
     pub provider: Arc<dyn Provider>,
+    /// Provider name that matches `provider` (captured at daemon startup).
+    /// Read this — NOT `config.default_provider` — in webhook default-path:
+    /// `model_routing_config set_default` mutates the config but cannot
+    /// rebuild the provider, so the two can diverge at runtime.
+    pub provider_name: String,
     pub model: String,
     pub temperature: f64,
     pub mem: Arc<dyn Memory>,
@@ -431,9 +436,13 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    let provider_name = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
-            config.default_provider.as_deref().unwrap_or("openrouter"),
+            &provider_name,
             config.api_key.as_deref(),
             config.api_url.as_deref(),
             &config.reliability,
@@ -885,6 +894,7 @@ pub async fn run_gateway(
     let state = AppState {
         config: config_state,
         provider,
+        provider_name,
         model,
         temperature,
         mem,
@@ -1869,17 +1879,18 @@ async fn handle_webhook(
     }
 
     // ── Resolve active provider/model for THIS request ──
-    // Default path: reuse state.provider (Arc built at daemon startup, no rebuild).
+    // Default path: reuse state.provider + state.provider_name + state.model,
+    // all captured at daemon startup. Reading from AppState (not from
+    // config_snapshot.default_provider) guarantees the labels/response match
+    // the Arc that actually answers: `model_routing_config set_default` can
+    // mutate config.default_provider at runtime without rebuilding the Arc.
     // Override path: build a fresh provider with empty model_routes so explicit
     // selection fully bypasses scenario routing (spec §4.5).
     let config_snapshot = state.config.lock().clone();
     let (active, provider_name, model_name): (ActiveProvider, String, String) =
         match classify_model_selection(webhook_body.model.as_deref()) {
             ModelSelection::Default => {
-                let name = config_snapshot
-                    .default_provider
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
+                let name = state.provider_name.clone();
                 let model = state.model.clone();
                 (ActiveProvider::Shared(state.provider.clone()), name, model)
             }
@@ -2899,6 +2910,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
@@ -2972,6 +2984,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
@@ -3371,6 +3384,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3454,6 +3468,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3549,6 +3564,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3615,6 +3631,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3686,6 +3703,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3762,6 +3780,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -3834,6 +3853,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider,
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -4318,6 +4338,10 @@ mod tests {
         memory: Arc<dyn Memory>,
         config: Config,
     ) -> AppState {
+        let provider_label = config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "mock".into());
         let model_label = config
             .default_model
             .clone()
@@ -4325,6 +4349,7 @@ mod tests {
         AppState {
             config: Arc::new(Mutex::new(config)),
             provider,
+            provider_name: provider_label,
             model: model_label,
             temperature: 0.0,
             mem: memory,
