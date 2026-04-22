@@ -436,29 +436,30 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    let fallback = config.providers.fallback_provider();
     let provider_name = config
-        .default_provider
+        .providers
+        .fallback
         .clone()
         .unwrap_or_else(|| "openrouter".to_string());
     let provider: Arc<dyn Provider> =
         Arc::from(zeroclaw_providers::create_resilient_provider_with_options(
             &provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
+            fallback.and_then(|e| e.api_key.as_deref()),
+            fallback.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
             &zeroclaw_providers::provider_runtime_options_from_config(&config),
         )?);
-    let model = config
-        .default_model
-        .clone()
+    let model = fallback
+        .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
-    let temperature = config.default_temperature;
+    let temperature = fallback.and_then(|e| e.temperature).unwrap_or(0.7);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.embedding_routes,
+        &config.providers.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        fallback.and_then(|e| e.api_key.as_deref()),
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
@@ -497,7 +498,10 @@ pub async fn run_gateway(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        config.api_key.as_deref(),
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref()),
         &config,
         Some(canvas_store.clone()),
     );
@@ -574,7 +578,7 @@ pub async fn run_gateway(
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
-        config.channels_config.webhook.as_ref().and_then(|webhook| {
+        config.channels.webhook.as_ref().and_then(|webhook| {
             webhook.secret.as_ref().and_then(|raw_secret| {
                 let trimmed_secret = raw_secret.trim();
                 (!trimmed_secret.is_empty())
@@ -584,7 +588,7 @@ pub async fn run_gateway(
 
     // WhatsApp channel (if configured)
     let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
-        .channels_config
+        .channels
         .whatsapp
         .as_ref()
         .filter(|wa| wa.is_cloud_config())
@@ -606,7 +610,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.whatsapp.as_ref().and_then(|wa| {
+            config.channels.whatsapp.as_ref().and_then(|wa| {
                 wa.app_secret
                     .as_deref()
                     .map(str::trim)
@@ -617,7 +621,7 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
             lq.api_token.clone(),
             lq.from_phone.clone(),
@@ -634,7 +638,7 @@ pub async fn run_gateway(
             (!secret.is_empty()).then(|| secret.to_owned())
         })
         .or_else(|| {
-            config.channels_config.linq.as_ref().and_then(|lq| {
+            config.channels.linq.as_ref().and_then(|lq| {
                 lq.signing_secret
                     .as_deref()
                     .map(str::trim)
@@ -645,22 +649,21 @@ pub async fn run_gateway(
         .map(Arc::from);
 
     // WATI channel (if configured)
-    let wati_channel: Option<Arc<WatiChannel>> =
-        config.channels_config.wati.as_ref().map(|wati_cfg| {
-            Arc::new(
-                WatiChannel::new(
-                    wati_cfg.api_token.clone(),
-                    wati_cfg.api_url.clone(),
-                    wati_cfg.tenant_id.clone(),
-                    wati_cfg.allowed_numbers.clone(),
-                )
-                .with_transcription(config.transcription.clone()),
+    let wati_channel: Option<Arc<WatiChannel>> = config.channels.wati.as_ref().map(|wati_cfg| {
+        Arc::new(
+            WatiChannel::new(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
             )
-        });
+            .with_transcription(config.transcription.clone()),
+        )
+    });
 
     // Nextcloud Talk channel (if configured)
     let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+        config.channels.nextcloud_talk.as_ref().map(|nc| {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
@@ -679,23 +682,19 @@ pub async fn run_gateway(
                 (!secret.is_empty()).then(|| secret.to_owned())
             })
             .or_else(|| {
-                config
-                    .channels_config
-                    .nextcloud_talk
-                    .as_ref()
-                    .and_then(|nc| {
-                        nc.webhook_secret
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|secret| !secret.is_empty())
-                            .map(ToOwned::to_owned)
-                    })
+                config.channels.nextcloud_talk.as_ref().and_then(|nc| {
+                    nc.webhook_secret
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|secret| !secret.is_empty())
+                        .map(ToOwned::to_owned)
+                })
             })
             .map(Arc::from);
 
     // Gmail Push channel (if configured and enabled)
     let gmail_push_channel: Option<Arc<GmailPushChannel>> = config
-        .channels_config
+        .channels
         .gmail_push
         .as_ref()
         .filter(|gp| gp.enabled)
@@ -1352,7 +1351,10 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_simple(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -1382,7 +1384,14 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 
     state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .chat(
+            zeroclaw_api::provider::ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            &state.model,
+            state.temperature,
+        )
         .await
 }
 
@@ -1643,6 +1652,7 @@ async fn run_gateway_webhook_agentic(
         &config.agent.tool_call_dedup_exempt,
         activated_handle.as_ref(),
         None,
+        None, // channel: Option<&dyn Channel> — webhook path has no channel
     )
     .await;
 
@@ -1881,9 +1891,9 @@ async fn handle_webhook(
     // ── Resolve active provider/model for THIS request ──
     // Default path: reuse state.provider + state.provider_name + state.model,
     // all captured at daemon startup. Reading from AppState (not from
-    // config_snapshot.default_provider) guarantees the labels/response match
+    // config_snapshot.providers.fallback) guarantees the labels/response match
     // the Arc that actually answers: `model_routing_config set_default` can
-    // mutate config.default_provider at runtime without rebuilding the Arc.
+    // mutate config at runtime without rebuilding the Arc.
     // Override path: build a fresh provider with empty model_routes so explicit
     // selection fully bypasses scenario routing (spec §4.5).
     let config_snapshot = state.config.lock().clone();
@@ -1962,6 +1972,13 @@ async fn handle_webhook(
     {
         Ok(response) => {
             let duration = started_at.elapsed();
+            // NOTE: agentic webhook path does not yet surface token usage
+            // (run_tool_call_loop aggregates usage internally but does not
+            // return it). Token accounting will be reinstated when the
+            // agentic handler returns a richer result object.
+            let input_tokens: Option<u64> = None;
+            let output_tokens: Option<u64> = None;
+            let tokens_used: Option<u64> = None;
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_name.clone(),
@@ -1969,8 +1986,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
                 },
             );
             state.observer.record_metric(
@@ -1981,7 +1998,7 @@ async fn handle_webhook(
                     provider: provider_name.clone(),
                     model: model_name.clone(),
                     duration,
-                    tokens_used: None,
+                    tokens_used,
                     cost_usd: None,
                 },
             );
@@ -4339,12 +4356,14 @@ mod tests {
         config: Config,
     ) -> AppState {
         let provider_label = config
-            .default_provider
+            .providers
+            .fallback
             .clone()
             .unwrap_or_else(|| "mock".into());
         let model_label = config
-            .default_model
-            .clone()
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "test-model".into());
         AppState {
             config: Arc::new(Mutex::new(config)),
@@ -4400,8 +4419,14 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let mut config = Config::default();
-        config.default_provider = Some("mock-default".to_string());
-        config.default_model = Some("mock-default-model".to_string());
+        config.providers.fallback = Some("mock-default".to_string());
+        config.providers.models.insert(
+            "mock-default".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                model: Some("mock-default-model".to_string()),
+                ..Default::default()
+            },
+        );
 
         let state = fresh_model_test_state(provider, memory, config);
 
