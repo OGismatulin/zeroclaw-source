@@ -1,0 +1,198 @@
+api_key = ""
+default_provider = "openrouter"
+default_model = "google/gemini-3-flash-preview"
+default_temperature = 0.7
+
+[reliability]
+fallback_providers = []
+
+[reliability.model_fallbacks]
+
+[memory]
+backend = "sqlite"
+auto_save = true
+embedding_provider = "openrouter"
+embedding_model = "openai/text-embedding-3-small"
+embedding_dimensions = 1536
+sqlite_open_timeout_secs = 30
+
+[agent]
+compact_context = false
+max_tool_iterations = 50
+max_history_messages = 50
+parallel_tools = true
+tool_dispatcher = "native"
+
+[skills]
+prompt_injection_mode = "compact"
+
+[observability]
+backend = "none"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "logs/runtime-trace.jsonl"
+runtime_trace_max_entries = 500
+
+[gateway]
+port = 3000
+host = "127.0.0.1"
+require_pairing = false
+allow_public_bind = false
+paired_tokens = ["__ZEROCLAW_BEARER_TOKEN__"]
+trust_forwarded_headers = false
+pair_rate_limit_per_minute = 0
+webhook_rate_limit_per_minute = 0
+rate_limit_max_keys = 10000
+idempotency_ttl_secs = 300
+idempotency_max_keys = 10000
+
+[tunnel]
+provider = "none"
+
+[channels_config]
+cli = true
+
+[channels_config.webhook]
+port = 3000
+secret = "__ZEROCLAW_WEBHOOK_SECRET__"
+
+[autonomy]
+level = "full"
+workspace_only = false
+allowed_commands = [
+    "git",
+    "npm",
+    "cargo",
+    "sh",
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "date",
+    "wget",
+    "python3",
+    "pip",
+    "pip3",
+    "node",
+    "npx",
+    "ffmpeg",
+    "convert",
+    "pandoc",
+    "curl",
+    "jq",
+]
+forbidden_paths = [
+    "/etc",
+    "/root",
+    "/home",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/opt",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/var",
+    "/tmp",
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config",
+]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = false
+block_high_risk_commands = false
+shell_env_passthrough = ["NOTIFY_URL", "NOTIFY_SECRET", "NOTIFY_FILE_URL", "OPENROUTER_API_KEY", "CREATIO_BASE_URL", "CREATIO_USERNAME", "CREATIO_PASSWORD", "PG_PROD_HOST", "PG_PROD_PORT", "PG_PROD_USER", "PG_PROD_PASSWORD", "GITLAB_DEPLOY_USER", "GITLAB_DEPLOY_TOKEN", "GOOGLE_SERVICE_ACCOUNT_JSON"]
+auto_approve = [
+    "file_read",
+    "file_write",
+    "memory_recall",
+    "shell",
+    "http_request",
+]
+always_ask = []
+allowed_roots = ["/zeroclaw-data/code-repos"]
+non_cli_excluded_tools = []
+
+[mcp]
+enabled = true
+deferred_loading = false
+
+[[mcp.servers]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+tool_timeout_secs = 60
+
+[[mcp.servers]]
+name = "lalafo-db"
+transport = "http"
+url = "http://localhost:4000/mcp"
+tool_timeout_secs = 120
+
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+max_response_size = 100000
+timeout_secs = 30
+
+[delegate]
+timeout_secs = 90
+agentic_timeout_secs = 180
+
+[agents.worker]
+provider = "openai-codex"
+model = "gpt-5.4-mini"
+api_key = ""
+agentic = true
+max_iterations = 15
+system_prompt = "You are a fast, focused task executor. Run the delegated sub-task independently using the tools available. Return a concise, structured result."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search", "glob_search",
+    "shell", "http_request", "web_fetch", "web_search_tool", "text_browser",
+    "memory_recall", "memory_store", "memory_forget", "memory_export",
+    "read_skill", "tool_search", "knowledge",
+    "delegate", "swarm",
+    "cron_add", "cron_list", "cron_remove", "cron_run", "cron_runs", "cron_update", "schedule",
+    "model_switch", "model_routing_config",
+    "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
+    "image_gen", "image_info", "pdf_read", "screenshot",
+    "sessions_history", "sessions_list", "sessions_send", "workspace",
+    "calculator", "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations",
+    "sop_advance", "sop_approve", "sop_execute", "sop_list", "sop_status",
+    "security_ops", "vi_verify",
+    "notion", "jira", "linkedin", "google_workspace", "microsoft365", "discord_search", "composio",
+]
+
+[agents.coder]
+provider = "openai-codex"
+model = "gpt-5.4"
+api_key = ""
+agentic = true
+max_iterations = 25
+system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Report concisely what you changed and why."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search", "glob_search",
+    "shell", "http_request", "web_fetch", "web_search_tool", "text_browser",
+    "memory_recall", "memory_store", "memory_forget", "memory_export",
+    "read_skill", "tool_search", "knowledge",
+    "delegate", "swarm",
+    "cron_add", "cron_list", "cron_remove", "cron_run", "cron_runs", "cron_update", "schedule",
+    "model_switch", "model_routing_config",
+    "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
+    "image_gen", "image_info", "pdf_read", "screenshot",
+    "sessions_history", "sessions_list", "sessions_send", "workspace",
+    "calculator", "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations",
+    "sop_advance", "sop_approve", "sop_execute", "sop_list", "sop_status",
+    "security_ops", "vi_verify",
+    "notion", "jira", "linkedin", "google_workspace", "microsoft365", "discord_search", "composio",
+]

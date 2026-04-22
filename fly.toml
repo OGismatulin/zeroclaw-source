@@ -1,0 +1,66 @@
+app = 'ai-forge-zeroclaw'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  # ZEROCLAW_PROVIDER = 'minimax'
+  # ZEROCLAW_MODEL = 'minimax-m2.7'
+  # ZEROCLAW_PROVIDER = 'openai-codex'
+  # ZEROCLAW_MODEL = 'gpt-5.4'
+  # ZEROCLAW_PROVIDER = 'glm'
+  # ZEROCLAW_MODEL = 'glm-5-turbo'
+  ZEROCLAW_PROVIDER = 'zai'
+  ZEROCLAW_MODEL = 'glm-5-turbo'
+  ZEROCLAW_MANAGER_HOST = '0.0.0.0'
+  ZEROCLAW_MANAGER_PORT = '3000'
+  ZEROCLAW_MANAGER_BASE_PORT = '3001'
+  ZEROCLAW_MANAGER_REQUEST_TIMEOUT_SECS = '1800'
+  ZEROCLAW_MANAGER_MAX_INSTANCES = '6'
+  ZEROCLAW_CHILD_HOST = '127.0.0.1'
+  ZEROCLAW_AUTONOMY_LEVEL = 'full'
+  ZEROCLAW_GATEWAY_TIMEOUT_SECS = '1800'
+  ZEROCLAW_REASONING_EFFORT = 'xhigh'
+  RUST_LOG = 'zeroclaw=trace,hyper=info'
+  PG_STAGE_HOST = 'stage.postgres.kube-two.yallasvc.net'
+  PG_STAGE_PORT = '6432'
+  PG_PROD_HOST = 'slave.db.yallasvc.net'
+  PG_PROD_PORT = '5432'
+  PG_PROD_CATALOG_HOST = 'slave.catalog.db.yallasvc.net'
+  MCP_DB_PORT = '4000'
+
+  # Public URLs — plain env, not secrets. Values are non-sensitive (own app domain + CRM base URL).
+  # Kept here instead of fly secrets so the integration wiring is visible in git.
+  NOTIFY_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify'
+  NOTIFY_FILE_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify/file'
+  CREATIO_BASE_URL = 'https://lalafo.creatio.com'
+
+[mounts]
+  source = 'zeroclaw_data'
+  destination = '/zeroclaw-data'
+  processes = ['app']
+
+[http_service]
+  internal_port = 3000
+  force_https = false
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [http_service.http_options]
+    idle_timeout = 900
+
+  [[http_service.checks]]
+    grace_period = '15s'
+    interval = '30s'
+    method = 'GET'
+    timeout = '5s'
+    path = '/health'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024

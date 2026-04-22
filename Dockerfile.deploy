@@ -1,0 +1,142 @@
+# syntax=docker/dockerfile:1.7
+#
+# Deploy Dockerfile for ghcr.io/ogismatulin/zeroclaw (ai-forge-zeroclaw on Fly).
+#
+# Lives in the OGismatulin/zeroclaw-source fork (option A: CI + deploy colocated
+# with Rust source). Upstream's own Dockerfile at ./Dockerfile is untouched —
+# this one is exclusively for our runtime image with Python/Node/OpenVPN tooling
+# and our Python gateway manager layered on top of the Rust binary.
+
+FROM busybox:1.37.0-musl AS busybox
+
+FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+# Copy all workspace crate Cargo.toml files for dependency caching
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
+COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
+COPY crates/zeroclaw-infra/Cargo.toml crates/zeroclaw-infra/Cargo.toml
+COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
+COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
+COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
+COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
+COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
+COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
+COPY crates/zeroclaw-tui/Cargo.toml crates/zeroclaw-tui/Cargo.toml
+COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
+COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
+COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
+COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
+COPY crates/zeroclaw-macros/Cargo.toml crates/zeroclaw-macros/Cargo.toml
+COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+# Create stub source files for all crates so cargo can resolve the workspace
+RUN mkdir -p src benches apps/tauri/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && for crate_dir in \
+         robot-kit aardvark-sys zeroclaw-api zeroclaw-infra zeroclaw-config \
+         zeroclaw-providers zeroclaw-memory zeroclaw-channels zeroclaw-tools \
+         zeroclaw-runtime zeroclaw-tui zeroclaw-plugins zeroclaw-gateway \
+         zeroclaw-hardware zeroclaw-tool-call-parser; do \
+       mkdir -p "crates/$crate_dir/src" && \
+       echo "pub fn placeholder() {}" > "crates/$crate_dir/src/lib.rs"; \
+    done \
+    && mkdir -p crates/zeroclaw-macros/src \
+    && echo "" > crates/zeroclaw-macros/src/lib.rs
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    cargo build --release --locked --features rag-pdf
+RUN rm -rf src benches apps crates/*/src
+
+COPY src/ src/
+COPY benches/ benches/
+COPY crates/ crates/
+COPY apps/ apps/
+COPY firmware/ firmware/
+COPY web/ web/
+RUN mkdir -p web/dist && \
+    if [ ! -f web/dist/index.html ]; then \
+    printf '%s\n' \
+    '<!doctype html>' \
+    '<html lang="en">' \
+    '  <head>' \
+    '    <meta charset="utf-8" />' \
+    '    <meta name="viewport" content="width=device-width,initial-scale=1" />' \
+    '    <title>ZeroClaw Dashboard</title>' \
+    '  </head>' \
+    '  <body>' \
+    '    <h1>ZeroClaw Dashboard Unavailable</h1>' \
+    '    <p>Frontend assets are not bundled in this build. Build the web UI to populate <code>web/dist</code>.</p>' \
+    '  </body>' \
+    '</html>' > web/dist/index.html; \
+    fi
+RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    rm -rf /app/target/release/.fingerprint/zeroclaw-* \
+           /app/target/release/.fingerprint/zeroclawlabs-* \
+           /app/target/release/zeroclaw \
+           /app/target/release/deps/zeroclaw-* \
+           /app/target/release/deps/libzeroclaw-* && \
+    touch src/main.rs src/lib.rs && \
+    cargo build --release --locked --features rag-pdf && \
+    cp target/release/zeroclaw /app/zeroclaw && \
+    strip /app/zeroclaw
+
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba
+
+USER root
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
+    nodejs \
+    npm \
+    build-essential \
+    curl \
+    jq \
+    ffmpeg \
+    imagemagick \
+    pandoc \
+    openvpn \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=busybox /bin/busybox /bin/busybox
+RUN ["/bin/busybox", "--install", "-s", "/bin"]
+
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY config.fly.toml.template /seed/config.fly.toml.template
+COPY scripts/gateway_manager.py /usr/local/bin/gateway_manager.py
+COPY scripts/fly-entrypoint.sh /usr/local/bin/fly-entrypoint.sh
+COPY scripts/mcp_db_server.py /usr/local/bin/mcp_db_server.py
+COPY scripts/code_repos_sync.py /usr/local/bin/code_repos_sync.py
+
+RUN pip install --no-cache-dir --break-system-packages requests pandas psycopg2-binary "mcp[cli]" uvicorn starlette openpyxl gspread google-auth pyarrow matplotlib seaborn
+
+RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py
+
+ENV ZEROCLAW_DATA_ROOT=/zeroclaw-data
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_MANAGER_PORT=3000
+ENV ZEROCLAW_MANAGER_BASE_PORT=3001
+
+WORKDIR /zeroclaw-data
+
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/fly-entrypoint.sh"]
+CMD []
