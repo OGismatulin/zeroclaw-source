@@ -888,7 +888,11 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
-            } else if name == "anthropic" || name == "openai" || name == "groq" {
+            } else if name == "anthropic"
+                || name == "openai"
+                || name == "groq"
+                || name == "opencode-go"
+            {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
                 // provider (e.g. a custom: gateway). This enables multi-provider setups
@@ -897,6 +901,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
                     "groq" => &["GROQ_API_KEY"],
+                    "opencode-go" => &["OPENCODE_GO_API_KEY"],
                     _ => &[],
                 };
                 for env_var in env_candidates {
@@ -1313,11 +1318,12 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new(
+        "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new_with_user_agent(
             "OpenCode Go",
             "https://opencode.ai/zen/go/v1",
             key,
             AuthStyle::Bearer,
+            "curl/8.0.0",
         ))),
         name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
@@ -2832,6 +2838,17 @@ mod tests {
         let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
         let resolved = resolve_provider_credential("opencode-go", None);
+        assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_opencode_go_env_beats_cross_provider_override() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("opencode-go", Some("zai-fallback-key"));
         assert_eq!(resolved.as_deref(), Some("go-test-key"));
     }
 
