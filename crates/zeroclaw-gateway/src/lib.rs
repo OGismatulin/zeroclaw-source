@@ -1761,29 +1761,34 @@ async fn run_gateway_webhook_agentic(
     result
 }
 
-/// Single source of truth for webhook `body.model` override.
-/// Pairs each allowed model with the provider that must handle it.
-/// Extending this list requires rebuild + deploy; keep it short and deliberate.
-const MODEL_ALLOWLIST: &[(&str, &str)] = &[
-    ("glm-5-turbo", "zai"),
-    ("glm-5.1", "zai"),
-    ("gpt-5.4", "openai-codex"),
-    ("gpt-5.4-mini", "openai-codex"),
-];
-
-fn resolve_provider_for_model(model: &str) -> Option<&'static str> {
-    MODEL_ALLOWLIST
+/// Provider validation source-of-truth: the central ProviderInfo registry
+/// from zeroclaw_providers. Adding a new MODEL for an already-registered
+/// provider requires no Rust changes — gateway passes the model string
+/// through unvalidated to the provider, which fails fast on its own
+/// catalog. Adding a new PROVIDER itself still requires Rust changes
+/// (factory + registry) and is governed by zeroclaw-providers.
+fn provider_exists_in_registry(name: &str) -> bool {
+    zeroclaw_providers::list_providers()
         .iter()
-        .find(|(m, _)| *m == model)
-        .map(|(_, p)| *p)
+        .any(|p| p.name == name)
 }
 
-fn allowlist_model_names() -> Vec<&'static str> {
-    MODEL_ALLOWLIST.iter().map(|(m, _)| *m).collect()
+fn registry_canonical_provider_names() -> Vec<&'static str> {
+    zeroclaw_providers::list_providers()
+        .into_iter()
+        .map(|p| p.name)
+        .collect()
 }
 
-/// Classification result for the optional `body.model` field.
+/// Classification result for the optional `body.model` + `body.provider` pair.
 /// Pure logic, no I/O — delegates provider creation to the caller.
+///
+/// Contract (spec 2026-05-03 hard cutover, replaces former MODEL_ALLOWLIST):
+/// - Both absent → Default (caller uses daemon defaults)
+/// - Both present → Override (validated against ProviderInfo registry)
+/// - Only one half present → MissingModel/MissingProvider (400)
+/// - Either field empty/whitespace → InvalidEmpty (400)
+/// - provider not in registry → UnknownProvider (400) with available list
 #[derive(Debug)]
 pub(crate) enum ModelSelection {
     /// No override — caller uses daemon default provider/model.
@@ -1791,34 +1796,45 @@ pub(crate) enum ModelSelection {
     /// Validated override — caller must create the named provider with this model.
     Override {
         model: String,
-        provider: &'static str,
+        provider: String,
     },
-    /// Explicit empty/whitespace `model` — 400 invalid_model.
+    /// `model` or `provider` present but empty/whitespace.
     InvalidEmpty,
-    /// Non-empty but not in MODEL_ALLOWLIST — 400 unknown_model.
-    Unknown {
+    /// `provider` set but `model` missing → 400 missing_model.
+    MissingModel,
+    /// `model` set but `provider` missing → 400 missing_provider.
+    MissingProvider,
+    /// `provider` not in ProviderInfo registry (canonical names only;
+    /// aliases are not accepted by validation — bot must send canonical).
+    UnknownProvider {
         requested: String,
-        available: Vec<&'static str>,
+        available_providers: Vec<&'static str>,
     },
 }
 
-pub(crate) fn classify_model_selection(raw: Option<&str>) -> ModelSelection {
-    match raw {
-        None => ModelSelection::Default,
-        Some(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return ModelSelection::InvalidEmpty;
-            }
-            match resolve_provider_for_model(trimmed) {
-                Some(provider) => ModelSelection::Override {
-                    model: trimmed.to_string(),
-                    provider,
-                },
-                None => ModelSelection::Unknown {
-                    requested: trimmed.to_string(),
-                    available: allowlist_model_names(),
-                },
+pub(crate) fn classify_provider_selection(
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> ModelSelection {
+    let model_trimmed = model.map(|s| s.trim());
+    let provider_trimmed = provider.map(|s| s.trim());
+
+    match (model_trimmed, provider_trimmed) {
+        (None, None) => ModelSelection::Default,
+        (Some(""), _) | (_, Some("")) => ModelSelection::InvalidEmpty,
+        (Some(_), None) => ModelSelection::MissingProvider,
+        (None, Some(_)) => ModelSelection::MissingModel,
+        (Some(m), Some(p)) => {
+            if provider_exists_in_registry(p) {
+                ModelSelection::Override {
+                    model: m.to_string(),
+                    provider: p.to_string(),
+                }
+            } else {
+                ModelSelection::UnknownProvider {
+                    requested: p.to_string(),
+                    available_providers: registry_canonical_provider_names(),
+                }
             }
         }
     }
@@ -1864,12 +1880,16 @@ impl ActiveProvider {
 }
 
 /// Webhook request body.
-/// `model` is optional: absent → daemon default provider/model.
+/// `model` and `provider` are optional but must come together: both
+/// absent → daemon default; both present → validated override (provider
+/// against ProviderInfo registry); only one → 400 missing_*.
 #[derive(serde::Deserialize, Default)]
 pub struct WebhookBody {
     pub message: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -1988,29 +2008,32 @@ async fn handle_webhook(
     // selection fully bypasses scenario routing (spec §4.5).
     let config_snapshot = state.config.lock().clone();
     let (active, provider_name, model_name): (ActiveProvider, String, String) =
-        match classify_model_selection(webhook_body.model.as_deref()) {
+        match classify_provider_selection(
+            webhook_body.model.as_deref(),
+            webhook_body.provider.as_deref(),
+        ) {
             ModelSelection::Default => {
                 let name = state.provider_name.clone();
                 let model = state.model.clone();
                 (ActiveProvider::Shared(state.provider.clone()), name, model)
             }
-            ModelSelection::Override { model, provider: provider_static } => {
-                match build_override_provider(&config_snapshot, provider_static, &model) {
+            ModelSelection::Override { model, provider } => {
+                match build_override_provider(&config_snapshot, &provider, &model) {
                     Ok(p) => (
                         ActiveProvider::Owned(p),
-                        provider_static.to_string(),
+                        provider,
                         model,
                     ),
                     Err(e) => {
                         tracing::warn!(
-                            "Webhook: failed to init override provider {provider_static}: {e:#}"
+                            "Webhook: failed to init override provider {provider}: {e:#}"
                         );
                         let err = serde_json::json!({
                             "error": format!(
-                                "failed to initialize provider '{provider_static}'"
+                                "failed to initialize provider '{provider}'"
                             ),
                             "error_code": "provider_initialization_failed",
-                            "provider": provider_static,
+                            "provider": provider,
                             "model": model,
                         });
                         return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
@@ -2019,17 +2042,31 @@ async fn handle_webhook(
             }
             ModelSelection::InvalidEmpty => {
                 let err = serde_json::json!({
-                    "error": "model must not be empty",
+                    "error": "model and provider must not be empty",
                     "error_code": "invalid_model",
                 });
                 return (StatusCode::BAD_REQUEST, Json(err));
             }
-            ModelSelection::Unknown { requested, available } => {
+            ModelSelection::MissingModel => {
                 let err = serde_json::json!({
-                    "error": format!("unknown model '{requested}'"),
-                    "error_code": "unknown_model",
-                    "requested_model": requested,
-                    "available_models": available,
+                    "error": "provider was set but model is missing — both must come together",
+                    "error_code": "missing_model",
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            }
+            ModelSelection::MissingProvider => {
+                let err = serde_json::json!({
+                    "error": "model was set but provider is missing — both must come together",
+                    "error_code": "missing_provider",
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            }
+            ModelSelection::UnknownProvider { requested, available_providers } => {
+                let err = serde_json::json!({
+                    "error": format!("unknown provider '{requested}'"),
+                    "error_code": "unknown_provider",
+                    "requested_provider": requested,
+                    "available_providers": available_providers,
                 });
                 return (StatusCode::BAD_REQUEST, Json(err));
             }
@@ -3010,74 +3047,109 @@ mod tests {
     }
 
     #[test]
-    fn model_allowlist_resolves_known_models() {
-        assert_eq!(resolve_provider_for_model("glm-5-turbo"), Some("zai"));
-        assert_eq!(resolve_provider_for_model("glm-5.1"), Some("zai"));
-        assert_eq!(resolve_provider_for_model("gpt-5.4"), Some("openai-codex"));
-        assert_eq!(resolve_provider_for_model("gpt-5.4-mini"), Some("openai-codex"));
+    fn provider_registry_validation_accepts_canonical_names() {
+        // Sample of canonical names that must exist in ProviderInfo registry.
+        assert!(provider_exists_in_registry("openai-codex"));
+        assert!(provider_exists_in_registry("zai"));
+        assert!(provider_exists_in_registry("opencode-go"));
+        assert!(provider_exists_in_registry("openrouter"));
     }
 
     #[test]
-    fn model_allowlist_rejects_unknown_model() {
-        assert_eq!(resolve_provider_for_model("gpt-typo"), None);
-        assert_eq!(resolve_provider_for_model(""), None);
-        // case-sensitive by design
-        assert_eq!(resolve_provider_for_model("GLM-5-Turbo"), None);
+    fn provider_registry_validation_rejects_aliases_and_unknown() {
+        // Strict canonical only — aliases (e.g. "z.ai" → "zai") rejected.
+        assert!(!provider_exists_in_registry("z.ai"));
+        assert!(!provider_exists_in_registry("opencode-zen"));
+        assert!(!provider_exists_in_registry("gpt-typo"));
+        assert!(!provider_exists_in_registry(""));
     }
 
     #[test]
-    fn classify_model_selection_none_returns_default() {
-        assert!(matches!(classify_model_selection(None), ModelSelection::Default));
+    fn classify_provider_selection_none_returns_default() {
+        assert!(matches!(
+            classify_provider_selection(None, None),
+            ModelSelection::Default
+        ));
     }
 
     #[test]
-    fn classify_model_selection_valid_returns_override() {
-        match classify_model_selection(Some("gpt-5.4")) {
+    fn classify_provider_selection_pair_returns_override() {
+        match classify_provider_selection(Some("kimi-k2.6"), Some("opencode-go")) {
             ModelSelection::Override { model, provider } => {
-                assert_eq!(model, "gpt-5.4");
-                assert_eq!(provider, "openai-codex");
+                assert_eq!(model, "kimi-k2.6");
+                assert_eq!(provider, "opencode-go");
             }
             other => panic!("expected Override, got {other:?}"),
         }
     }
 
     #[test]
-    fn classify_model_selection_empty_or_whitespace_rejects() {
+    fn classify_provider_selection_empty_or_whitespace_rejects() {
+        // Empty model with provider set
         assert!(matches!(
-            classify_model_selection(Some("")),
+            classify_provider_selection(Some(""), Some("zai")),
             ModelSelection::InvalidEmpty
         ));
+        // Empty provider with model set
         assert!(matches!(
-            classify_model_selection(Some("   ")),
+            classify_provider_selection(Some("glm-5.1"), Some("")),
             ModelSelection::InvalidEmpty
         ));
+        // Both whitespace
         assert!(matches!(
-            classify_model_selection(Some("\t\n")),
+            classify_provider_selection(Some("   "), Some("\t")),
             ModelSelection::InvalidEmpty
         ));
     }
 
     #[test]
-    fn classify_model_selection_unknown_reports_available_list() {
-        match classify_model_selection(Some("xyz")) {
-            ModelSelection::Unknown { requested, available } => {
-                assert_eq!(requested, "xyz");
-                assert!(available.contains(&"gpt-5.4"));
-                assert!(available.contains(&"glm-5-turbo"));
-                assert!(available.contains(&"glm-5.1"));
-                assert!(available.contains(&"gpt-5.4-mini"));
-            }
-            other => panic!("expected Unknown, got {other:?}"),
+    fn classify_provider_selection_missing_provider() {
+        match classify_provider_selection(Some("glm-5.1"), None) {
+            ModelSelection::MissingProvider => {}
+            other => panic!("expected MissingProvider, got {other:?}"),
         }
     }
 
     #[test]
-    fn classify_model_selection_trims_before_matching() {
-        // leading/trailing spaces must not cause "unknown"
-        match classify_model_selection(Some("  gpt-5.4  ")) {
+    fn classify_provider_selection_missing_model() {
+        match classify_provider_selection(None, Some("zai")) {
+            ModelSelection::MissingModel => {}
+            other => panic!("expected MissingModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_provider_selection_unknown_provider_reports_available() {
+        match classify_provider_selection(Some("kimi-k2.6"), Some("totally-fake-provider")) {
+            ModelSelection::UnknownProvider { requested, available_providers } => {
+                assert_eq!(requested, "totally-fake-provider");
+                // Sanity check: a few expected canonical names must be in the list.
+                assert!(available_providers.contains(&"openai-codex"));
+                assert!(available_providers.contains(&"zai"));
+                assert!(available_providers.contains(&"opencode-go"));
+            }
+            other => panic!("expected UnknownProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_provider_selection_canonical_only_rejects_alias() {
+        // strict canonical: alias "z.ai" of canonical "zai" must be rejected.
+        match classify_provider_selection(Some("glm-5.1"), Some("z.ai")) {
+            ModelSelection::UnknownProvider { requested, .. } => {
+                assert_eq!(requested, "z.ai");
+            }
+            other => panic!("expected UnknownProvider for alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_provider_selection_trims_before_matching() {
+        // Leading/trailing whitespace must not cause Unknown when canonical name is correct.
+        match classify_provider_selection(Some("  kimi-k2.6  "), Some("  opencode-go  ")) {
             ModelSelection::Override { model, provider } => {
-                assert_eq!(model, "gpt-5.4");
-                assert_eq!(provider, "openai-codex");
+                assert_eq!(model, "kimi-k2.6");
+                assert_eq!(provider, "opencode-go");
             }
             other => panic!("expected Override after trim, got {other:?}"),
         }
