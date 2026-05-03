@@ -60,7 +60,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, Provider};
+use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -1669,7 +1669,7 @@ async fn run_gateway_webhook_agentic(
         );
     if !native_tools {
         system_prompt.push_str(
-            &zeroclaw_runtime::agent::loop_::build_tool_instructions(&tools_registry, None),
+            &zeroclaw_runtime::agent::loop_::build_tool_instructions(&tools_registry),
         );
     }
     if !deferred_section.is_empty() {
@@ -4719,6 +4719,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -4729,6 +4730,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
