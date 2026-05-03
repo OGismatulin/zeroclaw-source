@@ -1441,6 +1441,8 @@ async fn run_gateway_webhook_agentic(
         (None, None)
     };
 
+    let fallback_provider = config.providers.fallback_provider();
+
     let (
         mut tools_registry,
         delegate_handle,
@@ -1460,7 +1462,7 @@ async fn run_gateway_webhook_agentic(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        config.api_key.as_deref(),
+        fallback_provider.and_then(|e| e.api_key.as_deref()),
         &config,
         None, // canvas_store
     );
@@ -1641,7 +1643,7 @@ async fn run_gateway_webhook_agentic(
         observer.as_ref(),
         provider_name,
         model_name,
-        config.default_temperature,
+        fallback_provider.and_then(|e| e.temperature).unwrap_or(0.7),
         true,
         "webhook",
         None,
@@ -1746,10 +1748,11 @@ fn build_override_provider(
     let empty_routes: &[zeroclaw_config::schema::ModelRouteConfig] = &[];
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(config);
+    let fallback_provider = config.providers.fallback_provider();
     zeroclaw_providers::create_routed_provider_with_options(
         provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
+        fallback_provider.and_then(|e| e.api_key.as_deref()),
+        fallback_provider.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         empty_routes,
         model_name,
