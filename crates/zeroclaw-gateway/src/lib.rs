@@ -7,8 +7,12 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod acp;
 pub mod api;
+pub mod api_config;
+pub mod api_onboard;
 pub mod api_pairing;
+pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 #[cfg(feature = "webauthn")]
@@ -18,10 +22,13 @@ pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
+pub mod openapi;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+#[cfg(feature = "gateway-voice-duplex")]
+pub mod voice_duplex;
 pub mod ws;
 
 use anyhow::{Context, Result};
@@ -31,7 +38,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post},
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -53,7 +60,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -66,6 +73,15 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// Default request timeout for `POST /api/cron/{id}/run` (10 minutes).
+///
+/// Manually-triggered cron jobs run synchronously inside the request handler
+/// and frequently exceed the 30s gateway-wide default — agent jobs in
+/// particular can take minutes to complete a full reasoning loop. Capping at
+/// 10 minutes keeps the route from hanging indefinitely while still allowing
+/// realistic workloads to finish.
+pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
+
 /// Read gateway request timeout from `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var
 /// at runtime, falling back to [`REQUEST_TIMEOUT_SECS`].
 ///
@@ -77,6 +93,18 @@ pub fn gateway_request_timeout_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(REQUEST_TIMEOUT_SECS)
+}
+
+/// Read manual cron-run request timeout from
+/// `ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS` at runtime, falling back to
+/// [`LONG_RUNNING_REQUEST_TIMEOUT_SECS`]. Long-running jobs (e.g. agent prompts that
+/// invoke tools) can comfortably exceed the 30s gateway-wide default, so the
+/// `/api/cron/{id}/run` route gets its own timeout layer.
+pub fn gateway_long_running_request_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LONG_RUNNING_REQUEST_TIMEOUT_SECS)
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -113,11 +141,18 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
 }
 
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+    const MAX_SESSION_ID_LEN: usize = 128;
     headers
         .get("X-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
         .map(str::to_owned)
 }
 
@@ -377,6 +412,11 @@ pub struct AppState {
     pub event_buffer: Arc<sse::EventBuffer>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Reload signal sender owned by the daemon. /admin/reload writes `true`
+    /// here; the daemon's wait loop reacts and re-instantiates every
+    /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
+    /// — reload then degrades to a 503 with a clear message.
+    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
@@ -399,6 +439,13 @@ pub struct AppState {
     /// In-memory webhook conversation history per session.
     /// Protected by async mutex to serialize concurrent webhook requests.
     pub(crate) webhook_session: Arc<TokioMutex<Option<WebhookSessionState>>>,
+    /// Per-session cancellation tokens for aborting in-flight agent responses.
+    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
+    /// current turn. Entries are inserted before each turn and removed after
+    /// completion (normal or cancelled).
+    pub cancel_tokens: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -408,6 +455,11 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // Reload sender owned by the daemon. /admin/reload writes `true` here;
+    // the daemon's wait loop reacts via `subscribe()` and tears down to
+    // re-init. Cross-platform replacement for the SIGUSR1 hack.
+    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
@@ -477,7 +529,12 @@ pub async fn run_gateway(
         (None, None)
     };
 
-    let canvas_store = tools::CanvasStore::new();
+    // Reuse the daemon-supplied canvas store when present so channel-
+    // server agents (Telegram/Discord/Slack) push frames into the same
+    // store the gateway's WebSocket and REST endpoints serve (#5356).
+    // Standalone gateway invocations (no daemon supervisor) fall back
+    // to a fresh store.
+    let canvas_store = canvas_store.unwrap_or_default();
 
     let (
         mut tools_registry_raw,
@@ -918,6 +975,7 @@ pub async fn run_gateway(
         event_tx,
         event_buffer,
         shutdown_tx,
+        reload_tx,
         node_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
@@ -926,6 +984,7 @@ pub async fn run_gateway(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
+        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -953,15 +1012,11 @@ pub async fn run_gateway(
         webhook_session: Arc::new(TokioMutex::new(None)),
     };
 
-    // Config PUT needs larger body limit (1MB)
-    let config_put_router = Router::new()
-        .route("/api/config", put(api::handle_api_config_put))
-        .layer(RequestBodyLimitLayer::new(1_048_576));
-
     // Build router with middleware
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -981,7 +1036,49 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
-        .route("/api/config", get(api::handle_api_config_get))
+        .route(
+            "/api/config",
+            patch(api_config::handle_patch).options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-key", post(api_config::handle_map_key))
+        .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
+        .route(
+            "/api/onboard/catalog/models",
+            get(api_onboard::handle_catalog_models),
+        )
+        .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route("/api/onboard/sections", get(api_onboard::handle_sections))
+        .route(
+            "/api/onboard/sections/{section}",
+            get(api_onboard::handle_section_picker),
+        )
+        .route(
+            "/api/onboard/sections/{section}/items/{key}",
+            post(api_onboard::handle_section_select),
+        )
+        .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/personality/templates",
+            get(api_personality::handle_templates),
+        )
+        .route(
+            "/api/personality/{filename}",
+            get(api_personality::handle_get).put(api_personality::handle_put),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route("/api/openapi.json", get(openapi::handle_openapi_json))
+        .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
@@ -994,6 +1091,9 @@ pub async fn run_gateway(
             delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
         )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        // Note: `/api/cron/{id}/run` is registered on a separate router below
+        // with a longer TimeoutLayer — manual cron triggers run the job
+        // synchronously and routinely exceed the 30s gateway-wide default.
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/integrations/settings",
@@ -1008,6 +1108,7 @@ pub async fn run_gateway(
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
@@ -1017,6 +1118,7 @@ pub async fn run_gateway(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -1078,6 +1180,8 @@ pub async fn run_gateway(
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
+        // ── ACP client bridge ──
+        .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket canvas updates ──
@@ -1086,16 +1190,29 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
-        // ── Config PUT with larger body limit ──
-        .merge(config_put_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs()),
         ));
+
+    // Manual cron-trigger route lives on its own sub-router so it can opt out
+    // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
+    // the route through `merge`, so only this endpoint sees the longer
+    // timeout.
+    let cron_run_router: Router = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_long_running_request_timeout_secs()),
+        ));
+
+    let inner = inner.merge(cron_run_router);
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -1350,62 +1467,32 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    message: &str,
-) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
-    let user_messages = vec![ChatMessage::user(message)];
-
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        zeroclaw_runtime::agent::system_prompt::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-        &messages,
-        &multimodal_config,
-    )
-    .await?;
-
-    state
-        .provider
-        .chat(
-            zeroclaw_api::provider::ChatRequest {
-                messages: &prepared.messages,
-                tools: None,
-            },
-            &state.model,
-            state.temperature,
-        )
-        .await
-}
-
-/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+/// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let config = state.config.lock().clone();
-    Box::pin(zeroclaw_runtime::agent::process_message(
-        config, message, session_id,
-    ))
-    .await
+    // Tests exercise webhook infrastructure (idempotency, auth, autosave)
+    // through handle_webhook, so dispatch to the mock provider directly
+    // instead of bootstrapping the full agent runtime.
+    #[cfg(test)]
+    {
+        let _ = session_id;
+        return state
+            .provider
+            .chat_with_system(None, message, &state.model, Some(state.temperature))
+            .await;
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.lock().clone();
+        Box::pin(zeroclaw_runtime::agent::process_message(
+            config, message, session_id,
+        ))
+        .await
+    }
 }
 
 /// Agentic webhook chat that preserves gateway auth/idempotency flow while
@@ -1989,8 +2076,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens,
-                    output_tokens,
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             );
             state.observer.record_metric(
@@ -2001,7 +2088,7 @@ async fn handle_webhook(
                     provider: provider_name.clone(),
                     model: model_name.clone(),
                     duration,
-                    tokens_used,
+                    tokens_used: None,
                     cost_usd: None,
                 },
             );
@@ -2177,6 +2264,17 @@ async fn handle_whatsapp_message(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+
+        // Route approval replies to pending approval requests before dispatching to agent
+        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
+        {
+            let mut map = wa.pending_approvals().lock().await;
+            if let Some(sender) = map.remove(&token) {
+                let _ = sender.send(response);
+                continue;
+            }
+        }
+
         let session_id = sender_session_id("whatsapp", msg);
 
         // Auto-save to memory
@@ -2685,6 +2783,70 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// POST /admin/reload — reload the daemon in place (localhost only).
+///
+/// Sends `true` on the reload channel the daemon owns. The daemon's main
+/// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
+/// loop in `src/main.rs` re-reads config from disk and re-runs
+/// `daemon::run` — re-instantiating every subsystem (gateway / channels /
+/// heartbeat / scheduler / mqtt) with the fresh config.
+///
+/// Same PID throughout. Brief HTTP downtime while the gateway listener
+/// rebinds — typically sub-second. Clients should poll `/health` to detect
+/// when the new instance is ready.
+///
+/// Cross-platform — works identically on Linux, macOS, and Windows because
+/// the channel is in-process tokio, not an OS signal. The gateway-only
+/// `zeroclaw gateway start` (no daemon supervisor) returns 503 with a
+/// clear message because there's nothing to signal.
+async fn handle_admin_reload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let Some(reload_tx) = state.reload_tx.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no daemon supervisor — running as standalone gateway. \
+                          Restart the process to pick up config changes."
+            })),
+        ));
+    };
+
+    tracing::info!("🔄 Admin reload request received");
+    // Trigger graceful shutdown of THIS gateway instance's axum::serve so
+    // its TcpListener releases the port before the daemon supervisor
+    // spawns the new instance. Without this, daemon::run aborts the
+    // gateway tokio task at the next await point — but the OLD listener
+    // can stay bound briefly, racing the NEW gateway's bind. The new
+    // bind then fails and spawn_component_supervisor backs off; in the
+    // meantime the OLD gateway keeps serving requests with stale
+    // in-memory config, and `/api/config/drift` reports drift against
+    // disk because in-memory hasn't been replaced yet. Cold restart
+    // (process exit + start) hits this path differently because the OS
+    // fully releases the listener — that's why the user observes "shut
+    // down + bring up = correct" but "/admin/reload = stale".
+    let shutdown_tx = state.shutdown_tx.clone();
+    // Brief delay so the HTTP response flushes before tear-down begins.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Drain axum first so the listener releases.
+        let _ = shutdown_tx.send(true);
+        // Then signal the daemon to re-read disk and re-spawn subsystems.
+        let _ = reload_tx.send(true);
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Daemon reload initiated".to_string(),
+        }),
+    ))
+}
+
 /// GET /admin/paircode — fetch current pairing code (localhost only)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
@@ -2807,6 +2969,18 @@ mod tests {
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn long_running_request_timeout_default_is_ten_minutes() {
+        assert_eq!(LONG_RUNNING_REQUEST_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn long_running_request_timeout_falls_back_to_default() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS") };
+        assert_eq!(gateway_long_running_request_timeout_secs(), 600);
     }
 
     #[test]
@@ -2955,6 +3129,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -2965,6 +3140,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3029,6 +3205,7 @@ mod tests {
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3039,6 +3216,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3241,6 +3419,65 @@ mod tests {
     }
 
     #[test]
+    fn webhook_session_id_accepts_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("abc-DEF_123.foo"));
+        assert_eq!(webhook_session_id(&headers), Some("abc-DEF_123.foo".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("  my-session  "));
+        assert_eq!(webhook_session_id(&headers), Some("my-session".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static(""));
+        assert_eq!(webhook_session_id(&headers), None);
+
+        headers.insert("X-Session-Id", HeaderValue::from_static("   "));
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_oversized() {
+        let mut headers = HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&long).unwrap());
+        assert_eq!(webhook_session_id(&headers), None);
+
+        let at_limit = "b".repeat(128);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&at_limit).unwrap());
+        assert!(webhook_session_id(&headers).is_some());
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_invalid_chars() {
+        let mut headers = HeaderMap::new();
+        for bad in &[
+            "has/slash",
+            "has:colon",
+            "has space",
+            "has@at",
+            "emoji\u{1f600}",
+        ] {
+            if let Ok(val) = HeaderValue::from_str(bad) {
+                headers.insert("X-Session-Id", val);
+                assert_eq!(webhook_session_id(&headers), None, "should reject: {bad}");
+            }
+        }
+    }
+
+    #[test]
     fn whatsapp_memory_key_includes_sender_and_message_id() {
         let msg = ChannelMessage {
             id: "wamid-123".into(),
@@ -3325,7 +3562,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())
@@ -3429,6 +3666,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3439,6 +3677,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3513,6 +3752,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3523,6 +3763,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3609,6 +3850,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3619,6 +3861,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3676,6 +3919,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3686,6 +3930,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3748,6 +3993,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3758,6 +4004,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3825,6 +4072,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3835,6 +4083,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
@@ -3898,6 +4147,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3908,6 +4158,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
