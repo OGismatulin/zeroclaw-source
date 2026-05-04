@@ -74,7 +74,7 @@ impl Tool for SessionsListTool {
     }
 
     fn description(&self) -> &str {
-        "List all active conversation sessions with their channel, last activity time, and message count."
+        "List OTHER sessions tracked by SessionBackend (channel sessions like Slack/WhatsApp/WS chats), with their channel, last activity time, and message count. Does NOT include the current webhook conversation — that history is already in your context window."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -147,7 +147,7 @@ impl Tool for SessionsHistoryTool {
     }
 
     fn description(&self) -> &str {
-        "Read the message history of a specific session by its session ID. Returns the last N messages."
+        "Read the message history of a DIFFERENT session by its session ID from SessionBackend. Returns the last N messages. Does NOT return the current webhook conversation — for that, just look at your existing context."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -247,7 +247,7 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
+        "Send a message to ANOTHER session by its session ID via SessionBackend. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication. Not for replying inside the current webhook turn."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -340,7 +340,7 @@ impl Tool for SessionsCurrentTool {
     }
 
     fn description(&self) -> &str {
-        "Return the session key and metadata for the session this agent is currently running in."
+        "Return the session_id string of the request you are currently answering. Use this only when you need the literal id (e.g. to pass it to another tool). Do NOT use this to recall what the user just said — current conversation history is already in your context window."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
