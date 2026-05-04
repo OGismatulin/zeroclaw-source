@@ -1626,19 +1626,19 @@ async fn run_gateway_webhook_agentic(
         ("image_info", "Read image metadata."),
         (
             "sessions_current",
-            "Return the active session id and message count.",
+            "Return the session_id of the request you are answering. NOTE: the current conversation history is already in your context window — use this only when you need the literal session id string, not to recall what the user just said.",
         ),
         (
             "sessions_list",
-            "List recent sessions across channels with last activity and message count.",
+            "List OTHER sessions tracked by SessionBackend (Slack/WhatsApp/WS channels), not the current webhook conversation. Empty for pure webhook deployments.",
         ),
         (
             "sessions_history",
-            "Read message history of a given session_id (params: session_id, optional limit).",
+            "Read transcript of a DIFFERENT session_id from SessionBackend. Does not return the current webhook conversation — that history is already in your context.",
         ),
         (
             "sessions_send",
-            "Append a user message to another session_id (params: session_id, message).",
+            "Post a message to ANOTHER session_id via SessionBackend. Inter-session orchestration only.",
         ),
     ];
     if matches!(
@@ -1738,26 +1738,32 @@ async fn run_gateway_webhook_agentic(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    // Run tool loop (lock held — concurrent requests wait)
-    let result = zeroclaw_runtime::agent::loop_::agent_turn(
-        provider,
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        model_name,
-        fallback_provider.and_then(|e| e.temperature).unwrap_or(0.7),
-        true,
-        "webhook",
-        None,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-        Some(&approval_manager),
-        &excluded_tools,
-        &config.agent.tool_call_dedup_exempt,
-        activated_handle.as_ref(),
-        None,
-        None, // channel: Option<&dyn Channel> — webhook path has no channel
+    // Run tool loop (lock held — concurrent requests wait).
+    // Scope the session_id into TOOL_LOOP_SESSION_KEY so sessions_current
+    // tool can identify the active session from inside the loop.
+    let session_key_for_scope = session_id.map(str::to_owned);
+    let result = zeroclaw_runtime::agent::loop_::scope_session_key(
+        session_key_for_scope,
+        zeroclaw_runtime::agent::loop_::agent_turn(
+            provider,
+            &mut history,
+            &tools_registry,
+            observer.as_ref(),
+            provider_name,
+            model_name,
+            fallback_provider.and_then(|e| e.temperature).unwrap_or(0.7),
+            true,
+            "webhook",
+            None,
+            &config.multimodal,
+            config.agent.max_tool_iterations,
+            Some(&approval_manager),
+            &excluded_tools,
+            &config.agent.tool_call_dedup_exempt,
+            activated_handle.as_ref(),
+            None,
+            None, // channel: Option<&dyn Channel> — webhook path has no channel
+        ),
     )
     .await;
 
