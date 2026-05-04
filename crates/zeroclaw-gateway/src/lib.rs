@@ -1624,6 +1624,22 @@ async fn run_gateway_webhook_agentic(
         ),
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
+        (
+            "sessions_current",
+            "Return the active session id and message count.",
+        ),
+        (
+            "sessions_list",
+            "List recent sessions across channels with last activity and message count.",
+        ),
+        (
+            "sessions_history",
+            "Read message history of a given session_id (params: session_id, optional limit).",
+        ),
+        (
+            "sessions_send",
+            "Append a user message to another session_id (params: session_id, message).",
+        ),
     ];
     if matches!(
         config.skills.prompt_injection_mode,
