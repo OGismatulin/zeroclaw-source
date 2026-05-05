@@ -77,3 +77,7 @@ apps/tauri/tauri.conf.json
 apps/tauri/build.rs
 !apps/tauri/Cargo.toml
 scripts/
+!scripts/gateway_manager.py
+!scripts/fly-entrypoint.sh
+!scripts/mcp_db_server.py
+!scripts/code_repos_sync.py

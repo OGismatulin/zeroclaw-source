@@ -662,6 +662,7 @@ pub async fn agent_turn(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     channel: Option<&dyn Channel>,
+    cancellation_token: Option<CancellationToken>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -677,7 +678,7 @@ pub async fn agent_turn(
         channel_reply_target,
         multimodal_config,
         max_tool_iterations,
-        None,
+        cancellation_token,
         None,
         None,
         excluded_tools,
@@ -3458,6 +3459,7 @@ pub async fn process_message(
         activated_handle_pm.as_ref(),
         None,
         None, // channel: process_message path has no channel ref
+        None, // cancellation_token: process_message path is non-cancellable
     )
     .await
 }
@@ -6192,6 +6194,7 @@ mod tests {
                 Some(&activated),
                 None,
                 None, // channel
+                None, // cancellation_token
             )
             .await
             .expect("wrapper path should execute activated tools");

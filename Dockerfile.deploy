@@ -75,6 +75,20 @@ COPY tools/ tools/
 COPY xtask/ xtask/
 COPY firmware/ firmware/
 COPY web/ web/
+
+# .dockerignore intentionally excludes apps/tauri/src/ (desktop-only sources
+# we don't need for the gateway image), but cargo's workspace resolution
+# still requires SOMETHING for apps/tauri (Cargo.toml has no [[bin]]).
+# Drop a stub main.rs/lib.rs back so `cargo build --release --features rag-pdf`
+# can resolve the workspace. The real binary built by this stage is
+# zeroclaw (gateway) — we never invoke the tauri target.
+RUN mkdir -p apps/tauri/src && \
+    if [ ! -f apps/tauri/src/main.rs ]; then \
+        echo "fn main() {}" > apps/tauri/src/main.rs; \
+    fi && \
+    if [ ! -f apps/tauri/src/lib.rs ]; then \
+        echo "" > apps/tauri/src/lib.rs; \
+    fi
 RUN mkdir -p web/dist && \
     if [ ! -f web/dist/index.html ]; then \
     printf '%s\n' \

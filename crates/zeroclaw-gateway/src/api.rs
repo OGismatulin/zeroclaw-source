@@ -953,12 +953,12 @@ pub async fn handle_api_session_delete(
     // this, deleting a session mid-turn leaks the map entry until the
     // streaming task happens to wake up — and on a process crash the
     // entry is lost entirely (#5835).
-    let token = state
+    let entry = state
         .cancel_tokens
         .lock()
         .expect("cancel_tokens lock poisoned")
         .remove(&session_key);
-    if let Some(token) = token {
+    if let Some((_id, token)) = entry {
         token.cancel();
         tracing::info!(session_key, "cancelled in-flight turn for deleted session");
     }
@@ -1134,14 +1134,14 @@ pub async fn handle_api_session_abort(
 
     // Look up and cancel the token. Hold the lock only long enough to
     // clone the token — cancellation itself does not need the lock.
-    let token = state
+    let entry = state
         .cancel_tokens
         .lock()
         .expect("cancel_tokens lock poisoned")
         .get(&session_key)
         .cloned();
 
-    if let Some(token) = token {
+    if let Some((_id, token)) = entry {
         token.cancel();
         tracing::info!(session_key, "session abort requested");
         Json(serde_json::json!({ "status": "aborted" })).into_response()
@@ -1298,6 +1298,8 @@ mod tests {
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_token_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            webhook_lock_timeout_secs: 1, // fast tests
             reload_tx: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,

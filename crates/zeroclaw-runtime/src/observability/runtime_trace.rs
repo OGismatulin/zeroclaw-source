@@ -313,6 +313,34 @@ pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<RuntimeTraceEven
     Ok(None)
 }
 
+/// Record a "turn cancelled" trace event from the gateway webhook path.
+///
+/// `iterations_completed` and `tool_calls_executed` are best-effort counters;
+/// the current `run_tool_call_loop` does not return them, so MVP callers may
+/// pass 0. The fields are reserved in the trace payload for future plumbing.
+pub fn record_turn_cancelled(
+    session_id: &str,
+    iterations_completed: u32,
+    tool_calls_executed: u32,
+    reason: &str,
+) {
+    record_event(
+        "turn_cancelled",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "session_id": session_id,
+            "iterations_completed": iterations_completed,
+            "tool_calls_executed": tool_calls_executed,
+            "reason": reason,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

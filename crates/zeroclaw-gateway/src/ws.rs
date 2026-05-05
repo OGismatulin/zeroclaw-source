@@ -501,13 +501,21 @@ async fn process_chat_message(
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
     // of outcome (normal, error, or cancelled).
+    //
+    // Map values are `(id, token)` so other handlers (webhook supersede)
+    // can CAS-remove their own entries safely. WS does not need supersede
+    // semantics (one connection = one turn lifecycle), but we still grab
+    // a fresh id so the map shape is uniform across all code paths.
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_id = state
+        .cancel_token_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     {
         state
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
+            .insert(session_key.to_string(), (cancel_id, cancel_token.clone()));
     }
 
     // Channel for streaming turn events from the agent.
