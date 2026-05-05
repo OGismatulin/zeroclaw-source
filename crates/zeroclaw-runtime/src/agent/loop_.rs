@@ -476,7 +476,16 @@ fn build_native_assistant_history(
     obj.to_string()
 }
 
-#[cfg(test)]
+/// Resolve which text to surface to the user for a single iteration.
+///
+/// When the iteration produced text-style `<tool_call>` blocks but no
+/// surrounding prose, `parsed_text` is empty after extraction; we MUST NOT
+/// fall back to `response_text` (the raw LLM output with XML blocks),
+/// otherwise the JSON arguments leak into the user-visible reply once the
+/// channel's HTML sanitizer drops the unknown `<tool_call>` tags but keeps
+/// their content. Native tool-call providers are different: their
+/// `response_text` is just assistant prose (the call payload travels in a
+/// separate field), so falling back to it is safe and intended.
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -1403,11 +1412,12 @@ pub async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
