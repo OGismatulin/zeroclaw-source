@@ -1042,6 +1042,17 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let cleaned = strip_think_tags(response);
     let response = cleaned.as_str();
 
+    // Detect hallucinated `<tool_result>` blocks. Some models (notably
+    // gpt-5.5 via openai-codex when emitting text-style tool calls) roleplay
+    // the entire tool-call → tool-result → final-answer cycle inside a single
+    // assistant turn, before the runtime has actually executed anything. The
+    // trailing "answer" is based on fabricated tool output and is always
+    // wrong: the runtime will execute the real tool calls and the next
+    // iteration will produce the correct answer. Treat any presence of
+    // `<tool_result` as a strong hallucination signal and drop the iteration's
+    // prose entirely when tool calls were extracted.
+    let saw_tool_result = response.contains("<tool_result");
+
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -1420,6 +1431,14 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
         text_parts.push(remaining.trim().to_string());
+    }
+
+    // Hallucinated tool_result blocks were emitted alongside real tool calls
+    // — the entire prose payload is suspect. Keep the calls (the runtime will
+    // execute them for real), drop the text (the next iteration will produce
+    // the correct answer based on real tool output).
+    if saw_tool_result && !calls.is_empty() {
+        return (String::new(), calls);
     }
 
     (text_parts.join("\n"), calls)
@@ -2151,6 +2170,37 @@ Tail"#;
         assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_drops_prose_when_hallucinated_tool_result_with_calls() {
+        // Regression: gpt-5.5 via openai-codex was seen emitting a full
+        // <tool_call><tool_result><tool_call><tool_result>...<b>final</b>
+        // roleplay in a single iteration — fake results, fake answer, all
+        // before the runtime actually executed anything. The hallucinated
+        // prose must NOT reach the user. Tool calls are still extracted so
+        // the runtime executes them for real.
+        let response = "<tool_call>\n{\"name\":\"http_request\",\"arguments\":{\"url\":\"https://example.com\"}}\n</tool_call>\
+            <tool_result name=\"http_request\">\n{\"status\":200,\"body\":\"fake\"}\n</tool_result>\
+            <b>Hallucinated final answer based on fake data.</b>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            text.is_empty(),
+            "iteration prose with hallucinated tool_result must be dropped, got: {text:?}"
+        );
+        assert_eq!(calls.len(), 1, "tool_call must still be extracted");
+        assert_eq!(calls[0].name, "http_request");
+    }
+
+    #[test]
+    fn parse_tool_calls_keeps_text_when_tool_result_without_calls() {
+        // Existing contract preserved: when there are NO tool_calls, prose
+        // around <tool_result> stays (parser is lenient — see
+        // parse_tool_calls_handles_empty_tool_result above).
+        let response = "I'll run that command.\n<tool_result name=\"shell\">\n\n</tool_result>\nDone.";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+        assert!(text.contains("Done."), "prose must survive when no calls extracted, got: {text:?}");
     }
 
     #[test]
