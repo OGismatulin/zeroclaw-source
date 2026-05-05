@@ -478,14 +478,25 @@ fn build_native_assistant_history(
 
 /// Resolve which text to surface to the user for a single iteration.
 ///
-/// When the iteration produced text-style `<tool_call>` blocks but no
-/// surrounding prose, `parsed_text` is empty after extraction; we MUST NOT
-/// fall back to `response_text` (the raw LLM output with XML blocks),
-/// otherwise the JSON arguments leak into the user-visible reply once the
-/// channel's HTML sanitizer drops the unknown `<tool_call>` tags but keeps
-/// their content. Native tool-call providers are different: their
-/// `response_text` is just assistant prose (the call payload travels in a
-/// separate field), so falling back to it is safe and intended.
+/// Iterations that emit text-style `<tool_call>` blocks (no native API
+/// tool_calls field) must contribute NO prose to the accumulated display:
+///
+/// - Prose AFTER the tool_calls is always wrong — the model has not seen the
+///   real tool result yet, so any "final answer", "couldn't fetch data",
+///   `<tool_result>` roleplay, or "Done!" is fabricated. The next iteration
+///   produces the correct answer from real tool output and that's what the
+///   user should see.
+/// - Prose BETWEEN tool_calls (inter-call narration) is wasted in webhook
+///   flow because the user only sees the post-loop accumulated reply.
+/// - Prose BEFORE the first tool_call (pre-call narration like "Let me
+///   check the weather...") is the only legitimate case, but in webhook
+///   flow it concatenates with the next iteration's final answer and adds
+///   noise. Drop it too — the final answer alone is cleaner.
+///
+/// Native tool-call providers (OpenAI tools API, Anthropic tool_use, Gemini
+/// function calls) are different: their `response_text` is just assistant
+/// prose accompanying a structured `tool_calls` field that travels OUT OF
+/// BAND. Whatever narration they emit is intentional and safe to surface.
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -493,12 +504,11 @@ fn resolve_display_text(
     has_native_tool_calls: bool,
 ) -> String {
     if has_tool_calls {
-        if !parsed_text.is_empty() {
-            return parsed_text.to_string();
-        }
         if has_native_tool_calls {
             return response_text.to_string();
         }
+        // Text-style tool_calls only — drop ALL prose; the next iteration
+        // will produce the correct answer from real tool output.
         return String::new();
     }
 
@@ -6229,14 +6239,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_display_text_keeps_plain_text_for_tool_turns() {
+    fn resolve_display_text_drops_prose_for_text_style_tool_turns() {
+        // Contract: text-style tool_calls + ANY prose → drop the prose. The
+        // model can't have produced a legitimate final answer in the same
+        // iteration as text-style tool_calls — it has not seen real tool
+        // results yet. Whatever prose is there (pre-call narration like
+        // "Let me check...", inter-call commentary, or a fabricated final
+        // answer / <tool_result> roleplay) must NOT reach the user. The
+        // next iteration produces the correct answer from real tool output.
         let display = resolve_display_text(
             "<tool_call>{\"name\":\"shell\"}</tool_call>",
             "Let me check that.",
             true,
             false,
         );
-        assert_eq!(display, "Let me check that.");
+        assert!(
+            display.is_empty(),
+            "text-style tool_calls + prose must drop the prose, got: {display:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_display_text_drops_premature_final_answer() {
+        // Regression: gpt-5.5 via openai-codex emitted text-style tool_calls
+        // followed by a <b>...</b> "couldn't fetch data" final answer in the
+        // same iteration, before the runtime had executed the tool calls.
+        // This is the same bug class as the hallucinated <tool_result>
+        // roleplay — model can't know the result yet, so any final-answer-
+        // shaped prose is wrong. The next iteration produces the correct
+        // answer based on the real tool output.
+        let display = resolve_display_text(
+            "<tool_call>{\"name\":\"http_request\",\"arguments\":{\"url\":\"...\"}}</tool_call>",
+            "<b>Прогноз на неделю</b>\n\nНе удалось получить данные.",
+            true,
+            false,
+        );
+        assert!(
+            display.is_empty(),
+            "premature final answer must be dropped, got: {display:?}"
+        );
     }
 
     #[test]
