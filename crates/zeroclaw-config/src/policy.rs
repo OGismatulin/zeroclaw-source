@@ -1194,28 +1194,24 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
-                !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
-                })
+                // All git args are permitted. Trade-off accepted: `-c key=val`,
+                // `config`, and `alias` can theoretically inject commands via
+                // git hooks/editor, but the agent already has free-form file_write
+                // + python3, so this restriction was net-zero security and
+                // net-negative ergonomics (it falsely blocked `git -C`, which
+                // is just directory selection, because args were lowercased
+                // before checking). See
+                // docs/superpowers/plans/2026-05-06-relax-policy-git-python.md.
+                let _ = args;
+                true
             }
             "python" | "python3" => {
-                // -c executes arbitrary code from argument string
-                // -m runs any installed module as a script — broad block is intentional:
-                //   -m http.server opens a local exfil vector
-                //   -m pip install double-covers the pip arm
-                //   -m pytest, -m mypy, -m venv are blocked as collateral;
-                //   narrowing to a curated module list is a future option
-                // starts_with covers glued form: python3 -c'code' (one whitespace token)
-                // Ref: https://docs.python.org/3/using/cmdline.html
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
+                // -c and -m are permitted. The agent already runs free-form
+                // Python via file_write + python3 file.py, so blocking inline
+                // forms only forced workaround scripts. See
+                // docs/superpowers/plans/2026-05-06-relax-policy-git-python.md.
+                let _ = args;
+                true
             }
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
@@ -2481,31 +2477,32 @@ mod tests {
     // ── Interpreter argument injection (#5698) ────────────────────
 
     #[test]
-    fn interpreter_inline_eval_blocked() {
+    fn interpreter_inline_eval_node_blocked_python_allowed() {
         let p = default_policy();
-        // python: -c executes code string, -m runs arbitrary module
-        assert!(!p.is_command_allowed("python3 -c 'import os; os.system(\"id\")'"));
-        assert!(!p.is_command_allowed("python -c '__import__(\"os\").system(\"id\")'"));
-        assert!(!p.is_command_allowed("python3 -m http.server"));
-        assert!(!p.is_command_allowed("python3 -m pip install evil"));
-        // Broad -m block: these are intentional collateral
-        assert!(!p.is_command_allowed("python3 -m pytest"));
-        assert!(!p.is_command_allowed("python3 -m mypy src/"));
-        assert!(!p.is_command_allowed("python3 -m venv .venv"));
-        // Glued form: -mhttp.server is one token
-        assert!(!p.is_command_allowed("python3 -mhttp.server"));
-        // node: -e/--eval evaluates JS, -p/--print evaluates and prints
+        // Python: -c and -m are permitted (relaxed 2026-05-06).
+        assert!(p.is_command_allowed("python3 -c 'print(1)'"));
+        assert!(p.is_command_allowed(
+            "python -c '__import__(\"os\").environ.get(\"HOME\")'"
+        ));
+        assert!(p.is_command_allowed("python3 -m http.server"));
+        assert!(p.is_command_allowed("python3 -m pytest"));
+        assert!(p.is_command_allowed("python3 -m mypy src/"));
+        assert!(p.is_command_allowed("python3 -m venv .venv"));
+        // Glued form
+        assert!(p.is_command_allowed("python3 -c'import os'"));
+        assert!(p.is_command_allowed("python3 -mhttp.server"));
+        // Flag with other args before it
+        assert!(p.is_command_allowed("python3 -W ignore -c 'import os'"));
+
+        // Node remains blocked: -e/--eval evaluates JS, -p/--print evaluates and prints.
         assert!(!p.is_command_allowed("node -e 'require(\"child_process\").execSync(\"id\")'"));
         assert!(!p.is_command_allowed("node --eval 'process.exit(1)'"));
         assert!(!p.is_command_allowed("node --eval=process.exit(1)"));
         assert!(!p.is_command_allowed("node -p '1+1'"));
         assert!(!p.is_command_allowed("node --print 'process.env'"));
         assert!(!p.is_command_allowed("node --print=process.env"));
-        // Glued form bypass: -c'code' is one whitespace token
-        assert!(!p.is_command_allowed("python3 -c'import os'"));
+        // Glued form
         assert!(!p.is_command_allowed("node -e'process.exit()'"));
-        // Flag with other args before it
-        assert!(!p.is_command_allowed("python3 -W ignore -c 'import os'"));
     }
 
     #[test]
@@ -2636,14 +2633,18 @@ mod tests {
     #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
-        // find -exec is a common bypass
+        // find -exec / -ok still allow arbitrary command execution — keep blocked.
         assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
         assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
-        // git config/alias can execute commands
-        assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
-        assert!(!p.is_command_allowed("git alias.st status"));
-        assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
-        // Legitimate commands should still work
+        // Git args are now permitted (relaxed 2026-05-06). The agent has free-form
+        // file_write + python3, so blocking config/alias/-c was net-zero security.
+        assert!(p.is_command_allowed("git config core.editor \"rm -rf /\""));
+        assert!(p.is_command_allowed("git alias.st status"));
+        assert!(p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        assert!(p.is_command_allowed(
+            "git -C /zeroclaw-data/code-repos/payment-microservice log"
+        ));
+        // Legitimate commands continue to work.
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
