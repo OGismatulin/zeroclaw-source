@@ -28,7 +28,12 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_TOKEN is a PAT with write:packages scope. The default
+          # GITHUB_TOKEN cannot push to the ghcr.io/ogismatulin/zeroclaw
+          # package because the package is bound to a different repo
+          # (OGismatulin/zeroclaw, not OGismatulin/zeroclaw-source) and
+          # GitHub provides no public API to rebind packages.
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Generate tags
         id: meta
