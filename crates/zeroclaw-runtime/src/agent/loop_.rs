@@ -494,21 +494,27 @@ fn build_native_assistant_history(
 ///   noise. Drop it too — the final answer alone is cleaner.
 ///
 /// Native tool-call providers (OpenAI tools API, Anthropic tool_use, Gemini
-/// function calls) are different: their `response_text` is just assistant
-/// prose accompanying a structured `tool_calls` field that travels OUT OF
-/// BAND. Whatever narration they emit is intentional and safe to surface.
+/// function calls) emit `response_text` alongside a structured `tool_calls`
+/// field that travels OUT OF BAND. Historically that prose was treated as
+/// intentional narration and surfaced. Updated 2026-05-06: some providers
+/// (e.g. opencode-go/deepseek) emit full chain-of-thought in `content` next
+/// to native tool_calls. That CoT must not leak to the user. Contract now:
+/// drop ALL prose for tool-call iterations (both text-style and native).
+/// Full CoT remains in runtime-trace.jsonl for diagnostics.
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
     has_tool_calls: bool,
-    has_native_tool_calls: bool,
+    _has_native_tool_calls: bool,
 ) -> String {
     if has_tool_calls {
-        if has_native_tool_calls {
-            return response_text.to_string();
-        }
-        // Text-style tool_calls only — drop ALL prose; the next iteration
-        // will produce the correct answer from real tool output.
+        // Both text-style and native tool_calls: drop ALL prose. The model
+        // can't have produced a legitimate final answer in the same iteration
+        // as tool_calls — it has not seen real tool results yet. Whatever
+        // prose is there (pre-call narration, inter-call commentary,
+        // chain-of-thought, hallucinated <tool_result>, premature final
+        // answer) must NOT reach the user. The next iteration produces the
+        // correct answer from real tool output.
         return String::new();
     }
 
@@ -858,7 +864,7 @@ pub async fn run_tool_call_loop(
     provider_name: &str,
     model: &str,
     temperature: f64,
-    silent: bool,
+    _silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     channel_reply_target: Option<&str>,
@@ -1493,26 +1499,10 @@ pub async fn run_tool_call_loop(
             ));
         }
 
-        // Accumulate text from this iteration (tool calls present, loop continues).
-        accumulated_display_text.push_str(&display_text);
-
-        // Native tool-call providers can return assistant text separately from
-        // the structured call payload; relay it to draft-capable channels.
-        if !display_text.is_empty() {
-            if !native_tool_calls.is_empty()
-                && let Some(ref tx) = on_delta
-            {
-                let mut narration = display_text.clone();
-                if !narration.ends_with('\n') {
-                    narration.push('\n');
-                }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
-            }
-            if !silent {
-                print!("{display_text}");
-                let _ = std::io::stdout().flush();
-            }
-        }
+        // Tool-call iteration: display_text is always empty by contract
+        // (resolve_display_text drops prose for has_tool_calls=true). Nothing
+        // to accumulate, stream, or print here. The final iteration (no tool
+        // calls) handles display via the post-hoc chunking path above.
 
         // Execute tool calls and build results. `individual_results` tracks per-call output so
         // native-mode history can emit one role=tool message per tool call with the correct ID.
@@ -5757,7 +5747,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_relays_native_tool_call_text_via_on_delta() {
+    async fn run_tool_call_loop_does_not_relay_native_tool_call_text_via_on_delta() {
+        // Regression for incident 2026-05-06: native tool-call providers
+        // emit prose (often full CoT) in response_text alongside out-of-band
+        // tool_calls. That prose must NOT be relayed to draft-capable
+        // channels — only the final answer (last iteration with no tool
+        // calls) should reach the user. Status messages from tool dispatch
+        // are still relayed.
         let provider = ScriptedProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
                 ChatResponse {
@@ -5827,30 +5823,197 @@ mod tests {
             None, // collected_receipts
         )
         .await
-        .expect("native tool-call text should be relayed through on_delta");
+        .expect("tool loop should complete");
 
         let mut deltas: Vec<DraftEvent> = Vec::new();
         while let Some(delta) = rx.recv().await {
             deltas.push(delta);
         }
 
+        // Native tool-call narration must NOT be relayed.
         assert!(
-            deltas
-                .iter()
-                .any(|delta| matches!(delta, StreamDelta::Text(t) if t == "Task started. Waiting 30 seconds before checking status.\n")),
-            "native assistant text should be relayed to on_delta"
+            !deltas.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Text(t) if t.contains("Task started")
+            )),
+            "native tool-call narration must NOT be relayed via on_delta, got deltas: {deltas:?}"
         );
+
+        // Status messages from tool dispatch are still relayed.
         assert!(
-            deltas
-                .iter()
-                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
-            "tool-call progress line should still be relayed"
+            deltas.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)")
+            )),
+            "tool-call progress status should still be relayed"
         );
+
+        // Final answer is still produced via final-iteration chunking.
+        assert!(
+            deltas.iter().any(|delta| matches!(
+                delta,
+                StreamDelta::Text(t) if t.contains("Final answer")
+            )),
+            "final answer text should be relayed via on_delta on the last iteration"
+        );
+
+        // Accumulated result contains only the final answer.
         assert!(
             result.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {result}"
+            "result should end with final answer, got: {result}"
+        );
+        assert!(
+            !result.contains("Task started"),
+            "result must not contain intermediate native narration, got: {result}"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_drops_deepseek_style_chain_of_thought() {
+        // Regression for actual incident on 2026-05-06 (turn a0b912c1):
+        // opencode-go/deepseek-v4-flash emitted full English chain-of-thought
+        // in `content` across two iterations alongside native tool_calls,
+        // before the final Russian answer in iter 3. The CoT prose leaked
+        // to Telegram. After Variant A contract: only iter 3's final answer
+        // reaches the user.
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                // Iter 1: read_skill(weather) + CoT
+                ChatResponse {
+                    text: Some(
+                        "The user is asking about the weather today. \
+                         According to my instructions, I should use the \
+                         `weather` skill for weather requests. Let me read \
+                         the skill first."
+                            .into(),
+                    ),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"read_skill"}"#.into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                // Iter 2: http_request + more CoT
+                ChatResponse {
+                    text: Some(
+                        "The user is asking about the weather today. \
+                         The user's default location is Bishkek (from \
+                         USER.md). Let me fetch the weather data from \
+                         Open-Meteo API."
+                            .into(),
+                    ),
+                    tool_calls: vec![ToolCall {
+                        id: "call_2".into(),
+                        name: "count_tool".into(),
+                        arguments: r#"{"value":"http_request"}"#.into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                // Iter 3: final answer in Russian, no tool calls
+                ChatResponse {
+                    text: Some(
+                        "Бишкек, сегодня 6 мая: 21°C, малооблачно. \
+                         Рекомендация: футболка."
+                            .into(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("Погода на сегодня"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "opencode-go",
+            "deepseek-v4-flash",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        let mut deltas: Vec<DraftEvent> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            deltas.push(delta);
+        }
+
+        // No CoT prose in any Text delta.
+        for delta in &deltas {
+            if let StreamDelta::Text(t) = delta {
+                assert!(
+                    !t.contains("The user is asking"),
+                    "intermediate CoT must not appear in deltas, got: {t:?}"
+                );
+                assert!(
+                    !t.contains("default location is Bishkek"),
+                    "intermediate CoT must not appear in deltas, got: {t:?}"
+                );
+            }
+        }
+
+        // No CoT in final accumulated result.
+        assert!(
+            !result.contains("The user is asking"),
+            "intermediate CoT must not appear in accumulated result, got: {result}"
+        );
+        assert!(
+            !result.contains("Open-Meteo API"),
+            "intermediate CoT must not appear in accumulated result, got: {result}"
+        );
+
+        // Final Russian answer is preserved.
+        assert!(
+            result.contains("Бишкек, сегодня 6 мая"),
+            "final answer must reach the user, got: {result}"
+        );
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -6281,9 +6444,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_display_text_uses_response_text_for_native_tool_turns() {
+    fn resolve_display_text_drops_prose_for_native_tool_turns() {
+        // Contract update (2026-05-06): native tool_calls now follow the same
+        // rule as text-style — drop ALL prose. Models like deepseek emit full
+        // chain-of-thought in `content` next to native tool_calls; that prose
+        // must NOT reach the user. The next iteration produces the correct
+        // answer from real tool output. CoT remains in runtime-trace.jsonl.
         let display = resolve_display_text("Task started.", "", true, true);
-        assert_eq!(display, "Task started.");
+        assert!(
+            display.is_empty(),
+            "native tool_calls + prose must drop the prose, got: {display:?}"
+        );
     }
 
     #[test]
