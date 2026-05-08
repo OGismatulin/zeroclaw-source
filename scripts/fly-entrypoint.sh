@@ -633,6 +633,19 @@ for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   fi
 done
 
+# Patch: append [shell_tool] section to raise shell timeout from 60s default to 600s
+# (long-running research scripts like skills/last30days/scripts/run.py).
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  if ! grep -q '^\[shell_tool\]' "$cfg" 2>/dev/null; then
+    cat >> "$cfg" <<'SHELLTOOL'
+
+[shell_tool]
+timeout_secs = 600
+SHELLTOOL
+  fi
+done
+
 # Patch: append lalafo-db MCP server if missing (requires [mcp] to already exist)
 for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$cfg" ] || continue

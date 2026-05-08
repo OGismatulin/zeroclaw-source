@@ -143,6 +143,9 @@ allowed_domains = ["*"]
 max_response_size = 100000
 timeout_secs = 30
 
+[shell_tool]
+timeout_secs = 600
+
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 180
