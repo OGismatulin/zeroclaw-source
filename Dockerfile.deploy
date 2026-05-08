@@ -150,7 +150,7 @@ COPY scripts/fly-entrypoint.sh /usr/local/bin/fly-entrypoint.sh
 COPY scripts/mcp_db_server.py /usr/local/bin/mcp_db_server.py
 COPY scripts/code_repos_sync.py /usr/local/bin/code_repos_sync.py
 
-RUN pip install --no-cache-dir --break-system-packages requests pandas psycopg2-binary "mcp[cli]" uvicorn starlette openpyxl gspread google-auth pyarrow matplotlib seaborn
+RUN pip install --no-cache-dir --break-system-packages requests pandas psycopg2-binary "mcp[cli]" uvicorn starlette openpyxl gspread google-auth pyarrow matplotlib seaborn yt-dlp
 
 RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py
 

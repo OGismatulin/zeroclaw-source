@@ -434,6 +434,78 @@ open(p, 'w').write(c)
   fi
 done
 
+# Patch: ensure shell_env_passthrough includes SCRAPECREATORS_API_KEY
+if ! grep -q '"SCRAPECREATORS_API_KEY"' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$config_file" "SCRAPECREATORS_API_KEY"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '"SCRAPECREATORS_API_KEY"' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$user_config" "SCRAPECREATORS_API_KEY"
+  fi
+done
+
+# Patch: ensure shell_env_passthrough includes XAI_API_KEY
+if ! grep -q '"XAI_API_KEY"' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$config_file" "XAI_API_KEY"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '"XAI_API_KEY"' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$user_config" "XAI_API_KEY"
+  fi
+done
+
+# Patch: ensure shell_env_passthrough includes BRAVE_API_KEY
+if ! grep -q '"BRAVE_API_KEY"' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$config_file" "BRAVE_API_KEY"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '"BRAVE_API_KEY"' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$user_config" "BRAVE_API_KEY"
+  fi
+done
+
 # Patch: keep runtime allowlist aligned with config.toml and config.fly.toml.template
 for command in $baseline_allowed_commands; do
   ensure_multiline_array_item "allowed_commands" "$command"
