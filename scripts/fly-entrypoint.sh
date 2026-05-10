@@ -661,6 +661,45 @@ MCPDB
   fi
 done
 
+# Graylog MCP migration (post lalafo-db)
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  if grep -q '^\[mcp\]' "$cfg" && ! grep -q 'name = "graylog"' "$cfg"; then
+    echo "[entrypoint] Adding graylog MCP to $cfg"
+    cat >> "$cfg" <<'MCPGRAYLOG'
+
+[[mcp.servers]]
+name = "graylog"
+transport = "http"
+url = "http://localhost:4001/mcp"
+tool_timeout_secs = 120
+MCPGRAYLOG
+  fi
+done
+
+# forbidden_paths — Python для робастности (sed на multiline TOML arrays)
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PYEOF'
+import re
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+text = p.read_text()
+if "/zeroclaw-data/mcp_graylog" in text:
+    sys.exit(0)
+new = re.sub(
+    r'(forbidden_paths\s*=\s*\[)',
+    r'\1\n    "/zeroclaw-data/mcp_graylog",',
+    text, count=1
+)
+if new != text:
+    p.write_text(new)
+    print(f"[entrypoint] Added /zeroclaw-data/mcp_graylog to forbidden_paths in {p}")
+PYEOF
+done
+
 # Patch: append [delegate] + [agents.worker] + [agents.coder] if missing (subagents for parallel delegation)
 for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$cfg" ] || continue
@@ -755,6 +794,24 @@ if ip link show tun0 > /dev/null 2>&1; then
     else
         echo "[fly-entrypoint] WARNING: MCP DB Server started (pid=$MCP_DB_PID) but /health is not healthy"
     fi
+fi
+
+# --- MCP Graylog Server — independent of VPN ---
+echo "[fly-entrypoint] Starting MCP Graylog Server on port ${GRAYLOG_MCP_PORT:-4001}..."
+python3 /usr/local/bin/mcp_graylog.py &
+MCP_GRAYLOG_PID=$!
+MCP_GRAYLOG_READY=0
+for i in $(seq 1 10); do
+    if curl -s "http://localhost:${GRAYLOG_MCP_PORT:-4001}/health" > /dev/null 2>&1; then
+        MCP_GRAYLOG_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$MCP_GRAYLOG_READY" -eq 1 ]; then
+    echo "[fly-entrypoint] MCP Graylog Server started (pid=$MCP_GRAYLOG_PID)"
+else
+    echo "[fly-entrypoint] WARNING: MCP Graylog Server (pid=$MCP_GRAYLOG_PID) /health not yet OK — cookie may be expired/missing"
 fi
 
 export ZEROCLAW_DATA_ROOT=/zeroclaw-data

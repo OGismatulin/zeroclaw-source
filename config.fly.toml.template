@@ -104,6 +104,7 @@ forbidden_paths = [
     "~/.gnupg",
     "~/.aws",
     "~/.config",
+    "/zeroclaw-data/mcp_graylog",
 ]
 max_actions_per_hour = 20
 max_cost_per_day_cents = 500
@@ -135,6 +136,12 @@ tool_timeout_secs = 60
 name = "lalafo-db"
 transport = "http"
 url = "http://localhost:4000/mcp"
+tool_timeout_secs = 120
+
+[[mcp.servers]]
+name = "graylog"
+transport = "http"
+url = "http://localhost:4001/mcp"
 tool_timeout_secs = 120
 
 [http_request]
