@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -981,9 +982,14 @@ def _convert_csv_to_target(
     - fallback_warning: None on clean success; string describing fallback if parquet failed
 
     NEVER raises on conversion failure for parquet — fallback to CSV is silent-but-warned.
+
+    Uses ``shutil.move`` (not ``Path.replace``) because ``tempfile.gettempdir()`` and the
+    workspace upload dir live on different filesystems on Fly (`/tmp` is memfs, the Fly
+    volume is mounted at ``/zeroclaw-data``); ``Path.replace`` raises
+    ``OSError: [Errno 18] Invalid cross-device link`` in that scenario.
     """
     if fmt == "csv":
-        tmp_path.replace(out_path)
+        shutil.move(str(tmp_path), str(out_path))
         return out_path, None
     if fmt == "json":
         try:
@@ -1004,7 +1010,7 @@ def _convert_csv_to_target(
             return out_path, None
         except Exception as e:
             csv_fallback = out_path.with_suffix(".csv")
-            tmp_path.replace(csv_fallback)
+            shutil.move(str(tmp_path), str(csv_fallback))
             return csv_fallback, f"parquet_conversion_failed: {e}; saved as csv"
     raise ValueError(f"Unsupported format: {fmt}")
 
