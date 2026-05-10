@@ -646,7 +646,10 @@ async def tool_count(
 
 # --- Tools (Task 7, spec §4.3.1, §4.3.4, §4.3.5) ---
 
-MAX_STDOUT_BYTES = 32 * 1024  # 32 KB
+# Inline tool output cap. Production logs are wide (~30 fields × 200-800 bytes),
+# 50-message search trivially busts 32 KB. Main agent runs on a 1M-context model,
+# so we can afford a much larger inline payload before falling back to file export.
+MAX_STDOUT_BYTES = 256 * 1024  # 256 KB
 HARD_LIMIT_SEARCH = 1000
 
 # Graylog 6.x search endpoints. The Views API (POST /api/search/messages)
@@ -1064,11 +1067,14 @@ async def tool_search_to_file(
     fields: str | None = None,
     streams: str | None = None,
     max_rows: int = 100_000,
-    format: str = "parquet",
+    format: str = "csv",
     timeout_secs: int = EXPORT_DEFAULT_TIMEOUT_S,
     _user_id: int | str | None = None,
 ) -> str:
-    """Stream search results to file (CSV/JSON/Parquet)."""
+    """Stream search results to file. Default ``format='csv'`` — pandas reads it
+    natively, no pyarrow conversion to fail on mixed-type columns. Pass
+    ``format='parquet'`` explicitly when a typed column store is actually needed.
+    """
     started = time.monotonic()
     auth = get_auth()
     capped_rows = min(int(max_rows), EXPORT_HARD_CAP_ROWS)
