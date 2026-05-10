@@ -80,4 +80,6 @@ scripts/
 !scripts/gateway_manager.py
 !scripts/fly-entrypoint.sh
 !scripts/mcp_db_server.py
+!scripts/mcp_graylog.py
+!scripts/graylog_pack_cookie.py
 !scripts/code_repos_sync.py
