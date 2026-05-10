@@ -32,6 +32,18 @@ DEFAULT_PORT = int(os.environ.get("GRAYLOG_MCP_PORT", "4001"))
 GRAYLOG_BASE_URL = os.environ.get("GRAYLOG_BASE_URL", "https://graylog.yallasvc.net")
 GRAYLOG_STATE_DIR = Path(os.environ.get("GRAYLOG_STATE_DIR", "/zeroclaw-data/mcp_graylog"))
 GRAYLOG_SESSION_COOKIE_B64 = os.environ.get("GRAYLOG_SESSION_COOKIE", "")
+# Graylog API token (Basic auth, username=token, password="token"). Independent
+# of oauth2-proxy session cookie — both are required in this deployment because
+# oauth2-proxy gates the reverse-proxy and Graylog itself authenticates the API.
+GRAYLOG_API_TOKEN = os.environ.get("GRAYLOG_API_TOKEN", "")
+
+
+def _api_token_header() -> dict[str, str]:
+    """Return Authorization header for Graylog API token, or empty dict."""
+    if not GRAYLOG_API_TOKEN:
+        return {}
+    encoded = base64.b64encode(f"{GRAYLOG_API_TOKEN}:token".encode()).decode("ascii")
+    return {"Authorization": f"Basic {encoded}"}
 
 
 class CookieAuth:
@@ -246,6 +258,7 @@ async def _call_graylog_json(
         "Accept": accept,
         "X-Requested-By": "zeroclaw-mcp",
         **auth.headers(),
+        **_api_token_header(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.request(
@@ -284,6 +297,7 @@ async def _call_graylog_stream(
         "Accept": accept,
         "X-Requested-By": "zeroclaw-mcp",
         **auth.headers(),
+        **_api_token_header(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
@@ -439,7 +453,8 @@ async def _keepalive_iteration(auth: CookieAuth) -> None:
     `_call_graylog` already raises SessionExpired on sign-in detection. Other
     HTTP errors (5xx, network failures) are not raised here — caller decides.
     """
-    await _call_graylog("GET", "/api/system/lbstatus", auth=auth, timeout=10)
+    # lbstatus returns text/plain "ALIVE" — accept anything to avoid 406.
+    await _call_graylog("GET", "/api/system/lbstatus", auth=auth, accept="*/*", timeout=10)
 
 
 async def keepalive_loop(auth: CookieAuth, interval_s: int = KEEPALIVE_INTERVAL_S) -> None:
@@ -510,7 +525,7 @@ async def tool_health(_user_id: int | str | None = None) -> str:
         return json.dumps(base)
     try:
         response = await _call_graylog(
-            "GET", "/api/system/lbstatus", auth=auth, timeout=10
+            "GET", "/api/system/lbstatus", auth=auth, accept="*/*", timeout=10
         )
         if response.status_code == 200:
             base.update({"status": "healthy", "last_probe_status": "ok"})
