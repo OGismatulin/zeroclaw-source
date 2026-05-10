@@ -579,16 +579,25 @@ async def tool_count(
     """Count messages matching query."""
     started = time.monotonic()
     auth = get_auth()
-    body: dict[str, Any] = {
+    try:
+        range_secs = _range_to_seconds(range)
+    except ValueError as e:
+        _audit_tool(
+            "count", started, status="error",
+            error_code="invalid_range", query=query, range=range, user_id=_user_id,
+        )
+        return json.dumps({"error": "invalid_range", "detail": str(e)})
+    params: dict[str, str] = {
         "query": query,
-        "size": 0,
-        "timerange": {"type": "relative", "range": _range_to_seconds(range)},
+        "range": str(range_secs),
+        "limit": "1",
     }
-    if streams:
-        body["streams"] = [s.strip() for s in streams.split(",") if s.strip()]
+    streams_filter = _build_streams_filter(streams)
+    if streams_filter:
+        params["filter"] = streams_filter
     try:
         response = await _call_graylog(
-            "POST", "/api/search/messages", auth=auth, json_body=body
+            "GET", _SEARCH_UNIVERSAL, auth=auth, params=params
         )
     except SessionExpired:
         _audit_tool(
@@ -640,6 +649,46 @@ async def tool_count(
 MAX_STDOUT_BYTES = 32 * 1024  # 32 KB
 HARD_LIMIT_SEARCH = 1000
 
+# Graylog 6.x search endpoints. The Views API (POST /api/search/messages)
+# returns a different shape (schema/datarows) and does not honor `size:0` for
+# count-only queries. The legacy "universal" endpoints return the classic
+# shape ({messages, total_results, time_range}) and `/export` streams CSV.
+_SEARCH_UNIVERSAL = "/api/search/universal/relative"
+_SEARCH_UNIVERSAL_CSV = "/api/search/universal/relative/export"
+
+
+def _build_streams_filter(streams: str | None) -> str | None:
+    """Convert comma-separated stream IDs into Graylog universal filter syntax.
+
+    Single stream → "streams:<id>". Multiple → "streams:<id1> OR streams:<id2>".
+    """
+    if not streams:
+        return None
+    ids = [s.strip() for s in streams.split(",") if s.strip()]
+    if not ids:
+        return None
+    return " OR ".join(f"streams:{sid}" for sid in ids)
+
+
+def _flatten_universal_messages(data: dict[str, Any]) -> dict[str, Any]:
+    """Convert universal-search response into a flat shape consumable downstream.
+
+    Universal API wraps each hit: ``[{"message": {...}, "highlight_ranges": {...}}, ...]``.
+    Returns ``{"messages": [...flat dicts...], "total_results": N, "time_range": {...}}``.
+    """
+    messages = data.get("messages", []) or []
+    flat: list[dict[str, Any]] = []
+    for m in messages:
+        if isinstance(m, dict) and isinstance(m.get("message"), dict):
+            flat.append(m["message"])
+        elif isinstance(m, dict):
+            flat.append(m)
+    return {
+        "messages": flat,
+        "total_results": data.get("total_results", len(flat)),
+        "time_range": data.get("time_range"),
+    }
+
 
 def _escape_lucene_phrase(value: str) -> str:
     """Escape Lucene reserved chars for safe inclusion in phrase query.
@@ -685,18 +734,27 @@ async def tool_search(
             user_id=_user_id,
         )
         return json.dumps({"error": f"limit cap is {HARD_LIMIT_SEARCH}"})
-    body: dict[str, Any] = {
+    try:
+        range_secs = _range_to_seconds(range)
+    except ValueError as e:
+        _audit_tool(
+            "search", started, status="error",
+            error_code="invalid_range", query=query, range=range, limit=limit, user_id=_user_id,
+        )
+        return json.dumps({"error": "invalid_range", "detail": str(e)})
+    params: dict[str, str] = {
         "query": query,
-        "size": int(limit),
-        "timerange": {"type": "relative", "range": _range_to_seconds(range)},
+        "range": str(range_secs),
+        "limit": str(int(limit)),
     }
     if fields:
-        body["fields"] = [f.strip() for f in fields.split(",") if f.strip()]
-    if streams:
-        body["streams"] = [s.strip() for s in streams.split(",") if s.strip()]
+        params["fields"] = ",".join(f.strip() for f in fields.split(",") if f.strip())
+    streams_filter = _build_streams_filter(streams)
+    if streams_filter:
+        params["filter"] = streams_filter
     try:
         response = await _call_graylog(
-            "POST", "/api/search/messages", auth=auth, json_body=body
+            "GET", _SEARCH_UNIVERSAL, auth=auth, params=params
         )
     except SessionExpired:
         _audit_tool(
@@ -727,7 +785,7 @@ async def tool_search(
                 "body": response.text[:500],
             }
         )
-    result_str = _maybe_truncate(response.json())
+    result_str = _maybe_truncate(_flatten_universal_messages(response.json()))
     parsed = json.loads(result_str)
     _audit_tool(
         "search",
@@ -874,14 +932,14 @@ def _resolve_upload_path(workspace: str, out_name: str, fmt: str) -> Path:
 
 
 async def _stream_csv_to_tempfile(
-    auth: CookieAuth, body: dict, max_bytes: int, timeout_s: int
+    auth: CookieAuth, params: dict[str, str], max_bytes: int, timeout_s: int
 ) -> tuple[Path, bool]:
-    """POST /api/search/messages with Accept: text/csv, write streamed body to tempfile.
+    """GET /api/search/universal/relative/export with Accept: text/csv, stream to tempfile.
 
     Returns (tempfile_path, truncated). Aborts on byte/timeout caps; row-count
-    enforcement happens via Graylog's `size` parameter (already in body).
+    enforcement happens via Graylog's ``limit`` query param.
 
-    NOTE: We intentionally do NOT count rows by `chunk.count(b"\\n")` — CSV cells
+    NOTE: We intentionally do NOT count rows by ``chunk.count(b"\\n")`` — CSV cells
     with embedded newlines (log messages) would skew the count. Final row_count
     comes from pyarrow.Table.num_rows after conversion (caller).
     """
@@ -890,7 +948,7 @@ async def _stream_csv_to_tempfile(
     truncated = False
     start = time.monotonic()
     async with _call_graylog_stream(
-        "POST", "/api/search/messages", auth=auth, json_body=body,
+        "GET", _SEARCH_UNIVERSAL_CSV, auth=auth, params=params,
         accept="text/csv", timeout=timeout_s,
     ) as response:
         # If proxy fed us sign-in HTML on stream — detect on first chunk
@@ -1032,19 +1090,36 @@ async def tool_search_to_file(
             {"error": "invalid_out_name_or_workspace", "detail": str(e)}
         )
 
-    body: dict = {
+    try:
+        range_secs = _range_to_seconds(range)
+    except ValueError as e:
+        _audit_tool(
+            "search_to_file", started, status="error",
+            error_code="invalid_range", query=query, range=range,
+            max_rows=capped_rows, user_id=_user_id,
+        )
+        return json.dumps({"error": "invalid_range", "detail": str(e)})
+
+    # Universal /export REQUIRES `fields` (returns 400 "must not be empty"
+    # if absent). When the caller didn't specify, pass a sane default that
+    # captures most of what an ops engineer needs from a log line.
+    fields_param = (
+        ",".join(f.strip() for f in fields.split(",") if f.strip())
+        if fields else "timestamp,source,message"
+    )
+    params: dict[str, str] = {
         "query": query,
-        "size": capped_rows,
-        "timerange": {"type": "relative", "range": _range_to_seconds(range)},
+        "range": str(range_secs),
+        "limit": str(capped_rows),
+        "fields": fields_param,
     }
-    if fields:
-        body["fields"] = [f.strip() for f in fields.split(",") if f.strip()]
-    if streams:
-        body["streams"] = [s.strip() for s in streams.split(",") if s.strip()]
+    streams_filter = _build_streams_filter(streams)
+    if streams_filter:
+        params["filter"] = streams_filter
 
     try:
         tmp, truncated = await _stream_csv_to_tempfile(
-            auth, body, max_bytes=EXPORT_HARD_CAP_BYTES, timeout_s=capped_timeout,
+            auth, params, max_bytes=EXPORT_HARD_CAP_BYTES, timeout_s=capped_timeout,
         )
     except SessionExpired:
         _audit_tool(
