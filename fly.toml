@@ -32,6 +32,11 @@ primary_region = 'iad'
   PG_PROD_PORT = '5432'
   PG_PROD_CATALOG_HOST = 'slave.catalog.db.yallasvc.net'
   MCP_DB_PORT = '4000'
+  GRAYLOG_BASE_URL = 'https://graylog.yallasvc.net'
+  GRAYLOG_MCP_PORT = '4001'
+  GRAYLOG_KEEPALIVE_INTERVAL_S = '1500'
+  GRAYLOG_REFRESH_INTERVAL_S = '1500'
+  GRAYLOG_OPERATOR_TELEGRAM_USER_ID = '83292437'
 
   # Public URLs — plain env, not secrets. Values are non-sensitive (own app domain + CRM base URL).
   # Kept here instead of fly secrets so the integration wiring is visible in git.

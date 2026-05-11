@@ -25,6 +25,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 import httpx
 
@@ -184,9 +185,448 @@ class CookieAuth:
             pass  # don't break absorb on audit failures
         return True
 
+    def write_cookies(self, cookies: dict[str, str]) -> None:
+        """Atomically write a full cookie dict from silent SSO refresh.
+
+        Unlike absorb(), which parses raw Set-Cookie headers from oauth2-proxy
+        callback responses, this method accepts an already-parsed cookie dict
+        (the harvest output of silent_sso_refresh). REPLACES all _oauth2_proxy*
+        shards with the new set — does not preserve stale shards from previous
+        session shape.
+        """
+        if not cookies:
+            return
+        current = self._cookies_snapshot()
+        # Drop any existing _oauth2_proxy* shards — silent SSO's harvest is authoritative
+        merged = {k: v for k, v in current.items() if not k.startswith("_oauth2_proxy")}
+        merged.update(cookies)
+        self._write_state_atomic(merged, source="silent_sso_write")
+        self._cached = merged
+        try:
+            get_audit().log_event("cookie_refreshed", source="silent_sso_write")
+        except Exception:
+            pass
+
 
 class SessionExpired(Exception):
     """Raised when oauth2-proxy returns sign-in HTML response."""
+
+
+class MSSessionAuth:
+    """Microsoft Entra session cookies for silent SSO refresh.
+
+    Mirrors CookieAuth pattern: env blob bootstraps state file at first run,
+    rolling refresh (via absorb()) updates the file on every successful silent SSO.
+
+    Bootstrap fingerprint logic:
+    - self._bootstrap_fingerprint = sha256(env_blob)[:16], set ONCE in __init__.
+    - State file records this fingerprint. On startup, fingerprint match → use state.
+    - Fingerprint mismatch → operator re-bootstrapped → drop state, use env.
+
+    CRITICAL: absorb() must NOT mutate self._bootstrap_fingerprint. The fingerprint
+    identifies the bootstrap secret, not the current persistent-cookie value.
+    Rotating ESTSAUTHPERSISTENT via absorb() does NOT trigger re-bootstrap on next start.
+    """
+
+    STATUS_DEGRADED = "degraded"
+    STATUS_HEALTHY = "healthy"
+    STATUS_EXPIRED = "expired"
+
+    def __init__(self, state_path: Path, env_cookie_b64: str):
+        self._state_path = Path(state_path)
+        self._env_cookie_b64 = env_cookie_b64 or ""
+        self._bootstrap_fingerprint = (
+            hashlib.sha256(self._env_cookie_b64.encode()).hexdigest()[:16]
+            if self._env_cookie_b64 else ""
+        )
+        self._lock_path = self._state_path.with_suffix(".lock")
+        self._cookies: dict[str, str] = {}
+        self.status = self.STATUS_DEGRADED  # set below by _load_or_initialize
+        self._last_diagnosis: str | None = None
+        self._load_or_initialize()
+
+    @property
+    def bootstrap_fingerprint(self) -> str:
+        """Immutable fingerprint of the bootstrap env blob (NOT current persistent cookie)."""
+        return self._bootstrap_fingerprint
+
+    @property
+    def current_persistent_fingerprint(self) -> str:
+        """Fingerprint of the CURRENT ESTSAUTHPERSISTENT value (changes on absorb)."""
+        val = self._cookies.get("ESTSAUTHPERSISTENT", "")
+        return hashlib.sha256(val[:128].encode()).hexdigest()[:16] if val else ""
+
+    @property
+    def last_diagnosis(self) -> str | None:
+        return self._last_diagnosis
+
+    def cookies(self) -> dict[str, str]:
+        """Return a copy of current cookies (read-only snapshot)."""
+        return dict(self._cookies)
+
+    def _decode_env(self) -> dict[str, str]:
+        if not self._env_cookie_b64:
+            return {}
+        try:
+            decoded = json.loads(base64.b64decode(self._env_cookie_b64))
+        except Exception:
+            return {}
+        flat: dict[str, str] = {}
+        for domain_map in decoded.get("microsoft_session", {}).values():
+            for name, info in domain_map.items():
+                value = info["value"] if isinstance(info, dict) else info
+                if value:
+                    flat[name] = value
+        return flat
+
+    def _load_or_initialize(self) -> None:
+        env_cookies = self._decode_env()
+
+        if self._state_path.exists():
+            try:
+                saved = json.loads(self._state_path.read_text())
+                if saved.get("bootstrap_fingerprint") == self._bootstrap_fingerprint:
+                    self._cookies = saved.get("cookies", {})
+                    if self._cookies:
+                        self.status = self.STATUS_HEALTHY
+                        return
+                else:
+                    # operator re-bootstrapped → ignore stale state
+                    self._state_path.unlink(missing_ok=True)
+            except Exception:
+                pass  # corrupt → fall through to env
+
+        if env_cookies:
+            self._cookies = env_cookies
+            self.status = self.STATUS_HEALTHY
+            self._write_state_atomic(source="env_bootstrap")
+            return
+
+        self._cookies = {}
+        self.status = self.STATUS_DEGRADED
+        try:
+            get_audit().log_event("ms_session_missing", reason="no_env_no_state")
+        except Exception:
+            pass
+
+    def absorb(self, refreshed: dict[str, str]) -> None:
+        """Merge refreshed cookies from Microsoft Set-Cookie headers.
+
+        Bootstrap fingerprint MUST NOT change here (see class docstring).
+        """
+        if not refreshed:
+            return
+        merged = {**self._cookies, **refreshed}
+        self._cookies = merged
+        self._write_state_atomic(source="absorb")
+
+    def mark_expired(self, diagnosis: str) -> None:
+        self.status = self.STATUS_EXPIRED
+        self._last_diagnosis = diagnosis
+        try:
+            get_audit().log_event("ms_session_expired", diagnosis=diagnosis)
+        except Exception:
+            pass
+
+    def mark_healthy(self) -> None:
+        """Recovery transition called after a successful refresh on previously-expired state."""
+        self.status = self.STATUS_HEALTHY
+        self._last_diagnosis = None
+
+    def _write_state_atomic(self, source: str) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "cookies": self._cookies,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "bootstrap_fingerprint": self._bootstrap_fingerprint,
+            "source": source,
+        }
+        with open(self._lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+            try:
+                tmp = self._state_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(payload, indent=2))
+                tmp.replace(self._state_path)
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+
+class MSSessionExpired(Exception):
+    """Raised when Microsoft silent SSO returns sign-in HTML instead of redirect."""
+
+
+class SilentSSOFailure(Exception):
+    """Raised on network/protocol errors during silent SSO that are not session expiry."""
+
+
+_SILENT_SSO_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Cookies Microsoft refreshes on every silent SSO (verified empirically 2026-05-11).
+_MS_REFRESHED_COOKIE_NAMES = {
+    "ESTSAUTH", "ESTSAUTHLIGHT", "ESTSAUTHPERSISTENT", "CCState",
+    "SignInStateCookie", "buid", "fpc", "x-ms-gateway-slice",
+    "AADSSO", "MSFPC", "esctx",
+}
+
+
+def _diagnose_microsoft_html(text: str) -> str:
+    low = text.lower()
+    title_start = low.find("<title>")
+    title_end = low.find("</title>")
+    title = text[title_start + 7:title_end].strip() if 0 <= title_start < title_end else "?"
+    if "verify" in low or "authenticator" in low or "mfa" in low or "code from" in low:
+        hint = "MFA challenge triggered (Conditional Access likely)"
+    elif "consent" in low or "permissions requested" in low:
+        hint = "Consent screen forced UI flow"
+    elif "sign in" in low or "signin" in low:
+        hint = "Microsoft session expired or invalid"
+    else:
+        hint = "Unexpected HTML response from Microsoft"
+    return f"<title>{title}</title>  {hint}"
+
+
+async def silent_sso_refresh(
+    *, graylog_base: str, ms_session: "MSSessionAuth", cookie_auth: "CookieAuth",
+) -> dict:
+    """Perform 4-step silent SSO and persist results to ms_session + cookie_auth.
+
+    Returns: dict with keys ``oauth2_proxy_cookies`` (dict[str, str]),
+                            ``refreshed_ms_count`` (int).
+
+    Raises:
+        MSSessionExpired: Microsoft returned HTML instead of redirect at step 2.
+                          Caller should NOT retry; ms_session.status is set to expired.
+        SilentSSOFailure: Protocol violation (no Location, no code=, no _oauth2_proxy,
+                          MS session has no cookies).
+    """
+    ms_cookies = ms_session.cookies()
+    if not ms_cookies:
+        raise SilentSSOFailure("ms_session has no cookies — bootstrap required")
+
+    async with httpx.AsyncClient(
+        follow_redirects=False, timeout=30, headers=_SILENT_SSO_HEADERS,
+    ) as client:
+        # STEP 1: trigger oauth2-proxy login
+        r = await client.get(f"{graylog_base}/oauth2/start", params={"rd": "/"})
+        if r.status_code != 302:
+            raise SilentSSOFailure(f"step1: expected 302, got {r.status_code}")
+        authorize_url = r.headers.get("location", "")
+        if not authorize_url:
+            raise SilentSSOFailure("step1: no Location header")
+
+        # STEP 2: Microsoft authorize with stored cookies
+        # Set cookies on the host extracted from authorize_url (works for both
+        # login.microsoftonline.com in prod AND 127.0.0.1 in tests).
+        ms_host = urlparse(authorize_url).hostname or "login.microsoftonline.com"
+        for name, value in ms_cookies.items():
+            client.cookies.set(name, value, domain=ms_host)
+            # Also set on the leading-dot domain for matching real Microsoft subdomains
+            if not ms_host[0].isdigit():
+                client.cookies.set(name, value, domain="." + ms_host.split(".", 1)[-1])
+
+        r = await client.get(authorize_url, headers={**_SILENT_SSO_HEADERS,
+                                                       "Referer": f"{graylog_base}/"})
+        if r.status_code != 302:
+            diagnosis = _diagnose_microsoft_html(r.text) if r.text.startswith("<") else \
+                        f"non-redirect status={r.status_code}"
+            ms_session.mark_expired(diagnosis)
+            raise MSSessionExpired(diagnosis)
+        callback_url = r.headers.get("location", "")
+        if "code=" not in callback_url:
+            raise SilentSSOFailure(f"step2: no code= in redirect: {callback_url[:200]}")
+
+        # Harvest refreshed MS cookies from Set-Cookie headers on step 2 response.
+        refreshed_ms: dict[str, str] = {}
+        for raw in r.headers.get_list("set-cookie"):
+            if "=" not in raw:
+                continue
+            name, _, rest = raw.partition("=")
+            value = rest.split(";", 1)[0]
+            if name in _MS_REFRESHED_COOKIE_NAMES:
+                refreshed_ms[name] = value
+
+        # STEP 3: follow callback chain into oauth2-proxy
+        hops = 0
+        loc = callback_url
+        while hops < 10:
+            if loc.startswith("/"):
+                loc = f"{graylog_base}{loc}"
+            r = await client.get(loc)
+            if r.status_code not in (301, 302, 303, 307, 308):
+                break
+            loc = r.headers.get("location", "")
+            if not loc:
+                break
+            hops += 1
+
+        # STEP 4: harvest _oauth2_proxy* cookies
+        oauth2_proxy: dict[str, str] = {}
+        for cookie in client.cookies.jar:
+            if cookie.name.startswith("_oauth2_proxy"):
+                oauth2_proxy[cookie.name] = cookie.value
+        if "_oauth2_proxy" not in oauth2_proxy:
+            raise SilentSSOFailure(
+                f"step4: no _oauth2_proxy cookie (final status={r.status_code})"
+            )
+
+        # Persist outputs
+        if refreshed_ms:
+            ms_session.absorb(refreshed_ms)
+        if ms_session.status == MSSessionAuth.STATUS_EXPIRED:
+            ms_session.mark_healthy()
+        cookie_auth.write_cookies(oauth2_proxy)
+
+        return {"oauth2_proxy_cookies": oauth2_proxy,
+                "refreshed_ms_count": len(refreshed_ms)}
+
+
+class SilentSSORefresh:
+    """Long-running refresher: silent SSO every interval_s seconds.
+
+    On healthy iteration → ms_session.absorb() + cookie_auth.write_cookies().
+    On expired iteration → post Telegram alert (once, idempotent until recovery).
+    On network error → log, retry on next tick.
+
+    Designed to run in a daemon thread with its own asyncio loop (see main()).
+    """
+
+    def __init__(self, *, graylog_base: str, ms_session: "MSSessionAuth",
+                 cookie_auth: "CookieAuth", interval_s: int,
+                 notify_url: str | None, notify_secret: str | None,
+                 operator_telegram_user_id: str | None) -> None:
+        self.graylog_base = graylog_base
+        self.ms_session = ms_session
+        self.cookie_auth = cookie_auth
+        self.interval_s = max(60, min(3600, interval_s))
+        self.notify_url = notify_url
+        self.notify_secret = notify_secret
+        self.operator_telegram_user_id = operator_telegram_user_id
+        self.status: str = "pending"  # pending | healthy | expired | network_error
+        self.last_refresh_at: datetime | None = None
+        self.last_error: str | None = None
+        self.refresh_count: int = 0
+        self._expiry_alert_sent: bool = False
+        self._stop_event: asyncio.Event | None = None
+
+    async def refresh_now(self) -> None:
+        """Run one iteration. Used by tests and by run_forever()."""
+        # Early-return on degraded/expired state (don't hammer Microsoft).
+        if self.ms_session.status == MSSessionAuth.STATUS_DEGRADED:
+            self.status = "degraded"
+            return
+        if self.ms_session.status == MSSessionAuth.STATUS_EXPIRED:
+            # Source of truth is ms_session.status; the task-level self.status is just a mirror.
+            # Retry the alert each tick — _maybe_alert is idempotent on _expiry_alert_sent latch,
+            # so if a previous POST failed, we'll keep retrying until it succeeds.
+            self.status = "expired"
+            await self._maybe_alert(self.ms_session.last_diagnosis or self.last_error or "session expired")
+            return
+
+        try:
+            result = await silent_sso_refresh(
+                graylog_base=self.graylog_base,
+                ms_session=self.ms_session, cookie_auth=self.cookie_auth,
+            )
+        except MSSessionExpired as exc:
+            self.status = "expired"
+            self.last_error = str(exc)
+            await self._maybe_alert(str(exc))
+            return
+        except SilentSSOFailure as exc:
+            self.status = "network_error"
+            self.last_error = str(exc)
+            try:
+                get_audit().log_event("silent_sso_failure", error=str(exc))
+            except Exception:
+                pass
+            return
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            self.status = "network_error"
+            self.last_error = f"network: {exc}"
+            try:
+                get_audit().log_event("silent_sso_network_error", error=str(exc))
+            except Exception:
+                pass
+            return
+
+        # Success path
+        self.status = "healthy"
+        self.last_refresh_at = datetime.now(timezone.utc)
+        self.last_error = None
+        self.refresh_count += 1
+        self._expiry_alert_sent = False  # latch reset on recovery
+        try:
+            get_audit().log_event(
+                "silent_sso_refresh", result="ok",
+                refreshed_ms=result["refreshed_ms_count"],
+                refresh_count=self.refresh_count,
+            )
+        except Exception:
+            pass
+
+    async def _maybe_alert(self, diagnosis: str) -> None:
+        if self._expiry_alert_sent:
+            return
+        if not (self.notify_url and self.notify_secret and self.operator_telegram_user_id):
+            return
+        last_refresh = (self.last_refresh_at.isoformat() if self.last_refresh_at else "never")
+        text = (
+            "MCP Graylog: silent SSO expired\n\n"
+            f"Diagnosis: {diagnosis}\n"
+            f"Last successful refresh: {last_refresh}\n\n"
+            "To recover:\n"
+            "1. Open https://graylog.yallasvc.net/ in Chrome, log in via SSO\n"
+            "2. Run: python3 scripts/extract_ms_cookies.py\n"
+            "3. Run: BLOB=$(python3 scripts/extract_ms_cookies.py --pack)\n"
+            "4. Run: make graylog-set-ms-cookies COOKIES_B64=$BLOB"
+        )
+        payload = {"user_id": int(self.operator_telegram_user_id), "message": text}
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    self.notify_url, json=payload,
+                    headers={"X-Webhook-Secret": self.notify_secret},
+                )
+            if resp.status_code < 300:
+                self._expiry_alert_sent = True
+                try:
+                    get_audit().log_event("silent_sso_expiry_alert_sent")
+                except Exception:
+                    pass
+            else:
+                try:
+                    get_audit().log_event("silent_sso_alert_failed",
+                                          status=resp.status_code, body=resp.text[:200])
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                get_audit().log_event("silent_sso_alert_failed", error=str(exc))
+            except Exception:
+                pass
+
+    async def run_forever(self) -> None:
+        """Loop body for daemon thread. Construct stop_event inside running loop."""
+        self._stop_event = asyncio.Event()
+        await self.refresh_now()
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_s)
+            except asyncio.TimeoutError:
+                pass
+            if self._stop_event.is_set():
+                break
+            await self.refresh_now()
 
 
 def _is_signin_redirect(response) -> bool:
@@ -266,14 +706,11 @@ async def _call_graylog_json(
             method, url, params=params, json=json_body, headers=headers,
         )
     # response.content is fully buffered, safe to use after client close
-    set_cookies = _extract_set_cookies(response)
-    if set_cookies:
-        auth.absorb(set_cookies)
     if _is_signin_redirect(response):
         raise SessionExpired(
-            "oauth2-proxy returned sign-in HTML — cookie expired. "
-            "Re-provision via DevTools "
-            "(see workspace/skills/graylog-search/references/provisioning.md)"
+            "oauth2-proxy returned sign-in HTML — silent SSO refresh likely failed. "
+            "Check /health for ms_session.status; re-bootstrap via "
+            "scripts/extract_ms_cookies.py + make graylog-set-ms-cookies if needed."
         )
     return response
 
@@ -305,13 +742,6 @@ async def _call_graylog_stream(
             method, url, params=params, json=json_body, headers=headers,
         ) as response:
             yield response
-            # absorb Set-Cookie AFTER caller is done (we're still inside the streams)
-            try:
-                set_cookies = _extract_set_cookies(response)
-                if set_cookies:
-                    auth.absorb(set_cookies)
-            except Exception:
-                pass
 
 
 _AUTH: CookieAuth | None = None
@@ -327,17 +757,44 @@ def get_auth() -> CookieAuth:
     return _AUTH
 
 
+def _ms_session_block() -> dict:
+    """Return ms_session info for /health + tool_health responses."""
+    ms = get_ms_session()
+    silent_sso = get_silent_sso()
+    return {
+        "status": ms.status,
+        "bootstrap_fingerprint": ms.bootstrap_fingerprint,
+        "current_persistent_fingerprint": ms.current_persistent_fingerprint,
+        "refresh_count_since_boot": silent_sso.refresh_count,
+        "last_refresh_at": (silent_sso.last_refresh_at.isoformat()
+                            if silent_sso.last_refresh_at else None),
+        "last_diagnosis": ms.last_diagnosis,
+    }
+
+
 def health_status() -> dict:
     """Return current MCP Graylog health snapshot."""
     auth = get_auth()
+    ms_block = _ms_session_block()
+    base: dict[str, Any] = {
+        "graylog_base_url": GRAYLOG_BASE_URL,
+        "cookie_present": bool(auth._cookies_snapshot()),
+        "ms_session": ms_block,
+    }
+    if ms_block["status"] == MSSessionAuth.STATUS_DEGRADED:
+        base.update({"status": "degraded", "reason": "ms_cookies_missing",
+                      "action": "run scripts/extract_ms_cookies.py + "
+                                "make graylog-set-ms-cookies COOKIES_B64=..."})
+        return base
+    if ms_block["status"] == MSSessionAuth.STATUS_EXPIRED:
+        base.update({"status": "expired", "reason": "ms_session_expired"})
+        return base
     if not auth._cookies_snapshot():
-        return {
-            "status": "unhealthy",
-            "reason": "cookie_missing",
-            "action": "set GRAYLOG_SESSION_COOKIE env via fly secrets set",
-        }
-    # Placeholder, real probe added in Task 5+
-    return {"status": "unknown", "reason": "not_yet_probed"}
+        # Silent SSO running but hasn't yet produced first cookie
+        base.update({"status": "pending", "reason": "awaiting_first_refresh"})
+        return base
+    base["status"] = "healthy"
+    return base
 
 
 # --- AuditLog (Task 10, spec §4.5) ---
@@ -401,6 +858,40 @@ def get_audit() -> AuditLog:
     if _AUDIT is None:
         _AUDIT = AuditLog(GRAYLOG_STATE_DIR / "audit.log")
     return _AUDIT
+
+
+_MS_SESSION: MSSessionAuth | None = None
+
+
+def get_ms_session() -> MSSessionAuth:
+    global _MS_SESSION
+    if _MS_SESSION is None:
+        _MS_SESSION = MSSessionAuth(
+            state_path=GRAYLOG_STATE_DIR / "ms_session.json",
+            env_cookie_b64=os.environ.get("MICROSOFT_SESSION_COOKIES", ""),
+        )
+    return _MS_SESSION
+
+
+_SILENT_SSO: SilentSSORefresh | None = None
+
+
+def get_silent_sso() -> SilentSSORefresh:
+    global _SILENT_SSO
+    if _SILENT_SSO is None:
+        _SILENT_SSO = SilentSSORefresh(
+            graylog_base=GRAYLOG_BASE_URL,
+            ms_session=get_ms_session(),
+            cookie_auth=get_auth(),
+            interval_s=int(os.environ.get(
+                "GRAYLOG_REFRESH_INTERVAL_S",
+                os.environ.get("GRAYLOG_KEEPALIVE_INTERVAL_S", "1500"),
+            )),
+            notify_url=os.environ.get("NOTIFY_URL") or None,
+            notify_secret=os.environ.get("NOTIFY_SECRET") or None,
+            operator_telegram_user_id=os.environ.get("GRAYLOG_OPERATOR_TELEGRAM_USER_ID") or None,
+        )
+    return _SILENT_SSO
 
 
 def _audit_tool(tool_name: str, started_at: float, **fields: Any) -> None:
@@ -496,6 +987,7 @@ async def tool_health(_user_id: int | str | None = None) -> str:
         "graylog_base_url": GRAYLOG_BASE_URL,
         "cookie_present": bool(snap),
     }
+    base["ms_session"] = _ms_session_block()
     # Cookie age + last refresh from state.json mtime (proxy for last absorb)
     if snap and state_path.exists():
         try:
@@ -512,7 +1004,7 @@ async def tool_health(_user_id: int | str | None = None) -> str:
                 )
         except Exception:
             pass
-    base["keepalive_next_s"] = KEEPALIVE_INTERVAL_S  # best-effort static estimate
+    base["silent_sso_interval_s"] = get_silent_sso().interval_s
 
     if not snap:
         base.update({"status": "unhealthy", "reason": "cookie_missing"})
@@ -958,7 +1450,11 @@ async def _stream_csv_to_tempfile(
         # If proxy fed us sign-in HTML on stream — detect on first chunk
         ct = (response.headers.get("Content-Type", "") or "").lower()
         if ct.startswith("text/html"):
-            raise SessionExpired("sign-in HTML on streaming endpoint")
+            raise SessionExpired(
+                "oauth2-proxy returned sign-in HTML — silent SSO refresh likely failed. "
+                "Check /health for ms_session.status; re-bootstrap via "
+                "scripts/extract_ms_cookies.py + make graylog-set-ms-cookies if needed."
+            )
         with tmp.open("wb") as fh:
             async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
                 if time.monotonic() - start > timeout_s:
@@ -1466,21 +1962,22 @@ def main() -> None:
     server = create_http_server(DEFAULT_PORT)
     print(f"[mcp_graylog] listening on http://0.0.0.0:{server.server_address[1]}")
 
-    auth = get_auth()
-    if auth._cookies_snapshot():
-        # Run keepalive in side-thread with its own asyncio loop.
-        # CRITICAL: create_task requires a RUNNING loop. We wrap keepalive_loop
-        # in run_until_complete which manages the lifecycle correctly.
-        # (loop.create_task + loop.run_forever raises RuntimeError on the
-        # non-running loop in Python 3.10+.)
-        def _run_loop() -> None:
+    ms_session = get_ms_session()
+    if ms_session.status == MSSessionAuth.STATUS_DEGRADED:
+        print("[mcp_graylog] MS session cookies not provisioned — silent SSO disabled",
+              flush=True)
+    else:
+        silent_sso = get_silent_sso()
+
+        def _run_silent_sso_loop() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(keepalive_loop(auth))
+                loop.run_until_complete(silent_sso.run_forever())
             finally:
                 loop.close()
-        threading.Thread(target=_run_loop, daemon=True, name="keepalive").start()
+
+        threading.Thread(target=_run_silent_sso_loop, daemon=True, name="silent_sso").start()
 
     server.serve_forever()
 

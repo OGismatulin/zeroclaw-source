@@ -82,4 +82,5 @@ scripts/
 !scripts/mcp_db_server.py
 !scripts/mcp_graylog.py
 !scripts/graylog_pack_cookie.py
+!scripts/extract_ms_cookies.py
 !scripts/code_repos_sync.py
