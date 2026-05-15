@@ -78,6 +78,7 @@ apps/tauri/build.rs
 !apps/tauri/Cargo.toml
 scripts/
 !scripts/gateway_manager.py
+!scripts/bootstrap_nightly_retro_cron.py
 !scripts/fly-entrypoint.sh
 !scripts/mcp_db_server.py
 !scripts/mcp_graylog.py
