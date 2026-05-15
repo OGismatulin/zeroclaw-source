@@ -146,15 +146,16 @@ RUN ["/bin/busybox", "--install", "-s", "/bin"]
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY config.fly.toml.template /seed/config.fly.toml.template
 COPY scripts/gateway_manager.py /usr/local/bin/gateway_manager.py
+COPY scripts/bootstrap_nightly_retro_cron.py /usr/local/bin/bootstrap_nightly_retro_cron.py
 COPY scripts/fly-entrypoint.sh /usr/local/bin/fly-entrypoint.sh
 COPY scripts/mcp_db_server.py /usr/local/bin/mcp_db_server.py
 COPY scripts/mcp_graylog.py /usr/local/bin/mcp_graylog.py
 COPY scripts/graylog_pack_cookie.py /usr/local/bin/graylog_pack_cookie.py
 COPY scripts/code_repos_sync.py /usr/local/bin/code_repos_sync.py
 
-RUN pip install --no-cache-dir --break-system-packages requests pandas psycopg2-binary httpx "mcp[cli]" uvicorn starlette openpyxl gspread google-auth pyarrow matplotlib seaborn yt-dlp
+RUN pip install --no-cache-dir --break-system-packages requests pandas psycopg2-binary httpx "mcp[cli]" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn yt-dlp
 
-RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py
+RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py
 
 ENV ZEROCLAW_DATA_ROOT=/zeroclaw-data
 ENV HOME=/zeroclaw-data

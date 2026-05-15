@@ -15,6 +15,7 @@ import secrets
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, TextIO, TypedDict
@@ -542,6 +543,8 @@ class GatewayRegistry:
                 f"child daemon on port {port} did not become healthy"
             ) from exc
 
+        self._ensure_default_cron_jobs(user_key)
+
         # Success: terminate old process, replace entry
         if old_instance is not None:
             self._terminate_process(old_instance)
@@ -560,6 +563,51 @@ class GatewayRegistry:
         )
         self._instances[user_key] = instance
         return instance
+
+    def _ensure_default_cron_jobs(self, user_key: str) -> None:
+        """Best-effort: bootstrap default cron jobs (e.g. nightly retro)
+        in the freshly spawned daemon's workspace. Idempotent — skips
+        users who already have the job. Failures are logged and
+        swallowed; they must never break daemon spawn."""
+        script = (
+            Path(__file__).resolve().parent / "bootstrap_nightly_retro_cron.py"
+        )
+        if not script.is_file():
+            return
+        if not user_key.startswith("tg_"):
+            return
+        user_id = user_key[len("tg_"):]
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--workspaces-root",
+                    str(self.settings.workspaces_root),
+                    "--user",
+                    user_id,
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                print(
+                    f"[gateway-manager] cron bootstrap for {user_key} "
+                    f"returned {result.returncode}: {result.stderr.strip()}",
+                    file=sys.stderr,
+                )
+            elif result.stdout.strip():
+                print(
+                    f"[gateway-manager] cron bootstrap for {user_key}: "
+                    f"{result.stdout.strip()}"
+                )
+        except Exception as exc:
+            print(
+                f"[gateway-manager] cron bootstrap for {user_key} failed: {exc}",
+                file=sys.stderr,
+            )
 
     def get_instance(self, user_key: str) -> DaemonInstance | None:
         return self._instances.get(user_key)
@@ -893,6 +941,7 @@ _EVENT_TOOL_CALL_START = "tool_call_start"
 _EVENT_TOOL_CALL_RESULT = "tool_call_result"
 _EVENT_LLM_REQUEST = "llm_request"
 _EVENT_TURN_FINAL_RESPONSE = "turn_final_response"
+_EVENT_TURN_CANCELLED = "turn_cancelled"
 
 
 class _ToolEvent(TypedDict):
@@ -1208,6 +1257,19 @@ class ProgressNotifier:
                 et = event.get("event_type", "")
                 payload = event.get("payload") or {}
                 stats["events"] += 1
+
+                if et == _EVENT_TURN_CANCELLED:
+                    # Skip user-facing notify on cancellation — the bot edits
+                    # M1's "Думаю..." placeholder via WebhookCancelled response,
+                    # so a separate progress notify here would be a duplicate.
+                    print(
+                        f"[ProgressNotifier] turn_cancelled "
+                        f"user={self.user_id} "
+                        f"session={payload.get('session_id', '')} "
+                        f"reason={payload.get('reason', '')}",
+                        flush=True,
+                    )
+                    continue
 
                 if et == _EVENT_TOOL_CALL_START:
                     tool = payload.get("tool", "")
