@@ -2877,27 +2877,13 @@ async fn process_channel_message(
     // Use the existing ContextCompressor to summarize older history
     // before the LLM call, preventing context-window-exceeded errors
     // and preserving key decisions through LLM-driven summarization.
-    //
-    // Per-model window: prefer the explicit registry entry for this model;
-    // fall back to the global ctx.context_token_budget for unknown models.
-    // Same resolved value is reused as `max_context_tokens` arg passed into
-    // `run_tool_call_loop` below so in-loop recovery uses the same bound.
-    let resolved_context_window = ctx
-        .prompt_config
-        .agent
-        .context_compression
-        .model_windows
-        .get(route.model.as_str())
-        .copied()
-        .unwrap_or(ctx.context_token_budget);
     {
         let cc_config = ctx.prompt_config.agent.context_compression.clone();
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             cc_config,
-            resolved_context_window,
+            ctx.context_token_budget,
         )
-        .with_memory(Arc::clone(&ctx.memory))
-        .with_session_id(Some(history_key.as_str()));
+        .with_memory(Arc::clone(&ctx.memory));
         match compressor
             .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
             .await
@@ -2909,9 +2895,6 @@ async fn process_channel_message(
                     tokens_before = result.tokens_before,
                     tokens_after = result.tokens_after,
                     passes = result.passes_used,
-                    model = %route.model,
-                    context_window = resolved_context_window,
-                    session_id = %history_key,
                     "Proactive context compression applied before LLM call"
                 );
             }
@@ -3199,7 +3182,7 @@ async fn process_channel_message(
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
-                        resolved_context_window,
+                        ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
                         None, // receipt_generator
