@@ -19,9 +19,35 @@ sqlite_open_timeout_secs = 30
 [agent]
 compact_context = false
 max_tool_iterations = 50
-max_history_messages = 50
+max_history_messages = 200
+max_context_tokens = 128_000
 parallel_tools = true
 tool_dispatcher = "native"
+
+[agent.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+
+[agent.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"mimo-v2-pro"             = 800_000
+"mimo-v2-omni"            = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.6-plus"            = 800_000
+"qwen3.5-plus"            = 800_000
+"minimax-m2.7"            = 196_608
+"minimax-m2.5"            = 196_608
+"kimi-k2.6"               = 256_000
+"kimi-k2.5"               = 256_000
+"gpt-5.5"                 = 400_000
+"gpt-5.4"                 = 400_000
+"gpt-5.4-mini"            = 400_000
+"glm-5-turbo"             = 128_000
+"glm-5"                   = 128_000
+"glm-5.1"                 = 128_000
 
 [skills]
 prompt_injection_mode = "compact"

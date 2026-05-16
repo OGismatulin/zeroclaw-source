@@ -4,6 +4,7 @@
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 #[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use zeroclaw_macros::Configurable;
 
@@ -210,6 +211,8 @@ pub struct ContextCompressionConfig {
     pub tool_result_retrim_chars: usize,
     #[serde(default)]
     pub tool_result_trim_exempt: Vec<String>,
+    #[serde(default)]
+    pub model_windows: HashMap<String, usize>,
 }
 
 impl Default for ContextCompressionConfig {
@@ -227,6 +230,7 @@ impl Default for ContextCompressionConfig {
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
             tool_result_trim_exempt: Vec::new(),
+            model_windows: HashMap::new(),
         }
     }
 }

@@ -2983,7 +2983,8 @@ pub async fn run(
                                     config.agent.context_compression.clone(),
                                     config.agent.max_context_tokens,
                                 )
-                                .with_memory(mem.clone());
+                                .with_memory(mem.clone())
+                                .with_session_id(memory_session_id.as_deref());
                             let error_msg = format!("{e}");
                             match compressor
                                 .compress_on_error(
@@ -3042,7 +3043,8 @@ pub async fn run(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
                 )
-                .with_memory(mem.clone());
+                .with_memory(mem.clone())
+                .with_session_id(memory_session_id.as_deref());
                 match compressor
                     .compress_if_needed(&mut history, provider.as_ref(), &model_name)
                     .await

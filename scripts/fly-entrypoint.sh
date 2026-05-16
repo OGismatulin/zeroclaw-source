@@ -763,6 +763,72 @@ SUBAGENTS
   fi
 done
 
+# Patch: wire context compression with per-model context windows
+# (max_history_messages 50→200, add max_context_tokens=128_000,
+#  add [agent.context_compression] + model_windows registry)
+# Idempotent: only patches if old value present / new key absent.
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+
+  # Bump max_history_messages from old default 50 → 200 (leave custom values alone)
+  sed -i 's/^max_history_messages = 50$/max_history_messages = 200/' "$cfg"
+
+  # Insert max_context_tokens = 128_000 right after max_history_messages, if missing
+  if ! grep -q '^max_context_tokens' "$cfg" 2>/dev/null; then
+    python3 -c "
+import sys, re
+p = sys.argv[1]
+c = open(p).read()
+c = re.sub(
+    r'(max_history_messages\s*=\s*\d+)',
+    r'\1\nmax_context_tokens = 128_000',
+    c,
+    count=1,
+)
+open(p, 'w').write(c)
+" "$cfg"
+  fi
+
+  # Append [agent.context_compression] base block, if missing.
+  # Separate guard from model_windows — handles partial state.
+  if ! grep -q '^\[agent\.context_compression\]' "$cfg" 2>/dev/null; then
+    cat >> "$cfg" <<'BASE_EOF'
+
+[agent.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+BASE_EOF
+  fi
+
+  # Append [agent.context_compression.model_windows] registry block, if missing.
+  # Separate guard ensures partial state converges to full state on rerun.
+  if ! grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null; then
+    cat >> "$cfg" <<'WINDOWS_EOF'
+
+[agent.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"mimo-v2-pro"             = 800_000
+"mimo-v2-omni"            = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.6-plus"            = 800_000
+"qwen3.5-plus"            = 800_000
+"minimax-m2.7"            = 196_608
+"minimax-m2.5"            = 196_608
+"kimi-k2.6"               = 256_000
+"kimi-k2.5"               = 256_000
+"gpt-5.5"                 = 400_000
+"gpt-5.4"                 = 400_000
+"gpt-5.4-mini"            = 400_000
+"glm-5-turbo"             = 128_000
+"glm-5"                   = 128_000
+"glm-5.1"                 = 128_000
+WINDOWS_EOF
+  fi
+done
+
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
     openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log /tmp/openvpn.log

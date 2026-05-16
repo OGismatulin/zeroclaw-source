@@ -365,9 +365,12 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 pub(crate) struct WebhookSessionState {
     session_id: String,
     history: Vec<ChatMessage>,
+    last_provider: String,
+    last_model: String,
 }
 
 /// Outcome of a webhook agent turn.
+#[derive(Debug)]
 pub(crate) enum TurnOutcome {
     /// Normal completion — final assistant response text.
     Ok(String),
@@ -1822,6 +1825,14 @@ async fn run_gateway_webhook_agentic(
     let prior_session_id_matches = prior_session
         .as_ref()
         .is_some_and(|ws| session_id.is_some_and(|id| id == ws.session_id));
+    // Detect cross-model switch BEFORE match consumes prior_session.
+    // If the same session_id arrives on a different (provider, model), the
+    // existing history may exceed the new model's context window — pre-turn
+    // compaction below uses the new model's window to shrink it preemptively.
+    let cross_model_switch = prior_session_id_matches
+        && prior_session.as_ref().is_some_and(|ws| {
+            ws.last_provider != provider_name || ws.last_model != model_name
+        });
     let mut history = match prior_session {
         Some(mut ws) if prior_session_id_matches => {
             // Update system prompt (tools/skills/memory may have changed)
@@ -1835,6 +1846,53 @@ async fn run_gateway_webhook_agentic(
         // Different session or first request — fresh history
         _ => vec![ChatMessage::system(&system_prompt)],
     };
+
+    // Pre-turn compaction protection: if (provider, model) changed since the
+    // last turn for this same session_id, compact existing history against the
+    // new model's window before running agent_turn. Without this, switching
+    // from a 800K-window model down to a 128K-window model on a long session
+    // could overflow the provider on the first call.
+    if cross_model_switch {
+        let context_window = config
+            .agent
+            .context_compression
+            .model_windows
+            .get(model_name)
+            .copied()
+            .unwrap_or(config.agent.max_context_tokens);
+        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
+            config.agent.context_compression.clone(),
+            context_window,
+        )
+        .with_memory(state.mem.clone())
+        .with_session_id(session_id);
+
+        match compressor
+            .compress_if_needed(&mut history, provider, model_name)
+            .await
+        {
+            Ok(result) if result.compressed => {
+                tracing::info!(
+                    passes = result.passes_used,
+                    before = result.tokens_before,
+                    after = result.tokens_after,
+                    new_model = %model_name,
+                    new_provider = %provider_name,
+                    new_window = context_window,
+                    session_id = %session_id.unwrap_or_default(),
+                    "Webhook pre-turn compaction (cross-model switch)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id.unwrap_or_default(),
+                    "Webhook pre-turn compaction failed, continuing with full history"
+                );
+            }
+        }
+    }
 
     // Append current user message
     history.push(ChatMessage::user(&enriched));
@@ -1908,6 +1966,55 @@ async fn run_gateway_webhook_agentic(
         Err(err) => Err(err),
     };
 
+    // Post-turn context compression: if the history grew past threshold for
+    // this model, run the LLM summarizer + fast-trim before the dumb
+    // trim_history below. Symmetric with trim_history — runs on any outcome
+    // (Ok / Cancelled / Err). On failure we fall through silently and let
+    // trim_history clamp the message count.
+    {
+        let context_window = config
+            .agent
+            .context_compression
+            .model_windows
+            .get(model_name)
+            .copied()
+            .unwrap_or(config.agent.max_context_tokens);
+        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
+            config.agent.context_compression.clone(),
+            context_window,
+        )
+        .with_memory(state.mem.clone())
+        .with_session_id(session_id);
+
+        match compressor
+            .compress_if_needed(&mut history, provider, model_name)
+            .await
+        {
+            Ok(result) if result.compressed => {
+                tracing::info!(
+                    passes = result.passes_used,
+                    before = result.tokens_before,
+                    after = result.tokens_after,
+                    threshold = (context_window as f64
+                        * config.agent.context_compression.threshold_ratio)
+                        as usize,
+                    context_window = context_window,
+                    model = %model_name,
+                    session_id = %session_id.unwrap_or_default(),
+                    "Webhook post-turn context compression complete"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id.unwrap_or_default(),
+                    "Webhook post-turn context compression failed, falling back to history trim"
+                );
+            }
+        }
+    }
+
     // Trim history regardless of outcome — partial context after a non-cancel
     // error is still useful for the next turn's recall.
     zeroclaw_runtime::agent::loop_::trim_history(
@@ -1923,6 +2030,8 @@ async fn run_gateway_webhook_agentic(
     *session_guard = Some(WebhookSessionState {
         session_id: sid,
         history,
+        last_provider: provider_name.to_string(),
+        last_model: model_name.to_string(),
     });
 
     // CAS-remove cancel_tokens entry on every path. Idempotent — no-op if M2
@@ -5161,6 +5270,82 @@ mod tests {
                 .any(|m| m.role == "system" && m.content.contains("[turn cancelled]")),
             "history must contain [turn cancelled] marker, got: {history:?}"
         );
+    }
+
+    // ── Context compression wiring tests (spec 2026-05-06) ──────────────
+
+    /// After a webhook turn completes, WebhookSessionState must carry the
+    /// (provider_name, model_name) it just ran with — pre-turn cross-model
+    /// detection on the next turn reads these fields to decide whether to
+    /// compact preemptively.
+    #[tokio::test]
+    async fn webhook_persists_last_provider_and_last_model_in_session_state() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = make_test_state(provider.clone(), memory);
+
+        let outcome = run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "mimo",
+            "mimo-v2.5-pro",
+            "hello",
+            Some("tg_user_99999"),
+            None,
+        )
+        .await
+        .expect("function-level Result<>");
+        assert!(matches!(outcome, TurnOutcome::Ok(_)));
+
+        let session = state.webhook_session.lock().await;
+        let ws = session.as_ref().expect("session state preserved");
+        assert_eq!(ws.last_provider, "mimo");
+        assert_eq!(ws.last_model, "mimo-v2.5-pro");
+        assert_eq!(ws.session_id, "tg_user_99999");
+    }
+
+    /// Cross-model detection: if a turn for the same session_id runs with a
+    /// different (provider, model), the pre-turn block should fire and the
+    /// final saved state reflects the NEW pair (proving the path executed
+    /// and replaced the previous one).
+    #[tokio::test]
+    async fn webhook_save_state_overwrites_provider_and_model_on_switch() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = make_test_state(provider.clone(), memory);
+
+        // First turn — establish baseline (provider=mimo, model=mimo-v2.5-pro).
+        run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "mimo",
+            "mimo-v2.5-pro",
+            "hello",
+            Some("tg_user_99999"),
+            None,
+        )
+        .await
+        .expect("first turn");
+
+        // Second turn — switch provider+model on the same session_id.
+        run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "glm",
+            "glm-5-turbo",
+            "world",
+            Some("tg_user_99999"),
+            None,
+        )
+        .await
+        .expect("second turn");
+
+        let session = state.webhook_session.lock().await;
+        let ws = session.as_ref().expect("session state preserved");
+        assert_eq!(ws.last_provider, "glm");
+        assert_eq!(ws.last_model, "glm-5-turbo");
     }
 
     #[tokio::test]

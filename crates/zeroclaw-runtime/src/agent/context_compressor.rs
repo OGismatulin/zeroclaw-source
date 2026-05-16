@@ -123,6 +123,7 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    session_id: Option<String>,
 }
 
 impl ContextCompressor {
@@ -131,6 +132,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            session_id: None,
         }
     }
 
@@ -138,6 +140,15 @@ impl ContextCompressor {
     /// old messages are discarded. Without this, compressed facts are lost.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Scope persisted compression summaries to a session_id so they can be
+    /// retrieved by session-filtered `mem.recall(...)`. Pass `None` to keep
+    /// the "global memory" default; do NOT collapse `None` to `Some("")` via
+    /// `unwrap_or_default` — an empty string never matches a real session.
+    pub fn with_session_id(mut self, session_id: Option<&str>) -> Self {
+        self.session_id = session_id.map(str::to_owned);
         self
     }
 
@@ -363,7 +374,7 @@ impl ContextCompressor {
                     &facts_key,
                     &summary,
                     zeroclaw_memory::traits::MemoryCategory::Daily,
-                    None,
+                    self.session_id.as_deref(),
                 )
                 .await
             {

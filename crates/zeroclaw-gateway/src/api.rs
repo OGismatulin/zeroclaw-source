@@ -1265,6 +1265,7 @@ mod tests {
         AppState {
             config: Arc::new(Mutex::new(config)),
             provider: Arc::new(MockProvider),
+            provider_name: "mock".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: Arc::new(MockMemory),
