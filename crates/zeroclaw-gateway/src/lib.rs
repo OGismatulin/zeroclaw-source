@@ -1979,6 +1979,27 @@ async fn run_gateway_webhook_agentic(
             .get(model_name)
             .copied()
             .unwrap_or(config.agent.max_context_tokens);
+        let threshold = (context_window as f64
+            * config.agent.context_compression.threshold_ratio)
+            as usize;
+        let history_len = history.len();
+        let registry_hit = config
+            .agent
+            .context_compression
+            .model_windows
+            .contains_key(model_name);
+        tracing::info!(
+            history_len = history_len,
+            context_window = context_window,
+            threshold = threshold,
+            threshold_ratio = config.agent.context_compression.threshold_ratio,
+            enabled = config.agent.context_compression.enabled,
+            registry_hit = registry_hit,
+            model = %model_name,
+            session_id = %session_id.unwrap_or_default(),
+            "Webhook post-turn compaction check (pre-call)"
+        );
+
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             config.agent.context_compression.clone(),
             context_window,
@@ -1990,21 +2011,19 @@ async fn run_gateway_webhook_agentic(
             .compress_if_needed(&mut history, provider, model_name)
             .await
         {
-            Ok(result) if result.compressed => {
+            Ok(result) => {
                 tracing::info!(
+                    compressed = result.compressed,
                     passes = result.passes_used,
                     before = result.tokens_before,
                     after = result.tokens_after,
-                    threshold = (context_window as f64
-                        * config.agent.context_compression.threshold_ratio)
-                        as usize,
+                    threshold = threshold,
                     context_window = context_window,
                     model = %model_name,
                     session_id = %session_id.unwrap_or_default(),
-                    "Webhook post-turn context compression complete"
+                    "Webhook post-turn compaction result"
                 );
             }
-            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(
                     error = %e,
