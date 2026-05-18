@@ -1971,17 +1971,22 @@ async fn run_gateway_webhook_agentic(
     // trim_history below. Symmetric with trim_history — runs on any outcome
     // (Ok / Cancelled / Err). On failure we fall through silently and let
     // trim_history clamp the message count.
+    let context_window = config
+        .agent
+        .context_compression
+        .model_windows
+        .get(model_name)
+        .copied()
+        .unwrap_or(config.agent.max_context_tokens);
+    let threshold =
+        (context_window as f64 * config.agent.context_compression.threshold_ratio) as usize;
+    let tokens_before_for_event =
+        zeroclaw_runtime::agent::context_compressor::estimate_tokens(&history);
+    let mut compressed_for_event: bool = false;
+    let mut passes_for_event: u32 = 0;
+    let mut compression_succeeded: bool = false;
+
     {
-        let context_window = config
-            .agent
-            .context_compression
-            .model_windows
-            .get(model_name)
-            .copied()
-            .unwrap_or(config.agent.max_context_tokens);
-        let threshold = (context_window as f64
-            * config.agent.context_compression.threshold_ratio)
-            as usize;
         let history_len = history.len();
         let registry_hit = config
             .agent
@@ -2012,6 +2017,9 @@ async fn run_gateway_webhook_agentic(
             .await
         {
             Ok(result) => {
+                compressed_for_event = result.compressed;
+                passes_for_event = result.passes_used;
+                compression_succeeded = true;
                 tracing::info!(
                     compressed = result.compressed,
                     passes = result.passes_used,
@@ -2040,6 +2048,41 @@ async fn run_gateway_webhook_agentic(
         &mut history,
         config.agent.max_history_messages,
     );
+
+    // Emit after trim_history so the payload reflects the state saved below.
+    // Cancelled turns are superseded by the next webhook, which will emit its
+    // own context_state event.
+    let was_cancelled = matches!(&outcome_result, Ok(TurnOutcome::Cancelled));
+    if !was_cancelled {
+        let tokens_after_trim =
+            zeroclaw_runtime::agent::context_compressor::estimate_tokens(&history);
+        let percent = if context_window > 0 {
+            ((tokens_after_trim as f64 / context_window as f64) * 100.0).round() as u8
+        } else {
+            0
+        };
+        zeroclaw_runtime::observability::runtime_trace::record_event(
+            "context_state",
+            Some("webhook"),
+            Some(provider_name),
+            Some(model_name),
+            None,
+            Some(compression_succeeded),
+            None,
+            serde_json::json!({
+                "tokens_after_trim": tokens_after_trim,
+                "tokens_before": tokens_before_for_event,
+                "context_window": context_window,
+                "threshold": threshold,
+                "percent": percent,
+                "compressed": compressed_for_event,
+                "passes": passes_for_event,
+                "session_id": session_id.unwrap_or_default(),
+                "history_len_after_trim": history.len(),
+                "compression_succeeded": compression_succeeded,
+            }),
+        );
+    }
 
     // Always restore session back into the mutex slot, even on non-cancel
     // error. Without this, the next turn for the same session would start

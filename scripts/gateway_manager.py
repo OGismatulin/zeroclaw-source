@@ -942,12 +942,19 @@ _EVENT_TOOL_CALL_RESULT = "tool_call_result"
 _EVENT_LLM_REQUEST = "llm_request"
 _EVENT_TURN_FINAL_RESPONSE = "turn_final_response"
 _EVENT_TURN_CANCELLED = "turn_cancelled"
+_EVENT_CONTEXT_STATE = "context_state"
 
 
 class _ToolEvent(TypedDict):
     tool: str
     success: bool
     args: str
+
+
+class _ContextFullnessState(TypedDict):
+    warned_at_percent: int
+    last_compression_event_id: str | None
+    last_percent: int
 
 
 class ProgressNotifier:
@@ -1064,6 +1071,11 @@ class ProgressNotifier:
     # events across iterations until interval elapses. turn_final_response
     # always force-flushes so no events are dropped at turn end.
     _MIN_SEND_INTERVAL_SECS: float = 5.0
+    # Context fullness alert thresholds. Warn ratio is below the default
+    # compaction trigger (0.70), giving the user a heads-up before compaction.
+    _CTX_WARN_RATIO: float = 0.60
+    _CTX_WARN_RESET_RATIO: float = 0.40
+    _CTX_MIN_BUMP_FOR_REWARN_PCT: int = 15
 
     def __init__(
         self,
@@ -1071,6 +1083,9 @@ class ProgressNotifier:
         user_id: str,
         notify_url: str,
         notify_secret: str,
+        *,
+        ctx_state: dict[str, _ContextFullnessState] | None = None,
+        ctx_state_lock: threading.Lock | None = None,
     ) -> None:
         self.trace_path = trace_path
         self.user_id = user_id
@@ -1085,6 +1100,8 @@ class ProgressNotifier:
         # Track last send to enforce _MIN_SEND_INTERVAL_SECS. Initialize to
         # -inf so the first flush is never rate-limited.
         self._last_sent_ts: float = float("-inf")
+        self._ctx_state = ctx_state
+        self._ctx_state_lock = ctx_state_lock
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._monitor, daemon=True)
@@ -1269,6 +1286,10 @@ class ProgressNotifier:
                         f"reason={payload.get('reason', '')}",
                         flush=True,
                     )
+                    continue
+
+                if et == _EVENT_CONTEXT_STATE:
+                    self._handle_context_state(event)
                     continue
 
                 if et == _EVENT_TOOL_CALL_START:
@@ -1515,6 +1536,83 @@ class ProgressNotifier:
         except Exception as exc:
             print(f"[ProgressNotifier] send failed: {exc}", flush=True)
 
+    def _handle_context_state(self, event: dict) -> None:
+        payload = event.get("payload") or {}
+        sid = str(payload.get("session_id") or "")
+        if not sid:
+            return
+        if self._ctx_state is None or self._ctx_state_lock is None:
+            return
+
+        tokens_before = int(payload.get("tokens_before", 0))
+        tokens_after_trim = int(payload.get("tokens_after_trim", 0))
+        window = int(payload.get("context_window", 0))
+        compressed = bool(payload.get("compressed", False))
+
+        if window <= 0:
+            return
+
+        percent_before = round(tokens_before / window * 100)
+        percent_after = round(tokens_after_trim / window * 100)
+        warn_threshold_pct = round(self._CTX_WARN_RATIO * 100)
+        reset_threshold_pct = round(self._CTX_WARN_RESET_RATIO * 100)
+        passes = int(payload.get("passes", 0))
+        event_id = str(event.get("id") or "")
+        message: str | None = None
+
+        with self._ctx_state_lock:
+            st = self._ctx_state.get(sid) or {
+                "warned_at_percent": 0,
+                "last_compression_event_id": None,
+                "last_percent": 0,
+            }
+
+            if compressed and event_id != st["last_compression_event_id"]:
+                st["last_compression_event_id"] = event_id
+                st["warned_at_percent"] = 0
+                st["last_percent"] = percent_after
+                self._ctx_state[sid] = st
+                if passes > 0:
+                    message = (
+                        f"📉 Сжал историю: {tokens_before:,} → "
+                        f"{tokens_after_trim:,} токенов "
+                        f"({passes} итераций суммаризации)"
+                    )
+                else:
+                    message = (
+                        "📉 Подрезал длинные tool-results: "
+                        f"{tokens_before:,} → {tokens_after_trim:,} токенов "
+                        "(без LLM суммаризации)"
+                    )
+            else:
+                should_warn = (
+                    not compressed
+                    and percent_before >= warn_threshold_pct
+                    and (
+                        st["warned_at_percent"] == 0
+                        or percent_before
+                        >= st["warned_at_percent"]
+                        + self._CTX_MIN_BUMP_FOR_REWARN_PCT
+                    )
+                )
+                if should_warn:
+                    st["warned_at_percent"] = percent_before
+                    message = (
+                        f"⚠ Контекст {percent_before}% "
+                        f"({tokens_before:,} / {window:,} токенов) — "
+                        "приближается к порогу компакции"
+                    )
+                elif (
+                    percent_after < reset_threshold_pct
+                    and st["warned_at_percent"] != 0
+                ):
+                    st["warned_at_percent"] = 0
+                st["last_percent"] = percent_after
+                self._ctx_state[sid] = st
+
+        if message is not None:
+            self._send_notify(message)
+
 
 def forward_webhook_to_child(
     instance: DaemonInstance,
@@ -1570,6 +1668,8 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     timeout = settings.request_timeout_secs
     notify_url = os.getenv("NOTIFY_URL", "")
     notify_secret = os.getenv("NOTIFY_SECRET", "")
+    ctx_state: dict[str, _ContextFullnessState] = {}
+    ctx_state_lock = threading.Lock()
 
     def _forward(
         instance: DaemonInstance,
@@ -1588,6 +1688,8 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 user_id=user_id,
                 notify_url=notify_url,
                 notify_secret=notify_secret,
+                ctx_state=ctx_state,
+                ctx_state_lock=ctx_state_lock,
             )
             notifier.start()
         try:
