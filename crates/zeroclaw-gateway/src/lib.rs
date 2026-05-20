@@ -1927,6 +1927,12 @@ async fn run_gateway_webhook_agentic(
         message,
         config.memory.min_relevance_score,
         session_id,
+        // exclude_conversation = false: webhook is user-initiated, so
+        // Conversation-category memory entries (chat history recall)
+        // are exactly what we want. See #5415 / #5456 — the flag exists
+        // to keep cron / heartbeat runs from leaking chat into prompts
+        // the user did not start, which does not apply here.
+        false,
     )
     .await;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2600,8 +2606,11 @@ async fn handle_webhook(
             // return it). Token accounting will be reinstated when the
             // agentic handler returns a richer result object — see Top-10
             // recommendation for cost tracking integration (v0.7.5 merge).
-            let input_tokens: Option<u64> = None;
-            let output_tokens: Option<u64> = None;
+            // Prefixed with _ to suppress unused-variable warnings; once
+            // ToolLoopCostTrackingContext is wired into run_gateway_webhook_agentic
+            // these will be assigned from the scope's captured Usage.
+            let _input_tokens: Option<u64> = None;
+            let _output_tokens: Option<u64> = None;
             let tokens_used: Option<u64> = None;
             let cost_usd: Option<f64> = None;
             state.observer.record_event(
