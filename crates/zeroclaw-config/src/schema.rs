@@ -603,6 +603,23 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Per-provider input/output token pricing (USD per 1M tokens). When set,
+    /// merged into the cost-tracking lookup at `<provider_id>/<model>` so the
+    /// budget surface attributes spend correctly even when the same model is
+    /// served by different providers at different rates. Top-level
+    /// `[cost.prices.<key>]` entries continue to take precedence on conflict;
+    /// this field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
+    /// tool calling for Groq models that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_tools: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1473,6 +1490,46 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
+/// HMAC tool execution receipt configuration (`[agent.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Generate HMAC receipts on every tool execution. Default: `false`.
+    /// When false, the entire receipt subsystem is inert (no key, no
+    /// generation, no append, no system-prompt addendum).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append a trailing `Tool receipts:` block to user-visible replies so
+    /// receipts are auditable from the channel surface, not just the
+    /// internal history. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+    /// Inject the receipt-echo instruction into the system prompt so the
+    /// model carries receipts verbatim into its response. Default: `true`.
+    /// No effect when `enabled = false`.
+    #[serde(default = "default_inject_system_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_inject_system_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_inject_system_prompt(),
+        }
+    }
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1557,6 +1614,11 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipt configuration.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1607,6 +1669,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }
@@ -2709,6 +2772,12 @@ impl Default for BrowserComputerUseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Browser",
+    description = "Chrome/Chromium control",
+    status_field = "enabled"
+)]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default = "default_true")]
@@ -3064,7 +3133,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
@@ -3072,6 +3141,11 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
+    /// Tavily Search API key (required if provider is "tavily")
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub tavily_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -3101,6 +3175,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            tavily_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -3366,6 +3441,12 @@ pub struct GoogleWorkspaceAllowedOperation {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "google-workspace"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Google Workspace",
+    description = "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+    status_field = "enabled"
+)]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
@@ -6306,6 +6387,12 @@ impl Default for HeartbeatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Cron",
+    description = "Scheduled tasks",
+    status_field = "enabled"
+)]
 pub struct CronConfig {
     /// Enable the cron subsystem. Default: `true`.
     #[serde(default = "default_true")]
@@ -6633,103 +6720,169 @@ pub struct ChannelsConfig {
     pub cli: bool,
     /// Telegram bot channel configuration.
     #[nested]
+    #[display_name = "Telegram"]
+    #[description = "Bot API — long-polling"]
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
     #[nested]
+    #[display_name = "Discord"]
+    #[description = "Servers, channels & DMs"]
     pub discord: Option<DiscordConfig>,
     /// Discord history channel — logs ALL messages and forwards @mentions to agent.
     #[nested]
+    #[display_name = "Discord History"]
+    #[description = "Logs all messages, forwards mentions to the agent"]
     pub discord_history: Option<DiscordHistoryConfig>,
     /// Slack bot channel configuration.
     #[nested]
+    #[display_name = "Slack"]
+    #[description = "Workspace apps via Web API"]
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration.
     #[nested]
+    #[display_name = "Mattermost"]
+    #[description = "Self-hosted team chat"]
     pub mattermost: Option<MattermostConfig>,
     /// Webhook channel configuration.
     #[nested]
+    #[display_name = "Webhooks"]
+    #[description = "HTTP endpoint for triggers"]
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     #[nested]
+    #[display_name = "iMessage"]
+    #[description = "macOS AppleScript bridge"]
     pub imessage: Option<IMessageConfig>,
     /// Matrix channel configuration.
     #[nested]
+    #[display_name = "Matrix"]
+    #[description = "Matrix protocol (Element)"]
     pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
     #[nested]
+    #[display_name = "Signal"]
+    #[description = "Privacy-focused via signal-cli"]
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     #[nested]
+    #[display_name = "WhatsApp"]
+    #[description = "Meta Cloud API or Web mode"]
     pub whatsapp: Option<WhatsAppConfig>,
     /// Linq Partner API channel configuration.
     #[nested]
+    #[display_name = "Linq"]
+    #[description = "Linq Partner API for iMessage/RCS/SMS"]
     pub linq: Option<LinqConfig>,
     /// WATI WhatsApp Business API channel configuration.
     #[nested]
+    #[display_name = "WATI"]
+    #[description = "WhatsApp Business API gateway"]
     pub wati: Option<WatiConfig>,
     /// Nextcloud Talk bot channel configuration.
     #[nested]
+    #[display_name = "Nextcloud Talk"]
+    #[description = "Self-hosted Nextcloud chat"]
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     #[nested]
+    #[display_name = "Email"]
+    #[description = "IMAP / SMTP inbox bridge"]
     pub email: Option<crate::scattered_types::EmailConfig>,
     /// Gmail Pub/Sub push notification channel configuration.
     #[nested]
+    #[display_name = "Gmail Push"]
+    #[description = "Pub/Sub push notifications for Gmail"]
     pub gmail_push: Option<crate::scattered_types::GmailPushConfig>,
     /// IRC channel configuration.
     #[nested]
+    #[display_name = "IRC"]
+    #[description = "Classic IRC with SASL / NickServ"]
     pub irc: Option<IrcConfig>,
     /// Lark channel configuration.
     #[nested]
+    #[display_name = "Lark"]
+    #[description = "ByteDance Lark / Feishu international"]
     pub lark: Option<LarkConfig>,
     /// LINE Messaging API channel configuration.
     #[nested]
+    #[display_name = "LINE"]
+    #[description = "LINE Messaging API"]
     pub line: Option<LineConfig>,
     /// Feishu channel configuration.
     #[nested]
+    #[display_name = "Feishu"]
+    #[description = "ByteDance Feishu (China)"]
     pub feishu: Option<FeishuConfig>,
     /// DingTalk channel configuration.
     #[nested]
+    #[display_name = "DingTalk"]
+    #[description = "DingTalk Stream Mode"]
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     #[nested]
+    #[display_name = "WeCom"]
+    #[description = "WeChat Enterprise Bot Webhook"]
     pub wecom: Option<WeComConfig>,
     /// WeChat personal iLink Bot channel configuration (QR code login).
     #[nested]
+    #[display_name = "WeChat"]
+    #[description = "WeChat personal iLink Bot (QR login)"]
     pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     #[nested]
+    #[display_name = "QQ Official"]
+    #[description = "Tencent QQ Bot SDK"]
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
     #[nested]
+    #[display_name = "X / Twitter"]
+    #[description = "X / Twitter API"]
     pub twitter: Option<TwitterConfig>,
     /// Mochat customer service channel configuration.
     #[nested]
+    #[display_name = "Mochat"]
+    #[description = "Mochat customer service"]
     pub mochat: Option<MochatConfig>,
     #[cfg(feature = "channel-nostr")]
     #[nested]
+    #[display_name = "Nostr"]
+    #[description = "Decentralized DMs (NIP-04)"]
     pub nostr: Option<NostrConfig>,
     /// ClawdTalk voice channel configuration.
     #[nested]
+    #[display_name = "ClawdTalk"]
+    #[description = "ClawdTalk voice channel"]
     pub clawdtalk: Option<crate::scattered_types::ClawdTalkConfig>,
     /// Reddit channel configuration (OAuth2 bot).
     #[nested]
+    #[display_name = "Reddit"]
+    #[description = "Reddit OAuth2 bot"]
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     #[nested]
+    #[display_name = "Bluesky"]
+    #[description = "Bluesky / AT Protocol"]
     pub bluesky: Option<BlueskyConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
+    #[display_name = "Voice Call"]
+    #[description = "Twilio / Telnyx / Plivo voice calls"]
     pub voice_call: Option<crate::scattered_types::VoiceCallConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     #[nested]
+    #[display_name = "Voice Wake"]
+    #[description = "Local wake-word detection"]
     pub voice_wake: Option<VoiceWakeConfig>,
     /// Voice duplex configuration (full-duplex voice over WebSocket).
     #[nested]
+    #[display_name = "Voice Duplex"]
+    #[description = "Full-duplex voice over WebSocket"]
     pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
+    #[display_name = "MQTT"]
+    #[description = "MQTT SOP listener"]
     pub mqtt: Option<MqttConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
@@ -9110,6 +9263,8 @@ impl Default for NotionConfig {
 ///
 /// ## Auth
 /// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
+/// Jira Server/Data Center uses Bearer token auth: omit `email` and set
+/// `api_token` to a personal access token.
 /// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -9121,9 +9276,10 @@ pub struct JiraConfig {
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
     pub base_url: String,
-    /// Jira account email used for Basic auth.
-    #[serde(default)]
-    pub email: String,
+    /// Jira account email used for Basic auth (Cloud).
+    /// Omit for Server/DC deployments using Bearer token auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
     #[serde(default)]
     #[secret]
@@ -9152,7 +9308,7 @@ impl Default for JiraConfig {
         Self {
             enabled: false,
             base_url: String::new(),
-            email: String::new(),
+            email: None,
             api_token: String::new(),
             allowed_actions: default_jira_allowed_actions(),
             timeout_secs: default_jira_timeout_secs(),
@@ -9945,6 +10101,45 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Collect the `IntegrationDescriptor` from every nested config that
+    /// declares one via `#[integration(...)]`. Adding a new toggleable
+    /// integration is one struct-level attribute on the new config + one
+    /// row in this method. The integrations registry consumes the result
+    /// without per-vendor branches.
+    pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
+        vec![
+            self.browser.integration_descriptor(),
+            self.cron.integration_descriptor(),
+            self.google_workspace.integration_descriptor(),
+        ]
+    }
+
+    /// Combine top-level `[cost.prices.<key>]` entries with any per-provider
+    /// `pricing` entries declared on `[providers.models.<id>]`. Per-provider
+    /// pricing is keyed as `<provider_id>/<model>` to align with the lookup
+    /// pattern in `record_tool_loop_cost_usage` (qualified `<provider>/<model>`
+    /// → bare `<model>` → suffix-after-last-slash). The qualified-first lookup
+    /// order is what makes per-provider disambiguation actually take effect:
+    /// an operator who sets `[providers.models.openai.pricing]` for `gpt-4o`
+    /// gets that rate even if a generic `[cost.prices.gpt-4o]` is also set.
+    /// Top-level entries still win on exact-key conflict so existing operator
+    /// overrides keyed as `<provider>/<model>` are never silently shadowed.
+    pub fn combined_pricing(&self) -> std::collections::HashMap<String, ModelPricing> {
+        let mut combined = self.cost.prices.clone();
+        for (provider_id, provider) in &self.providers.models {
+            let (Some(pricing), Some(model)) = (&provider.pricing, &provider.model) else {
+                continue;
+            };
+            if model.is_empty() {
+                continue;
+            }
+            combined
+                .entry(format!("{provider_id}/{model}"))
+                .or_insert_with(|| pricing.clone());
+        }
+        combined
+    }
+
     /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
     ///
     /// Keys present in `Config::default()` serialization pass immediately.
@@ -10972,9 +11167,6 @@ impl Config {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
             }
-            if self.jira.email.trim().is_empty() {
-                anyhow::bail!("jira.email must not be empty when jira.enabled = true");
-            }
             if self.jira.api_token.trim().is_empty()
                 && std::env::var("JIRA_API_TOKEN")
                     .unwrap_or_default()
@@ -11335,6 +11527,16 @@ impl Config {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
                 self.web_search.brave_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Tavily API key: ZEROCLAW_TAVILY_API_KEY or TAVILY_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_TAVILY_API_KEY").or_else(|_| std::env::var("TAVILY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.tavily_api_key = Some(api_key.to_string());
             }
         }
 
@@ -11753,6 +11955,17 @@ impl_enum_prop_kind!(
     SandboxBackend,
     AutonomyLevel,
 );
+
+impl HasPropKind for ModelPricing {
+    // ModelPricing is a 2-field struct (`input`, `output`). Wire form is a
+    // JSON object (e.g. `{"input": 1.0, "output": 2.5}`); the dashboard
+    // renders a sub-form for the inner fields. `PropKind::Object` (vs
+    // `String`) is what makes the round-trip through `Config::set_prop`
+    // succeed — `parse_prop_value` parses the JSON into a TOML table so
+    // serde deserializes it back into the typed `ModelPricing` instead
+    // of failing on a TOML string (#6357 review).
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
@@ -13022,6 +13235,7 @@ default_temperature = 0.7
         config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
+        config.web_search.tavily_api_key = Some("tavily-credential".into());
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         config.channels.feishu = Some(FeishuConfig {
             enabled: true,
@@ -13097,6 +13311,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(web_search_encrypted).unwrap(),
             "brave-credential"
+        );
+
+        let tavily_encrypted = stored.web_search.tavily_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(tavily_encrypted));
+        assert_eq!(
+            store.decrypt(tavily_encrypted).unwrap(),
+            "tavily-credential"
         );
 
         let worker = stored.agents.get("worker").unwrap();
@@ -15645,6 +15866,26 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    async fn validate_rejects_unpublished_jira_actions() {
+        for action in ["list_projects", "myself"] {
+            let mut config = Config::default();
+            config.jira.enabled = true;
+            config.jira.base_url = "https://jira.example.test".into();
+            config.jira.api_token = "token".into();
+            config.jira.allowed_actions = vec![action.into()];
+
+            let err = config
+                .validate()
+                .expect_err("unpublished Jira action should be rejected")
+                .to_string();
+            assert!(
+                err.contains("jira.allowed_actions contains unknown action"),
+                "expected Jira allowed action error for {action}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     async fn env_override_reasoning_enabled() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -18022,6 +18263,95 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn hashmap_property_paths_preserve_url_like_keys() {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            workspace_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        let provider_key = "custom:https://api.example.invalid/v1";
+        config
+            .providers
+            .models
+            .insert(provider_key.to_string(), ModelProviderConfig::default());
+
+        let api_key_path = format!("providers.models.{provider_key}.api-key");
+        let base_url_path = format!("providers.models.{provider_key}.base-url");
+        let model_path = format!("providers.models.{provider_key}.model");
+        let temperature_path = format!("providers.models.{provider_key}.temperature");
+
+        assert!(
+            Config::prop_is_secret(&api_key_path),
+            "url-like provider keys must still route secret metadata"
+        );
+
+        config.set_prop(&api_key_path, "sk-test-custom").unwrap();
+        config
+            .set_prop(&base_url_path, "https://api.example.invalid/v1")
+            .unwrap();
+        config.set_prop(&model_path, "local-large").unwrap();
+        config.set_prop(&temperature_path, "0.2").unwrap();
+
+        let provider = config
+            .providers
+            .models
+            .get(provider_key)
+            .expect("custom provider key should be preserved exactly");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(provider.model.as_deref(), Some("local-large"));
+        assert_eq!(provider.temperature, Some(0.2));
+
+        assert_eq!(config.get_prop(&api_key_path).unwrap(), "**** (encrypted)");
+        assert_eq!(
+            config.get_prop(&base_url_path).unwrap(),
+            "https://api.example.invalid/v1"
+        );
+
+        config.save().await.unwrap();
+        let raw_toml = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        assert!(
+            raw_toml.contains(provider_key),
+            "saved TOML should preserve the exact URL-like provider key"
+        );
+        assert!(
+            !raw_toml.contains("sk-test-custom"),
+            "saved TOML must not contain the plaintext custom provider API key"
+        );
+
+        let mut loaded: Config = toml::from_str::<crate::migration::V1Compat>(&raw_toml)
+            .unwrap()
+            .into_config();
+        loaded.config_path = config.config_path.clone();
+        loaded.workspace_dir = config.workspace_dir.clone();
+        let store = crate::secrets::SecretStore::new(dir.path(), loaded.secrets.encrypt);
+        loaded.decrypt_secrets(&store).unwrap();
+        let loaded_provider = loaded
+            .providers
+            .models
+            .get(provider_key)
+            .expect("saved custom provider key should reload exactly");
+        assert_eq!(
+            loaded.providers.fallback.as_deref(),
+            None,
+            "property round-trip should not invent a fallback provider"
+        );
+        assert_eq!(loaded_provider.api_key.as_deref(), Some("sk-test-custom"));
+        assert_eq!(
+            loaded_provider.base_url.as_deref(),
+            Some("https://api.example.invalid/v1")
+        );
+        assert_eq!(loaded_provider.model.as_deref(), Some("local-large"));
+        assert_eq!(loaded_provider.temperature, Some(0.2));
+    }
+
+    #[test]
     async fn enum_variants_callback_returns_values() {
         let mx = test_matrix_config();
         let fields = mx.prop_fields();
@@ -18512,5 +18842,221 @@ allowed_users = ["@u:m"]
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+    }
+
+    // ── combined_pricing: per-provider + top-level merge (#6251) ──────
+
+    fn pricing(input: f64, output: f64) -> ModelPricing {
+        ModelPricing { input, output }
+    }
+
+    fn config_with_provider(
+        provider_id: &str,
+        model: Option<&str>,
+        per_provider_pricing: Option<ModelPricing>,
+    ) -> Config {
+        let mut config = Config::default();
+        // Start clean: Config::default() seeds CostConfig::default() which calls
+        // get_default_pricing(); for these tests we want a deterministic baseline.
+        config.cost.prices.clear();
+        config.providers.models.insert(
+            provider_id.to_string(),
+            ModelProviderConfig {
+                model: model.map(ToString::to_string),
+                pricing: per_provider_pricing,
+                ..ModelProviderConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn combined_pricing_passes_through_when_no_per_provider_pricing() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+        config
+            .cost
+            .prices
+            .insert("openai/gpt-4o".into(), pricing(2.5, 10.0));
+
+        let combined = config.combined_pricing();
+        assert_eq!(combined.len(), 1);
+        let entry = combined.get("openai/gpt-4o").expect("top-level entry");
+        assert_eq!(entry.input, 2.5);
+        assert_eq!(entry.output, 10.0);
+    }
+
+    #[test]
+    async fn combined_pricing_merges_per_provider_into_provider_slash_model_key() {
+        let config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("anthropic/claude-sonnet-4-5")
+            .expect("per-provider pricing keyed as <provider_id>/<model>");
+        assert_eq!(entry.input, 3.0);
+        assert_eq!(entry.output, 15.0);
+    }
+
+    #[test]
+    async fn combined_pricing_top_level_wins_on_conflict() {
+        let mut config = config_with_provider(
+            "anthropic",
+            Some("claude-sonnet-4-5"),
+            Some(pricing(3.0, 15.0)),
+        );
+        // Operator pinned a different rate at the top level — must survive.
+        config
+            .cost
+            .prices
+            .insert("anthropic/claude-sonnet-4-5".into(), pricing(2.0, 8.0));
+
+        let combined = config.combined_pricing();
+        let entry = combined.get("anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(
+            entry.input, 2.0,
+            "top-level [cost.prices] override must not be silently shadowed by per-provider pricing"
+        );
+        assert_eq!(entry.output, 8.0);
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_no_model() {
+        // Provider has pricing but no `model` set — we cannot synthesize the
+        // <provider_id>/<model> key, so the entry must be skipped (not crash,
+        // not produce a malformed key).
+        let config = config_with_provider("openrouter", None, Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "per-provider pricing without `model` is silently skipped, got {combined:?}"
+        );
+    }
+
+    #[test]
+    async fn combined_pricing_skips_provider_with_empty_model() {
+        let config = config_with_provider("openrouter", Some(""), Some(pricing(1.0, 2.0)));
+
+        let combined = config.combined_pricing();
+        assert!(
+            combined.is_empty(),
+            "empty model string must be treated the same as missing, got {combined:?}"
+        );
+    }
+
+    // ── set_prop round-trip for `pricing` (#6357 review) ──────────────
+    //
+    // Dashboard / JSON-patch callers send `pricing` as a JSON object
+    // (`{"input": 1.0, "output": 2.5}`). Before #6357 review, `pricing` was
+    // classified as `PropKind::String`, which meant `parse_prop_value`
+    // inserted the JSON text as a TOML string and serde failed to
+    // deserialize it back into `Option<ModelPricing>`. The fix classifies
+    // `ModelPricing` as `PropKind::Object` and routes through `json_to_toml`
+    // so the value lands as a typed inline table. These tests pin that
+    // contract end-to-end through `Config::set_prop` and the wire-form
+    // coercion at `coerce_for_set_prop`.
+
+    #[test]
+    async fn set_prop_round_trips_per_provider_pricing_object() {
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        // Caller hits `Config::set_prop` directly with the JSON-stringified
+        // object that the dashboard / CLI hand off after type coercion.
+        config
+            .set_prop(
+                "providers.models.openai.pricing",
+                r#"{"input": 1.5, "output": 6.0}"#,
+            )
+            .expect("set_prop must accept a JSON object for pricing");
+
+        // Round-trip 1: typed access on the struct must reflect the write.
+        let pricing = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone())
+            .expect("pricing must round-trip back into a typed ModelPricing, not a string");
+        assert_eq!(pricing.input, 1.5);
+        assert_eq!(pricing.output, 6.0);
+
+        // Round-trip 2: the merged pricing map (the runtime/channel cost
+        // contexts consume this) must show the new values keyed under
+        // `<provider_id>/<model>`.
+        let combined = config.combined_pricing();
+        let entry = combined
+            .get("openai/gpt-4o")
+            .expect("set_prop write must surface in combined_pricing");
+        assert_eq!(entry.input, 1.5);
+        assert_eq!(entry.output, 6.0);
+    }
+
+    #[test]
+    async fn set_prop_pricing_rejects_non_object_string_payload() {
+        // Sanity: a quoted JSON string (which is what the buggy
+        // `PropKind::String` path would have silently accepted by writing
+        // the raw text into a TOML string field) must NOT round-trip into
+        // a typed `ModelPricing`. The fix is `PropKind::Object`, which
+        // requires a JSON object; anything else fails set_prop and leaves
+        // the field unchanged. We assert the failure is observable AND
+        // that no garbage state was written.
+        let mut config = config_with_provider("openai", Some("gpt-4o"), None);
+
+        let result = config.set_prop(
+            "providers.models.openai.pricing",
+            "\"{\\\"input\\\":1.5,\\\"output\\\":6.0}\"",
+        );
+        assert!(
+            result.is_err(),
+            "a JSON string in place of an object must be rejected by set_prop"
+        );
+        // Pricing must still be `None` — no partial / garbage write.
+        let pricing_after = config
+            .providers
+            .models
+            .get("openai")
+            .and_then(|m| m.pricing.clone());
+        assert!(
+            pricing_after.is_none(),
+            "rejected set_prop must not mutate pricing, got {pricing_after:?}"
+        );
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_round_trips_pricing_payload() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        // Dashboard / CLI sends a real JSON object; the coercion layer
+        // must hand it back as a JSON-stringified object (the wire form
+        // that `parse_prop_value`'s `Object` arm consumes).
+        let coerced = coerce_for_set_prop(
+            &serde_json::json!({"input": 1.5, "output": 6.0}),
+            Some(PropKind::Object),
+        )
+        .expect("JSON object payload must coerce successfully for an Object field");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&coerced).expect("coerced output must remain valid JSON");
+        assert_eq!(parsed, serde_json::json!({"input": 1.5, "output": 6.0}));
+    }
+
+    #[test]
+    async fn coerce_for_set_prop_object_rejects_non_object() {
+        use crate::traits::PropKind;
+        use crate::typed_value::coerce_for_set_prop;
+
+        let err = coerce_for_set_prop(
+            &serde_json::json!("{\"input\":1.5}"),
+            Some(PropKind::Object),
+        )
+        .expect_err("a JSON string is not a JSON object — must be rejected");
+        assert!(
+            err.message.contains("object"),
+            "rejection message must name the object requirement, got: {}",
+            err.message
+        );
     }
 }

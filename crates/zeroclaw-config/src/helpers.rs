@@ -7,6 +7,11 @@ use crate::traits::{PropFieldInfo, PropKind};
 /// return the HashMap key + the fully-qualified inner name that the value
 /// type's own `get_prop` / `set_prop` expects.
 ///
+/// HashMap keys are user-controlled and may contain dots, URLs, or hostnames
+/// (for example `providers.models.custom:https://example.invalid/v1.api-key`).
+/// Current map-keyed config sections expose leaf fields, so split from the
+/// right and preserve any dots inside the runtime key.
+///
 /// Returns `None` when the path doesn't match, letting the derive's
 /// generated code fall through to the next nested field.
 pub fn route_hashmap_path<'a>(
@@ -21,7 +26,7 @@ pub fn route_hashmap_path<'a>(
         format!("{my_prefix}.{field_name}")
     };
     let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
-    let (hm_key, inner_suffix) = rest.split_once('.')?;
+    let (hm_key, inner_suffix) = rest.rsplit_once('.')?;
     let inner_name = if inner_prefix.is_empty() {
         inner_suffix.to_string()
     } else {
@@ -205,6 +210,20 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 .map_err(|e| anyhow::anyhow!("invalid JSON array of objects: {e}"))?;
             json_to_toml(v).ok_or_else(|| {
                 anyhow::anyhow!("JSON value contained only nulls — nothing to write")
+            })
+        }
+        // Struct-shaped scalar: parse the JSON object into a TOML table so
+        // the parent serde round-trip deserializes into the typed struct
+        // (e.g. `Option<ModelPricing>`). Inserting a raw String here would
+        // fail serde because the field is typed, not free-form text.
+        PropKind::Object => {
+            let v: serde_json::Value = serde_json::from_str(value_str)
+                .map_err(|e| anyhow::anyhow!("invalid JSON object: {e}"))?;
+            if !matches!(v, serde_json::Value::Object(_)) {
+                anyhow::bail!("Object field requires a JSON object; got {v}");
+            }
+            json_to_toml(v).ok_or_else(|| {
+                anyhow::anyhow!("JSON object contained only nulls — nothing to write")
             })
         }
     }

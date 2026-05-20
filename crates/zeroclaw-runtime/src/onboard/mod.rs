@@ -403,6 +403,24 @@ async fn prompt_field(
                 }
             }
         }
+        PropKind::Object => {
+            // Struct-shaped scalar (e.g. providers.models.<id>.pricing).
+            // Same TUI fallback as ObjectArray: edit as raw JSON; the
+            // dashboard renders a proper sub-form.
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            match ui.string(prompt, prefill).await? {
+                Answer::Back => return Ok(Nav::Back),
+                Answer::Value(new) => {
+                    if (is_set || !new.is_empty()) && new != current {
+                        persist(cfg, name, &new).await?;
+                    }
+                }
+            }
+        }
     }
     Ok(Nav::Done)
 }
@@ -1395,7 +1413,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://localhost:{port}")
+        format!("http://127.0.0.1:{port}")
     }
 
     #[tokio::test]
@@ -1675,6 +1693,40 @@ mod tests {
             .expect("custom provider entry should be seeded");
         assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
         assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
+    }
+
+    #[tokio::test]
+    async fn providers_custom_openai_menu_flow_persists_url_keyed_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"data":[{"id":"local-small"},{"id":"local-large"}]}"#,
+            None,
+        )
+        .await;
+        let provider = format!("custom:{base_url}");
+
+        let flags = Flags::default();
+        let mut ui = QuickUi::new()
+            .with("Provider", CUSTOM_OPENAI_COMPAT_LABEL)
+            .with("OpenAI-compatible base URL", base_url.clone())
+            .with("api-key", "sk-custom-test")
+            .with("Model", "local-large");
+
+        run(&mut cfg, &mut ui, Section::Providers, &flags)
+            .await
+            .unwrap();
+
+        assert_eq!(cfg.providers.fallback.as_deref(), Some(provider.as_str()));
+        let model_cfg = cfg
+            .providers
+            .models
+            .get(&provider)
+            .expect("custom provider entry should be persisted under its URL key");
+        assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
+        assert_eq!(model_cfg.base_url.as_deref(), Some(base_url.as_str()));
+        assert_eq!(model_cfg.model.as_deref(), Some("local-large"));
     }
 
     #[tokio::test]

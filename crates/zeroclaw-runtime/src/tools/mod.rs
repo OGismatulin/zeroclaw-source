@@ -264,6 +264,18 @@ pub fn register_skill_tools(
     }
 }
 
+/// Always-on built-in tools that surface in the integrations panel as
+/// `(display_name, description)` pairs. The integrations registry consumes
+/// this verbatim — adding a new always-on built-in is one row here, no
+/// edit to the registry. Tools with a config struct (Browser, Cron,
+/// GoogleWorkspace) declare themselves via the `#[integration(...)]`
+/// attribute on the schema struct instead.
+pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
+    ("Shell", "Terminal command execution"),
+    ("File System", "Read/write files"),
+    ("Weather", "Forecasts & conditions (wttr.in)"),
+];
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -448,6 +460,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
+            root_config.skills.allow_scripts,
         )));
     }
 
@@ -528,6 +541,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
@@ -565,12 +579,22 @@ pub fn all_tools_with_runtime(
             );
         } else if root_config.jira.base_url.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
-        } else if root_config.jira.email.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
         } else {
+            let email = root_config
+                .jira
+                .email
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if email.is_some() {
+                tracing::info!("Jira tool: Cloud mode (API v3, Basic auth)");
+            } else {
+                tracing::info!("Jira tool: Server/DC mode (API v2, Bearer auth)");
+            }
             tool_arcs.push(Arc::new(JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
-                root_config.jira.email.trim().to_string(),
+                email,
                 api_token,
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
@@ -690,11 +714,16 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session tools (JSONL path). If a separate SQLite registration path is
-    // added, these tools need to be registered there too.
-    if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
-        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(session_store);
+    // Session tools share the channel orchestrator's backend via the
+    // `make_session_backend` factory, keyed off `[channels].session_backend`.
+    // Previously the tools opened the JSONL `SessionStore` while the
+    // gateway WS path opened `SqliteSessionBackend`, so any session
+    // created via /ws/chat was invisible to `sessions_list` /
+    // `sessions_history`. Routing both call sites through the factory
+    // closes that gap and honors the operator's configured backend.
+    if let Ok(backend) =
+        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+    {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
