@@ -13,8 +13,13 @@ primary_region = 'iad'
   # ZEROCLAW_MODEL = 'glm-5-turbo'
   # ZEROCLAW_PROVIDER = 'zai'
   # ZEROCLAW_MODEL = 'glm-5-turbo'
-  ZEROCLAW_PROVIDER = 'opencode-go'
-  ZEROCLAW_MODEL = 'deepseek-v4-flash'
+  # ZEROCLAW_PROVIDER = 'opencode-go'
+  # ZEROCLAW_MODEL = 'deepseek-v4-flash'
+  # Wafer.ai default — 2026-05-21. Подключён через встроенный custom:URL,
+  # api key читается из generic fallback ZEROCLAW_API_KEY (Fly secret wfr_...).
+  # Этап 2 (named provider `wafer` в Rust registry для /model UX) — следующий sprint.
+  ZEROCLAW_PROVIDER = 'custom:https://pass.wafer.ai/v1'
+  ZEROCLAW_MODEL = 'GLM-5.1'
   ZEROCLAW_MANAGER_HOST = '0.0.0.0'
   ZEROCLAW_MANAGER_PORT = '3000'
   ZEROCLAW_MANAGER_BASE_PORT = '3001'
