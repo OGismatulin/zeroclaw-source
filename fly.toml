@@ -51,7 +51,10 @@ primary_region = 'iad'
 [http_service]
   internal_port = 3000
   force_https = false
-  auto_stop_machines = 'stop'
+  # autostop disabled 2026-05-21: cron retro (3:00 UTC) must run on schedule.
+  # autostop killed the scheduler tokio task and led to retro racing with
+  # the first user webhook of the morning. See docs/analysis/2026-05-21-deploy-cron-race-fix.md.
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
