@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 import email.parser
 import email.policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -936,6 +937,97 @@ class GatewayManagerServer:
             "mime_type": mime_type,
         }
 
+    def handle_warmup(
+        self,
+        *,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[int, dict[str, object]]:
+        """Spawn per-user daemons for all known workspaces without invoking the
+        agent. Used after deploy to discharge cron catch-up before users start
+        chatting, so missed jobs don't race with the first webhook turn."""
+        if not self.pairing_state.is_authorized(headers.get("authorization")):
+            return 401, {"error": "missing or invalid bearer token"}
+
+        expected_secret = self.settings.webhook_secret
+        if expected_secret and headers.get("x-webhook-secret") != expected_secret:
+            return 403, {"error": "missing or invalid webhook secret"}
+
+        exclude: set[str] = {"tg_99999"}
+        if body:
+            try:
+                payload = json.loads(body.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return 400, {"error": "invalid warmup payload"}
+            if not isinstance(payload, dict):
+                return 400, {"error": "warmup payload must be a JSON object"}
+            if "exclude" in payload:
+                raw = payload["exclude"]
+                if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
+                    return 400, {
+                        "error": "warmup payload `exclude` must be a list of strings"
+                    }
+                exclude = set(raw)
+
+        workspaces_root = self.settings.workspaces_root
+        if not workspaces_root.exists():
+            return 200, {
+                "warmed": [],
+                "failed": {},
+                "skipped": [],
+                "elapsed_ms": 0,
+            }
+
+        candidates = sorted(
+            d.name
+            for d in workspaces_root.iterdir()
+            if d.is_dir() and d.name.startswith("tg_")
+        )
+        targets = [u for u in candidates if u not in exclude]
+        skipped = sorted(u for u in candidates if u in exclude)
+
+        if self.registry is None or not hasattr(self.registry, "ensure_instance"):
+            return 503, {"error": "manager registry is not configured"}
+
+        start = time.monotonic()
+        warmed: list[str] = []
+        failed: dict[str, str] = {}
+        lock = threading.Lock()
+
+        def _warm_one(user_key: str) -> None:
+            try:
+                self.registry.ensure_instance(user_key)
+                with lock:
+                    warmed.append(user_key)
+            except (DaemonSpawnError, DaemonCapacityError) as exc:
+                with lock:
+                    failed[user_key] = str(exc)
+            except Exception as exc:  # noqa: BLE001 — log per-user, continue with rest
+                with lock:
+                    failed[user_key] = (
+                        f"unexpected: {exc.__class__.__name__}: {exc}"
+                    )
+
+        if targets:
+            max_workers = min(len(targets), max(self.settings.max_instances, 1))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                # Consume the iterator so all tasks complete before we return.
+                for _ in pool.map(_warm_one, targets):
+                    pass
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        print(
+            f"[gateway-manager] warmup: warmed={len(warmed)} failed={len(failed)} "
+            f"skipped={len(skipped)} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        return 200, {
+            "warmed": sorted(warmed),
+            "failed": failed,
+            "skipped": skipped,
+            "elapsed_ms": elapsed_ms,
+        }
+
 
 _EVENT_TOOL_CALL_START = "tool_call_start"
 _EVENT_TOOL_CALL_RESULT = "tool_call_result"
@@ -1763,6 +1855,14 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                     headers=headers,
                     body=body,
                     content_type=content_type,
+                )
+                self._write_json(status_code, payload)
+                return
+
+            if self.path == "/warmup":
+                status_code, payload = self.server.app.handle_warmup(
+                    headers=headers,
+                    body=body,
                 )
                 self._write_json(status_code, payload)
                 return

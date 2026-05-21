@@ -24,3 +24,12 @@ jobs:
       - run: flyctl deploy --image ghcr.io/ogismatulin/zeroclaw:latest
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      # Warm up per-user daemons so the cron catch-up (e.g. nightly retro)
+      # runs immediately after deploy instead of racing with the first user
+      # webhook. See docs/analysis/2026-05-21-deploy-cron-race-fix.md.
+      - name: Warm up per-user daemons
+        run: flyctl ssh console -a ai-forge-zeroclaw -C 'python3 /usr/local/bin/fly_warmup.py'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        continue-on-error: true
