@@ -85,3 +85,4 @@ scripts/
 !scripts/graylog_pack_cookie.py
 !scripts/extract_ms_cookies.py
 !scripts/code_repos_sync.py
+!scripts/fly_warmup.py
