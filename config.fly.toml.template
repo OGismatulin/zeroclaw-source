@@ -4,20 +4,17 @@ default_model = "google/gemini-3-flash-preview"
 default_temperature = 0.7
 
 [reliability]
-# Enable fallback mechanism globally
-enabled = true
+fallback_providers = ["opencode-go"]
 
-# Explicit mapping of primary models to their fallback destinations.
-# opencode-go provider requires bare model names without prefixes.
-[reliability.targets]
-"GLM-5.1" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"Qwen3.5-397B-A17B" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"minimax-m2.7" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"glm-5-turbo" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gpt-5.4-mini" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gpt-5.4" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"google/gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+[reliability.model_fallbacks]
+"GLM-5.1"            = ["deepseek-v4-flash"]
+"Qwen3.5-397B-A17B"  = ["deepseek-v4-flash"]
+"gpt-5.5"            = ["deepseek-v4-flash"]
+"gpt-5.4"            = ["deepseek-v4-flash"]
+"gpt-5.4-mini"       = ["deepseek-v4-flash"]
+"glm-5-turbo"        = ["deepseek-v4-flash"]
+"glm-5.1"            = ["deepseek-v4-flash"]
+"minimax-m2.7"       = ["deepseek-v4-flash"]
 
 [memory]
 backend = "sqlite"

@@ -267,53 +267,56 @@ fi
 
 ensure_observability_runtime_trace
 
-# Patch: Ensure global reliability targets are configured (three-files sync).
-# Idempotent: strips ALL existing [reliability...] sections (including duplicate
-# [reliability.targets] from past entrypoint runs with a buggy non-greedy regex)
-# then re-appends one canonical block. Safe to re-run on already-clean configs.
-python3 - "$config_file" <<'PY_RELIABILITY'
+# Patch: Ensure global fallback to opencode-go is configured (three-files sync).
+# Idempotent: strips ALL existing [reliability...] sections (including the
+# invented "targets" subsection from past buggy deploys) then re-appends one
+# canonical block with the actual ReliabilityConfig schema:
+# fallback_providers + model_fallbacks. Safe to re-run on already-clean configs.
+#
+# Applies to template AND every per-user config (in-place loop, no rm).
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PY_RELIABILITY'
 import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
 # Match [reliability] or [reliability.<sub>] header + content up to next
-# non-reliability section header or EOF. Lazy match means each section is
-# captured separately and removed by re.sub's repeated application.
+# non-reliability section header or EOF. Re.sub removes all such sections
+# (collapses duplicates from past broken deploys with non-greedy regex).
 section_re = re.compile(
     r'(?ms)^\[reliability(?:\.[a-zA-Z0-9_]+)?\].*?(?=^\[(?!reliability)|\Z)'
 )
 c = section_re.sub('', c)
 canonical = """[reliability]
-# Enable fallback mechanism globally
-enabled = true
+fallback_providers = ["opencode-go"]
 
-# Explicit mapping of primary models to their fallback destinations.
-# opencode-go provider requires bare model names without prefixes.
-[reliability.targets]
-"GLM-5.1" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"Qwen3.5-397B-A17B" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"minimax-m2.7" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"glm-5-turbo" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gpt-5.4-mini" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gpt-5.4" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"google/gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
-"gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+[reliability.model_fallbacks]
+"GLM-5.1"            = ["deepseek-v4-flash"]
+"Qwen3.5-397B-A17B"  = ["deepseek-v4-flash"]
+"gpt-5.5"            = ["deepseek-v4-flash"]
+"gpt-5.4"            = ["deepseek-v4-flash"]
+"gpt-5.4-mini"       = ["deepseek-v4-flash"]
+"glm-5-turbo"        = ["deepseek-v4-flash"]
+"glm-5.1"            = ["deepseek-v4-flash"]
+"minimax-m2.7"       = ["deepseek-v4-flash"]
 
 """
 c = c.rstrip() + "\n\n" + canonical
 p.write_text(c, encoding="utf-8")
-print(f"[entrypoint] Configured global reliability target in {p}")
+print(f"[entrypoint] Configured reliability fallback in {p}")
 PY_RELIABILITY
+done
 
 # Patch: fix api_key = "minimax-oauth" literal leak for non-minimax providers
 sed -i 's/^api_key = "minimax-oauth"/api_key = ""/' "$config_file"
 
-# Force regeneration of per-user configs on next request to ensure clean template convergence
-for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
-  [ -f "$user_config" ] || continue
-  echo "[entrypoint] Removing stale per-user config to force regeneration: $user_config"
-  rm -f "$user_config"
-done
+# NOTE: per-user config.toml regeneration via rm has been REMOVED (2026-05-22).
+# Migration of [reliability] section happens in-place via the PY_RELIABILITY block
+# above, which is idempotent and will apply to template + every per-user config
+# after the v3 fix-forward commit. Removing per-user configs violated
+# «ЗАПРЕТ: удаление пользовательских данных на Fly» (CLAUDE.md) and contributed
+# to incident 2026-04-01.
 
 # Patch: ensure shell_env_passthrough includes NOTIFY vars
 if grep -q 'shell_env_passthrough = \[\]' "$config_file" 2>/dev/null; then
@@ -862,7 +865,7 @@ WINDOWS_EOF
   # the insertion strictly inside the [agent.context_compression.model_windows]
   # block and never lands in trailing TOML tables.
   # Guard checks for the literal "= 202_752" value (unique to model_windows;
-  # not present in [reliability.targets] which uses an inline-table value).
+  # not present in legacy reliability inline-table sections).
   if grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null && \
      ! grep -qE '"GLM-5\.1"\s*=\s*202_752' "$cfg" 2>/dev/null; then
     python3 - "$cfg" <<'PY'
