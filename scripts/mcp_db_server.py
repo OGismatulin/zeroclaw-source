@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import re
+import shutil
 import socket
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import psycopg2
+from psycopg2 import errors as pg_errors
 
 DDL_BLOCKLIST_RE = re.compile(
     r"\b(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER)\b",
@@ -146,6 +153,199 @@ STATEMENT_TIMEOUT_MS = 30_000
 ALLOWED_PATH_ROOT = "/zeroclaw-data/workspaces/"
 ALLOWED_PATH_SEGMENT = "/workspace/state/sql/"
 
+_RETRYABLE_PG_PATTERNS = (
+    "timeout expired",
+    "could not connect",
+    "connection refused",
+    "server closed the connection",
+    "server closed the connection unexpectedly",
+    "the database system is starting up",
+    "no route to host",
+    "network is unreachable",
+)
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BACKOFFS_SECS = (0.5, 1.5)
+_NON_RETRYABLE_SQLSTATES = frozenset({"57014"})
+_DML_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b",
+    re.IGNORECASE,
+)
+
+PG_HOST_ROUTE_TARGETS = {
+    "slave.db.yallasvc.net": "46.4.211.98",
+    "slave.catalog.db.yallasvc.net": "195.201.82.13",
+}
+VPN_ROUTE_WAIT_SECS = int(os.environ.get("MCP_DB_VPN_ROUTE_WAIT_SECS", "25"))
+VPN_ROUTE_POLL_SECS = float(os.environ.get("MCP_DB_VPN_ROUTE_POLL_SECS", "1"))
+
+
+def _is_transient_pg_error(exc: BaseException) -> bool:
+    """Return True for PG failures that are safe to retry for read-only SQL."""
+    sqlstate = getattr(exc, "pgcode", None)
+    if sqlstate in _NON_RETRYABLE_SQLSTATES:
+        return False
+    if isinstance(exc, pg_errors.QueryCanceled):
+        return False
+    msg = str(exc).lower()
+    return any(pattern in msg for pattern in _RETRYABLE_PG_PATTERNS)
+
+
+def _sql_is_retry_safe(sql: str) -> bool:
+    """True iff SQL is a pure SELECT/WITH read query without nested DML."""
+    cleaned = _strip_sql_noise(sql).strip().lstrip("(").lstrip()
+    first_word = cleaned.split()[0].upper() if cleaned else ""
+    if first_word not in ("SELECT", "WITH"):
+        return False
+    return _DML_RE.search(cleaned) is None
+
+
+def _route_uses_tun0(ip: str) -> bool:
+    """Check whether Linux routes an IP through tun0; skip where unavailable."""
+    if sys.platform == "darwin" or shutil.which("ip") is None:
+        return True
+    try:
+        proc = subprocess.run(
+            ["ip", "route", "get", ip],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except FileNotFoundError:
+        return True
+    except subprocess.SubprocessError:
+        return False
+    except Exception:
+        return False
+    return proc.returncode == 0 and " dev tun0 " in f" {proc.stdout} "
+
+
+def _wait_for_vpn_route(host: str) -> None:
+    """Wait until a known prod host route goes through tun0."""
+    ip = PG_HOST_ROUTE_TARGETS.get(host)
+    if not ip:
+        return
+    deadline = time.monotonic() + VPN_ROUTE_WAIT_SECS
+    while time.monotonic() < deadline:
+        if _route_uses_tun0(ip):
+            return
+        time.sleep(VPN_ROUTE_POLL_SECS)
+    raise RuntimeError(f"vpn_unavailable: route to {host} ({ip}) is not via tun0")
+
+
+def _execute_pg_with_retry(
+    connect_kwargs: dict,
+    sql: str,
+    statement_timeout_ms: int,
+) -> tuple[str, object, object]:
+    """Run PG SQL, retrying transient connect/execute failures for reads only."""
+    retry_safe = _sql_is_retry_safe(sql)
+    last_exc: BaseException | None = None
+    host = connect_kwargs.get("host")
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        conn = None
+        is_dml = False
+        try:
+            if host:
+                _wait_for_vpn_route(host)
+            conn = psycopg2.connect(**connect_kwargs, connect_timeout=10)
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {statement_timeout_ms}")
+                cur.execute(sql)
+                if cur.description is None:
+                    is_dml = True
+                    return ("dml", cur.rowcount, conn)
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                return ("rows", columns, rows)
+        except psycopg2.Error as exc:
+            last_exc = exc
+            if (
+                not retry_safe
+                or not _is_transient_pg_error(exc)
+                or attempt == RETRY_MAX_ATTEMPTS - 1
+            ):
+                raise
+            print(
+                f"[retry] pg execute attempt {attempt + 1} failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(RETRY_BACKOFFS_SECS[attempt])
+        finally:
+            if conn is not None and not is_dml:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise last_exc or RuntimeError("unreachable pg retry state")
+
+
+_RETRYABLE_CH_EXC = (
+    urllib.error.URLError,
+    socket.timeout,
+    http.client.RemoteDisconnected,
+)
+
+
+def _ch_post_with_retry(req: urllib.request.Request, timeout: int) -> bytes:
+    """POST ClickHouse query with retry for full-buffer idempotent reads."""
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            raise
+        except _RETRYABLE_CH_EXC as exc:
+            last_exc = exc
+            if attempt == RETRY_MAX_ATTEMPTS - 1:
+                raise
+            print(
+                f"[retry] ch attempt {attempt + 1} failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(RETRY_BACKOFFS_SECS[attempt])
+    raise last_exc or RuntimeError("unreachable ch retry state")
+
+
+def _ch_post_with_retry_initial(req: urllib.request.Request, timeout: int):
+    """Open a ClickHouse stream with retry before the first byte only."""
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except _RETRYABLE_CH_EXC as exc:
+            last_exc = exc
+            if attempt == RETRY_MAX_ATTEMPTS - 1:
+                raise
+            print(
+                f"[retry] ch stream initial attempt {attempt + 1} failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(RETRY_BACKOFFS_SECS[attempt])
+    raise last_exc or RuntimeError("unreachable ch stream retry state")
+
+
+def _count_openvpn_resets(log_path: str, window_secs: int = 300) -> int:
+    """Count recent-looking OpenVPN soft reconnects from the tail of its log."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256_000))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return 0
+    # OpenVPN logs are not reliably machine-parseable across configs. Keep this
+    # cheap and deterministic; smoke checks divide by their observed window.
+    _ = window_secs
+    return tail.count("SIGUSR1[soft,connection-reset]")
+
 
 def validate_file_path(path: str) -> str:
     """Validate that a file path is absolute and under a per-workspace SQL directory."""
@@ -174,51 +374,40 @@ def truncate_result(data: str, max_chars: int = MAX_RESULT_CHARS) -> tuple[str, 
 
 def execute_query(env: str, db: str, sql: str) -> dict:
     """Execute SQL query and return structured result."""
-    import psycopg2
-
     check_sql_safety(sql)
     sql = apply_auto_limit(sql)
     params = resolve_connection_params(env, db)
 
-    conn = psycopg2.connect(
-        host=params["host"],
-        port=params["port"],
-        user=params["user"],
-        password=params["password"],
-        dbname=params["dbname"],
-        sslmode=params["sslmode"],
-        connect_timeout=10,
+    kind, payload_a, payload_b = _execute_pg_with_retry(
+        params, sql, STATEMENT_TIMEOUT_MS
     )
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
-            cur.execute(sql)
-            if cur.description is None:
-                # DML without result set
-                row_count = cur.rowcount
-                conn.commit()
-                return {
-                    "columns": [],
-                    "rows": [],
-                    "row_count": row_count,
-                    "message": f"{row_count} row(s) affected",
-                }
-            columns = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-            # Convert to JSON-safe types
-            safe_rows = []
-            for row in rows:
-                safe_rows.append([
-                    str(v) if v is not None and not isinstance(v, (int, float, bool, str)) else v
-                    for v in row
-                ])
-            return {
-                "columns": columns,
-                "rows": safe_rows,
-                "row_count": len(safe_rows),
-            }
-    finally:
-        conn.close()
+    if kind == "dml":
+        row_count = payload_a
+        conn = payload_b
+        try:
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "columns": [],
+            "rows": [],
+            "row_count": row_count,
+            "message": f"{row_count} row(s) affected",
+        }
+
+    columns = payload_a
+    rows = payload_b
+    safe_rows = []
+    for row in rows:
+        safe_rows.append([
+            str(v) if v is not None and not isinstance(v, (int, float, bool, str)) else v
+            for v in row
+        ])
+    return {
+        "columns": columns,
+        "rows": safe_rows,
+        "row_count": len(safe_rows),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +487,7 @@ def execute_ch_query(sql: str, db: str | None = None) -> str:
 
     req = urllib.request.Request(url, data=stripped.encode("utf-8"), method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8")
+        return _ch_post_with_retry(req, timeout=30).decode("utf-8")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise ValueError(
@@ -448,16 +636,34 @@ def _check_select_only(sql: str) -> None:
 
 
 def _open_pg_connection(params: dict, timeout_secs: int):
-    import psycopg2
-    return psycopg2.connect(
-        host=params["host"],
-        port=params["port"],
-        user=params["user"],
-        password=params["password"],
-        dbname=params["dbname"],
-        sslmode=params["sslmode"],
-        connect_timeout=10,
-    )
+    """Open a PG connection with retry on initial transient connect failures."""
+    _ = timeout_secs
+    host = params.get("host")
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_MAX_ATTEMPTS):
+        try:
+            if host:
+                _wait_for_vpn_route(host)
+            return psycopg2.connect(
+                host=params["host"],
+                port=params["port"],
+                user=params["user"],
+                password=params["password"],
+                dbname=params["dbname"],
+                sslmode=params["sslmode"],
+                connect_timeout=10,
+            )
+        except psycopg2.OperationalError as exc:
+            last_exc = exc
+            if not _is_transient_pg_error(exc) or attempt == RETRY_MAX_ATTEMPTS - 1:
+                raise
+            print(
+                f"[retry] pg connect attempt {attempt + 1} failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(RETRY_BACKOFFS_SECS[attempt])
+    raise last_exc or RuntimeError("unreachable pg connect retry state")
 
 
 def execute_query_to_file(
@@ -716,16 +922,25 @@ def execute_ch_query_to_file(
     start = _time.monotonic()
     tmp_path = abs_path if fmt != "xlsx" else abs_path + ".tmp.csv"
     try:
-        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+        resp = _ch_post_with_retry_initial(req, timeout=timeout_secs)
+        try:
             with open(tmp_path, "wb") as fh:
                 while True:
                     chunk = resp.read(65536)
                     if not chunk:
                         break
                     fh.write(chunk)
+        finally:
+            close = getattr(resp, "close", None)
+            if close is not None:
+                close()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise ValueError(f"ClickHouse HTTP {e.code}: {body}") from None
+    except (OSError, socket.error):
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     # Parse CSV/JSON header + row_count; convert to xlsx if needed.
     if fmt == "csv":
@@ -1071,6 +1286,19 @@ def health() -> str:
             result["clickhouse"] = "reachable"
     except Exception:
         result["clickhouse"] = "unreachable"
+
+    result["routes"] = {
+        "prod": "tun0" if _route_uses_tun0(
+            PG_HOST_ROUTE_TARGETS["slave.db.yallasvc.net"]
+        ) else "off-vpn",
+        "prod_catalog": "tun0" if _route_uses_tun0(
+            PG_HOST_ROUTE_TARGETS["slave.catalog.db.yallasvc.net"]
+        ) else "off-vpn",
+    }
+    result["openvpn_recent_resets"] = _count_openvpn_resets(
+        os.environ.get("OPENVPN_LOG_PATH", "/tmp/openvpn.log"),
+        window_secs=300,
+    )
 
     if (
         result["vpn"] != "tun0 up"

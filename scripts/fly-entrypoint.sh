@@ -12,8 +12,80 @@ workspaces_dir="/zeroclaw-data/workspaces"
 template_file="/seed/config.fly.toml.template"
 baseline_allowed_commands="git npm cargo sh ls cat grep find echo pwd wc head tail date wget python3 pip pip3 node npx ffmpeg convert pandoc curl jq"
 baseline_auto_approve="file_read file_write memory_recall shell http_request"
+openvpn_source_config="/zeroclaw-data/vpn/client.ovpn"
+openvpn_runtime_config="/tmp/zeroclaw-client.ovpn"
+openvpn_log_path="${OPENVPN_LOG_PATH:-/tmp/openvpn.log}"
 
 mkdir -p "$config_dir" "$workspace_dir" "$shared_auth_dir" "$manager_dir" "$workspaces_dir"
+
+ensure_ovpn_option() {
+  file="$1"
+  option="$2"
+  if ! grep -Fx -- "$option" "$file" >/dev/null 2>&1; then
+    printf '%s\n' "$option" >> "$file"
+  fi
+}
+
+prepare_openvpn_config() {
+  cp "$openvpn_source_config" "$openvpn_runtime_config"
+  ensure_ovpn_option "$openvpn_runtime_config" "persist-key"
+  ensure_ovpn_option "$openvpn_runtime_config" "persist-tun"
+  ensure_ovpn_option "$openvpn_runtime_config" "resolv-retry infinite"
+  ensure_ovpn_option "$openvpn_runtime_config" "connect-retry 2 10"
+  ensure_ovpn_option "$openvpn_runtime_config" "connect-retry-max 0"
+  ensure_ovpn_option "$openvpn_runtime_config" "keepalive 10 60"
+  ensure_ovpn_option "$openvpn_runtime_config" "ping-restart 120"
+  ensure_ovpn_option "$openvpn_runtime_config" "pull-filter ignore \"redirect-gateway\""
+}
+
+vpn_route_ok() {
+  ip link show tun0 >/dev/null 2>&1 || return 1
+  ip route get 46.4.211.98 2>/dev/null | grep -q ' dev tun0 ' || return 1
+  ip route get 195.201.82.13 2>/dev/null | grep -q ' dev tun0 ' || return 1
+}
+
+start_openvpn_watchdog() {
+  (
+    failures=0
+    restarts=0
+    restarts_window_start=$(date +%s)
+    restarts_limit=${VPN_WATCHDOG_MAX_RESTARTS:-5}
+    restarts_window_secs=${VPN_WATCHDOG_RESTARTS_WINDOW_SECS:-3600}
+    cooldown_secs=${VPN_WATCHDOG_COOLDOWN_SECS:-900}
+    while true; do
+      if vpn_route_ok; then
+        failures=0
+      else
+        failures=$((failures + 1))
+        echo "[vpn-watchdog] tun0/routes unhealthy (failures=$failures)" >&2
+        if [ "$failures" -ge 3 ]; then
+          now=$(date +%s)
+          if [ "$((now - restarts_window_start))" -ge "$restarts_window_secs" ]; then
+            restarts=0
+            restarts_window_start=$now
+          fi
+          if [ "$restarts" -ge "$restarts_limit" ]; then
+            echo "[vpn-watchdog] CRITICAL: ${restarts_limit} restarts in last ${restarts_window_secs}s; backing off ${cooldown_secs}s before next attempt" >&2
+            sleep "$cooldown_secs"
+            restarts=0
+            restarts_window_start=$(date +%s)
+            failures=0
+            continue
+          fi
+          restarts=$((restarts + 1))
+          echo "[vpn-watchdog] restarting openvpn (restart $restarts/$restarts_limit in window)" >&2
+          pkill -x openvpn || true
+          sleep 1
+          openvpn --config "$openvpn_runtime_config" --daemon --log "$openvpn_log_path"
+          failures=0
+        fi
+      fi
+      sleep "${VPN_WATCHDOG_INTERVAL_SECS:-5}"
+    done
+  ) &
+  VPN_WATCHDOG_PID=$!
+  echo "[fly-entrypoint] OpenVPN watchdog started (pid=$VPN_WATCHDOG_PID)"
+}
 
 copy_sanitized_workspace_template() {
   python3 - "$1" "$2" <<'PY'
@@ -884,14 +956,21 @@ PY
 done
 
 # --- OpenVPN ---
-if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
-    openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log /tmp/openvpn.log
+if [ -f "$openvpn_source_config" ] && command -v openvpn > /dev/null 2>&1; then
+    prepare_openvpn_config
+    openvpn --config "$openvpn_runtime_config" --daemon --log "$openvpn_log_path"
     for i in $(seq 1 15); do
         ip link show tun0 > /dev/null 2>&1 && break
         sleep 1
     done
     if ip link show tun0 > /dev/null 2>&1; then
         echo "[fly-entrypoint] OpenVPN: tun0 is up"
+        if vpn_route_ok; then
+            echo "[fly-entrypoint] OpenVPN: prod DB routes use tun0"
+        else
+            echo "[fly-entrypoint] WARNING: OpenVPN tun0 is up but prod DB routes are not ready"
+        fi
+        start_openvpn_watchdog
     else
         echo "[fly-entrypoint] WARNING: OpenVPN tun0 did not come up, DB tools will be unavailable"
     fi
