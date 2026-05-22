@@ -22,6 +22,33 @@ vpn_route_ok() {
   ip route get 195.201.82.13 2>/dev/null | grep -q ' dev tun0 ' || return 1
 }
 
+# OpenVPN client config wrapper: copy volume config to /tmp and append hardened
+# client-side options if they're not already in the source. Critical for keeping
+# the tunnel alive — without `keepalive` the server rips idle UDP and our long
+# psycopg2 connections die mid-query (see analysis 2026-05-22).
+openvpn_active_config="/tmp/zeroclaw-client.ovpn"
+prepare_openvpn_config() {
+  local src=/zeroclaw-data/vpn/client.ovpn
+  local dst="$openvpn_active_config"
+  cp "$src" "$dst"
+  ensure_ovpn_option() {
+    local line="$1"
+    local key
+    key="$(printf '%s' "$line" | awk '{print $1}')"
+    if ! grep -E "^[[:space:]]*${key}([[:space:]]|$)" "$dst" >/dev/null 2>&1; then
+      printf '\n%s\n' "$line" >> "$dst"
+    fi
+  }
+  ensure_ovpn_option "persist-key"
+  ensure_ovpn_option "persist-tun"
+  ensure_ovpn_option "resolv-retry infinite"
+  ensure_ovpn_option "connect-retry 2 10"
+  ensure_ovpn_option "connect-retry-max 0"
+  ensure_ovpn_option "keepalive 10 60"
+  ensure_ovpn_option "ping-restart 120"
+  ensure_ovpn_option "pull-filter ignore \"redirect-gateway\""
+}
+
 start_openvpn_watchdog() {
   (
     set +e
@@ -55,7 +82,7 @@ start_openvpn_watchdog() {
           echo "[vpn-watchdog] restarting openvpn (restart $restarts/$restarts_limit in window)" >&2
           pkill -x openvpn || true
           sleep 1
-          openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path" || echo "[vpn-watchdog] ERROR: openvpn restart command failed" >&2
+          openvpn --config "$openvpn_active_config" --daemon --log "$openvpn_log_path" || echo "[vpn-watchdog] ERROR: openvpn restart command failed" >&2
           failures=0
         fi
       fi
@@ -936,7 +963,8 @@ done
 
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
-    openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path"
+    prepare_openvpn_config
+    openvpn --config "$openvpn_active_config" --daemon --log "$openvpn_log_path"
     for i in $(seq 1 15); do
         ip link show tun0 > /dev/null 2>&1 && break
         sleep 1
