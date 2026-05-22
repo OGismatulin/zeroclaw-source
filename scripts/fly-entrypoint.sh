@@ -856,8 +856,10 @@ WINDOWS_EOF
   # Anchored to "glm-5.1" line (guaranteed present in WINDOWS_EOF) — keeps
   # the insertion strictly inside the [agent.context_compression.model_windows]
   # block and never lands in trailing TOML tables.
+  # Guard checks for the literal "= 202_752" value (unique to model_windows;
+  # not present in [reliability.targets] which uses an inline-table value).
   if grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null && \
-     ! grep -q '^"GLM-5\.1"' "$cfg" 2>/dev/null; then
+     ! grep -qE '"GLM-5\.1"\s*=\s*202_752' "$cfg" 2>/dev/null; then
     python3 - "$cfg" <<'PY'
 import sys, re
 p = sys.argv[1]
