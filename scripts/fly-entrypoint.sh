@@ -22,35 +22,6 @@ vpn_route_ok() {
   ip route get 195.201.82.13 2>/dev/null | grep -q ' dev tun0 ' || return 1
 }
 
-# OpenVPN client config wrapper: copy volume config to /tmp and append hardened
-# client-side options if they're not already in the source. Critical for keeping
-# the tunnel alive — without `keepalive` the server rips idle UDP and our long
-# psycopg2 connections die mid-query (see analysis 2026-05-22).
-#
-# POSIX sh only — Fly runs `/bin/sh /usr/local/bin/fly-entrypoint.sh` (dash).
-# No `local`, no `[[ ]]`, no nested function definitions.
-openvpn_active_config="/tmp/zeroclaw-client.ovpn"
-_ensure_ovpn_option() {
-  # $1 = full directive line; $2 = config file path
-  ovpn_opt_line="$1"
-  ovpn_opt_file="$2"
-  ovpn_opt_key=$(printf '%s' "$ovpn_opt_line" | awk '{print $1}')
-  if ! grep -E "^[[:space:]]*${ovpn_opt_key}([[:space:]]|\$)" "$ovpn_opt_file" >/dev/null 2>&1; then
-    printf '\n%s\n' "$ovpn_opt_line" >> "$ovpn_opt_file"
-  fi
-}
-prepare_openvpn_config() {
-  cp /zeroclaw-data/vpn/client.ovpn "$openvpn_active_config"
-  _ensure_ovpn_option "persist-key"                                "$openvpn_active_config"
-  _ensure_ovpn_option "persist-tun"                                "$openvpn_active_config"
-  _ensure_ovpn_option "resolv-retry infinite"                      "$openvpn_active_config"
-  _ensure_ovpn_option "connect-retry 2 10"                         "$openvpn_active_config"
-  _ensure_ovpn_option "connect-retry-max 0"                        "$openvpn_active_config"
-  _ensure_ovpn_option "keepalive 10 60"                            "$openvpn_active_config"
-  _ensure_ovpn_option "ping-restart 120"                           "$openvpn_active_config"
-  _ensure_ovpn_option "pull-filter ignore \"redirect-gateway\""    "$openvpn_active_config"
-}
-
 start_openvpn_watchdog() {
   (
     set +e
@@ -84,7 +55,7 @@ start_openvpn_watchdog() {
           echo "[vpn-watchdog] restarting openvpn (restart $restarts/$restarts_limit in window)" >&2
           pkill -x openvpn || true
           sleep 1
-          openvpn --config "$openvpn_active_config" --daemon --log "$openvpn_log_path" || echo "[vpn-watchdog] ERROR: openvpn restart command failed" >&2
+          openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path" || echo "[vpn-watchdog] ERROR: openvpn restart command failed" >&2
           failures=0
         fi
       fi
@@ -965,8 +936,7 @@ done
 
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
-    prepare_openvpn_config
-    openvpn --config "$openvpn_active_config" --daemon --log "$openvpn_log_path"
+    openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path"
     for i in $(seq 1 15); do
         ip link show tun0 > /dev/null 2>&1 && break
         sleep 1
