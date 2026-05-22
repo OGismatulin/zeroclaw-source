@@ -902,6 +902,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 || name == "openai"
                 || name == "groq"
                 || name == "opencode-go"
+                || name == "wafer"
             {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
@@ -912,6 +913,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     "openai" => &["OPENAI_API_KEY"],
                     "groq" => &["GROQ_API_KEY"],
                     "opencode-go" => &["OPENCODE_GO_API_KEY"],
+                    "wafer" => &["WAFER_API_KEY"],
                     _ => &[],
                 };
                 for env_var in env_candidates {
@@ -974,6 +976,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
+        "wafer" => vec!["WAFER_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
@@ -1334,6 +1337,12 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
             "curl/8.0.0",
+        ))),
+        "wafer" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Wafer",
+            "https://pass.wafer.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
@@ -2185,6 +2194,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "wafer",
+            display_name: "Wafer",
+            description: "Wafer.ai inference (GLM-5.1, Qwen3.5-397B-A17B)",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
             name: "zai",
             display_name: "Z.AI",
             description: "Z.AI inference",
@@ -3023,6 +3040,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_wafer() {
+        assert!(create_provider("wafer", Some("key")).is_ok());
+    }
+
+    #[test]
     fn resolve_provider_credential_opencode_go_env() {
         let _env_lock = env_lock();
         let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
@@ -3042,6 +3064,37 @@ mod tests {
 
         let resolved = resolve_provider_credential("opencode-go", Some("zai-fallback-key"));
         assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_wafer_env() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("WAFER_API_KEY", Some("wfr-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("wafer", None);
+        assert_eq!(resolved.as_deref(), Some("wfr-test-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_wafer_env_beats_cross_provider_override() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("WAFER_API_KEY", Some("wfr-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("wafer", Some("zai-fallback-key"));
+        assert_eq!(resolved.as_deref(), Some("wfr-test-key"));
+    }
+
+    #[test]
+    fn list_providers_contains_wafer() {
+        let providers = list_providers();
+        assert!(
+            providers.iter().any(|p| p.name == "wafer"),
+            "wafer must be in ProviderInfo registry so gateway validation accepts it"
+        );
     }
 
     #[test]

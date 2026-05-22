@@ -3626,6 +3626,7 @@ mod tests {
         assert!(provider_exists_in_registry("zai"));
         assert!(provider_exists_in_registry("opencode-go"));
         assert!(provider_exists_in_registry("openrouter"));
+        assert!(provider_exists_in_registry("wafer"));
     }
 
     #[test]
