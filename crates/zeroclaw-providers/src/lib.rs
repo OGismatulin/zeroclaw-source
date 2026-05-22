@@ -2194,6 +2194,14 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "wafer",
+            display_name: "Wafer",
+            description: "Wafer.ai inference (GLM-5.1, Qwen3.5-397B-A17B)",
+            aliases: &[],
+            activation: ProviderActivation::FallbackKey,
+            local: false,
+        },
+        ProviderInfo {
             name: "zai",
             display_name: "Z.AI",
             description: "Z.AI inference",
@@ -3078,6 +3086,15 @@ mod tests {
 
         let resolved = resolve_provider_credential("wafer", Some("zai-fallback-key"));
         assert_eq!(resolved.as_deref(), Some("wfr-test-key"));
+    }
+
+    #[test]
+    fn list_providers_contains_wafer() {
+        let providers = list_providers();
+        assert!(
+            providers.iter().any(|p| p.name == "wafer"),
+            "wafer must be in ProviderInfo registry so gateway validation accepts it"
+        );
     }
 
     #[test]
