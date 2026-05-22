@@ -974,6 +974,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
         "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "opencode-go" => vec!["OPENCODE_GO_API_KEY"],
+        "wafer" => vec!["WAFER_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
@@ -3053,6 +3054,17 @@ mod tests {
 
         let resolved = resolve_provider_credential("opencode-go", Some("zai-fallback-key"));
         assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
+    fn resolve_provider_credential_wafer_env() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("WAFER_API_KEY", Some("wfr-test-key"));
+        let _generic_guard = EnvGuard::set("API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_provider_credential("wafer", None);
+        assert_eq!(resolved.as_deref(), Some("wfr-test-key"));
     }
 
     #[test]
