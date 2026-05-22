@@ -267,28 +267,47 @@ fi
 
 ensure_observability_runtime_trace
 
-# Patch: append [reliability] section if missing (fallback disabled to surface config errors)
-if ! grep -q '^\[reliability\]' "$config_file" 2>/dev/null; then
-  cat >> "$config_file" <<'RELIABILITY'
+# Patch: Ensure global reliability targets are configured (three-files sync)
+# Matches [reliability] section up to the next section [ or end of file.
+python3 - "$config_file" <<'PY_RELIABILITY'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1])
+c = p.read_text(encoding="utf-8")
+pattern = r'(?ms)^\[reliability\].*?(?=^\[|\Z)'
+replacement = """[reliability]
+# Enable fallback mechanism globally
+enabled = true
 
-[reliability]
-fallback_providers = []
+# Explicit mapping of primary models to their fallback destinations.
+# opencode-go provider requires bare model names without prefixes.
+[reliability.targets]
+"GLM-5.1" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"Qwen3.5-397B-A17B" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"minimax-m2.7" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"glm-5-turbo" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"gpt-5.4-mini" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"gpt-5.4" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"google/gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
+"gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
 
-[reliability.model_fallbacks]
-RELIABILITY
-fi
-
-# Patch: disable fallback in existing configs to surface provider misconfiguration
-sed -i 's/fallback_providers = \["openrouter"\]/fallback_providers = []/' "$config_file"
+"""
+if re.search(r'^\[reliability\]', c, re.M):
+    c = re.sub(pattern, replacement, c)
+else:
+    c = c.rstrip() + "\n\n" + replacement
+p.write_text(c, encoding="utf-8")
+print(f"[entrypoint] Configured global reliability target in {p}")
+PY_RELIABILITY
 
 # Patch: fix api_key = "minimax-oauth" literal leak for non-minimax providers
 sed -i 's/^api_key = "minimax-oauth"/api_key = ""/' "$config_file"
 
-# Patch: propagate api_key and fallback fix to existing per-user configs
+# Force regeneration of per-user configs on next request to ensure clean template convergence
 for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$user_config" ] || continue
-  sed -i 's/^api_key = "minimax-oauth"/api_key = ""/' "$user_config"
-  sed -i 's/fallback_providers = \["openrouter"\]/fallback_providers = []/' "$user_config"
+  echo "[entrypoint] Removing stale per-user config to force regeneration: $user_config"
+  rm -f "$user_config"
 done
 
 # Patch: ensure shell_env_passthrough includes NOTIFY vars
@@ -825,7 +844,32 @@ BASE_EOF
 "glm-5-turbo"             = 128_000
 "glm-5"                   = 128_000
 "glm-5.1"                 = 128_000
+# Wafer.ai-hosted (capital "GLM-5.1" is a separate case-sensitive key from
+# the Z.AI lowercase variant; ZEROCLAW_MODEL ships the string as-is).
+"GLM-5.1"                 = 202_752
+"Qwen3.5-397B-A17B"       = 262_144
 WINDOWS_EOF
+  fi
+
+  # Insert wafer-specific entries (capital GLM-5.1 + Qwen3.5-397B-A17B) into
+  # existing model_windows section if missing. Idempotent — skips on rerun.
+  # Anchored to "glm-5.1" line (guaranteed present in WINDOWS_EOF) — keeps
+  # the insertion strictly inside the [agent.context_compression.model_windows]
+  # block and never lands in trailing TOML tables.
+  if grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null && \
+     ! grep -q '^"GLM-5\.1"' "$cfg" 2>/dev/null; then
+    python3 - "$cfg" <<'PY'
+import sys, re
+p = sys.argv[1]
+c = open(p).read()
+c = re.sub(
+    r'("glm-5\.1"\s*=\s*\d+(?:_\d+)?)',
+    r'\1\n"GLM-5.1"                 = 202_752\n"Qwen3.5-397B-A17B"       = 262_144',
+    c,
+    count=1,
+)
+open(p, 'w').write(c)
+PY
   fi
 done
 
