@@ -267,15 +267,23 @@ fi
 
 ensure_observability_runtime_trace
 
-# Patch: Ensure global reliability targets are configured (three-files sync)
-# Matches [reliability] section up to the next section [ or end of file.
+# Patch: Ensure global reliability targets are configured (three-files sync).
+# Idempotent: strips ALL existing [reliability...] sections (including duplicate
+# [reliability.targets] from past entrypoint runs with a buggy non-greedy regex)
+# then re-appends one canonical block. Safe to re-run on already-clean configs.
 python3 - "$config_file" <<'PY_RELIABILITY'
 import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-pattern = r'(?ms)^\[reliability\].*?(?=^\[|\Z)'
-replacement = """[reliability]
+# Match [reliability] or [reliability.<sub>] header + content up to next
+# non-reliability section header or EOF. Lazy match means each section is
+# captured separately and removed by re.sub's repeated application.
+section_re = re.compile(
+    r'(?ms)^\[reliability(?:\.[a-zA-Z0-9_]+)?\].*?(?=^\[(?!reliability)|\Z)'
+)
+c = section_re.sub('', c)
+canonical = """[reliability]
 # Enable fallback mechanism globally
 enabled = true
 
@@ -292,10 +300,7 @@ enabled = true
 "gemini-3-flash-preview" = { provider = "opencode-go", model = "deepseek-v4-flash" }
 
 """
-if re.search(r'^\[reliability\]', c, re.M):
-    c = re.sub(pattern, replacement, c)
-else:
-    c = c.rstrip() + "\n\n" + replacement
+c = c.rstrip() + "\n\n" + canonical
 p.write_text(c, encoding="utf-8")
 print(f"[entrypoint] Configured global reliability target in {p}")
 PY_RELIABILITY
