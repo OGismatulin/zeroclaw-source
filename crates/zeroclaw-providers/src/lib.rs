@@ -1335,6 +1335,12 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
             "curl/8.0.0",
         ))),
+        "wafer" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Wafer",
+            "https://pass.wafer.ai/v1",
+            key,
+            AuthStyle::Bearer,
+        ))),
         name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
@@ -3020,6 +3026,11 @@ mod tests {
     #[test]
     fn factory_opencode_go() {
         assert!(create_provider("opencode-go", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_wafer() {
+        assert!(create_provider("wafer", Some("key")).is_ok());
     }
 
     #[test]
