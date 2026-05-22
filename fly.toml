@@ -2,7 +2,7 @@ app = 'ai-forge-zeroclaw'
 primary_region = 'iad'
 
 [build]
-  dockerfile = 'Dockerfile.deploy'
+  dockerfile = 'Dockerfile'
 
 [env]
   # ZEROCLAW_PROVIDER = 'minimax'
@@ -15,11 +15,8 @@ primary_region = 'iad'
   # ZEROCLAW_MODEL = 'glm-5-turbo'
   # ZEROCLAW_PROVIDER = 'opencode-go'
   # ZEROCLAW_MODEL = 'deepseek-v4-flash'
-  # Wafer.ai default — 2026-05-21. Подключён через встроенный custom:URL,
-  # api key читается из generic fallback ZEROCLAW_API_KEY (Fly secret wfr_...).
-  # Этап 2 (named provider `wafer` в Rust registry для /model UX) — следующий sprint.
-  ZEROCLAW_PROVIDER = 'custom:https://pass.wafer.ai/v1'
-  ZEROCLAW_MODEL = 'GLM-5.1'
+  ZEROCLAW_PROVIDER = 'opencode-go'
+  ZEROCLAW_MODEL = 'deepseek-v4-flash'
   ZEROCLAW_MANAGER_HOST = '0.0.0.0'
   ZEROCLAW_MANAGER_PORT = '3000'
   ZEROCLAW_MANAGER_BASE_PORT = '3001'
@@ -29,9 +26,6 @@ primary_region = 'iad'
   ZEROCLAW_AUTONOMY_LEVEL = 'full'
   ZEROCLAW_GATEWAY_TIMEOUT_SECS = '1800'
   ZEROCLAW_REASONING_EFFORT = 'medium'
-  GRAYLOG_BASE_URL = 'https://graylog.yallasvc.net'
-  GRAYLOG_MCP_PORT = '4001'
-  GRAYLOG_KEEPALIVE_INTERVAL_S = '1500'
   RUST_LOG = 'zeroclaw=trace,hyper=info'
   PG_STAGE_HOST = 'stage.postgres.kube-two.yallasvc.net'
   PG_STAGE_PORT = '6432'
@@ -39,6 +33,9 @@ primary_region = 'iad'
   PG_PROD_PORT = '5432'
   PG_PROD_CATALOG_HOST = 'slave.catalog.db.yallasvc.net'
   MCP_DB_PORT = '4000'
+  GRAYLOG_BASE_URL = 'https://graylog.yallasvc.net'
+  GRAYLOG_MCP_PORT = '4001'
+  GRAYLOG_KEEPALIVE_INTERVAL_S = '1500'
   GRAYLOG_REFRESH_INTERVAL_S = '1500'
   GRAYLOG_OPERATOR_TELEGRAM_USER_ID = '83292437'
 
