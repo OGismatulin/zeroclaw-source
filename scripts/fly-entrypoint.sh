@@ -26,27 +26,29 @@ vpn_route_ok() {
 # client-side options if they're not already in the source. Critical for keeping
 # the tunnel alive — without `keepalive` the server rips idle UDP and our long
 # psycopg2 connections die mid-query (see analysis 2026-05-22).
+#
+# POSIX sh only — Fly runs `/bin/sh /usr/local/bin/fly-entrypoint.sh` (dash).
+# No `local`, no `[[ ]]`, no nested function definitions.
 openvpn_active_config="/tmp/zeroclaw-client.ovpn"
+_ensure_ovpn_option() {
+  # $1 = full directive line; $2 = config file path
+  ovpn_opt_line="$1"
+  ovpn_opt_file="$2"
+  ovpn_opt_key=$(printf '%s' "$ovpn_opt_line" | awk '{print $1}')
+  if ! grep -E "^[[:space:]]*${ovpn_opt_key}([[:space:]]|\$)" "$ovpn_opt_file" >/dev/null 2>&1; then
+    printf '\n%s\n' "$ovpn_opt_line" >> "$ovpn_opt_file"
+  fi
+}
 prepare_openvpn_config() {
-  local src=/zeroclaw-data/vpn/client.ovpn
-  local dst="$openvpn_active_config"
-  cp "$src" "$dst"
-  ensure_ovpn_option() {
-    local line="$1"
-    local key
-    key="$(printf '%s' "$line" | awk '{print $1}')"
-    if ! grep -E "^[[:space:]]*${key}([[:space:]]|$)" "$dst" >/dev/null 2>&1; then
-      printf '\n%s\n' "$line" >> "$dst"
-    fi
-  }
-  ensure_ovpn_option "persist-key"
-  ensure_ovpn_option "persist-tun"
-  ensure_ovpn_option "resolv-retry infinite"
-  ensure_ovpn_option "connect-retry 2 10"
-  ensure_ovpn_option "connect-retry-max 0"
-  ensure_ovpn_option "keepalive 10 60"
-  ensure_ovpn_option "ping-restart 120"
-  ensure_ovpn_option "pull-filter ignore \"redirect-gateway\""
+  cp /zeroclaw-data/vpn/client.ovpn "$openvpn_active_config"
+  _ensure_ovpn_option "persist-key"                                "$openvpn_active_config"
+  _ensure_ovpn_option "persist-tun"                                "$openvpn_active_config"
+  _ensure_ovpn_option "resolv-retry infinite"                      "$openvpn_active_config"
+  _ensure_ovpn_option "connect-retry 2 10"                         "$openvpn_active_config"
+  _ensure_ovpn_option "connect-retry-max 0"                        "$openvpn_active_config"
+  _ensure_ovpn_option "keepalive 10 60"                            "$openvpn_active_config"
+  _ensure_ovpn_option "ping-restart 120"                           "$openvpn_active_config"
+  _ensure_ovpn_option "pull-filter ignore \"redirect-gateway\""    "$openvpn_active_config"
 }
 
 start_openvpn_watchdog() {
