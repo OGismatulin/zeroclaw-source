@@ -149,7 +149,7 @@ max_actions_per_hour = 20
 max_cost_per_day_cents = 500
 require_approval_for_medium_risk = false
 block_high_risk_commands = false
-shell_env_passthrough = ["NOTIFY_URL", "NOTIFY_SECRET", "NOTIFY_FILE_URL", "OPENROUTER_API_KEY", "CREATIO_BASE_URL", "CREATIO_USERNAME", "CREATIO_PASSWORD", "PG_PROD_HOST", "PG_PROD_PORT", "PG_PROD_USER", "PG_PROD_PASSWORD", "GITLAB_DEPLOY_USER", "GITLAB_DEPLOY_TOKEN", "GOOGLE_SERVICE_ACCOUNT_JSON", "SCRAPECREATORS_API_KEY", "XAI_API_KEY", "BRAVE_API_KEY"]
+shell_env_passthrough = ["NOTIFY_URL", "NOTIFY_SECRET", "NOTIFY_FILE_URL", "OPENROUTER_API_KEY", "CREATIO_BASE_URL", "CREATIO_USERNAME", "CREATIO_PASSWORD", "PG_PROD_HOST", "PG_PROD_PORT", "PG_PROD_USER", "PG_PROD_PASSWORD", "GITLAB_DEPLOY_USER", "GITLAB_DEPLOY_TOKEN", "GOOGLE_SERVICE_ACCOUNT_JSON", "SCRAPECREATORS_API_KEY", "XAI_API_KEY", "BRAVE_API_KEY", "JIRA_API_TOKEN"]
 auto_approve = [
     "file_read",
     "file_write",
@@ -187,6 +187,14 @@ tool_timeout_secs = 120
 enabled = true
 allowed_domains = ["*"]
 max_response_size = 100000
+timeout_secs = 30
+
+[jira]
+enabled = true
+base_url = "https://yallaclassifieds.atlassian.net"
+email = "oleg.gismatulin@lalafo.com"
+api_token = ""
+allowed_actions = ["get_ticket", "search_tickets", "comment_ticket"]
 timeout_secs = 30
 
 [shell_tool]

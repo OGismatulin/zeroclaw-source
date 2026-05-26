@@ -584,6 +584,75 @@ open(p, 'w').write(c)
   fi
 done
 
+# Patch: ensure shell_env_passthrough includes JIRA_API_TOKEN
+if ! grep -q '"JIRA_API_TOKEN"' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$config_file" "JIRA_API_TOKEN"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '"JIRA_API_TOKEN"' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys, re
+p, v = sys.argv[1], sys.argv[2]
+c = open(p).read()
+c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\1\"' + v + r'\", ', c, count=1)
+open(p, 'w').write(c)
+" "$user_config" "JIRA_API_TOKEN"
+  fi
+done
+
+# Patch: ensure [jira] section exists with enabled=true and Lalafo defaults
+#  - template ($config_file) AND every per-user config get the same block
+#  - api_token stays empty; runtime reads JIRA_API_TOKEN env var (Fly secret)
+#  - idempotent: skip if section already present
+#  - NO shell function (dash -eu + nested fn = crash-loop risk, see
+#    docs/analysis/2026-05-22-vpn-flap-mitigations-attempted.md)
+if ! grep -q '^\[jira\]' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys
+p = sys.argv[1]
+with open(p, 'a') as f:
+    f.write('''
+
+[jira]
+enabled = true
+base_url = \"https://yallaclassifieds.atlassian.net\"
+email = \"oleg.gismatulin@lalafo.com\"
+api_token = \"\"
+allowed_actions = [\"get_ticket\", \"search_tickets\", \"comment_ticket\"]
+timeout_secs = 30
+''')
+" "$config_file"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '^\[jira\]' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys
+p = sys.argv[1]
+with open(p, 'a') as f:
+    f.write('''
+
+[jira]
+enabled = true
+base_url = \"https://yallaclassifieds.atlassian.net\"
+email = \"oleg.gismatulin@lalafo.com\"
+api_token = \"\"
+allowed_actions = [\"get_ticket\", \"search_tickets\", \"comment_ticket\"]
+timeout_secs = 30
+''')
+" "$user_config"
+  fi
+done
+
 # Patch: keep runtime allowlist aligned with config.toml and config.fly.toml.template
 for command in $baseline_allowed_commands; do
   ensure_multiline_array_item "allowed_commands" "$command"
