@@ -343,6 +343,7 @@ canonical = """[reliability]
 fallback_providers = ["opencode-go"]
 
 [reliability.model_fallbacks]
+# Phase 1 (2026-05-22)
 "GLM-5.1"            = ["deepseek-v4-flash"]
 "Qwen3.5-397B-A17B"  = ["deepseek-v4-flash"]
 "gpt-5.5"            = ["deepseek-v4-flash"]
@@ -351,6 +352,16 @@ fallback_providers = ["opencode-go"]
 "glm-5-turbo"        = ["deepseek-v4-flash"]
 "glm-5.1"            = ["deepseek-v4-flash"]
 "minimax-m2.7"       = ["deepseek-v4-flash"]
+# Phase 2 (2026-05-28) — native opencode-go fallback
+# Spec: docs/superpowers/specs/2026-05-28-opencode-go-native-fallback-design.md
+"mimo-v2.5-pro"      = ["deepseek-v4-flash"]
+"mimo-v2.5"          = ["deepseek-v4-flash"]
+"mimo-v2-pro"        = ["deepseek-v4-flash"]
+"mimo-v2-omni"       = ["deepseek-v4-flash"]
+"glm-5"              = ["deepseek-v4-flash"]
+"minimax-m2.5"       = ["deepseek-v4-flash"]
+"kimi-k2.5"          = ["deepseek-v4-flash"]
+"qwen3.6-plus"       = ["deepseek-v4-flash"]
 
 """
 c = c.rstrip() + "\n\n" + canonical
