@@ -47,6 +47,16 @@ impl Observer for LogObserver {
             ObserverEvent::TurnComplete => {
                 info!("turn.complete");
             }
+            ObserverEvent::TurnTokenSummary {
+                total_input_tokens,
+                total_output_tokens,
+            } => {
+                info!(
+                    total_input_tokens = total_input_tokens,
+                    total_output_tokens = total_output_tokens,
+                    "turn.token_summary"
+                );
+            }
             ObserverEvent::ChannelMessage { channel, direction } => {
                 info!(channel = %channel, direction = %direction, "channel.message");
             }
