@@ -29,6 +29,8 @@ fallback_providers = ["opencode-go"]
 "minimax-m2.5"       = ["deepseek-v4-flash"]
 "kimi-k2.5"          = ["deepseek-v4-flash"]
 "qwen3.6-plus"       = ["deepseek-v4-flash"]
+# 2026-05-29 — analyst ensemble (deepseek-v4-pro has no native upstream fallback)
+"deepseek-v4-pro"    = ["deepseek-v4-flash"]
 
 [memory]
 backend = "sqlite"
@@ -216,54 +218,184 @@ timeout_secs = 600
 
 [delegate]
 timeout_secs = 90
-agentic_timeout_secs = 180
+agentic_timeout_secs = 600
 
 [agents.worker]
 provider = "openai-codex"
 model = "gpt-5.4-mini"
 api_key = ""
 agentic = true
-max_iterations = 15
+max_iterations = 50
 system_prompt = "You are a fast, focused task executor. Run the delegated sub-task independently using the tools available. Return a concise, structured result."
 allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search", "glob_search",
-    "shell", "http_request", "web_fetch", "web_search_tool", "text_browser",
-    "memory_recall", "memory_store", "memory_forget", "memory_export",
-    "read_skill", "tool_search", "knowledge",
-    "delegate", "swarm",
-    "cron_add", "cron_list", "cron_remove", "cron_run", "cron_runs", "cron_update", "schedule",
-    "model_switch", "model_routing_config",
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "swarm", "cron_add",
+    "cron_list", "cron_remove", "cron_run", "cron_runs",
+    "cron_update", "schedule", "model_switch", "model_routing_config",
     "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
     "image_gen", "image_info", "pdf_read", "screenshot",
     "sessions_history", "sessions_list", "sessions_send", "workspace",
-    "calculator", "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations",
-    "sop_advance", "sop_approve", "sop_execute", "sop_list", "sop_status",
-    "security_ops", "vi_verify",
-    "notion", "jira", "linkedin", "google_workspace", "microsoft365", "discord_search", "composio",
+    "calculator", "counting", "project_intel", "llm_task",
+    "report_template", "execute_pipeline", "git_operations", "sop_advance",
+    "sop_approve", "sop_execute", "sop_list", "sop_status",
+    "security_ops", "vi_verify", "notion", "jira",
+    "linkedin", "google_workspace", "microsoft365", "discord_search",
+    "composio", "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query",
+    "lalafo-db__query_file", "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases",
+    "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
+    "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
+    "graylog__by_user", "graylog__search_to_file",
 ]
 
 [agents.coder]
 provider = "openai-codex"
-model = "gpt-5.4"
+model = "gpt-5.5"
 api_key = ""
 agentic = true
-max_iterations = 25
+max_iterations = 50
 system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Report concisely what you changed and why."
 allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search", "glob_search",
-    "shell", "http_request", "web_fetch", "web_search_tool", "text_browser",
-    "memory_recall", "memory_store", "memory_forget", "memory_export",
-    "read_skill", "tool_search", "knowledge",
-    "delegate", "swarm",
-    "cron_add", "cron_list", "cron_remove", "cron_run", "cron_runs", "cron_update", "schedule",
-    "model_switch", "model_routing_config",
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "swarm", "cron_add",
+    "cron_list", "cron_remove", "cron_run", "cron_runs",
+    "cron_update", "schedule", "model_switch", "model_routing_config",
     "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
     "image_gen", "image_info", "pdf_read", "screenshot",
     "sessions_history", "sessions_list", "sessions_send", "workspace",
-    "calculator", "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations",
-    "sop_advance", "sop_approve", "sop_execute", "sop_list", "sop_status",
-    "security_ops", "vi_verify",
-    "notion", "jira", "linkedin", "google_workspace", "microsoft365", "discord_search", "composio",
+    "calculator", "counting", "project_intel", "llm_task",
+    "report_template", "execute_pipeline", "git_operations", "sop_advance",
+    "sop_approve", "sop_execute", "sop_list", "sop_status",
+    "security_ops", "vi_verify", "notion", "jira",
+    "linkedin", "google_workspace", "microsoft365", "discord_search",
+    "composio", "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query",
+    "lalafo-db__query_file", "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases",
+    "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
+    "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
+    "graylog__by_user", "graylog__search_to_file",
+]
+
+[agents.analyst_mimo]
+provider = "opencode-go"
+model = "mimo-v2.5-pro"
+api_key = ""
+agentic = true
+max_iterations = 50
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "cron_add", "cron_list",
+    "cron_remove", "cron_run", "cron_runs", "cron_update",
+    "schedule", "model_switch", "model_routing_config", "claude_code",
+    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
+    "image_info", "pdf_read", "screenshot", "sessions_history",
+    "sessions_list", "sessions_send", "workspace", "calculator",
+    "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
+    "sop_execute", "sop_list", "sop_status", "security_ops",
+    "vi_verify", "notion", "jira", "linkedin",
+    "google_workspace", "microsoft365", "discord_search", "composio",
+    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
+    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
+    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
+    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
+    "graylog__search_to_file",
+]
+
+[agents.analyst_deepseek_pro]
+provider = "opencode-go"
+model = "deepseek-v4-pro"
+api_key = ""
+agentic = true
+max_iterations = 50
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "cron_add", "cron_list",
+    "cron_remove", "cron_run", "cron_runs", "cron_update",
+    "schedule", "model_switch", "model_routing_config", "claude_code",
+    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
+    "image_info", "pdf_read", "screenshot", "sessions_history",
+    "sessions_list", "sessions_send", "workspace", "calculator",
+    "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
+    "sop_execute", "sop_list", "sop_status", "security_ops",
+    "vi_verify", "notion", "jira", "linkedin",
+    "google_workspace", "microsoft365", "discord_search", "composio",
+    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
+    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
+    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
+    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
+    "graylog__search_to_file",
+]
+
+[agents.analyst_deepseek_flash]
+provider = "opencode-go"
+model = "deepseek-v4-flash"
+api_key = ""
+agentic = true
+max_iterations = 50
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "cron_add", "cron_list",
+    "cron_remove", "cron_run", "cron_runs", "cron_update",
+    "schedule", "model_switch", "model_routing_config", "claude_code",
+    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
+    "image_info", "pdf_read", "screenshot", "sessions_history",
+    "sessions_list", "sessions_send", "workspace", "calculator",
+    "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
+    "sop_execute", "sop_list", "sop_status", "security_ops",
+    "vi_verify", "notion", "jira", "linkedin",
+    "google_workspace", "microsoft365", "discord_search", "composio",
+    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
+    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
+    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
+    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
+    "graylog__search_to_file",
+]
+
+[agents.analyst_glm]
+provider = "zai"
+model = "glm-5.1"
+api_key = ""
+agentic = true
+max_iterations = 50
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "cron_add", "cron_list",
+    "cron_remove", "cron_run", "cron_runs", "cron_update",
+    "schedule", "model_switch", "model_routing_config", "claude_code",
+    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
+    "image_info", "pdf_read", "screenshot", "sessions_history",
+    "sessions_list", "sessions_send", "workspace", "calculator",
+    "counting", "project_intel", "llm_task", "report_template",
+    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
+    "sop_execute", "sop_list", "sop_status", "security_ops",
+    "vi_verify", "notion", "jira", "linkedin",
+    "google_workspace", "microsoft365", "discord_search", "composio",
+    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
+    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
+    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
+    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
+    "graylog__search_to_file",
 ]
