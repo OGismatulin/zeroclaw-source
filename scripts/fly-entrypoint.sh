@@ -1038,6 +1038,15 @@ PY
   fi
 done
 
+# Migration: ensure workspace/cron_templates/ exists in per-user workspaces.
+# Idempotent: skip if already present.
+for user_ws in /zeroclaw-data/workspaces/tg_*/workspace; do
+    if [ -d "$user_ws" ] && [ ! -d "$user_ws/cron_templates" ]; then
+        echo "[fly-entrypoint] copying cron_templates/ to $user_ws"
+        cp -r /zeroclaw-data/template/workspace/cron_templates "$user_ws/" || true
+    fi
+done
+
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
     openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path"

@@ -571,7 +571,7 @@ class GatewayRegistry:
         users who already have the job. Failures are logged and
         swallowed; they must never break daemon spawn."""
         script = (
-            Path(__file__).resolve().parent / "bootstrap_nightly_retro_cron.py"
+            Path(__file__).resolve().parent / "bootstrap_default_cron_jobs.py"
         )
         if not script.is_file():
             return

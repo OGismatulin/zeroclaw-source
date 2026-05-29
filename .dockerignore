@@ -86,3 +86,5 @@ scripts/
 !scripts/extract_ms_cookies.py
 !scripts/code_repos_sync.py
 !scripts/fly_warmup.py
+!scripts/cron_template_install.py
+!scripts/bootstrap_default_cron_jobs.py
