@@ -431,7 +431,11 @@ impl AuthProfilesStore {
     }
 
     async fn write_persisted_locked(&self, persisted: &PersistedAuthProfiles) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+        // Resolve through a per-user symlink so tmp+rename land on the SHARED
+        // backing file. A bare rename onto a symlink path replaces the symlink
+        // with a regular file, stranding the write in the per-user dir (Bug B).
+        let real = self.real_path();
+        if let Some(parent) = real.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
                 format!(
                     "Failed to create auth profile directory at {}",
@@ -448,7 +452,7 @@ impl AuthProfilesStore {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let tmp_path = self.path.with_file_name(tmp_name);
+        let tmp_path = real.with_file_name(tmp_name);
 
         fs::write(&tmp_path, &json).await.with_context(|| {
             format!(
@@ -457,10 +461,10 @@ impl AuthProfilesStore {
             )
         })?;
 
-        fs::rename(&tmp_path, &self.path).await.with_context(|| {
+        fs::rename(&tmp_path, &real).await.with_context(|| {
             format!(
                 "Failed to replace auth profile store at {}",
-                self.path.display()
+                real.display()
             )
         })?;
 
@@ -708,6 +712,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AuthProfilesStore::new(dir.path(), false);
         assert_eq!(store.real_path(), dir.path().join("auth-profiles.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upsert_through_symlink_preserves_link_and_updates_shared() {
+        let shared = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let shared_file = shared.path().join("auth-profiles.json");
+        std::fs::write(&shared_file, b"{\"schema_version\":1,\"profiles\":{}}").unwrap();
+        std::os::unix::fs::symlink(&shared_file, user.path().join("auth-profiles.json")).unwrap();
+
+        let store = AuthProfilesStore::new(user.path(), false);
+        let profile = AuthProfile::new_token("openai-codex", "default", "tok123".into());
+        store.upsert_profile(profile, true).await.unwrap();
+
+        // per-user path STILL a symlink
+        assert!(
+            std::fs::symlink_metadata(user.path().join("auth-profiles.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // shared file actually updated (contains the profile)
+        let body = std::fs::read_to_string(&shared_file).unwrap();
+        assert!(body.contains("openai-codex"));
     }
 
     #[test]
