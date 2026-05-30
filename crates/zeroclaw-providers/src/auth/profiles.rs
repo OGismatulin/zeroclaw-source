@@ -15,6 +15,12 @@ const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
+// Dedicated cross-process refresh lock (flock(2)) lives next to the REAL
+// (symlink-resolved) store file so every daemon flocks the same inode.
+const REFRESH_LOCK_FILENAME: &str = "auth-profiles.refresh.lock";
+// > store LOCK_TIMEOUT_MS: must outlast a queue of 2-3 daemons each holding the
+// lock for one bounded HTTP refresh.
+const REFRESH_LOCK_TIMEOUT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -179,6 +185,12 @@ impl AuthProfilesStore {
                 Err(_) => self.path.clone(),
             },
         }
+    }
+
+    /// Path of the cross-process refresh lock, anchored next to the REAL store
+    /// file so all daemons sharing it via symlink flock the same inode.
+    fn refresh_lock_path(&self) -> PathBuf {
+        self.real_path().with_file_name(REFRESH_LOCK_FILENAME)
     }
 
     pub async fn load(&self) -> Result<AuthProfilesData> {
@@ -545,7 +557,56 @@ impl AuthProfilesStore {
             }
         }
     }
+
+    /// Cross-process exclusive lock around the token-refresh critical section.
+    /// Uses flock(2): the kernel releases it on fd close / process death, so a
+    /// daemon killed mid-refresh (SIGKILL/OOM/deploy) cannot brick auth with a
+    /// stale lock file (unlike the O_EXCL `acquire_lock` above).
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard> {
+        let path = self.refresh_lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create refresh lock directory at {}", parent.display())
+            })?;
+        }
+
+        let mut waited = 0_u64;
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("Failed to open refresh lock at {}", path.display()))?;
+
+            match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                Ok(flock) => return Ok(RefreshLockGuard(flock)),
+                // On Linux/macOS EWOULDBLOCK aliases EAGAIN; flock(LOCK_NB)
+                // contention surfaces as EAGAIN here.
+                Err((_, nix::errno::Errno::EAGAIN)) => {
+                    if waited >= REFRESH_LOCK_TIMEOUT_MS {
+                        tracing::warn!(path = %path.display(), "Timed out waiting for auth refresh lock");
+                        anyhow::bail!(
+                            "Timed out waiting for auth refresh lock at {}",
+                            path.display()
+                        );
+                    }
+                    sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
+                    waited = waited.saturating_add(LOCK_WAIT_MS);
+                }
+                Err((_, e)) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "Failed to acquire refresh lock at {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
 }
+
+/// RAII guard for the cross-process refresh flock. Dropping it (or process
+/// death) closes the fd and releases the kernel advisory lock.
+pub(crate) struct RefreshLockGuard(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
 
 struct AuthProfileLockGuard {
     lock_path: PathBuf,
@@ -712,6 +773,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AuthProfilesStore::new(dir.path(), false);
         assert_eq!(store.real_path(), dir.path().join("auth-profiles.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_lock_shared_contended_and_released() {
+        let shared = tempfile::tempdir().unwrap();
+        let u1 = tempfile::tempdir().unwrap();
+        let u2 = tempfile::tempdir().unwrap();
+        let shared_file = shared.path().join("auth-profiles.json");
+        std::fs::write(&shared_file, b"{}").unwrap();
+        std::os::unix::fs::symlink(&shared_file, u1.path().join("auth-profiles.json")).unwrap();
+        std::os::unix::fs::symlink(&shared_file, u2.path().join("auth-profiles.json")).unwrap();
+
+        let s1 = AuthProfilesStore::new(u1.path(), false);
+        let s2 = AuthProfilesStore::new(u2.path(), false);
+        // both daemons resolve to the SAME lock inode
+        assert_eq!(s1.refresh_lock_path(), s2.refresh_lock_path());
+
+        let g = s1.acquire_refresh_lock().await.unwrap();
+        // While s1 holds it, s2 cannot acquire. acquire_refresh_lock's OWN timeout
+        // is 20s, so we bound the wait with an EXTERNAL tokio::time::timeout — Err
+        // here comes from that outer timeout, proving s2 is blocked.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            s2.acquire_refresh_lock(),
+        )
+        .await;
+        assert!(blocked.is_err(), "s2 must block while s1 holds the flock");
+
+        // After s1 releases (Drop closes fd → kernel releases flock), s2 acquires fast.
+        drop(g);
+        let g2 = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s2.acquire_refresh_lock(),
+        )
+        .await
+        .expect("must not time out")
+        .expect("must acquire after release");
+        drop(g2);
     }
 
     #[cfg(unix)]

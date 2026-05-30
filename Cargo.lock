@@ -13515,6 +13515,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper",
+ "nix 0.30.1",
  "parking_lot",
  "rand 0.10.1",
  "regex",
