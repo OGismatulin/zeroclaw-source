@@ -163,6 +163,24 @@ impl AuthProfilesStore {
         &self.path
     }
 
+    /// Resolve `self.path` through a symlink to the real backing file so that
+    /// tmp+rename and lock files land in the SHARED directory, not the per-user
+    /// symlink directory. Falls back to `self.path` when not a symlink or
+    /// unresolvable (local single-user case => no-op).
+    fn real_path(&self) -> PathBuf {
+        match std::fs::canonicalize(&self.path) {
+            Ok(p) => p,
+            Err(_) => match std::fs::read_link(&self.path) {
+                Ok(target) if target.is_absolute() => target,
+                Ok(target) => self
+                    .path
+                    .parent()
+                    .map_or(target.clone(), |d| d.join(&target)),
+                Err(_) => self.path.clone(),
+            },
+        }
+    }
+
     pub async fn load(&self) -> Result<AuthProfilesData> {
         let _lock = self.acquire_lock().await?;
         self.load_locked().await
@@ -634,6 +652,63 @@ pub fn profile_id(provider: &str, profile_name: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn real_path_resolves_absolute_symlink_to_shared_target() {
+        let shared = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let shared_file = shared.path().join("auth-profiles.json");
+        std::fs::write(&shared_file, b"{}").unwrap();
+        std::os::unix::fs::symlink(&shared_file, user.path().join("auth-profiles.json")).unwrap();
+
+        let store = AuthProfilesStore::new(user.path(), false);
+        assert_eq!(
+            store.real_path(),
+            std::fs::canonicalize(&shared_file).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_path_resolves_relative_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let shared = base.path().join("shared");
+        let user = base.path().join("user");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let shared_file = shared.join("auth-profiles.json");
+        std::fs::write(&shared_file, b"{}").unwrap();
+        std::os::unix::fs::symlink(
+            "../shared/auth-profiles.json",
+            user.join("auth-profiles.json"),
+        )
+        .unwrap();
+
+        let store = AuthProfilesStore::new(&user, false);
+        assert_eq!(
+            store.real_path(),
+            std::fs::canonicalize(&shared_file).unwrap()
+        );
+    }
+
+    #[test]
+    fn real_path_noop_for_existing_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth-profiles.json"), b"{}").unwrap();
+        let store = AuthProfilesStore::new(dir.path(), false);
+        assert_eq!(
+            store.real_path(),
+            std::fs::canonicalize(dir.path().join("auth-profiles.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn real_path_noop_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthProfilesStore::new(dir.path(), false);
+        assert_eq!(store.real_path(), dir.path().join("auth-profiles.json"));
+    }
 
     #[test]
     fn profile_id_format() {
