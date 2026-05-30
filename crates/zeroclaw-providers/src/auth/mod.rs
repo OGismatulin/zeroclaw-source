@@ -6,7 +6,8 @@ pub mod profiles;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, RefreshLockGuard, TokenSet,
+    profile_id,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -23,6 +24,9 @@ const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
 const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
+// Bounds how long the cross-process refresh lock is held while the HTTP refresh
+// is in flight, so a hung upstream cannot keep other daemons waiting.
+const OAUTH_REFRESH_HTTP_TIMEOUT_SECS: u64 = 15;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -46,6 +50,12 @@ impl AuthService {
 
     pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
         self.store.load().await
+    }
+
+    /// Cross-process exclusive lock around the token-refresh critical section
+    /// (proxied to the shared-dir flock in `AuthProfilesStore`).
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard> {
+        self.store.acquire_refresh_lock().await
     }
 
     pub async fn store_openai_tokens(
@@ -187,6 +197,10 @@ impl AuthService {
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
         let _guard = refresh_lock.lock().await;
+        // Cross-process flock: serialize refresh across daemons that share this
+        // profile via symlink, so only one process spends the rotating refresh
+        // token. The losers re-check below and reuse the winner's fresh token.
+        let _xp_guard = self.acquire_refresh_lock().await?;
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
         let data = self.store.load().await?;
@@ -210,20 +224,31 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_openai_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        let refresh_outcome = tokio::time::timeout(
+            Duration::from_secs(OAUTH_REFRESH_HTTP_TIMEOUT_SECS),
+            refresh_openai_access_token_with_retries(&self.client, &refresh_token),
+        )
+        .await;
+        let mut refreshed = match refresh_outcome {
+            Ok(Ok(tokens)) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Ok(Err(err)) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+            Err(_) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                anyhow::bail!("OpenAI token refresh timed out");
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -276,6 +301,9 @@ impl AuthService {
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
         let _guard = refresh_lock.lock().await;
+        // Cross-process flock (symmetric with the OpenAI path): serialize refresh
+        // across daemons sharing this profile via symlink.
+        let _xp_guard = self.acquire_refresh_lock().await?;
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
         let data = self.store.load().await?;
@@ -299,20 +327,31 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_gemini_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        let refresh_outcome = tokio::time::timeout(
+            Duration::from_secs(OAUTH_REFRESH_HTTP_TIMEOUT_SECS),
+            refresh_gemini_access_token_with_retries(&self.client, &refresh_token),
+        )
+        .await;
+        let mut refreshed = match refresh_outcome {
+            Ok(Ok(tokens)) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Ok(Err(err)) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+            Err(_) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                anyhow::bail!("Gemini token refresh timed out");
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
@@ -512,6 +551,30 @@ fn clear_refresh_backoff(profile_id: &str) {
 mod tests {
     use super::*;
     use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+
+    #[tokio::test]
+    async fn valid_oauth_token_returns_without_refresh() {
+        // Baseline contract: a fresh OAuth token (far-future expiry) is returned
+        // without any HTTP refresh (early return before the refresh critsection).
+        // The full cross-process dedup contract is gated in local-first integration.
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AuthService::new(dir.path(), false);
+
+        let token_set = TokenSet {
+            access_token: "fresh-access".to_string(),
+            refresh_token: Some("refresh-xyz".to_string()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::days(30)),
+            token_type: Some("bearer".to_string()),
+            scope: Some("openid".to_string()),
+        };
+        svc.store_openai_tokens("default", token_set, None, true)
+            .await
+            .unwrap();
+
+        let tok = svc.get_valid_openai_access_token(None).await.unwrap();
+        assert_eq!(tok.as_deref(), Some("fresh-access"));
+    }
 
     #[test]
     fn normalize_provider_aliases() {
