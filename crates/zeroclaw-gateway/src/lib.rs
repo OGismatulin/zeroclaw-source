@@ -524,6 +524,9 @@ pub struct AppState {
     /// returning HTTP 503 `previous_turn_stuck`. Configurable via
     /// `ZEROCLAW_WEBHOOK_LOCK_TIMEOUT_SECS` env (default 5s).
     pub webhook_lock_timeout_secs: u64,
+    /// Optional hook runner (e.g. `PromptTraceHook`). `None` unless enabled via
+    /// `config.hooks.enabled` or the `ZEROCLAW_PROMPT_TRACE` env flag.
+    pub hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -552,14 +555,29 @@ pub async fn run_gateway(
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
+    // The per-user gateway_manager injects ZEROCLAW_PROMPT_TRACE only for the
+    // targeted users, so reading it here is safe (a non-targeted daemon never
+    // sees the flag set).
+    let prompt_trace_enabled = std::env::var("ZEROCLAW_PROMPT_TRACE")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> =
+        if config.hooks.enabled || prompt_trace_enabled {
+            let mut runner = zeroclaw_runtime::hooks::HookRunner::new();
+            if prompt_trace_enabled {
+                let max_mb: u64 = std::env::var("ZEROCLAW_PROMPT_TRACE_MAX_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(50);
+                runner.register(Box::new(zeroclaw_runtime::hooks::PromptTraceHook::new(
+                    config.workspace_dir.clone(),
+                    max_mb.saturating_mul(1024 * 1024),
+                )));
+            }
+            Some(std::sync::Arc::new(runner))
+        } else {
+            None
+        };
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1145,6 +1163,7 @@ pub async fn run_gateway(
             None
         },
         webhook_session: Arc::new(TokioMutex::new(None)),
+        hooks,
     };
 
     // Build router with middleware
@@ -2084,7 +2103,7 @@ async fn run_gateway_webhook_agentic(
             None,
             None, // channel: Option<&dyn Channel> — webhook path has no channel
             cancellation_token,
-            None, // hooks: wired to state.hooks in a follow-up step
+            state.hooks.as_deref(),
         ),
     )
     .await;
@@ -3793,6 +3812,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -3871,6 +3891,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -4344,6 +4365,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4434,6 +4456,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let headers = HeaderMap::new();
@@ -4536,6 +4559,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let response = handle_webhook(
@@ -4608,6 +4632,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4685,6 +4710,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4767,6 +4793,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -4844,6 +4871,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5346,6 +5374,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
         }
     }
 

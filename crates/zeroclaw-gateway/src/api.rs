@@ -1303,6 +1303,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             webhook_session: Arc::new(tokio::sync::Mutex::new(None)),
+            hooks: None,
         }
     }
 
