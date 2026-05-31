@@ -11,7 +11,7 @@
 //! | Prefix | Purpose | Detection function |
 //! |---|---|---|
 //! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
-//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
+//! | `user_msg` / `user_msg_*` / `webhook_msg_*` | Raw per-turn user messages (consolidation queue); `webhook_msg_*` is the live gateway/Telegram autosave key | [`is_user_autosave_key`] |
 //!
 //! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
 //! **not** filtered — they use different prefixes and are handled separately.
@@ -169,12 +169,23 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 }
 
 /// Auto-save key used for raw user messages captured per-turn.
-/// Re-injecting these into build_context causes exponential bloat: each recalled
-/// entry contains prior generations' context verbatim, growing unboundedly.
-/// Consolidated knowledge is already promoted to Core/Daily entries.
+///
+/// Two prefixes are produced in practice:
+/// - `user_msg` / `user_msg_*` — legacy CLI/channel per-turn autosave.
+/// - `webhook_msg_*` — the live gateway (Telegram) path: `webhook_memory_key()`
+///   in `zeroclaw-gateway` stores every incoming message as `webhook_msg_<uuid>`.
+///
+/// Both must be excluded from `build_context` recall. Re-injecting raw per-turn
+/// messages echoes the user's own current/prior turns back into `[Memory
+/// context]` (redundant noise, and on formats that store enriched content it
+/// grows unboundedly). Consolidated knowledge is already promoted to Core/Daily
+/// entries, which is what recall should surface instead.
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
-    normalized == "user_msg" || normalized.starts_with("user_msg_")
+    normalized == "user_msg"
+        || normalized.starts_with("user_msg_")
+        || normalized == "webhook_msg"
+        || normalized.starts_with("webhook_msg_")
 }
 
 /// Filter known synthetic autosave noise patterns that should not be
@@ -522,6 +533,21 @@ mod tests {
         assert!(is_user_autosave_key("USER_MSG_abcd"));
         assert!(!is_user_autosave_key("user_message"));
         assert!(!is_user_autosave_key("assistant_resp_1234"));
+    }
+
+    #[test]
+    fn user_autosave_key_detection_matches_gateway_webhook_keys() {
+        // Regression: the live gateway path autosaves as `webhook_msg_<uuid>`
+        // (zeroclaw-gateway `webhook_memory_key()`). These must be filtered from
+        // recall just like `user_msg_*`, otherwise the user's own message echoes
+        // back into `[Memory context]`.
+        assert!(is_user_autosave_key("webhook_msg"));
+        assert!(is_user_autosave_key(
+            "webhook_msg_a389f864-1407-4f48-a109-b6ab3f9d363a"
+        ));
+        assert!(is_user_autosave_key("WEBHOOK_MSG_ABCD"));
+        assert!(!is_user_autosave_key("webhook_message"));
+        assert!(!is_user_autosave_key("webhook"));
     }
 
     #[test]
