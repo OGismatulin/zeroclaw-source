@@ -1115,9 +1115,14 @@ pub async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Fire void hook before LLM call
+        // Fire void hook before LLM call. Capture the EXACT prepared input
+        // (post-context-build, post-trim) and the resolved active model — not
+        // the raw `history`/requested `model` — so the trace reflects what the
+        // provider actually receives.
         if let Some(hooks) = hooks {
-            hooks.fire_llm_input(history, model).await;
+            hooks
+                .fire_llm_input(&prepared_messages.messages, active_model)
+                .await;
         }
 
         // Budget enforcement — block if limit exceeded (no-op when not scoped)
@@ -1279,6 +1284,14 @@ pub async fn run_tool_call_loop(
             response_streamed_live,
         ) = match chat_result {
             Ok(resp) => {
+                // Fire void output hook with the exact provider response. This
+                // arm is the single convergence point for streaming-success,
+                // streaming-fallback, and non-streaming paths. Borrow only —
+                // must run before any field of `resp` is moved below.
+                if let Some(hooks) = hooks {
+                    hooks.fire_llm_output(&resp).await;
+                }
+
                 let (resp_input_tokens, resp_output_tokens) = resp
                     .usage
                     .as_ref()
