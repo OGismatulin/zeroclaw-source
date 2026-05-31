@@ -98,6 +98,10 @@ def _now() -> float:
     return time.time()
 
 
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(slots=True)
 class ManagerSettings:
     data_root: Path
@@ -745,7 +749,7 @@ class GatewayRegistry:
 
     @staticmethod
     def _spawn_process(
-        _user_key: str, _port: int, config_dir: Path
+        user_key: str, _port: int, config_dir: Path
     ) -> subprocess.Popen[str]:
         env = os.environ.copy()
         env["ZEROCLAW_CONFIG_DIR"] = str(config_dir)
@@ -763,6 +767,23 @@ class GatewayRegistry:
             "ZEROCLAW_ALLOW_PUBLIC_BIND",
         ):
             env.pop(key, None)
+        # Prompt-trace is opt-in per user. ZEROCLAW_PROMPT_TRACE_USERS is a
+        # comma-separated allowlist of user keys (e.g. "tg_99999"); empty/"all"/
+        # "*" means every daemon. Inject the flag ONLY into targeted daemons so a
+        # globally-set secret never leaks raw prompts of non-targeted prod users.
+        users_raw = os.getenv("ZEROCLAW_PROMPT_TRACE_USERS", "").strip()
+        trace_all = users_raw in ("", "all", "*")
+        users = {u.strip() for u in users_raw.split(",") if u.strip()}
+        if _truthy(os.getenv("ZEROCLAW_PROMPT_TRACE")) and (
+            trace_all or user_key in users
+        ):
+            env["ZEROCLAW_PROMPT_TRACE"] = "1"
+            max_mb = os.getenv("ZEROCLAW_PROMPT_TRACE_MAX_MB")
+            if max_mb:
+                env["ZEROCLAW_PROMPT_TRACE_MAX_MB"] = max_mb
+        else:
+            env.pop("ZEROCLAW_PROMPT_TRACE", None)
+            env.pop("ZEROCLAW_PROMPT_TRACE_MAX_MB", None)
         logs_dir = config_dir.parent / "workspace" / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         stderr_path = logs_dir / "daemon-stderr.log"
