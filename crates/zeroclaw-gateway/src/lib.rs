@@ -2084,6 +2084,7 @@ async fn run_gateway_webhook_agentic(
             None,
             None, // channel: Option<&dyn Channel> — webhook path has no channel
             cancellation_token,
+            None, // hooks: wired to state.hooks in a follow-up step
         ),
     )
     .await;

@@ -734,6 +734,7 @@ pub async fn agent_turn(
     model_switch_callback: Option<ModelSwitchCallback>,
     channel: Option<&dyn Channel>,
     cancellation_token: Option<CancellationToken>,
+    hooks: Option<&crate::hooks::HookRunner>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -750,8 +751,8 @@ pub async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         cancellation_token,
-        None,
-        None,
+        None,  // on_delta
+        hooks, // hooks
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -3503,6 +3504,7 @@ pub async fn process_message(
         None,
         None, // channel: process_message path has no channel ref
         None, // cancellation_token: process_message path is non-cancellable
+        None, // hooks: process_message path is out of prompt-trace scope
     )
     .await
 }
@@ -6424,6 +6426,7 @@ mod tests {
                 None,
                 None, // channel
                 None, // cancellation_token
+                None, // hooks
             )
             .await
             .expect("wrapper path should execute activated tools");
