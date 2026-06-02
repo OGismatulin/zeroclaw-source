@@ -71,10 +71,11 @@ protect_last_n = 10
 "gpt-5.4-mini"            = 400_000
 "glm-5-turbo"             = 128_000
 "glm-5"                   = 128_000
-"glm-5.1"                 = 128_000
-# Wafer.ai-hosted (advertise larger windows than Z.AI variant of glm-5.1).
-# Capital "GLM-5.1" is a separate key because ZEROCLAW_MODEL ships the string
-# as-is via env, and model_windows.get() is case-sensitive.
+"glm-5.1"                 = 202_752
+# Capital "GLM-5.1" is a separate case-sensitive key (ZEROCLAW_MODEL ships the
+# model string as-is via env; model_windows.get() is case-sensitive). Same
+# underlying ZhiPu GLM-5.1, same ~200K window — value verified 2026-06-02
+# (OpenRouter z-ai/glm-5.1 = 202_752).
 "GLM-5.1"                 = 202_752
 "Qwen3.5-397B-A17B"       = 262_144
 
@@ -225,7 +226,7 @@ provider = "openai-codex"
 model = "gpt-5.4-mini"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are a fast, focused task executor. Run the delegated sub-task independently using the tools available. Return a concise, structured result."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -255,7 +256,7 @@ provider = "openai-codex"
 model = "gpt-5.5"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Report concisely what you changed and why."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -285,7 +286,7 @@ provider = "opencode-go"
 model = "mimo-v2.5-pro"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -311,11 +312,11 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_pro]
-provider = "opencode-go"
+provider = "deepseek"
 model = "deepseek-v4-pro"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -341,11 +342,11 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_flash]
-provider = "opencode-go"
+provider = "deepseek"
 model = "deepseek-v4-flash"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -375,7 +376,7 @@ provider = "zai"
 model = "glm-5.1"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",

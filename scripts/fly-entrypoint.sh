@@ -884,7 +884,7 @@ if new != text:
 PYEOF
 done
 
-# Patch: subagents roster v2 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
+# Patch: subagents roster v3 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
 # Idempotent bounded strip-and-replace of [delegate] + every [agents.*] section.
 # Guard: version marker. Removal regex stops at next ^[ so it never touches
 # [agent.context_compression] / [reliability] (which sit AFTER agents at runtime).
@@ -896,15 +896,17 @@ import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-MARKER = "# subagents-v2-ensemble"
+MARKER = "# subagents-v3"
 if MARKER in c:
     sys.exit(0)  # already migrated
+# Strip orphan old marker line left above [delegate] by a prior v2 migration.
+c = c.replace("# subagents-v2-ensemble\n", "")
 # Remove [delegate] and every [agents.<name>] section: header -> next ^[ or EOF.
 c = re.sub(r'(?ms)^\[delegate\].*?(?=^\[|\Z)', '', c)
 c = re.sub(r'(?ms)^\[agents\.[^\]]+\].*?(?=^\[|\Z)', '', c)
 # MARKER is the LITERAL first line of canonical (not %s) so runtime guard and
 # the test regex anchor on the same string.
-canonical = """# subagents-v2-ensemble
+canonical = """# subagents-v3
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 600
@@ -914,7 +916,7 @@ provider = "openai-codex"
 model = "gpt-5.4-mini"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are a fast, focused task executor. Run the delegated sub-task independently using the tools available. Return a concise, structured result."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -944,7 +946,7 @@ provider = "openai-codex"
 model = "gpt-5.5"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Report concisely what you changed and why."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -974,7 +976,7 @@ provider = "opencode-go"
 model = "mimo-v2.5-pro"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -1000,11 +1002,11 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_pro]
-provider = "opencode-go"
+provider = "deepseek"
 model = "deepseek-v4-pro"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -1030,11 +1032,11 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_flash]
-provider = "opencode-go"
+provider = "deepseek"
 model = "deepseek-v4-flash"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -1064,7 +1066,7 @@ provider = "zai"
 model = "glm-5.1"
 api_key = ""
 agentic = true
-max_iterations = 50
+max_iterations = 80
 system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
@@ -1091,7 +1093,7 @@ allowed_tools = [
 """
 c = c.rstrip() + "\n\n" + canonical.lstrip("\n")
 p.write_text(c, encoding="utf-8")
-print(f"[entrypoint] subagents roster v2 applied to {p}")
+print(f"[entrypoint] subagents roster v3 applied to {p}")
 PY_SUBAGENTS
 done
 
@@ -1156,9 +1158,9 @@ BASE_EOF
 "gpt-5.4-mini"            = 400_000
 "glm-5-turbo"             = 128_000
 "glm-5"                   = 128_000
-"glm-5.1"                 = 128_000
-# Wafer.ai-hosted (capital "GLM-5.1" is a separate case-sensitive key from
-# the Z.AI lowercase variant; ZEROCLAW_MODEL ships the string as-is).
+"glm-5.1"                 = 202_752
+# Capital "GLM-5.1" is a separate case-sensitive key (ZEROCLAW_MODEL ships the
+# model string as-is). Same ZhiPu GLM-5.1, same ~200K window (verified 2026-06-02).
 "GLM-5.1"                 = 202_752
 "Qwen3.5-397B-A17B"       = 262_144
 WINDOWS_EOF
@@ -1186,6 +1188,21 @@ c = re.sub(
 open(p, 'w').write(c)
 PY
   fi
+
+  # 2026-06-02: fix lowercase glm-5.1 window 128_000 -> 202_752 in EXISTING
+  # per-user model_windows blocks (append-if-missing above won't touch them).
+  # Idempotent: re.sub is a no-op once value is already 202_752. Anchored to the
+  # exact lowercase key so glm-5 / glm-5-turbo (also 128_000) stay untouched.
+  python3 - "$cfg" <<'PY_GLM_WINDOW'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1])
+c = p.read_text(encoding="utf-8")
+new = re.sub(r'(?m)^("glm-5\.1"\s*=\s*)128_000\s*$', r'\g<1>202_752', c)
+if new != c:
+    p.write_text(new, encoding="utf-8")
+    print(f"[entrypoint] glm-5.1 window 128_000->202_752 in {p}")
+PY_GLM_WINDOW
 done
 
 # Migration: ensure workspace/cron_templates/ exists in per-user workspaces.
