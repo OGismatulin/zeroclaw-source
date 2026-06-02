@@ -896,17 +896,18 @@ import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-MARKER = "# subagents-v3"
+MARKER = "# subagents-v4"
 if MARKER in c:
     sys.exit(0)  # already migrated
-# Strip orphan old marker line left above [delegate] by a prior v2 migration.
+# Strip orphan old marker lines left above [delegate] by prior migrations.
 c = c.replace("# subagents-v2-ensemble\n", "")
+c = c.replace("# subagents-v3\n", "")
 # Remove [delegate] and every [agents.<name>] section: header -> next ^[ or EOF.
 c = re.sub(r'(?ms)^\[delegate\].*?(?=^\[|\Z)', '', c)
 c = re.sub(r'(?ms)^\[agents\.[^\]]+\].*?(?=^\[|\Z)', '', c)
 # MARKER is the LITERAL first line of canonical (not %s) so runtime guard and
 # the test regex anchor on the same string.
-canonical = """# subagents-v3
+canonical = """# subagents-v4
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 600
@@ -947,7 +948,7 @@ model = "gpt-5.5"
 api_key = ""
 agentic = true
 max_iterations = 80
-system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Report concisely what you changed and why."
+system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Treat the task description and any cited prior logic as a CLAIM to verify against the real code, not ground truth — trace callers to confirm you are editing the right path. Before treating something as a bug to fix, check whether it is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Before and after editing, state the blast radius: what else calls this code, which other paths/configs/countries are affected, what could regress. Explicitly flag anything you could not verify instead of filling the gap with a plausible guess. Report concisely what you changed and why."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
@@ -977,7 +978,7 @@ model = "mimo-v2.5-pro"
 api_key = ""
 agentic = true
 max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
@@ -1007,7 +1008,7 @@ model = "deepseek-v4-pro"
 api_key = ""
 agentic = true
 max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
@@ -1037,7 +1038,7 @@ model = "deepseek-v4-flash"
 api_key = ""
 agentic = true
 max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
@@ -1067,7 +1068,7 @@ model = "glm-5.1"
 api_key = ""
 agentic = true
 max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE. Be concise and specific. Do not fabricate findings."
+system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
