@@ -53,6 +53,15 @@ impl Observer for VerboseObserver {
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");
             }
+            ObserverEvent::TurnTokenSummary {
+                total_input_tokens,
+                total_output_tokens,
+            } => {
+                eprintln!(
+                    "< Tokens total: {}in / {}out",
+                    total_input_tokens, total_output_tokens
+                );
+            }
             _ => {}
         }
     }

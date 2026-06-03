@@ -354,6 +354,8 @@ mod tests {
             runtime_trace_mode: "rolling".to_string(),
             runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
             runtime_trace_max_entries: 3,
+            slack_webhook_url: None,
+            token_alert_threshold: 250_000,
         }
     }
 

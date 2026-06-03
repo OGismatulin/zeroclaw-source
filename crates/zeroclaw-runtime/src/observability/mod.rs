@@ -7,6 +7,7 @@ pub mod otel;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
+pub mod slack;
 pub mod traits;
 pub mod verbose;
 
@@ -19,6 +20,8 @@ pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
+#[allow(unused_imports)]
+pub use slack::SlackObserver;
 pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
@@ -71,6 +74,21 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                     "OpenTelemetry backend requested but this build was compiled without `observability-otel`; falling back to noop."
                 );
                 Box::new(NoopObserver)
+            }
+        }
+        "slack" => {
+            match config.slack_webhook_url.as_deref().filter(|s| !s.is_empty()) {
+                Some(webhook_url) => Box::new(SlackObserver::new(
+                    webhook_url,
+                    config.token_alert_threshold,
+                )),
+                None => {
+                    tracing::warn!(
+                        "Slack observability backend requested but `slack_webhook_url` is not \
+                         configured; falling back to noop."
+                    );
+                    Box::new(NoopObserver)
+                }
             }
         }
         "none" | "noop" => Box::new(NoopObserver),

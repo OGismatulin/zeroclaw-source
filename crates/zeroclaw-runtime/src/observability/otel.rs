@@ -224,6 +224,7 @@ impl Observer for OtelObserver {
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
+            | ObserverEvent::TurnTokenSummary { .. }
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {

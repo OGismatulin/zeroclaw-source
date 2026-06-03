@@ -5691,6 +5691,16 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// Slack incoming-webhook URL used by the `"slack"` observability backend
+    /// to post high-token-turn alerts.  Leave unset to disable webhook posting.
+    #[serde(default)]
+    pub slack_webhook_url: Option<String>,
+
+    /// Combined (input + output) token count per turn that triggers a Slack
+    /// alert.  `0` disables the alert entirely.  Default: 250 000.
+    #[serde(default = "default_token_alert_threshold")]
+    pub token_alert_threshold: u64,
 }
 
 impl Default for ObservabilityConfig {
@@ -5703,8 +5713,14 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            slack_webhook_url: None,
+            token_alert_threshold: default_token_alert_threshold(),
         }
     }
+}
+
+fn default_token_alert_threshold() -> u64 {
+    250_000
 }
 
 fn default_runtime_trace_mode() -> String {

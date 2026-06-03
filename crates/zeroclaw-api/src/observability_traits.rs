@@ -52,6 +52,17 @@ pub enum ObserverEvent {
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
+    /// Aggregate token counts for the entire tool-call loop of a single turn.
+    ///
+    /// Emitted by `run_tool_call_loop` at each return point so callers can
+    /// surface the true cumulative token spend across all LLM iterations in
+    /// one place (rather than summing individual `LlmResponse` events).
+    TurnTokenSummary {
+        /// Total input tokens consumed across all LLM calls in this turn.
+        total_input_tokens: u64,
+        /// Total output tokens generated across all LLM calls in this turn.
+        total_output_tokens: u64,
+    },
     /// A message was sent or received through a channel.
     ChannelMessage {
         /// Channel name (e.g., `"telegram"`, `"discord"`).

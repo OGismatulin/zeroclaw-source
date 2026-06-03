@@ -934,6 +934,11 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
 
+    // Token accumulators: summed across every LLM call in this turn so the
+    // final TurnTokenSummary event reflects true cumulative spend.
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -1298,6 +1303,11 @@ pub async fn run_tool_call_loop(
                     .map(|u| (u.input_tokens, u.output_tokens))
                     .unwrap_or((None, None));
 
+                // Accumulate across all iterations so TurnTokenSummary reports
+                // true turn-level totals rather than just the last call's usage.
+                total_input_tokens += resp_input_tokens.unwrap_or(0);
+                total_output_tokens += resp_output_tokens.unwrap_or(0);
+
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
                     model: model.to_string(),
@@ -1533,6 +1543,10 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
+            observer.record_event(&ObserverEvent::TurnTokenSummary {
+                total_input_tokens,
+                total_output_tokens,
+            });
             return Ok(accumulated_display_text);
         }
 
@@ -2071,6 +2085,10 @@ pub async fn run_tool_call_loop(
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
+            observer.record_event(&ObserverEvent::TurnTokenSummary {
+                total_input_tokens,
+                total_output_tokens,
+            });
             Ok(accumulated_display_text)
         }
         Err(e) => {
