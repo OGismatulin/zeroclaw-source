@@ -425,6 +425,14 @@ open(p, 'w').write(c)
   fi
 done
 
+# Bump main-agent max_tool_iterations 50 -> 100 (browser automation is
+# iteration-heavy; the old default cut off multi-step browse turns). Idempotent:
+# only the old default value is rewritten. Template AND every per-user config.
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  sed -i 's/^max_tool_iterations = 50$/max_tool_iterations = 100/' "$cfg"
+done
+
 # Patch: ensure shell_env_passthrough includes OPENROUTER_API_KEY
 if ! grep -q '"OPENROUTER_API_KEY"' "$config_file" 2>/dev/null; then
   python3 -c "

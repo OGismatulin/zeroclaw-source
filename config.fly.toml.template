@@ -42,7 +42,7 @@ sqlite_open_timeout_secs = 30
 
 [agent]
 compact_context = false
-max_tool_iterations = 50
+max_tool_iterations = 100
 max_history_messages = 200
 max_context_tokens = 128_000
 parallel_tools = true
