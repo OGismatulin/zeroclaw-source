@@ -88,3 +88,4 @@ scripts/
 !scripts/fly_warmup.py
 !scripts/cron_template_install.py
 !scripts/bootstrap_default_cron_jobs.py
+!scripts/agent_browser_wrapper.sh

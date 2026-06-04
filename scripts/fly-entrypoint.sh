@@ -10,7 +10,7 @@ shared_auth_dir="/zeroclaw-data/shared-auth"
 manager_dir="/zeroclaw-data/manager"
 workspaces_dir="/zeroclaw-data/workspaces"
 template_file="/seed/config.fly.toml.template"
-baseline_allowed_commands="git npm cargo sh ls cat grep find echo pwd wc head tail date wget python3 pip pip3 node npx ffmpeg convert pandoc curl jq"
+baseline_allowed_commands="git npm cargo sh ls cat grep find echo pwd wc head tail date wget python3 pip pip3 node npx ffmpeg convert pandoc curl jq agent-browser"
 baseline_auto_approve="file_read file_write memory_recall shell http_request"
 openvpn_log_path="${OPENVPN_LOG_PATH:-/tmp/openvpn.log}"
 
@@ -1204,6 +1204,28 @@ if new != c:
     p.write_text(new, encoding="utf-8")
     print(f"[entrypoint] glm-5.1 window 128_000->202_752 in {p}")
 PY_GLM_WINDOW
+done
+
+# Patch: agent-browser command + AGENT_BROWSER_* / ZEROCLAW_WORKSPACE passthrough.
+# Idempotent: insert "agent-browser" into the multi-line allowed_commands array if
+# absent, and append each of the 5 passthrough vars to shell_env_passthrough if
+# absent. Applies to template AND every per-user config (in-place loop, no rm).
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PY_AGENT_BROWSER'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1]); c = p.read_text(encoding="utf-8")
+if '"agent-browser"' not in c:
+    c = re.sub(r'(?ms)(^allowed_commands\s*=\s*\[.*?)(\n\])',
+               r'\1\n    "agent-browser",\2', c, count=1)
+for v in ("AGENT_BROWSER_PROFILE", "AGENT_BROWSER_SESSION",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "AGENT_BROWSER_ARGS",
+          "ZEROCLAW_WORKSPACE"):
+    if f'"{v}"' not in c:
+        c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\g<1>"' + v + '", ', c, count=1)
+p.write_text(c, encoding="utf-8")
+PY_AGENT_BROWSER
 done
 
 # Migration: ensure workspace/cron_templates/ exists in per-user workspaces.

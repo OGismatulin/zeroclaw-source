@@ -757,6 +757,16 @@ class GatewayRegistry:
         # Without this, daemon resolves workspace as {config_dir}/workspace
         # (inside .zeroclaw/), missing the template-copied personality files.
         env["ZEROCLAW_WORKSPACE"] = str(config_dir.parent / "workspace")
+        # Per-user agent-browser isolation (spec §7). The daemon is keyed by
+        # --session + $HOME; $HOME is shared across per-user daemons, so a per-user
+        # session name is the daemon-isolation key, and the profile is the on-disk
+        # cookie/login store. Both must be in shell_env_passthrough (they are) to
+        # survive the shell tool's env_clear.
+        workspace = config_dir.parent / "workspace"
+        env["AGENT_BROWSER_PROFILE"] = str(
+            workspace / "state" / "agent-browser" / "profile"
+        )
+        env["AGENT_BROWSER_SESSION"] = user_key
         # Remove env vars that override child config and cause conflicts:
         # - ZEROCLAW_GATEWAY_PORT: would override config port, causing bind conflict with manager
         # - ZEROCLAW_GATEWAY_HOST: child must bind to localhost, not 0.0.0.0
