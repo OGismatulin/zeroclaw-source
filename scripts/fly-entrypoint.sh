@@ -1302,5 +1302,26 @@ else
     echo "[fly-entrypoint] WARNING: MCP Graylog Server (pid=$MCP_GRAYLOG_PID) /health not yet OK — cookie may be expired/missing"
 fi
 
+# --- Lightpanda CDP sidecar (fast read-only parsing engine for agent-browser --cdp) ---
+# Shared, stateless, localhost-only. Started like the MCP sidecars; no respawn
+# (Chrome path is the fallback if it dies). Plain start-block only — no new shell
+# functions/loops (dash + set -eu crash-loop lesson, 2026-05-22). See spec 2026-06-05.
+echo "[fly-entrypoint] Starting Lightpanda CDP server on 127.0.0.1:${LIGHTPANDA_PORT:-9222}..."
+LIGHTPANDA_DISABLE_TELEMETRY=true lightpanda serve --host 127.0.0.1 --port "${LIGHTPANDA_PORT:-9222}" &
+LIGHTPANDA_PID=$!
+LIGHTPANDA_READY=0
+for i in $(seq 1 10); do
+    if curl -s "http://127.0.0.1:${LIGHTPANDA_PORT:-9222}/json/version" > /dev/null 2>&1; then
+        LIGHTPANDA_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$LIGHTPANDA_READY" -eq 1 ]; then
+    echo "[fly-entrypoint] Lightpanda CDP server started (pid=$LIGHTPANDA_PID)"
+else
+    echo "[fly-entrypoint] WARNING: Lightpanda (pid=$LIGHTPANDA_PID) /json/version not healthy — parsing falls back to Chrome"
+fi
+
 export ZEROCLAW_DATA_ROOT=/zeroclaw-data
 exec python3 /usr/local/bin/gateway_manager.py

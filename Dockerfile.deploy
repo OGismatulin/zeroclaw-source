@@ -194,15 +194,23 @@ RUN curl -fsSL "https://github.com/vercel-labs/agent-browser/releases/download/v
 COPY scripts/agent_browser_wrapper.sh /usr/local/bin/agent-browser
 RUN chmod 0755 /usr/local/bin/agent-browser
 
-# Engine: Chromium only (apt, /usr/bin/chromium). Lightpanda was evaluated and
-# dropped — its 0.3.1 linux-x64 build cannot honor our per-user AGENT_BROWSER_PROFILE
-# ("Profiles are not supported with Lightpanda") nor AGENT_BROWSER_ARGS ("Custom
-# Chrome arguments are not supported"), and its zygote dies as root without
-# --no-sandbox. Per-user profile isolation is non-negotiable, so chrome stays the
-# sole engine (upstream default). Chromium in a container needs sandbox-off flags.
-# (These ENVs set the daemon's env; per-subprocess passthrough is wired separately.)
+# Chromium is the DEFAULT engine (per-user profile, screenshots, logins, heavy
+# JS/SPA — see the agent-browser skill). Chromium in a container needs sandbox-off
+# flags. (These ENVs set the daemon's env; per-subprocess passthrough is wired
+# separately.)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
+
+# Lightpanda is ADDED as a standalone CDP sidecar (started by the entrypoints) for
+# fast read-only parsing via `agent-browser --cdp 9222`. NOT the agent-browser
+# bundled engine — the 2026-06-05 spike refuted the 0.3.1 bundled-launcher blockers
+# (standalone Lightpanda 1.0 runs as root, needs no --profile/--args). Static binary,
+# no extra apt deps in debian-trixie (verified). ~133 MB; pinned by manifest-list
+# digest (buildkit selects amd64). `lightpanda version` smoke also catches wrong arch.
+COPY --from=lightpanda/browser@sha256:6c8ee88d17e4f91179ec84adde16abf223eac8462e12d48b2d8b91264011c6f7 \
+     /usr/bin/lightpanda /usr/local/bin/lightpanda
+RUN chmod 0755 /usr/local/bin/lightpanda \
+ && /usr/local/bin/lightpanda version
 
 ENV ZEROCLAW_DATA_ROOT=/zeroclaw-data
 ENV HOME=/zeroclaw-data
