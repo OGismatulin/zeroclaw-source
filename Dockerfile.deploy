@@ -133,6 +133,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     npm \
     build-essential \
     curl \
+    git \
     jq \
     ffmpeg \
     imagemagick \
@@ -194,12 +195,36 @@ RUN curl -fsSL "https://github.com/vercel-labs/agent-browser/releases/download/v
 COPY scripts/agent_browser_wrapper.sh /usr/local/bin/agent-browser
 RUN chmod 0755 /usr/local/bin/agent-browser
 
+# GitHub CLI (gh) + GitLab CLI (glab): baked from pinned releases (same pattern as
+# agent-browser). gh authenticates statelessly from GITHUB_TOKEN (no `gh auth login`,
+# no ~/.config write — sidesteps forbidden_paths). glab authenticates from
+# GITLAB_TOKEN + GITLAB_HOST. See docs/integration/github-access.md.
+ARG GH_VERSION=2.93.0
+ARG GLAB_VERSION=1.102.0
+RUN curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+      -o /tmp/gh.tgz \
+ && tar -xzf /tmp/gh.tgz -C /tmp \
+ && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+ && rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_amd64" \
+ && gh --version
+RUN curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.tar.gz" \
+      -o /tmp/glab.tgz \
+ && tar -xzf /tmp/glab.tgz -C /tmp \
+ && install -m 0755 /tmp/bin/glab /usr/local/bin/glab \
+ && rm -rf /tmp/glab.tgz /tmp/bin \
+ && glab --version
+# git push to github.com uses gh as credential helper (token stays out of URLs/logs).
+RUN git config --system credential."https://github.com".helper "!gh auth git-credential"
+
 # Chromium is the DEFAULT engine (per-user profile, screenshots, logins, heavy
 # JS/SPA — see the agent-browser skill). Chromium in a container needs sandbox-off
 # flags. (These ENVs set the daemon's env; per-subprocess passthrough is wired
 # separately.)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
+
+# glab targets the Lalafo self-hosted GitLab; gh defaults to github.com.
+ENV GITLAB_HOST=gitlab.lalafo.com.ua
 
 # Lightpanda is ADDED as a standalone CDP sidecar (started by the entrypoints) for
 # fast read-only parsing via `agent-browser --cdp 9222`. NOT the agent-browser

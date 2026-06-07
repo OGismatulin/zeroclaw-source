@@ -767,6 +767,12 @@ class GatewayRegistry:
             workspace / "state" / "agent-browser" / "profile"
         )
         env["AGENT_BROWSER_SESSION"] = user_key
+        # glab reads GITLAB_TOKEN; reuse the existing GitLab deploy token so we don't
+        # provision a second secret. GITLAB_HOST comes from the image ENV. Both must be
+        # in shell_env_passthrough (they are) to survive the shell tool's env_clear.
+        gitlab_token = os.environ.get("GITLAB_DEPLOY_TOKEN", "")
+        if gitlab_token:
+            env["GITLAB_TOKEN"] = gitlab_token
         # Remove env vars that override child config and cause conflicts:
         # - ZEROCLAW_GATEWAY_PORT: would override config port, causing bind conflict with manager
         # - ZEROCLAW_GATEWAY_HOST: child must bind to localhost, not 0.0.0.0
