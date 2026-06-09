@@ -1257,6 +1257,21 @@ p.write_text(c, encoding="utf-8")
 PY_GITHUB
 done
 
+# Patch: IMAGE_UPLOAD_AWS_* passthrough for upload-ms s3_inspect.py (read-only S3).
+# Idempotent: append each var to shell_env_passthrough if absent. Template + per-user.
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PY_IMAGE_UPLOAD_AWS'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1]); c = p.read_text(encoding="utf-8")
+for v in ("IMAGE_UPLOAD_AWS_ACCESS_KEY_ID", "IMAGE_UPLOAD_AWS_SECRET_ACCESS_KEY"):
+    if f'"{v}"' not in c:
+        c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\g<1>"' + v + '", ', c, count=1)
+p.write_text(c, encoding="utf-8")
+PY_IMAGE_UPLOAD_AWS
+done
+
 # Migration: ensure workspace/cron_templates/ exists in per-user workspaces.
 # Idempotent: skip if already present.
 for user_ws in /zeroclaw-data/workspaces/tg_*/workspace; do
