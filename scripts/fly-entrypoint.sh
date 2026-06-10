@@ -388,7 +388,7 @@ if grep -q 'shell_env_passthrough = \[\]' "$config_file" 2>/dev/null; then
 fi
 
 # Patch: ensure shell_env_passthrough includes CREATIO and PG_PROD env vars
-for cvar in CREATIO_BASE_URL CREATIO_USERNAME CREATIO_PASSWORD PG_PROD_HOST PG_PROD_PORT PG_PROD_USER PG_PROD_PASSWORD; do
+for cvar in CREATIO_BASE_URL CREATIO_USERNAME CREATIO_PASSWORD PG_PROD_HOST PG_PROD_PORT PG_PROD_USER PG_PROD_PASSWORD PG_STAGE_HOST PG_STAGE_PORT PG_STAGE_USER PG_STAGE_PASSWORD; do
   if ! grep -q "\"$cvar\"" "$config_file" 2>/dev/null; then
     python3 -c "
 import sys, re
@@ -769,7 +769,7 @@ sed -i '/^config_path = /d' "$config_file"
 # Patch: propagate shell_env_passthrough updates to existing per-user configs
 for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$user_config" ] || continue
-  for cvar in CREATIO_BASE_URL CREATIO_USERNAME CREATIO_PASSWORD PG_PROD_HOST PG_PROD_PORT PG_PROD_USER PG_PROD_PASSWORD; do
+  for cvar in CREATIO_BASE_URL CREATIO_USERNAME CREATIO_PASSWORD PG_PROD_HOST PG_PROD_PORT PG_PROD_USER PG_PROD_PASSWORD PG_STAGE_HOST PG_STAGE_PORT PG_STAGE_USER PG_STAGE_PASSWORD; do
     if ! grep -q "\"$cvar\"" "$user_config" 2>/dev/null; then
       python3 -c "
 import sys, re
@@ -1270,6 +1270,21 @@ for v in ("IMAGE_UPLOAD_AWS_ACCESS_KEY_ID", "IMAGE_UPLOAD_AWS_SECRET_ACCESS_KEY"
         c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\g<1>"' + v + '", ', c, count=1)
 p.write_text(c, encoding="utf-8")
 PY_IMAGE_UPLOAD_AWS
+done
+
+# Patch: ADMIN_* passthrough for micromarket-db admin_micromarket.py (enable level via admin panel).
+# Idempotent: append each var to shell_env_passthrough if absent. Template + per-user.
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PY_ADMIN_MM'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1]); c = p.read_text(encoding="utf-8")
+for v in ("ADMIN_BASIC_USER", "ADMIN_BASIC_PASSWORD", "ADMIN_APP_EMAIL", "ADMIN_APP_PASSWORD", "ADMIN_OAUTH2_COOKIE"):
+    if f'"{v}"' not in c:
+        c = re.sub(r'(shell_env_passthrough\s*=\s*\[)', r'\g<1>"' + v + '", ', c, count=1)
+p.write_text(c, encoding="utf-8")
+PY_ADMIN_MM
 done
 
 # Migration: ensure workspace/cron_templates/ exists in per-user workspaces.
