@@ -969,6 +969,7 @@ class GatewayManagerServer:
 
         return 200, {
             "path": f"uploads/{unique_name}",
+            "abs_path": str(dest.resolve()),
             "original_name": original_name,
             "size": len(file_data),
             "mime_type": mime_type,

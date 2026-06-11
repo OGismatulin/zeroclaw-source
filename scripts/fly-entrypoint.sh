@@ -838,6 +838,24 @@ SHELLTOOL
   fi
 done
 
+# Patch: append [multimodal] vision routing section if missing (idempotent).
+# Delegated vision: [IMAGE:<abspath>] markers route the iteration to openrouter
+# (main provider opencode-go has vision=false). Keep block byte-identical to
+# config.toml / config.fly.toml.template (three-files rule).
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  if ! grep -q '^\[multimodal\]' "$cfg" 2>/dev/null; then
+    cat >> "$cfg" <<'MULTIMODAL'
+
+[multimodal]
+max_images = 4
+max_image_size_mb = 20
+vision_provider = "openrouter"
+vision_model = "google/gemini-3.1-flash-lite-preview"
+MULTIMODAL
+  fi
+done
+
 # Patch: append lalafo-db MCP server if missing (requires [mcp] to already exist)
 for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$cfg" ] || continue

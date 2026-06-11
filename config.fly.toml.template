@@ -79,6 +79,12 @@ protect_last_n = 10
 "GLM-5.1"                 = 202_752
 "Qwen3.5-397B-A17B"       = 262_144
 
+[multimodal]
+max_images = 4
+max_image_size_mb = 20
+vision_provider = "openrouter"
+vision_model = "google/gemini-3.1-flash-lite-preview"
+
 [skills]
 prompt_injection_mode = "compact"
 
