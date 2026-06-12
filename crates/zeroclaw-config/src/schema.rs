@@ -15368,6 +15368,42 @@ impl Config {
             config.config_path = config_path.clone();
             config.data_dir = workspace_dir;
 
+            // fork: synthesize the main runtime agent when migration didn't.
+            // Upstream's V1→V3 bridge only creates [agents.default] when the
+            // V1 config had NO [agents] blocks — but our V1 [agents.*] were
+            // SUBAGENT definitions (delegate targets), so existing per-user
+            // configs migrate into 6 aliased agents without a "default".
+            // resolved_runtime_agent_alias() would then pick the
+            // alphabetically-first subagent (analyst_deepseek_flash) and run
+            // every webhook turn under ITS restricted risk profile. Bridge:
+            // wire "default" to the migrated default risk/runtime profiles
+            // and the first model-provider entry (same pick as the gateway
+            // boot provider).
+            if !config.agents.contains_key("default")
+                && config.risk_profiles.contains_key("default")
+            {
+                let model_provider = config
+                    .providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(family, alias, _)| format!("{family}.{alias}"))
+                    .unwrap_or_default();
+                config.agents.insert(
+                    "default".to_string(),
+                    AliasedAgentConfig {
+                        model_provider: model_provider.into(),
+                        risk_profile: "default".to_string(),
+                        runtime_profile: if config.runtime_profiles.contains_key("default") {
+                            "default".to_string()
+                        } else {
+                            String::new()
+                        },
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+
             // fork: point migration-synthesized agents at the legacy
             // per-user workspace (<root>/workspace). Without this, V3's
             // agent_workspace_dir() would resolve to
