@@ -4955,12 +4955,12 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             provider_name: "mock".into(),
             cancel_token_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             webhook_lock_timeout_secs: 5,
             webhook_session: Arc::new(TokioMutex::new(None)),
             hooks: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         }
     }
@@ -8524,12 +8524,12 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             provider_name: "mock".into(),
             cancel_token_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             webhook_lock_timeout_secs: 5,
             webhook_session: Arc::new(TokioMutex::new(None)),
             hooks: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         }
     }
