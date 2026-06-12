@@ -147,18 +147,31 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// Gateway request timeout (seconds) for routes other than the long-running
-/// cron-trigger endpoint. Reads from typed config.
+/// cron-trigger endpoint. Env-first, falling back to typed config.
 pub fn gateway_request_timeout_secs(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
-    cfg.request_timeout_secs
+    // fork(v0.8.0 regressions): restore the v0.7.5 env contract. Upstream
+    // 4a22ff29f dropped this read; the 30s config default then killed every
+    // webhook turn longer than 30s in prod (TimeoutLayer 408 with an empty
+    // body -> manager JSON-parse error -> 500 to the bot). fly.toml [env]
+    // pins 1800; per-user configs do not set [gateway].request_timeout_secs.
+    std::env::var("ZEROCLAW_GATEWAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cfg.request_timeout_secs)
 }
 
 /// Manual cron-trigger request timeout (seconds), exempt from the
 /// gateway-wide [`gateway_request_timeout_secs`] limit so synchronous agent
-/// jobs can run to completion. Reads from typed config.
+/// jobs can run to completion. Env-first, falling back to typed config.
 pub fn gateway_long_running_request_timeout_secs(
     cfg: &zeroclaw_config::schema::GatewayConfig,
 ) -> u64 {
-    cfg.long_running_request_timeout_secs
+    // fork(v0.8.0 regressions): same env-first contract as
+    // gateway_request_timeout_secs (v378 parity).
+    std::env::var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cfg.long_running_request_timeout_secs)
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -4803,10 +4816,33 @@ mod tests {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
     }
 
+    // fork(v0.8.0 regressions): the two upstream default-assert tests
+    // (gateway_timeout_uses_typed_config_default,
+    // long_running_request_timeout_uses_typed_config_default) are absorbed here.
+    // After the env-first patch they read ZEROCLAW_GATEWAY_* and would race with
+    // this test under the default multi-threaded test runner; one test = one
+    // thread = serialized set/remove.
     #[test]
-    fn gateway_timeout_uses_typed_config_default() {
+    fn gateway_timeouts_default_env_override_and_parse_fail() {
         let cfg = zeroclaw_config::schema::GatewayConfig::default();
+        // defaults (env unset) — absorbed upstream asserts
         assert_eq!(gateway_request_timeout_secs(&cfg), 30);
+        assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 600);
+        // env wins (v378 parity)
+        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS", "1800") };
+        assert_eq!(gateway_request_timeout_secs(&cfg), 1800);
+        // parse fail -> config default
+        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS", "not-a-number") };
+        assert_eq!(gateway_request_timeout_secs(&cfg), 30);
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
+        assert_eq!(gateway_request_timeout_secs(&cfg), 30);
+
+        unsafe {
+            std::env::set_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS", "1200")
+        };
+        assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 1200);
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS") };
+        assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 600);
     }
 
     #[test]
@@ -5131,11 +5167,8 @@ mod tests {
         assert_eq!(LONG_RUNNING_REQUEST_TIMEOUT_SECS, 600);
     }
 
-    #[test]
-    fn long_running_request_timeout_uses_typed_config_default() {
-        let cfg = zeroclaw_config::schema::GatewayConfig::default();
-        assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 600);
-    }
+    // fork(v0.8.0 regressions): long_running_request_timeout_uses_typed_config_default
+    // absorbed into gateway_timeouts_default_env_override_and_parse_fail (above).
 
     #[test]
     fn webhook_body_requires_message_field() {
