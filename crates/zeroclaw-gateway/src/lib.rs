@@ -2963,13 +2963,13 @@ async fn run_gateway_webhook_agentic(
 /// catalog. Adding a new PROVIDER itself still requires Rust changes
 /// (factory + registry) and is governed by zeroclaw-providers.
 fn provider_exists_in_registry(name: &str) -> bool {
-    zeroclaw_providers::list_providers()
+    zeroclaw_providers::list_model_providers()
         .iter()
         .any(|p| p.name == name)
 }
 
 fn registry_canonical_provider_names() -> Vec<&'static str> {
-    zeroclaw_providers::list_providers()
+    zeroclaw_providers::list_model_providers()
         .into_iter()
         .map(|p| p.name)
         .collect()
