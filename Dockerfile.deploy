@@ -64,12 +64,14 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
        echo "pub fn placeholder() {}" > "crates/$crate_dir/src/lib.rs"; \
     done \
     && mkdir -p crates/zeroclaw-macros/src \
-    && echo "" > crates/zeroclaw-macros/src/lib.rs
+    && echo "" > crates/zeroclaw-macros/src/lib.rs \
+    && mkdir -p crates/zeroclaw-hardware/examples \
+    && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     cargo build --release --locked --features rag-pdf
-RUN rm -rf src benches apps crates/*/src tools xtask
+RUN rm -rf src benches apps crates/*/src crates/*/examples tools xtask
 
 COPY src/ src/
 COPY benches/ benches/
