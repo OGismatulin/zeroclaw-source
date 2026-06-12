@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["agent","approval","cli_input","cost","cron","daemon","doctor","health","heartbeat","hooks","i18n","identity","integrations","migration","nodes","observability","onboard","platform","rag","routines","security","service","skillforge","skills","sop","tools","trust","tunnel","util","verifiable_intent"]};

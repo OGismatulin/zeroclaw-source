@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["RuntimeTraceStorageMode"],"fn":["find_event_by_id","init_from_config","load_events","record_event","record_turn_cancelled","resolve_trace_path","storage_mode_from_config"],"struct":["RuntimeTraceEvent"]};

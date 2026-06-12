@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["MultimodalError"],"fn":["contains_image_markers","count_image_markers","extract_ollama_image_payload","parse_image_markers","prepare_messages_for_provider"],"struct":["PreparedMessages"]};

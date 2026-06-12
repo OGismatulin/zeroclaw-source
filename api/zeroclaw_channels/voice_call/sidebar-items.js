@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["CallDirection","CallState","VoiceProvider"],"struct":["CallRecord","TranscriptEntry","VoiceCallChannel","VoiceCallConfig"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["MaybeSet"],"fn":["is_serial_path_allowed","truncate_with_ellipsis"]};
