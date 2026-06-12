@@ -685,6 +685,9 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
+    // fork: pre-v0.8.0 stores spell this field "provider"; the alias keeps
+    // existing volume data readable after the upstream rename (patch #12).
+    #[serde(alias = "provider")]
     model_provider: String,
     profile_name: String,
     kind: String,
@@ -940,6 +943,48 @@ mod tests {
         assert!(raw.contains("enc2:"));
         assert!(!raw.contains("refresh-123"));
         assert!(!raw.contains("access-123"));
+    }
+
+    #[tokio::test]
+    async fn loads_pre_v080_store_with_legacy_provider_field() {
+        // fork regression (patch #12): stores written before the upstream
+        // v0.8.0 `provider` → `model_provider` rename must keep loading.
+        let tmp = TempDir::new().unwrap();
+        let legacy = r#"{
+  "schema_version": 1,
+  "updated_at": "2026-05-29T16:05:01Z",
+  "active_profiles": { "openai-codex": "openai-codex:default" },
+  "profiles": {
+    "openai-codex:default": {
+      "provider": "openai-codex",
+      "profile_name": "default",
+      "kind": "oauth",
+      "access_token": "plain-access",
+      "refresh_token": "plain-refresh",
+      "expires_at": "2026-06-08T16:05:00Z",
+      "token_type": "bearer",
+      "scope": "openid offline_access",
+      "created_at": "2026-05-29T16:05:01Z",
+      "updated_at": "2026-05-29T16:05:01Z",
+      "metadata": {}
+    }
+  }
+}"#;
+        tokio::fs::write(tmp.path().join("auth-profiles.json"), legacy)
+            .await
+            .unwrap();
+
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let data = store.load().await.unwrap();
+        let loaded = data.profiles.get("openai-codex:default").unwrap();
+        assert_eq!(loaded.model_provider, "openai-codex");
+        assert_eq!(
+            loaded
+                .token_set
+                .as_ref()
+                .and_then(|t| t.refresh_token.as_deref()),
+            Some("plain-refresh")
+        );
     }
 
     #[tokio::test]
