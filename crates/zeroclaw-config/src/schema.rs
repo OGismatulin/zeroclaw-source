@@ -5144,7 +5144,13 @@ pub struct MultimodalConfig {
     /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
     /// When set, messages containing `[IMAGE:]` markers are routed to this
     /// model_provider instead of the default text model_provider.
-    #[serde(default)]
+    // fork(v0.8.0 regressions): V1/V2 (and our three-files templates) spell
+    // this key `vision_provider`; V3 renamed it without a migration mapping,
+    // which silently disabled the vision route (user images then hard-failed
+    // with ProviderCapabilityError). Accept both spellings. Do NOT introduce
+    // the new spelling into shipped configs while the alias is load-bearing —
+    // a document with BOTH keys fails to parse (serde duplicate field).
+    #[serde(default, alias = "vision_provider")]
     pub vision_model_provider: Option<String>,
     /// Model to use when routing to the vision model_provider (e.g. `"llava:7b"`).
     /// Only used when `vision_model_provider` is set.
@@ -21584,6 +21590,36 @@ requires_openai_auth = true
         assert_eq!(profile.model.as_deref(), Some("gpt-5.3-codex"));
         assert_eq!(profile.wire_api, Some(WireApi::Responses));
         assert!(profile.requires_openai_auth);
+    }
+
+    #[test]
+    async fn multimodal_legacy_vision_provider_key_aliases() {
+        // fork(v0.8.0 regressions): V1/V2 configs and our deployment templates
+        // spell the key `vision_provider`; V3 renamed it without migration
+        // mapping, silently disabling the vision route.
+        let mm: MultimodalConfig =
+            toml::from_str("vision_provider = \"openrouter\"").expect("legacy key must parse");
+        assert_eq!(mm.vision_model_provider.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    async fn v1_multimodal_vision_provider_survives_migration_to_v3() {
+        let v1 = r#"
+[multimodal]
+max_images = 4
+max_image_size_mb = 20
+vision_provider = "openrouter"
+vision_model = "google/gemini-3.1-flash-lite-preview"
+"#;
+        let config = crate::migration::migrate_to_current(v1).expect("v1 config must migrate");
+        assert_eq!(
+            config.multimodal.vision_model_provider.as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            config.multimodal.vision_model.as_deref(),
+            Some("google/gemini-3.1-flash-lite-preview")
+        );
     }
 
     #[test]
