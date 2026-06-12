@@ -14749,11 +14749,7 @@ async fn resolve_runtime_config_dirs(
             {
                 let zeroclaw_dir = expand_tilde_path(custom_config_dir);
                 let data_dir = expand_tilde_path(&custom_workspace);
-                return Ok((
-                    zeroclaw_dir,
-                    data_dir,
-                    ConfigResolutionSource::EnvConfigDir,
-                ));
+                return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvConfigDir));
             }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
             return Ok((
@@ -21739,7 +21735,8 @@ vision_model = "google/gemini-3.1-flash-lite-preview"
 
     #[test]
     async fn legacy_provider_override_rewrites_pre_v3_doc() {
-        let v1 = "default_provider = \"zai\"\ndefault_model = \"glm-5.1\"\n\n[gateway]\nport = 3001\n";
+        let v1 =
+            "default_provider = \"zai\"\ndefault_model = \"glm-5.1\"\n\n[gateway]\nport = 3001\n";
         let out = apply_legacy_provider_override_to_pre_v3_doc(
             v1,
             Some("opencode-go"),

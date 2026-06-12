@@ -312,10 +312,7 @@ mod tests {
     fn test_observability_config(dir: &Path) -> ObservabilityConfig {
         ObservabilityConfig {
             log_persistence: "rolling".to_string(),
-            log_persistence_path: dir
-                .join("trace.jsonl")
-                .to_string_lossy()
-                .into_owned(),
+            log_persistence_path: dir.join("trace.jsonl").to_string_lossy().into_owned(),
             log_persistence_max_entries: 2,
             ..ObservabilityConfig::default()
         }

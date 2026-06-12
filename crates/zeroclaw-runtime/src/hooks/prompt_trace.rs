@@ -116,8 +116,7 @@ mod tests {
 
         let path = dir.path().join("logs").join("prompt-trace.jsonl");
         let body = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
         assert_eq!(v["kind"], "input");
         assert_eq!(v["model"], "deepseek-v4-flash");
         assert_eq!(v["messages_count"], 2);
@@ -136,10 +135,8 @@ mod tests {
             reasoning_content: None,
         };
         hook.on_llm_output(&resp).await;
-        let body =
-            std::fs::read_to_string(dir.path().join("logs/prompt-trace.jsonl")).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join("logs/prompt-trace.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
         assert_eq!(v["kind"], "output");
         assert!(v.get("model").is_none());
         assert_eq!(v["response"]["text"], "hi");
@@ -161,10 +158,8 @@ mod tests {
             reasoning_content: None,
         };
         hook.on_llm_output(&resp).await;
-        let body =
-            std::fs::read_to_string(dir.path().join("logs/prompt-trace.jsonl")).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join("logs/prompt-trace.jsonl")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
         assert_eq!(v["response"]["usage"]["input_tokens"], 123);
         assert_eq!(v["response"]["usage"]["output_tokens"], 45);
         assert_eq!(v["response"]["usage"]["cached_input_tokens"], 7);

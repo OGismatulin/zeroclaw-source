@@ -1351,9 +1351,7 @@ pub fn create_resilient_model_provider_with_options(
         vec![(primary_name.to_string(), primary_model_provider)];
 
     for fallback in &reliability.fallback_providers {
-        if fallback == primary_name
-            || model_providers.iter().any(|(name, _)| name == fallback)
-        {
+        if fallback == primary_name || model_providers.iter().any(|(name, _)| name == fallback) {
             continue;
         }
 

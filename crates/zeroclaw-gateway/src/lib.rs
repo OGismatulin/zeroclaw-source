@@ -62,9 +62,9 @@ use axum::{
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use tokio::sync::Mutex as TokioMutex;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -664,7 +664,12 @@ pub async fn run_gateway(
     // targeted users, so reading it here is safe (a non-targeted daemon never
     // sees the flag set).
     let prompt_trace_enabled = std::env::var("ZEROCLAW_PROMPT_TRACE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> =
         if config.hooks.enabled || prompt_trace_enabled {
@@ -2459,15 +2464,12 @@ async fn run_gateway_webhook_agentic(
     // fork (V3 multi-agent): the webhook always runs the default runtime
     // agent — its risk/runtime profiles supply what used to live in the
     // flat [autonomy] / [agent] sections.
-    let agent_alias = resolve_gateway_chat_agent_alias(&config, None)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "webhook chat requires at least one configured [agents.<alias>] entry"
-            )
-        })?;
-    let agent = config.resolved_agent_config(&agent_alias).ok_or_else(|| {
-        anyhow::anyhow!("agents.{agent_alias} missing from config")
+    let agent_alias = resolve_gateway_chat_agent_alias(&config, None).ok_or_else(|| {
+        anyhow::anyhow!("webhook chat requires at least one configured [agents.<alias>] entry")
     })?;
+    let agent = config
+        .resolved_agent_config(&agent_alias)
+        .ok_or_else(|| anyhow::anyhow!("agents.{agent_alias} missing from config"))?;
     let risk_profile = config
         .risk_profile_for_agent(&agent_alias)
         .with_context(|| {
@@ -2476,10 +2478,9 @@ async fn run_gateway_webhook_agentic(
             )
         })?
         .clone();
-    let observer: Arc<dyn zeroclaw_runtime::observability::Observer> =
-        Arc::from(zeroclaw_runtime::observability::create_observer(
-            &config.observability,
-        ));
+    let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
+        zeroclaw_runtime::observability::create_observer(&config.observability),
+    );
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::for_agent(&config, &agent_alias)?);
@@ -2529,23 +2530,19 @@ async fn run_gateway_webhook_agentic(
 
     // ── Wire MCP tools (non-fatal) ──────────────────────────────
     let mut deferred_section = String::new();
-    let mut activated_handle: Option<
-        std::sync::Arc<std::sync::Mutex<tools::ActivatedToolSet>>,
-    > = None;
+    let mut activated_handle: Option<std::sync::Arc<std::sync::Mutex<tools::ActivatedToolSet>>> =
+        None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         match tools::McpRegistry::connect_all(&config.mcp.servers).await {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
                 if config.mcp.deferred_loading {
-                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
-                    deferred_section =
-                        tools::build_deferred_tools_section(&deferred_set);
-                    let activated_set = std::sync::Arc::new(std::sync::Mutex::new(
-                        tools::ActivatedToolSet::new(),
-                    ));
+                    let deferred_set =
+                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
+                            .await;
+                    deferred_section = tools::build_deferred_tools_section(&deferred_set);
+                    let activated_set =
+                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
                     activated_handle = Some(std::sync::Arc::clone(&activated_set));
                     tools_registry.push(Box::new(tools::ToolSearchTool::new(
                         deferred_set,
@@ -2564,8 +2561,7 @@ async fn run_gateway_webhook_agentic(
                             if let Some(ref handle) = delegate_handle {
                                 handle.write().push(std::sync::Arc::clone(&wrapper));
                             }
-                            tools_registry
-                                .push(Box::new(tools::ArcToolRef(wrapper)));
+                            tools_registry.push(Box::new(tools::ArcToolRef(wrapper)));
                         }
                     }
                 }
@@ -2577,8 +2573,7 @@ async fn run_gateway_webhook_agentic(
     }
 
     let agent_workspace = config.agent_workspace_dir(&agent_alias);
-    let skills =
-        zeroclaw_runtime::skills::load_skills_with_config(&agent_workspace, &config);
+    let skills = zeroclaw_runtime::skills::load_skills_with_config(&agent_workspace, &config);
     tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
 
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -2655,9 +2650,9 @@ async fn run_gateway_webhook_agentic(
             true,
         );
     if !native_tools {
-        system_prompt.push_str(
-            &zeroclaw_runtime::agent::loop_::build_tool_instructions(&tools_registry),
-        );
+        system_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
+            &tools_registry,
+        ));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -2722,9 +2717,9 @@ async fn run_gateway_webhook_agentic(
     // existing history may exceed the new model's context window — pre-turn
     // compaction below uses the new model's window to shrink it preemptively.
     let cross_model_switch = prior_session_id_matches
-        && prior_session.as_ref().is_some_and(|ws| {
-            ws.last_provider != provider_name || ws.last_model != model_name
-        });
+        && prior_session
+            .as_ref()
+            .is_some_and(|ws| ws.last_provider != provider_name || ws.last_model != model_name);
     let mut history = match prior_session {
         Some(mut ws) if prior_session_id_matches => {
             // Update system prompt (tools/skills/memory may have changed)
@@ -2792,12 +2787,11 @@ async fn run_gateway_webhook_agentic(
     // Policy-level tool exclusion (risk_profile.excluded_tools) already ran
     // inside all_tools_with_runtime; only per-message MCP filter groups need
     // computing here.
-    let excluded_tools =
-        zeroclaw_runtime::agent::loop_::compute_excluded_mcp_tools(
-            &tools_registry,
-            &agent.resolved.tool_filter_groups,
-            message,
-        );
+    let excluded_tools = zeroclaw_runtime::agent::loop_::compute_excluded_mcp_tools(
+        &tools_registry,
+        &agent.resolved.tool_filter_groups,
+        message,
+    );
 
     // Run tool loop (lock held — concurrent requests wait).
     // Scope the session_id into TOOL_LOOP_SESSION_KEY so sessions_current
@@ -2873,8 +2867,8 @@ async fn run_gateway_webhook_agentic(
         .get(model_name)
         .copied()
         .unwrap_or(agent.resolved.max_context_tokens);
-    let threshold = (context_window as f64
-        * agent.resolved.context_compression.threshold_ratio) as usize;
+    let threshold =
+        (context_window as f64 * agent.resolved.context_compression.threshold_ratio) as usize;
     let tokens_before_for_event =
         zeroclaw_runtime::agent::context_compressor::estimate_tokens(&history);
     let mut compressed_for_event: bool = false;
@@ -2939,10 +2933,7 @@ async fn run_gateway_webhook_agentic(
 
     // Trim history regardless of outcome — partial context after a non-cancel
     // error is still useful for the next turn's recall.
-    zeroclaw_runtime::agent::loop_::trim_history(
-        &mut history,
-        agent.resolved.max_history_messages,
-    );
+    zeroclaw_runtime::agent::loop_::trim_history(&mut history, agent.resolved.max_history_messages);
 
     // Emit after trim_history so the payload reflects the state saved below.
     // Cancelled turns are superseded by the next webhook, which will emit its
@@ -3041,10 +3032,7 @@ pub(crate) enum ModelSelection {
     /// No override — caller uses daemon default provider/model.
     Default,
     /// Validated override — caller must create the named provider with this model.
-    Override {
-        model: String,
-        provider: String,
-    },
+    Override { model: String, provider: String },
     /// `model` or `provider` present but empty/whitespace.
     InvalidEmpty,
     /// `provider` set but `model` missing → 400 missing_model.
@@ -3131,7 +3119,6 @@ impl ActiveProvider {
         }
     }
 }
-
 
 fn resolve_gateway_chat_agent_alias(
     config: &Config,
@@ -3393,11 +3380,7 @@ async fn handle_webhook(
             }
             ModelSelection::Override { model, provider } => {
                 match build_override_provider(&config_snapshot, &provider, &model) {
-                    Ok(p) => (
-                        ActiveProvider::Owned(p),
-                        provider,
-                        model,
-                    ),
+                    Ok(p) => (ActiveProvider::Owned(p), provider, model),
                     Err(e) => {
                         tracing::warn!(
                             "Webhook: failed to init override provider {provider}: {e:#}"
@@ -3435,7 +3418,10 @@ async fn handle_webhook(
                 });
                 return (StatusCode::BAD_REQUEST, Json(err));
             }
-            ModelSelection::UnknownProvider { requested, available_providers } => {
+            ModelSelection::UnknownProvider {
+                requested,
+                available_providers,
+            } => {
                 let err = serde_json::json!({
                     "error": format!("unknown provider '{requested}'"),
                     "error_code": "unknown_provider",
@@ -4861,9 +4847,7 @@ mod tests {
         unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(&cfg), 30);
 
-        unsafe {
-            std::env::set_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS", "1200")
-        };
+        unsafe { std::env::set_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS", "1200") };
         assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 1200);
         unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS") };
         assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 600);
@@ -5295,7 +5279,10 @@ mod tests {
     #[test]
     fn classify_provider_selection_unknown_provider_reports_available() {
         match classify_provider_selection(Some("kimi-k2.6"), Some("totally-fake-provider")) {
-            ModelSelection::UnknownProvider { requested, available_providers } => {
+            ModelSelection::UnknownProvider {
+                requested,
+                available_providers,
+            } => {
                 assert_eq!(requested, "totally-fake-provider");
                 // Sanity check: a few expected canonical names must be in the list.
                 assert!(available_providers.contains(&"openai-codex"));
@@ -7761,7 +7748,6 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
-
         let state = fresh_model_test_state(provider, memory, "mock-default", "mock-default-model");
 
         let response = handle_webhook(
@@ -7905,10 +7891,7 @@ mod tests {
 
         // History should contain the [turn cancelled] system marker.
         let session = state.webhook_session.lock().await;
-        let history = &session
-            .as_ref()
-            .expect("session state preserved")
-            .history;
+        let history = &session.as_ref().expect("session state preserved").history;
         assert!(
             history
                 .iter()
@@ -8001,10 +7984,7 @@ mod tests {
         // Spec §8.1, item 1: register_cancel_token must put a fresh entry
         // into state.cancel_tokens under the given session_id, and the
         // returned id must match the map's id.
-        let state = make_test_state(
-            Arc::new(MockModelProvider::default()),
-            Arc::new(MockMemory),
-        );
+        let state = make_test_state(Arc::new(MockModelProvider::default()), Arc::new(MockMemory));
 
         let (id, token) = register_cancel_token(&state, "tg_user_99999");
 
@@ -8020,17 +8000,17 @@ mod tests {
         // - return distinct ids (so CAS-removal can tell them apart);
         // - cancel the FIRST token (signals M1 to abort);
         // - leave the SECOND token live in the map.
-        let state = make_test_state(
-            Arc::new(MockModelProvider::default()),
-            Arc::new(MockMemory),
-        );
+        let state = make_test_state(Arc::new(MockModelProvider::default()), Arc::new(MockMemory));
 
         let (id1, t1) = register_cancel_token(&state, "tg_user_99999");
         assert!(!t1.is_cancelled());
 
         let (id2, t2) = register_cancel_token(&state, "tg_user_99999");
         assert_ne!(id1, id2, "ids must be distinct");
-        assert!(t1.is_cancelled(), "first token must be cancelled by replace");
+        assert!(
+            t1.is_cancelled(),
+            "first token must be cancelled by replace"
+        );
         assert!(!t2.is_cancelled(), "second token must remain live");
 
         let map = state.cancel_tokens.lock().unwrap();
@@ -8042,10 +8022,7 @@ mod tests {
     fn register_cancel_token_isolates_by_session_id() {
         // Different session_ids must NOT cancel each other's tokens —
         // M2 from session A must not abort M1 from session B.
-        let state = make_test_state(
-            Arc::new(MockModelProvider::default()),
-            Arc::new(MockMemory),
-        );
+        let state = make_test_state(Arc::new(MockModelProvider::default()), Arc::new(MockMemory));
 
         let (_, t_a) = register_cancel_token(&state, "tg_user_11111");
         let (_, t_b) = register_cancel_token(&state, "tg_user_22222");
@@ -8163,7 +8140,10 @@ mod tests {
             "session_id": session_id,
         });
         assert_eq!(body["status"], "cancelled");
-        assert!(body.get("response").is_none(), "no response field on cancel");
+        assert!(
+            body.get("response").is_none(),
+            "no response field on cancel"
+        );
         assert_eq!(body["model"], "mock-default-model");
         assert_eq!(body["provider"], "mock-default");
         assert_eq!(body["session_id"], "tg_user_99999");

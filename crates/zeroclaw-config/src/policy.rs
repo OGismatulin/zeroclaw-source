@@ -3639,9 +3639,7 @@ mod tests {
         let p = default_policy();
         // Python: -c and -m are permitted (relaxed 2026-05-06).
         assert!(p.is_command_allowed("python3 -c 'print(1)'"));
-        assert!(p.is_command_allowed(
-            "python -c '__import__(\"os\").environ.get(\"HOME\")'"
-        ));
+        assert!(p.is_command_allowed("python -c '__import__(\"os\").environ.get(\"HOME\")'"));
         assert!(p.is_command_allowed("python3 -m http.server"));
         assert!(p.is_command_allowed("python3 -m pytest"));
         assert!(p.is_command_allowed("python3 -m mypy src/"));
@@ -3837,9 +3835,7 @@ mod tests {
         assert!(p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(p.is_command_allowed("git alias.st status"));
         assert!(p.is_command_allowed("git -c core.editor=calc.exe commit"));
-        assert!(p.is_command_allowed(
-            "git -C /zeroclaw-data/code-repos/payment-microservice log"
-        ));
+        assert!(p.is_command_allowed("git -C /zeroclaw-data/code-repos/payment-microservice log"));
         // Legitimate commands continue to work.
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));

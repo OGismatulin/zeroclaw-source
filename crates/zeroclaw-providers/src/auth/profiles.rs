@@ -493,10 +493,7 @@ impl AuthProfilesStore {
         })?;
 
         fs::rename(&tmp_path, &real).await.with_context(|| {
-            format!(
-                "Failed to replace auth profile store at {}",
-                real.display()
-            )
+            format!("Failed to replace auth profile store at {}", real.display())
         })?;
 
         Ok(())
@@ -597,7 +594,10 @@ impl AuthProfilesStore {
         let path = self.refresh_lock_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create refresh lock directory at {}", parent.display())
+                format!(
+                    "Failed to create refresh lock directory at {}",
+                    parent.display()
+                )
             })?;
         }
 
@@ -846,13 +846,10 @@ mod tests {
 
         // After s1 releases (Drop closes fd → kernel releases flock), s2 acquires fast.
         drop(g);
-        let g2 = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            s2.acquire_refresh_lock(),
-        )
-        .await
-        .expect("must not time out")
-        .expect("must acquire after release");
+        let g2 = tokio::time::timeout(std::time::Duration::from_secs(2), s2.acquire_refresh_lock())
+            .await
+            .expect("must not time out")
+            .expect("must acquire after release");
         drop(g2);
     }
 

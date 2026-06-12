@@ -2848,10 +2848,14 @@ Tail"#;
         // Existing contract preserved: when there are NO tool_calls, prose
         // around <tool_result> stays (parser is lenient — see
         // parse_tool_calls_handles_empty_tool_result above).
-        let response = "I'll run that command.\n<tool_result name=\"shell\">\n\n</tool_result>\nDone.";
+        let response =
+            "I'll run that command.\n<tool_result name=\"shell\">\n\n</tool_result>\nDone.";
         let (text, calls) = parse_tool_calls(response);
         assert!(calls.is_empty());
-        assert!(text.contains("Done."), "prose must survive when no calls extracted, got: {text:?}");
+        assert!(
+            text.contains("Done."),
+            "prose must survive when no calls extracted, got: {text:?}"
+        );
     }
 
     #[test]
