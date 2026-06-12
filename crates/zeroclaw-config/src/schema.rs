@@ -14977,6 +14977,61 @@ pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// fork(v0.8.0 regressions): upstream 4a22ff29f eradicated the legacy
+/// `ZEROCLAW_PROVIDER` / `ZEROCLAW_MODEL` env overrides. Our deploy contract
+/// (fly.toml [env], docker-compose .env) pins the runtime default through
+/// them, and per-user V1 configs on disk carry stale `default_provider`
+/// values (zai-era) that must keep losing to env. Re-apply the override on
+/// the RAW pre-V3 document before migration so the value rides the stock
+/// `fold_providers_globals_into_models` path (schema/v2.rs:861) into V3 —
+/// exactly as if the config file had been written with these values.
+/// V3 documents are left untouched (V3 has no global default-provider).
+fn apply_legacy_provider_override_to_pre_v3_doc(
+    contents: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    if provider.is_none() && model.is_none() {
+        return contents.to_string();
+    }
+    let Ok(mut doc) = toml::from_str::<toml::Value>(contents) else {
+        // Unparseable file: hand the original text to the migrator so the
+        // real parse error surfaces unchanged.
+        return contents.to_string();
+    };
+    if crate::migration::detect_version(&doc)
+        .map(|v| v >= crate::migration::CURRENT_SCHEMA_VERSION)
+        .unwrap_or(false)
+    {
+        // V3 has no global default-provider concept; the shim deliberately
+        // no-ops. Loud WARN so operators see why the legacy env contract
+        // stopped applying if a config ever gets migrated on disk (risk §6.7).
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "legacy ZEROCLAW_PROVIDER/ZEROCLAW_MODEL env overrides are ignored for V3 configs; \
+             pin the model on the agent/model-provider entry instead"
+        );
+        return contents.to_string();
+    }
+    let Some(table) = doc.as_table_mut() else {
+        return contents.to_string();
+    };
+    if let Some(p) = provider {
+        table.insert(
+            "default_provider".to_string(),
+            toml::Value::String(p.to_string()),
+        );
+    }
+    if let Some(m) = model {
+        table.insert(
+            "default_model".to_string(),
+            toml::Value::String(m.to_string()),
+        );
+    }
+    toml::to_string(&doc).unwrap_or_else(|_| contents.to_string())
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -15260,6 +15315,23 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
+
+            // fork(v0.8.0 regressions): re-apply the eradicated legacy env
+            // overrides on the raw pre-V3 document so they ride the stock
+            // migration fold (see apply_legacy_provider_override_to_pre_v3_doc).
+            let env_provider = std::env::var("ZEROCLAW_PROVIDER")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let env_model = std::env::var("ZEROCLAW_MODEL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let contents = apply_legacy_provider_override_to_pre_v3_doc(
+                &contents,
+                env_provider.as_deref(),
+                env_model.as_deref(),
+            );
 
             // Deserialize the config with the standard TOML parser.
             //
@@ -21619,6 +21691,90 @@ vision_model = "google/gemini-3.1-flash-lite-preview"
         assert_eq!(
             config.multimodal.vision_model.as_deref(),
             Some("google/gemini-3.1-flash-lite-preview")
+        );
+    }
+
+    #[test]
+    async fn legacy_provider_override_rewrites_pre_v3_doc() {
+        let v1 = "default_provider = \"zai\"\ndefault_model = \"glm-5.1\"\n\n[gateway]\nport = 3001\n";
+        let out = apply_legacy_provider_override_to_pre_v3_doc(
+            v1,
+            Some("opencode-go"),
+            Some("deepseek-v4-flash"),
+        );
+        let doc: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            doc.get("default_provider").and_then(toml::Value::as_str),
+            Some("opencode-go")
+        );
+        assert_eq!(
+            doc.get("default_model").and_then(toml::Value::as_str),
+            Some("deepseek-v4-flash")
+        );
+        // untouched sections survive the round-trip
+        assert_eq!(
+            doc.get("gateway")
+                .and_then(|g| g.get("port"))
+                .and_then(toml::Value::as_integer),
+            Some(3001)
+        );
+    }
+
+    #[test]
+    async fn legacy_provider_override_noop_without_env() {
+        let v1 = "default_provider = \"zai\"\n";
+        assert_eq!(
+            apply_legacy_provider_override_to_pre_v3_doc(v1, None, None),
+            v1
+        );
+    }
+
+    #[test]
+    async fn legacy_provider_override_skips_v3_docs() {
+        let v3 = "schema_version = 3\n";
+        assert_eq!(
+            apply_legacy_provider_override_to_pre_v3_doc(v3, Some("opencode-go"), None),
+            v3
+        );
+    }
+
+    #[test]
+    async fn legacy_provider_override_passes_unparseable_through() {
+        let broken = "this is not toml [";
+        assert_eq!(
+            apply_legacy_provider_override_to_pre_v3_doc(broken, Some("opencode-go"), None),
+            broken
+        );
+    }
+
+    #[test]
+    async fn legacy_provider_override_rides_v1_migration_into_v3() {
+        let v1 = "default_provider = \"zai\"\ndefault_model = \"glm-5.1\"\n";
+        let overridden = apply_legacy_provider_override_to_pre_v3_doc(
+            v1,
+            Some("opencode-go"),
+            Some("deepseek-v4-flash"),
+        );
+        let config = crate::migration::migrate_to_current(&overridden).expect("must migrate");
+        // "opencode-go" migrates into the "opencode" family with alias "go"
+        // (NOT "default") + fork uri pin zen/go/v1 — schema/v2.rs:625-640.
+        assert!(
+            config
+                .providers
+                .models
+                .contains_model_provider_type("opencode"),
+            "env-overridden provider must land in its typed slot"
+        );
+        let profile = config
+            .providers
+            .models
+            .find("opencode", "go")
+            .expect("opencode.go entry");
+        assert_eq!(profile.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            profile.uri.as_deref(),
+            Some("https://opencode.ai/zen/go/v1"),
+            "fork endpoint pin must ride along"
         );
     }
 
