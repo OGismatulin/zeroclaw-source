@@ -423,9 +423,10 @@ impl ReliableModelProvider {
         self
     }
 
-    /// Test-only hook: install per-model failover chains. Production builds
-    /// never call this — the schema has no surface for it.
-    #[cfg(test)]
+    /// Install per-model failover chains. Fork: production surface — the
+    /// fork's V3 `ReliabilityConfig` keeps `model_fallbacks` (see
+    /// docs/architecture/reliability.md), so the factory wires the 16-model
+    /// production map through here. Upstream had demoted this to test-only.
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
         self

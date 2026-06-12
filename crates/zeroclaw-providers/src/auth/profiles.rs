@@ -615,7 +615,18 @@ impl AuthProfilesStore {
                 // contention surfaces as EAGAIN here.
                 Err((_, nix::errno::Errno::EAGAIN)) => {
                     if waited >= REFRESH_LOCK_TIMEOUT_MS {
-                        tracing::warn!(path = %path.display(), "Timed out waiting for auth refresh lock");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "path": path.display().to_string()
+                            })),
+                            "Timed out waiting for auth refresh lock"
+                        );
                         anyhow::bail!(
                             "Timed out waiting for auth refresh lock at {}",
                             path.display()

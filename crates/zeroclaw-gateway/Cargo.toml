@@ -13,6 +13,9 @@ zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
+# fork: kept v0.7.5-era webhook/trace code still uses tracing::* macros
+# directly; zeroclaw-log's layer captures them, so behavior is unchanged.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-channels = { workspace = true, default-features = false, features = ["channel-acp-server"] }

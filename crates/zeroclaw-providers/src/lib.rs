@@ -1381,8 +1381,11 @@ pub fn create_resilient_model_provider_with_options(
         ) {
             Ok(provider) => model_providers.push((fallback.clone(), provider)),
             Err(_error) => {
-                tracing::warn!(
-                    fallback_provider = fallback,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"fallback_provider": fallback})),
                     "Ignoring invalid fallback provider during initialization"
                 );
             }
