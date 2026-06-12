@@ -22,10 +22,11 @@ use crate::layer::LogCaptureLayer;
 ///   as: `recording_override` (the `--log-level` flag) if `Some`,
 ///   else `RUST_LOG` from the environment, else `default_filter`.
 ///
-/// * **Terminal display** — the stderr fmt layer. Gated entirely by
-///   `verbose`: when `false` the fmt layer is muted (no log lines ever
-///   reach the terminal; direct `println!`/stdout is untouched). When
-///   `true` it surfaces events down to the same recording floor.
+/// * **Terminal display** — the stderr fmt layer. Gated by `verbose`:
+///   when `false` only WARN+ log lines reach the terminal (fork:
+///   ZEROCLAW_STDERR_FLOOR overrides the floor; direct `println!`/stdout
+///   is untouched). When `true` it surfaces events down to the same
+///   recording floor.
 ///
 /// All filter strings are `RUST_LOG`-compatible directives (e.g.
 /// `"info"` or `"debug,matrix_sdk=warn"`).
@@ -50,9 +51,9 @@ pub fn install_global_subscriber(
 
     // The fmt (terminal) layer carries its own filter so display can be
     // muted without touching what the capture layer records. When
-    // verbose is off, an OFF filter discards every event before it
-    // formats — stdout (println!) is unaffected because it never routes
-    // through tracing.
+    // verbose is off, a WARN floor (fork; ZEROCLAW_STDERR_FLOOR overrides)
+    // discards lower-severity events before they format — stdout (println!)
+    // is unaffected because it never routes through tracing.
     let fmt_filter = if verbose {
         match recording_override {
             Some(flag) => EnvFilter::new(flag),
@@ -61,7 +62,15 @@ pub fn install_global_subscriber(
             }
         }
     } else {
-        EnvFilter::new("off")
+        // fork(v0.8.0 regressions): upstream mutes the fmt layer entirely when
+        // not --verbose, leaving daemon stderr (our only prod channel for
+        // panics and provider WARN/ERRORs -- the manager redirects fd2 to
+        // daemon-stderr.log) permanently silent. Float WARN+ by default;
+        // ZEROCLAW_STDERR_FLOOR re-mutes ("off") or widens ("info"). The
+        // uppercase tail keeps the var invisible to the lowercase-only
+        // env-override grammar walker (env_overrides.rs:63-68).
+        let floor = std::env::var("ZEROCLAW_STDERR_FLOOR").unwrap_or_else(|_| "warn".to_string());
+        EnvFilter::try_new(&floor).unwrap_or_else(|_| EnvFilter::new("warn"))
     };
 
     let fmt_layer = fmt::layer()
