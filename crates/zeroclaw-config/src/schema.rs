@@ -15032,6 +15032,37 @@ fn apply_legacy_provider_override_to_pre_v3_doc(
     toml::to_string(&doc).unwrap_or_else(|_| contents.to_string())
 }
 
+/// fork(v0.8.0 regressions): resolve the `model_provider` ref the synthesized
+/// `default` agent should use to honor the env-pinned default provider/model
+/// (`ZEROCLAW_PROVIDER` / `ZEROCLAW_MODEL`).
+///
+/// `apply_legacy_provider_override_to_pre_v3_doc` writes the env provider/model
+/// onto the raw pre-V3 `default_provider`/`default_model`; the migration's
+/// `fold_providers_globals_into_models` then folds them into a single
+/// `providers.models.<family>.<alias>` entry using
+/// `normalize_provider_type(provider, "default")` (e.g. `opencode-go` →
+/// `opencode.go` with `model = deepseek-v4-flash`). The synthesized default
+/// agent must point at THAT entry. Without this it falls back to
+/// `iter_entries().next()` — the first populated typed slot in macro order,
+/// which for our per-user configs is an arbitrary SUBAGENT provider
+/// (`zai.agent_analyst_glm`), NOT the env default. We mirror the fold's
+/// `normalize_provider_type(.., "default")` call so the `(family, alias)` pair
+/// matches the folded entry, and only return the ref once we confirm the entry
+/// actually exists in `providers.models`.
+fn env_default_model_provider_ref(config: &Config) -> Option<String> {
+    let provider = std::env::var("ZEROCLAW_PROVIDER")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+    let (family, alias, _extras) = crate::schema::v2::normalize_provider_type(&provider, "default");
+    config
+        .providers
+        .models
+        .iter_entries()
+        .find(|(f, a, _)| *f == family.as_str() && *a == alias.as_str())
+        .map(|(f, a, _)| format!("{f}.{a}"))
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -15460,12 +15491,23 @@ impl Config {
             if !config.agents.contains_key("default")
                 && config.risk_profiles.contains_key("default")
             {
-                let model_provider = config
-                    .providers
-                    .models
-                    .iter_entries()
-                    .next()
-                    .map(|(family, alias, _)| format!("{family}.{alias}"))
+                // fork(v0.8.0 regressions): prefer the env-pinned default
+                // provider's folded entry (ZEROCLAW_PROVIDER/ZEROCLAW_MODEL via
+                // apply_legacy_provider_override_to_pre_v3_doc +
+                // fold_providers_globals_into_models). Only fall back to the
+                // first model-provider entry when no env default is set — that
+                // fallback would otherwise pick an arbitrary SUBAGENT provider
+                // (e.g. zai.agent_analyst_glm), breaking v378 env-default parity
+                // (see env_default_model_provider_ref docs).
+                let model_provider = env_default_model_provider_ref(&config)
+                    .or_else(|| {
+                        config
+                            .providers
+                            .models
+                            .iter_entries()
+                            .next()
+                            .map(|(family, alias, _)| format!("{family}.{alias}"))
+                    })
                     .unwrap_or_default();
                 config.agents.insert(
                     "default".to_string(),
@@ -21776,6 +21818,56 @@ vision_model = "google/gemini-3.1-flash-lite-preview"
             Some("https://opencode.ai/zen/go/v1"),
             "fork endpoint pin must ride along"
         );
+    }
+
+    #[test]
+    async fn env_default_provider_ref_prefers_env_over_first_slot() {
+        // fork(v0.8.0 regressions): the synthesized `default` agent must answer
+        // webhook turns with the env-pinned default provider — not the
+        // alphabetically/macro-order-first SUBAGENT slot. zai (slot pos 189)
+        // precedes opencode (pos 250), so iter_entries().next() picks zai; the
+        // env-aware resolver must override that to the folded opencode.go entry.
+        let _guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.zai.insert(
+            "agent_analyst_glm".to_string(),
+            ZaiModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("glm-5.1".to_string()),
+                    ..Default::default()
+                },
+                endpoint: Default::default(),
+            },
+        );
+        config.providers.models.opencode.insert(
+            "go".to_string(),
+            OpencodeModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("deepseek-v4-flash".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        // Sanity: the un-fixed pick (first populated slot) would be zai.
+        assert_eq!(
+            config
+                .providers
+                .models
+                .iter_entries()
+                .next()
+                .map(|(f, a, _)| format!("{f}.{a}")),
+            Some("zai.agent_analyst_glm".to_string()),
+            "guard precondition: first slot is the subagent provider"
+        );
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "opencode-go") };
+        assert_eq!(
+            env_default_model_provider_ref(&config),
+            Some("opencode.go".to_string()),
+            "env default provider must win over the first populated slot"
+        );
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // env unset -> None so the caller falls back to iter_entries().next().
+        assert_eq!(env_default_model_provider_ref(&config), None);
     }
 
     #[test]

@@ -555,7 +555,11 @@ fn dot_delivery_channel(job: &mut toml::Table) {
 ///
 /// The alias spellings here mirror the V2 registry's match arms in
 /// `crates/zeroclaw-providers/src/lib.rs` (`is_<vendor>_alias` functions).
-fn normalize_provider_type(
+// fork(v0.8.0 regressions): exposed to schema::load_or_init so the synthesized
+// `default` agent can resolve the same (family, alias) the global-default fold
+// (fold_providers_globals_into_models) used for ZEROCLAW_PROVIDER — keeping the
+// env-pinned default provider as the webhook default (v378 parity).
+pub(crate) fn normalize_provider_type(
     raw: &str,
     incoming_alias: &str,
 ) -> (String, String, Vec<(&'static str, toml::Value)>) {
