@@ -15,12 +15,12 @@ flowchart TB
     subgraph Edges["Edge crates — talk to the outside"]
         CH["zeroclaw-channels<br/>30+ messaging integrations"]
         GW["zeroclaw-gateway<br/>REST · WebSocket · dashboard"]
-        PR["zeroclaw-providers<br/>LLM clients · fallback · routing"]
+        PR["zeroclaw-providers<br/>LLM clients · retry · routing"]
         TL["zeroclaw-tools<br/>browser · HTTP · PDF · hardware"]
     end
 
     subgraph Core["Core"]
-        RT["zeroclaw-runtime<br/>agent loop · security · SOP · cron · onboarding"]
+        RT["zeroclaw-runtime<br/>agent loop · security · SOP · cron · subagents"]
         MEM["zeroclaw-memory<br/>SQLite · embeddings · consolidation"]
         CFG["zeroclaw-config<br/>schema · autonomy · secrets"]
     end
@@ -41,10 +41,10 @@ flowchart TB
 
 | Crate | Role |
 |---|---|
-| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, onboarding wizard, TUI |
+| `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
-| `zeroclaw-api` | Public traits — `Provider`, `Channel`, `Tool`. The kernel ABI |
-| `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the router and fallback wrapper |
+| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`. The kernel ABI |
+| `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
 | `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
@@ -52,12 +52,14 @@ flowchart TB
 | `zeroclaw-memory` | Conversation memory, embeddings, vector retrieval |
 | `zeroclaw-plugins` | Dynamic plugin loading |
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
-| `zeroclaw-infra` | Tracing, metrics, structured logging |
+| `zeroclaw-infra` | Process-level support: SQLite session backend, debouncers, stall watchdog |
+| `zeroclaw-log` | The single log-emission surface: JSONL schema, attribution, `record!`/`scope!` macros, `/api/logs` reader, `Observer` bridge |
+| `zeroclaw-spawn` | Sanctioned `tokio::spawn` wrapper (`spawn!` macro) that propagates attribution |
 | `zeroclaw-macros` | Derive macros for config, tool registration |
-| `zeroclaw-tui` | Terminal UI |
+| `zerocode` | Terminal UI |
 | `aardvark-sys`, `robot-kit` | Specialised hardware support |
 
-The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further — the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.
+The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further: the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.
 
 ## Request lifecycle (short)
 
@@ -90,15 +92,15 @@ Full detail: [Request lifecycle](./request-lifecycle.md).
 
 Three trait-based extension points live in `zeroclaw-api`:
 
-- **`Provider`** — implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
-- **`Channel`** — implement for a new messaging platform. Inbound and outbound are separate hooks.
-- **`Tool`** — implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks.
+- **`Tool`**: implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
 
 All three are registered at startup via factory functions; the kernel doesn't know the concrete types. Compile-time feature flags decide which implementations ship in a given binary.
 
 ## Where to read next
 
-- [Crates](./crates.md) — per-crate deep dive
-- [Request lifecycle](./request-lifecycle.md) — streaming, tool calls, approvals
+- [Crates](./crates.md): per-crate deep dive
+- [Request lifecycle](./request-lifecycle.md): streaming, tool calls, approvals
 - [Model Providers → Overview](../providers/overview.md)
 - [Security → Overview](../security/overview.md)

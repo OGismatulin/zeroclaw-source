@@ -31,30 +31,34 @@ COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
 COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
 COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
 COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
-COPY crates/zeroclaw-tui/Cargo.toml crates/zeroclaw-tui/Cargo.toml
+COPY crates/zeroclaw-log/Cargo.toml crates/zeroclaw-log/Cargo.toml
+COPY crates/zeroclaw-spawn/Cargo.toml crates/zeroclaw-spawn/Cargo.toml
 COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
 COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
 COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
 COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
 COPY crates/zeroclaw-macros/Cargo.toml crates/zeroclaw-macros/Cargo.toml
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
 COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create stub source files for all crates so cargo can resolve the workspace
-RUN mkdir -p src/bin benches apps/tauri/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
     && echo "fn main() {}" > xtask/src/bin/fluent.rs \
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && for crate_dir in \
          robot-kit aardvark-sys zeroclaw-api zeroclaw-infra zeroclaw-config \
+         zeroclaw-log zeroclaw-spawn \
          zeroclaw-providers zeroclaw-memory zeroclaw-channels zeroclaw-tools \
-         zeroclaw-runtime zeroclaw-tui zeroclaw-plugins zeroclaw-gateway \
+         zeroclaw-runtime zeroclaw-plugins zeroclaw-gateway \
          zeroclaw-hardware zeroclaw-tool-call-parser; do \
        mkdir -p "crates/$crate_dir/src" && \
        echo "pub fn placeholder() {}" > "crates/$crate_dir/src/lib.rs"; \

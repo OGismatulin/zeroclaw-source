@@ -2,7 +2,7 @@
 //!
 //! Recovered verbatim from the pre-#5951 onboarding wizard's
 //! `scaffold_workspace()` (commit `0c622e607^:crates/zeroclaw-runtime/src/onboard/wizard.rs`).
-//! The wizard rewrite (#5960) shipped without a workspace-scaffolder, so
+//! The wizard rewrite shipped without a workspace-scaffolder, so
 //! these templates were dormant in git history. They are restored here
 //! for the dashboard's Personality onboarding step (#6175 follow-up) and
 //! exposed via `GET /api/personality/templates`.
@@ -139,6 +139,20 @@ mod tests {
         assert!(
             !rendered.iter().any(|(n, _)| *n == "MEMORY.md"),
             "MEMORY.md should be skipped when include_memory = false"
+        );
+    }
+
+    #[test]
+    fn including_memory_renders_memory_md() {
+        let ctx = TemplateContext {
+            include_memory: true,
+            ..TemplateContext::default()
+        };
+        let rendered = render_preset_default(&ctx);
+
+        assert!(
+            rendered.iter().any(|(n, _)| *n == "MEMORY.md"),
+            "MEMORY.md should be available for full per-agent template renders"
         );
     }
 

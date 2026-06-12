@@ -1,25 +1,118 @@
-use anyhow::Result;
-use chrono::{Local, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! Compatibility shim for the doctor command's log-reading utilities, plus
+//! the fork's legacy positional-arg `record_event` emission surface.
+//!
+//! Upstream retired `record_event` in favor of direct `zeroclaw_log::record!`
+//! invocations with the new ECS-flavored `LogEvent` schema. This fork keeps
+//! the legacy emitter alongside the new shim because external consumers parse
+//! the legacy JSONL shape (`event_type` / `timestamp` / `payload`) from
+//! `runtime-trace.jsonl`:
+//!
+//! - `scripts/gateway_manager.py` ProgressNotifier watchdog reads our
+//!   `context_state` events (`tokens_before`, `context_window`, `percent`,
+//!   `passes`, `session_id`),
+//! - the nightly-retrospective skill's `extract_day.py`,
+//! - the prompt-trace tooling.
+//!
+//! New-format lines written by `zeroclaw_log` and legacy lines written here
+//! coexist in the same file: the `zeroclaw_log` reader skips lines that fail
+//! `LogEvent` parse, rolling rotation on both sides is line-count based, and
+//! `migrate_legacy_jsonl_in_place` only fires when the FIRST line of the file
+//! is legacy-shaped (one-shot conversion of pre-merge history).
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
+
+use chrono::{Local, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
-use zeroclaw_config::schema::ObservabilityConfig;
+use zeroclaw_log::LogEvent;
 
-const DEFAULT_TRACE_REL_PATH: &str = "state/runtime-trace.jsonl";
+pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
-/// Runtime trace storage policy.
+fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
+    zeroclaw_log::LogConfig {
+        log_persistence: config.log_persistence.clone(),
+        log_persistence_path: config.log_persistence_path.clone(),
+        log_persistence_max_entries: config.log_persistence_max_entries,
+        log_tool_io: config.log_tool_io.clone(),
+        log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
+        log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+    }
+}
+
+/// Initialize log persistence from the observability config.
+///
+/// Fork: also installs the legacy trace logger so `record_event` /
+/// `record_turn_cancelled` keep appending legacy-shape lines to the same
+/// JSONL file.
+pub fn init_from_config(
+    config: &zeroclaw_config::schema::ObservabilityConfig,
+    workspace_dir: &Path,
+) {
+    zeroclaw_log::init_from_config(&to_log_config(config), workspace_dir);
+
+    let mode = LegacyStorageMode::from_raw(&config.log_persistence);
+    let path = resolve_trace_path(config, workspace_dir);
+    let logger = match mode {
+        LegacyStorageMode::None => None,
+        _ => Some(Arc::new(LegacyTraceLogger::new(
+            mode,
+            config.log_persistence_max_entries,
+            path,
+        ))),
+    };
+    let mut guard = TRACE_LOGGER.write().unwrap_or_else(|e| e.into_inner());
+    *guard = logger;
+}
+
+/// Resolve the configured log path (used by the doctor command).
+pub fn resolve_trace_path(
+    config: &zeroclaw_config::schema::ObservabilityConfig,
+    workspace_dir: &Path,
+) -> std::path::PathBuf {
+    let policy = zeroclaw_log::ResolvedPolicy::from_config(&to_log_config(config), workspace_dir);
+    policy.path
+}
+
+/// Load a page of events. Replaces the old `load_events` shape with a
+/// thin wrapper around the new paginated reader. The legacy
+/// `event_filter` (single action match) and `contains` (substring) args
+/// map straight onto the new [`LogFilter`] fields.
+pub fn load_events(
+    path: &Path,
+    limit: usize,
+    event_filter: Option<&str>,
+    contains: Option<&str>,
+) -> anyhow::Result<Vec<LogEvent>> {
+    let filter = LogFilter {
+        action: event_filter.map(str::to_string),
+        q: contains.map(str::to_string),
+        ..LogFilter::default()
+    };
+    let page = zeroclaw_log::load_page(path, &filter, limit)?;
+    Ok(page.events)
+}
+
+/// Lookup a single event by id.
+pub fn find_event_by_id(path: &Path, id: &str) -> anyhow::Result<Option<LogEvent>> {
+    zeroclaw_log::find_event_by_id(path, id)
+}
+
+// ---------------------------------------------------------------------------
+// Fork: legacy trace emitter (see module docs).
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTraceStorageMode {
+enum LegacyStorageMode {
     None,
     Rolling,
     Full,
 }
 
-impl RuntimeTraceStorageMode {
+impl LegacyStorageMode {
     fn from_raw(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "rolling" => Self::Rolling,
@@ -29,9 +122,11 @@ impl RuntimeTraceStorageMode {
     }
 }
 
-/// Structured runtime trace event for tool-call and model-reply diagnostics.
+/// Legacy-shape trace event. Field set and serialization MUST stay
+/// byte-compatible with the pre-v0.8.0 `RuntimeTraceEvent`: external Python
+/// consumers parse these exact keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeTraceEvent {
+struct LegacyTraceEvent {
     pub id: String,
     pub timestamp: String,
     pub event_type: String,
@@ -51,15 +146,15 @@ pub struct RuntimeTraceEvent {
     pub payload: Value,
 }
 
-struct RuntimeTraceLogger {
-    mode: RuntimeTraceStorageMode,
+struct LegacyTraceLogger {
+    mode: LegacyStorageMode,
     max_entries: usize,
     path: PathBuf,
     write_lock: std::sync::Mutex<()>,
 }
 
-impl RuntimeTraceLogger {
-    fn new(mode: RuntimeTraceStorageMode, max_entries: usize, path: PathBuf) -> Self {
+impl LegacyTraceLogger {
+    fn new(mode: LegacyStorageMode, max_entries: usize, path: PathBuf) -> Self {
         Self {
             mode,
             max_entries: max_entries.max(1),
@@ -68,8 +163,8 @@ impl RuntimeTraceLogger {
         }
     }
 
-    fn append(&self, event: &RuntimeTraceEvent) -> Result<()> {
-        if self.mode == RuntimeTraceStorageMode::None {
+    fn append(&self, event: &LegacyTraceEvent) -> anyhow::Result<()> {
+        if self.mode == LegacyStorageMode::None {
             return Ok(());
         }
 
@@ -99,14 +194,14 @@ impl RuntimeTraceLogger {
             let _ = fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
         }
 
-        if self.mode == RuntimeTraceStorageMode::Rolling {
+        if self.mode == LegacyStorageMode::Rolling {
             self.trim_to_last_entries()?;
         }
 
         Ok(())
     }
 
-    fn trim_to_last_entries(&self) -> Result<()> {
+    fn trim_to_last_entries(&self) -> anyhow::Result<()> {
         let raw = fs::read_to_string(&self.path).unwrap_or_default();
         let lines: Vec<&str> = raw
             .lines()
@@ -141,58 +236,10 @@ impl RuntimeTraceLogger {
     }
 }
 
-static TRACE_LOGGER: LazyLock<RwLock<Option<Arc<RuntimeTraceLogger>>>> =
+static TRACE_LOGGER: LazyLock<RwLock<Option<Arc<LegacyTraceLogger>>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Resolve runtime trace storage mode from config.
-pub fn storage_mode_from_config(config: &ObservabilityConfig) -> RuntimeTraceStorageMode {
-    let mode = RuntimeTraceStorageMode::from_raw(&config.runtime_trace_mode);
-    if mode == RuntimeTraceStorageMode::None
-        && !config.runtime_trace_mode.trim().is_empty()
-        && !config.runtime_trace_mode.eq_ignore_ascii_case("none")
-    {
-        tracing::warn!(
-            mode = %config.runtime_trace_mode,
-            "Unknown observability.runtime_trace_mode; falling back to none"
-        );
-    }
-    mode
-}
-
-/// Resolve runtime trace path from config.
-pub fn resolve_trace_path(config: &ObservabilityConfig, workspace_dir: &Path) -> PathBuf {
-    let raw = config.runtime_trace_path.trim();
-    let fallback = workspace_dir.join(DEFAULT_TRACE_REL_PATH);
-    if raw.is_empty() {
-        return fallback;
-    }
-
-    let configured = PathBuf::from(raw);
-    if configured.is_absolute() {
-        configured
-    } else {
-        workspace_dir.join(configured)
-    }
-}
-
-/// Initialize (or disable) runtime trace logging.
-pub fn init_from_config(config: &ObservabilityConfig, workspace_dir: &Path) {
-    let mode = storage_mode_from_config(config);
-    let logger = if mode == RuntimeTraceStorageMode::None {
-        None
-    } else {
-        Some(Arc::new(RuntimeTraceLogger::new(
-            mode,
-            config.runtime_trace_max_entries.max(1),
-            resolve_trace_path(config, workspace_dir),
-        )))
-    };
-
-    let mut guard = TRACE_LOGGER.write().unwrap_or_else(|e| e.into_inner());
-    *guard = logger;
-}
-
-/// Record a runtime trace event.
+/// Record a runtime trace event in the legacy JSONL shape.
 pub fn record_event(
     event_type: &str,
     channel: Option<&str>,
@@ -211,7 +258,7 @@ pub fn record_event(
         return;
     };
 
-    let event = RuntimeTraceEvent {
+    let event = LegacyTraceEvent {
         id: Uuid::new_v4().to_string(),
         timestamp: Local::now().to_rfc3339(),
         event_type: event_type.to_string(),
@@ -227,90 +274,6 @@ pub fn record_event(
     if let Err(err) = logger.append(&event) {
         tracing::warn!("Failed to write runtime trace event: {err}");
     }
-}
-
-/// Load recent runtime trace events from storage.
-pub fn load_events(
-    path: &Path,
-    limit: usize,
-    event_filter: Option<&str>,
-    contains: Option<&str>,
-) -> Result<Vec<RuntimeTraceEvent>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let raw = fs::read_to_string(path)?;
-    let mut events = Vec::new();
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<RuntimeTraceEvent>(trimmed) {
-            Ok(event) => events.push(event),
-            Err(err) => tracing::warn!("Skipping malformed runtime trace line: {err}"),
-        }
-    }
-
-    if let Some(filter) = event_filter.map(str::trim).filter(|f| !f.is_empty()) {
-        let normalized = filter.to_ascii_lowercase();
-        events.retain(|event| event.event_type.to_ascii_lowercase() == normalized);
-    }
-
-    if let Some(needle) = contains.map(str::trim).filter(|s| !s.is_empty()) {
-        let needle = needle.to_ascii_lowercase();
-        events.retain(|event| {
-            let mut haystack = format!(
-                "{} {} {}",
-                event.event_type,
-                event.message.as_deref().unwrap_or_default(),
-                event.payload
-            );
-            if let Some(channel) = &event.channel {
-                haystack.push_str(channel);
-            }
-            if let Some(provider) = &event.provider {
-                haystack.push_str(provider);
-            }
-            if let Some(model) = &event.model {
-                haystack.push_str(model);
-            }
-            haystack.to_ascii_lowercase().contains(&needle)
-        });
-    }
-
-    if events.len() > limit {
-        let keep_from = events.len() - limit;
-        events = events.split_off(keep_from);
-    }
-
-    events.reverse();
-    Ok(events)
-}
-
-/// Find a runtime trace event by id.
-pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<RuntimeTraceEvent>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw = fs::read_to_string(path)?;
-    for line in raw.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<RuntimeTraceEvent>(trimmed)
-            && event.id == id
-        {
-            return Ok(Some(event));
-        }
-    }
-
-    Ok(None)
 }
 
 /// Record a "turn cancelled" trace event from the gateway webhook path.
@@ -344,100 +307,51 @@ pub fn record_turn_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::ObservabilityConfig;
 
-    fn test_observability_config() -> ObservabilityConfig {
+    fn test_observability_config(dir: &Path) -> ObservabilityConfig {
         ObservabilityConfig {
-            backend: "none".to_string(),
-            otel_endpoint: None,
-            otel_service_name: None,
-            otel_headers: None,
-            runtime_trace_mode: "rolling".to_string(),
-            runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
-            runtime_trace_max_entries: 3,
+            log_persistence: "rolling".to_string(),
+            log_persistence_path: dir
+                .join("trace.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            log_persistence_max_entries: 2,
+            ..ObservabilityConfig::default()
         }
     }
 
     #[test]
-    fn resolve_trace_path_relative_joins_workspace() {
-        let cfg = test_observability_config();
-        let workspace = tempfile::tempdir().unwrap();
-        let path = resolve_trace_path(&cfg, workspace.path());
-        assert_eq!(path, workspace.path().join("state/runtime-trace.jsonl"));
-    }
-
-    #[test]
-    fn storage_mode_parses_known_values() {
-        let mut cfg = test_observability_config();
-        cfg.runtime_trace_mode = "none".into();
-        assert_eq!(
-            storage_mode_from_config(&cfg),
-            RuntimeTraceStorageMode::None
-        );
-
-        cfg.runtime_trace_mode = "rolling".into();
-        assert_eq!(
-            storage_mode_from_config(&cfg),
-            RuntimeTraceStorageMode::Rolling
-        );
-
-        cfg.runtime_trace_mode = "full".into();
-        assert_eq!(
-            storage_mode_from_config(&cfg),
-            RuntimeTraceStorageMode::Full
-        );
-    }
-
-    #[test]
-    fn rolling_mode_keeps_latest_entries() {
+    fn legacy_record_event_writes_legacy_shape_and_rolls() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("trace.jsonl");
-        let logger = RuntimeTraceLogger::new(RuntimeTraceStorageMode::Rolling, 2, path.clone());
+        let cfg = test_observability_config(tmp.path());
+        init_from_config(&cfg, tmp.path());
 
-        for i in 0..5 {
-            let event = RuntimeTraceEvent {
-                id: format!("id-{i}"),
-                timestamp: Utc::now().to_rfc3339(),
-                event_type: "test".into(),
-                channel: None,
-                provider: None,
-                model: None,
-                turn_id: None,
-                success: None,
-                message: Some(format!("event-{i}")),
-                payload: serde_json::json!({ "i": i }),
-            };
-            logger.append(&event).unwrap();
+        for i in 0..4 {
+            record_event(
+                "context_state",
+                Some("webhook"),
+                Some("opencode-go"),
+                Some("deepseek-v4-flash"),
+                None,
+                Some(true),
+                None,
+                serde_json::json!({ "i": i, "tokens_before": 100 + i }),
+            );
         }
 
-        let events = load_events(&path, 10, None, None).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].message.as_deref(), Some("event-4"));
-        assert_eq!(events[1].message.as_deref(), Some("event-3"));
-    }
+        let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "rolling mode keeps last max_entries lines");
 
-    #[test]
-    fn find_event_by_id_returns_match() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("trace.jsonl");
-        let logger = RuntimeTraceLogger::new(RuntimeTraceStorageMode::Full, 100, path.clone());
-
-        let target_id = "target-event";
-        let event = RuntimeTraceEvent {
-            id: target_id.into(),
-            timestamp: Utc::now().to_rfc3339(),
-            event_type: "tool_call_result".into(),
-            channel: Some("telegram".into()),
-            provider: Some("openrouter".into()),
-            model: Some("x".into()),
-            turn_id: Some("turn-1".into()),
-            success: Some(false),
-            message: Some("boom".into()),
-            payload: serde_json::json!({ "error": "boom" }),
-        };
-        logger.append(&event).unwrap();
-
-        let found = find_event_by_id(&path, target_id).unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().id, target_id);
+        let last: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(last["event_type"], "context_state");
+        assert_eq!(last["channel"], "webhook");
+        assert_eq!(last["payload"]["tokens_before"], 103);
+        assert!(last["timestamp"].is_string(), "legacy key is `timestamp`");
+        assert!(
+            last.get("@timestamp").is_none(),
+            "must NOT be the new LogEvent shape"
+        );
     }
 }
