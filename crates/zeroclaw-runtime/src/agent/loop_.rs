@@ -5580,6 +5580,8 @@ pub async fn process_message(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     None, // channel: process_message path has no channel ref
+                    None, // cancellation_token: process_message has no cancel surface
+                    None, // hooks: gateway injects its own HookRunner; none here
                 ),
             )
             .await

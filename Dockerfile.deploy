@@ -81,6 +81,8 @@ COPY tools/ tools/
 COPY xtask/ xtask/
 COPY firmware/ firmware/
 COPY web/ web/
+# v0.8.0: i18n bundle include_str! from the workspace root
+COPY locales.toml locales.toml
 
 # .dockerignore intentionally excludes apps/tauri/src/ (desktop-only sources
 # we don't need for the gateway image), but cargo's workspace resolution

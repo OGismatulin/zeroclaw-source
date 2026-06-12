@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use zeroclaw_api::provider::{ChatMessage, ChatResponse};
+use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 
 use super::traits::HookHandler;
 
