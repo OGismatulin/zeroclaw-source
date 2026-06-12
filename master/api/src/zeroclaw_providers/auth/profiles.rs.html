@@ -495,111 +495,111 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" d
 <a href=#493 id=493 data-nosnippet>493</a>        })<span class="question-mark">?</span>;
 <a href=#494 id=494 data-nosnippet>494</a>
 <a href=#495 id=495 data-nosnippet>495</a>        fs::rename(<span class="kw-2">&amp;</span>tmp_path, <span class="kw-2">&amp;</span>real).<span class="kw">await</span>.with_context(|| {
-<a href=#496 id=496 data-nosnippet>496</a>            <span class="macro">format!</span>(
-<a href=#497 id=497 data-nosnippet>497</a>                <span class="string">"Failed to replace auth profile store at {}"</span>,
-<a href=#498 id=498 data-nosnippet>498</a>                real.display()
-<a href=#499 id=499 data-nosnippet>499</a>            )
-<a href=#500 id=500 data-nosnippet>500</a>        })<span class="question-mark">?</span>;
+<a href=#496 id=496 data-nosnippet>496</a>            <span class="macro">format!</span>(<span class="string">"Failed to replace auth profile store at {}"</span>, real.display())
+<a href=#497 id=497 data-nosnippet>497</a>        })<span class="question-mark">?</span>;
+<a href=#498 id=498 data-nosnippet>498</a>
+<a href=#499 id=499 data-nosnippet>499</a>        <span class="prelude-val">Ok</span>(())
+<a href=#500 id=500 data-nosnippet>500</a>    }
 <a href=#501 id=501 data-nosnippet>501</a>
-<a href=#502 id=502 data-nosnippet>502</a>        <span class="prelude-val">Ok</span>(())
-<a href=#503 id=503 data-nosnippet>503</a>    }
-<a href=#504 id=504 data-nosnippet>504</a>
-<a href=#505 id=505 data-nosnippet>505</a>    <span class="kw">fn </span>encrypt_optional(<span class="kw-2">&amp;</span><span class="self">self</span>, value: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;String&gt;&gt; {
-<a href=#506 id=506 data-nosnippet>506</a>        <span class="kw">match </span>value {
-<a href=#507 id=507 data-nosnippet>507</a>            <span class="prelude-val">Some</span>(value) <span class="kw">if </span>!value.is_empty() =&gt; <span class="self">self</span>.secret_store.encrypt(value).map(<span class="prelude-val">Some</span>),
-<a href=#508 id=508 data-nosnippet>508</a>            <span class="prelude-val">Some</span>(<span class="kw">_</span>) | <span class="prelude-val">None </span>=&gt; <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>),
-<a href=#509 id=509 data-nosnippet>509</a>        }
-<a href=#510 id=510 data-nosnippet>510</a>    }
-<a href=#511 id=511 data-nosnippet>511</a>
-<a href=#512 id=512 data-nosnippet>512</a>    <span class="kw">fn </span>decrypt_optional(<span class="kw-2">&amp;</span><span class="self">self</span>, value: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;(<span class="prelude-ty">Option</span>&lt;String&gt;, <span class="prelude-ty">Option</span>&lt;String&gt;)&gt; {
-<a href=#513 id=513 data-nosnippet>513</a>        <span class="kw">match </span>value {
-<a href=#514 id=514 data-nosnippet>514</a>            <span class="prelude-val">Some</span>(value) <span class="kw">if </span>!value.is_empty() =&gt; {
-<a href=#515 id=515 data-nosnippet>515</a>                <span class="kw">let </span>(plaintext, migrated) = <span class="self">self</span>.secret_store.decrypt_and_migrate(value)<span class="question-mark">?</span>;
-<a href=#516 id=516 data-nosnippet>516</a>                <span class="prelude-val">Ok</span>((<span class="prelude-val">Some</span>(plaintext), migrated))
-<a href=#517 id=517 data-nosnippet>517</a>            }
-<a href=#518 id=518 data-nosnippet>518</a>            <span class="prelude-val">Some</span>(<span class="kw">_</span>) | <span class="prelude-val">None </span>=&gt; <span class="prelude-val">Ok</span>((<span class="prelude-val">None</span>, <span class="prelude-val">None</span>)),
-<a href=#519 id=519 data-nosnippet>519</a>        }
-<a href=#520 id=520 data-nosnippet>520</a>    }
-<a href=#521 id=521 data-nosnippet>521</a>
-<a href=#522 id=522 data-nosnippet>522</a>    <span class="kw">async fn </span>acquire_lock(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;AuthProfileLockGuard&gt; {
-<a href=#523 id=523 data-nosnippet>523</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = <span class="self">self</span>.lock_path.parent() {
-<a href=#524 id=524 data-nosnippet>524</a>            fs::create_dir_all(parent).<span class="kw">await</span>.with_context(|| {
-<a href=#525 id=525 data-nosnippet>525</a>                <span class="macro">format!</span>(
-<a href=#526 id=526 data-nosnippet>526</a>                    <span class="string">"Failed to create lock directory at {}"</span>,
-<a href=#527 id=527 data-nosnippet>527</a>                    parent.display().to_string()
-<a href=#528 id=528 data-nosnippet>528</a>                )
-<a href=#529 id=529 data-nosnippet>529</a>            })<span class="question-mark">?</span>;
-<a href=#530 id=530 data-nosnippet>530</a>        }
-<a href=#531 id=531 data-nosnippet>531</a>
-<a href=#532 id=532 data-nosnippet>532</a>        <span class="kw">let </span><span class="kw-2">mut </span>waited = <span class="number">0_u64</span>;
-<a href=#533 id=533 data-nosnippet>533</a>        <span class="kw">loop </span>{
-<a href=#534 id=534 data-nosnippet>534</a>            <span class="kw">match </span>OpenOptions::new()
-<a href=#535 id=535 data-nosnippet>535</a>                .create_new(<span class="bool-val">true</span>)
-<a href=#536 id=536 data-nosnippet>536</a>                .write(<span class="bool-val">true</span>)
-<a href=#537 id=537 data-nosnippet>537</a>                .open(<span class="kw-2">&amp;</span><span class="self">self</span>.lock_path)
-<a href=#538 id=538 data-nosnippet>538</a>                .<span class="kw">await
-<a href=#539 id=539 data-nosnippet>539</a>            </span>{
-<a href=#540 id=540 data-nosnippet>540</a>                <span class="prelude-val">Ok</span>(<span class="kw-2">mut </span>file) =&gt; {
-<a href=#541 id=541 data-nosnippet>541</a>                    <span class="kw">let </span><span class="kw-2">mut </span>buffer = Vec::new();
-<a href=#542 id=542 data-nosnippet>542</a>                    <span class="macro">writeln!</span>(<span class="kw-2">&amp;mut </span>buffer, <span class="string">"pid={}"</span>, std::process::id())<span class="question-mark">?</span>;
-<a href=#543 id=543 data-nosnippet>543</a>                    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = file.write_all(<span class="kw-2">&amp;</span>buffer).<span class="kw">await </span>{
-<a href=#544 id=544 data-nosnippet>544</a>                        fs::remove_file(<span class="kw-2">&amp;</span><span class="self">self</span>.lock_path)
-<a href=#545 id=545 data-nosnippet>545</a>                            .<span class="kw">await
-<a href=#546 id=546 data-nosnippet>546</a>                            </span>.inspect(|e| {
-<a href=#547 id=547 data-nosnippet>547</a>                                <span class="macro">::zeroclaw_log::record!</span>(
-<a href=#548 id=548 data-nosnippet>548</a>                                    ERROR,
-<a href=#549 id=549 data-nosnippet>549</a>                                    ::zeroclaw_log::Event::new(
-<a href=#550 id=550 data-nosnippet>550</a>                                        <span class="macro">module_path!</span>(),
-<a href=#551 id=551 data-nosnippet>551</a>                                        ::zeroclaw_log::Action::Fail
-<a href=#552 id=552 data-nosnippet>552</a>                                    )
-<a href=#553 id=553 data-nosnippet>553</a>                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-<a href=#554 id=554 data-nosnippet>554</a>                                    .with_attrs(<span class="macro">::serde_json::json!</span>({<span class="string">"e"</span>: <span class="macro">format!</span>(<span class="string">"{:?}"</span>, e)})),
-<a href=#555 id=555 data-nosnippet>555</a>                                    <span class="string">"Failed to remove auth profile lock file: "
-<a href=#556 id=556 data-nosnippet>556</a>                                </span>);
-<a href=#557 id=557 data-nosnippet>557</a>                            })
-<a href=#558 id=558 data-nosnippet>558</a>                            .ok();
-<a href=#559 id=559 data-nosnippet>559</a>                        <span class="kw">return </span><span class="prelude-val">Err</span>(e).with_context(|| {
-<a href=#560 id=560 data-nosnippet>560</a>                            <span class="macro">format!</span>(
-<a href=#561 id=561 data-nosnippet>561</a>                                <span class="string">"Failed to write auth profile lock at {}"</span>,
-<a href=#562 id=562 data-nosnippet>562</a>                                <span class="self">self</span>.lock_path.display()
-<a href=#563 id=563 data-nosnippet>563</a>                            )
-<a href=#564 id=564 data-nosnippet>564</a>                        });
-<a href=#565 id=565 data-nosnippet>565</a>                    }
-<a href=#566 id=566 data-nosnippet>566</a>                    <span class="kw">return </span><span class="prelude-val">Ok</span>(AuthProfileLockGuard {
-<a href=#567 id=567 data-nosnippet>567</a>                        lock_path: <span class="self">self</span>.lock_path.clone(),
-<a href=#568 id=568 data-nosnippet>568</a>                    });
-<a href=#569 id=569 data-nosnippet>569</a>                }
-<a href=#570 id=570 data-nosnippet>570</a>                <span class="prelude-val">Err</span>(e) <span class="kw">if </span>e.kind() == std::io::ErrorKind::AlreadyExists =&gt; {
-<a href=#571 id=571 data-nosnippet>571</a>                    <span class="kw">if </span>waited &gt;= LOCK_TIMEOUT_MS {
-<a href=#572 id=572 data-nosnippet>572</a>                        <span class="macro">anyhow::bail!</span>(
-<a href=#573 id=573 data-nosnippet>573</a>                            <span class="string">"Timed out waiting for auth profile lock at {}"</span>,
-<a href=#574 id=574 data-nosnippet>574</a>                            <span class="self">self</span>.lock_path.display()
-<a href=#575 id=575 data-nosnippet>575</a>                        );
-<a href=#576 id=576 data-nosnippet>576</a>                    }
-<a href=#577 id=577 data-nosnippet>577</a>                    sleep(Duration::from_millis(LOCK_WAIT_MS)).<span class="kw">await</span>;
-<a href=#578 id=578 data-nosnippet>578</a>                    waited = waited.saturating_add(LOCK_WAIT_MS);
-<a href=#579 id=579 data-nosnippet>579</a>                }
-<a href=#580 id=580 data-nosnippet>580</a>                <span class="prelude-val">Err</span>(e) =&gt; {
-<a href=#581 id=581 data-nosnippet>581</a>                    <span class="kw">return </span><span class="prelude-val">Err</span>(e).with_context(|| {
-<a href=#582 id=582 data-nosnippet>582</a>                        <span class="macro">format!</span>(
-<a href=#583 id=583 data-nosnippet>583</a>                            <span class="string">"Failed to create auth profile lock at {}"</span>,
-<a href=#584 id=584 data-nosnippet>584</a>                            <span class="self">self</span>.lock_path.display()
-<a href=#585 id=585 data-nosnippet>585</a>                        )
-<a href=#586 id=586 data-nosnippet>586</a>                    });
-<a href=#587 id=587 data-nosnippet>587</a>                }
-<a href=#588 id=588 data-nosnippet>588</a>            }
-<a href=#589 id=589 data-nosnippet>589</a>        }
-<a href=#590 id=590 data-nosnippet>590</a>    }
-<a href=#591 id=591 data-nosnippet>591</a>
-<a href=#592 id=592 data-nosnippet>592</a>    <span class="doccomment">/// Cross-process exclusive lock around the token-refresh critical section.
-<a href=#593 id=593 data-nosnippet>593</a>    /// Uses flock(2): the kernel releases it on fd close / process death, so a
-<a href=#594 id=594 data-nosnippet>594</a>    /// daemon killed mid-refresh (SIGKILL/OOM/deploy) cannot brick auth with a
-<a href=#595 id=595 data-nosnippet>595</a>    /// stale lock file (unlike the O_EXCL `acquire_lock` above).
-<a href=#596 id=596 data-nosnippet>596</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>acquire_refresh_lock(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;RefreshLockGuard&gt; {
-<a href=#597 id=597 data-nosnippet>597</a>        <span class="kw">let </span>path = <span class="self">self</span>.refresh_lock_path();
-<a href=#598 id=598 data-nosnippet>598</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = path.parent() {
-<a href=#599 id=599 data-nosnippet>599</a>            fs::create_dir_all(parent).<span class="kw">await</span>.with_context(|| {
-<a href=#600 id=600 data-nosnippet>600</a>                <span class="macro">format!</span>(<span class="string">"Failed to create refresh lock directory at {}"</span>, parent.display())
+<a href=#502 id=502 data-nosnippet>502</a>    <span class="kw">fn </span>encrypt_optional(<span class="kw-2">&amp;</span><span class="self">self</span>, value: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="prelude-ty">Option</span>&lt;String&gt;&gt; {
+<a href=#503 id=503 data-nosnippet>503</a>        <span class="kw">match </span>value {
+<a href=#504 id=504 data-nosnippet>504</a>            <span class="prelude-val">Some</span>(value) <span class="kw">if </span>!value.is_empty() =&gt; <span class="self">self</span>.secret_store.encrypt(value).map(<span class="prelude-val">Some</span>),
+<a href=#505 id=505 data-nosnippet>505</a>            <span class="prelude-val">Some</span>(<span class="kw">_</span>) | <span class="prelude-val">None </span>=&gt; <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>),
+<a href=#506 id=506 data-nosnippet>506</a>        }
+<a href=#507 id=507 data-nosnippet>507</a>    }
+<a href=#508 id=508 data-nosnippet>508</a>
+<a href=#509 id=509 data-nosnippet>509</a>    <span class="kw">fn </span>decrypt_optional(<span class="kw-2">&amp;</span><span class="self">self</span>, value: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;(<span class="prelude-ty">Option</span>&lt;String&gt;, <span class="prelude-ty">Option</span>&lt;String&gt;)&gt; {
+<a href=#510 id=510 data-nosnippet>510</a>        <span class="kw">match </span>value {
+<a href=#511 id=511 data-nosnippet>511</a>            <span class="prelude-val">Some</span>(value) <span class="kw">if </span>!value.is_empty() =&gt; {
+<a href=#512 id=512 data-nosnippet>512</a>                <span class="kw">let </span>(plaintext, migrated) = <span class="self">self</span>.secret_store.decrypt_and_migrate(value)<span class="question-mark">?</span>;
+<a href=#513 id=513 data-nosnippet>513</a>                <span class="prelude-val">Ok</span>((<span class="prelude-val">Some</span>(plaintext), migrated))
+<a href=#514 id=514 data-nosnippet>514</a>            }
+<a href=#515 id=515 data-nosnippet>515</a>            <span class="prelude-val">Some</span>(<span class="kw">_</span>) | <span class="prelude-val">None </span>=&gt; <span class="prelude-val">Ok</span>((<span class="prelude-val">None</span>, <span class="prelude-val">None</span>)),
+<a href=#516 id=516 data-nosnippet>516</a>        }
+<a href=#517 id=517 data-nosnippet>517</a>    }
+<a href=#518 id=518 data-nosnippet>518</a>
+<a href=#519 id=519 data-nosnippet>519</a>    <span class="kw">async fn </span>acquire_lock(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;AuthProfileLockGuard&gt; {
+<a href=#520 id=520 data-nosnippet>520</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = <span class="self">self</span>.lock_path.parent() {
+<a href=#521 id=521 data-nosnippet>521</a>            fs::create_dir_all(parent).<span class="kw">await</span>.with_context(|| {
+<a href=#522 id=522 data-nosnippet>522</a>                <span class="macro">format!</span>(
+<a href=#523 id=523 data-nosnippet>523</a>                    <span class="string">"Failed to create lock directory at {}"</span>,
+<a href=#524 id=524 data-nosnippet>524</a>                    parent.display().to_string()
+<a href=#525 id=525 data-nosnippet>525</a>                )
+<a href=#526 id=526 data-nosnippet>526</a>            })<span class="question-mark">?</span>;
+<a href=#527 id=527 data-nosnippet>527</a>        }
+<a href=#528 id=528 data-nosnippet>528</a>
+<a href=#529 id=529 data-nosnippet>529</a>        <span class="kw">let </span><span class="kw-2">mut </span>waited = <span class="number">0_u64</span>;
+<a href=#530 id=530 data-nosnippet>530</a>        <span class="kw">loop </span>{
+<a href=#531 id=531 data-nosnippet>531</a>            <span class="kw">match </span>OpenOptions::new()
+<a href=#532 id=532 data-nosnippet>532</a>                .create_new(<span class="bool-val">true</span>)
+<a href=#533 id=533 data-nosnippet>533</a>                .write(<span class="bool-val">true</span>)
+<a href=#534 id=534 data-nosnippet>534</a>                .open(<span class="kw-2">&amp;</span><span class="self">self</span>.lock_path)
+<a href=#535 id=535 data-nosnippet>535</a>                .<span class="kw">await
+<a href=#536 id=536 data-nosnippet>536</a>            </span>{
+<a href=#537 id=537 data-nosnippet>537</a>                <span class="prelude-val">Ok</span>(<span class="kw-2">mut </span>file) =&gt; {
+<a href=#538 id=538 data-nosnippet>538</a>                    <span class="kw">let </span><span class="kw-2">mut </span>buffer = Vec::new();
+<a href=#539 id=539 data-nosnippet>539</a>                    <span class="macro">writeln!</span>(<span class="kw-2">&amp;mut </span>buffer, <span class="string">"pid={}"</span>, std::process::id())<span class="question-mark">?</span>;
+<a href=#540 id=540 data-nosnippet>540</a>                    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = file.write_all(<span class="kw-2">&amp;</span>buffer).<span class="kw">await </span>{
+<a href=#541 id=541 data-nosnippet>541</a>                        fs::remove_file(<span class="kw-2">&amp;</span><span class="self">self</span>.lock_path)
+<a href=#542 id=542 data-nosnippet>542</a>                            .<span class="kw">await
+<a href=#543 id=543 data-nosnippet>543</a>                            </span>.inspect(|e| {
+<a href=#544 id=544 data-nosnippet>544</a>                                <span class="macro">::zeroclaw_log::record!</span>(
+<a href=#545 id=545 data-nosnippet>545</a>                                    ERROR,
+<a href=#546 id=546 data-nosnippet>546</a>                                    ::zeroclaw_log::Event::new(
+<a href=#547 id=547 data-nosnippet>547</a>                                        <span class="macro">module_path!</span>(),
+<a href=#548 id=548 data-nosnippet>548</a>                                        ::zeroclaw_log::Action::Fail
+<a href=#549 id=549 data-nosnippet>549</a>                                    )
+<a href=#550 id=550 data-nosnippet>550</a>                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+<a href=#551 id=551 data-nosnippet>551</a>                                    .with_attrs(<span class="macro">::serde_json::json!</span>({<span class="string">"e"</span>: <span class="macro">format!</span>(<span class="string">"{:?}"</span>, e)})),
+<a href=#552 id=552 data-nosnippet>552</a>                                    <span class="string">"Failed to remove auth profile lock file: "
+<a href=#553 id=553 data-nosnippet>553</a>                                </span>);
+<a href=#554 id=554 data-nosnippet>554</a>                            })
+<a href=#555 id=555 data-nosnippet>555</a>                            .ok();
+<a href=#556 id=556 data-nosnippet>556</a>                        <span class="kw">return </span><span class="prelude-val">Err</span>(e).with_context(|| {
+<a href=#557 id=557 data-nosnippet>557</a>                            <span class="macro">format!</span>(
+<a href=#558 id=558 data-nosnippet>558</a>                                <span class="string">"Failed to write auth profile lock at {}"</span>,
+<a href=#559 id=559 data-nosnippet>559</a>                                <span class="self">self</span>.lock_path.display()
+<a href=#560 id=560 data-nosnippet>560</a>                            )
+<a href=#561 id=561 data-nosnippet>561</a>                        });
+<a href=#562 id=562 data-nosnippet>562</a>                    }
+<a href=#563 id=563 data-nosnippet>563</a>                    <span class="kw">return </span><span class="prelude-val">Ok</span>(AuthProfileLockGuard {
+<a href=#564 id=564 data-nosnippet>564</a>                        lock_path: <span class="self">self</span>.lock_path.clone(),
+<a href=#565 id=565 data-nosnippet>565</a>                    });
+<a href=#566 id=566 data-nosnippet>566</a>                }
+<a href=#567 id=567 data-nosnippet>567</a>                <span class="prelude-val">Err</span>(e) <span class="kw">if </span>e.kind() == std::io::ErrorKind::AlreadyExists =&gt; {
+<a href=#568 id=568 data-nosnippet>568</a>                    <span class="kw">if </span>waited &gt;= LOCK_TIMEOUT_MS {
+<a href=#569 id=569 data-nosnippet>569</a>                        <span class="macro">anyhow::bail!</span>(
+<a href=#570 id=570 data-nosnippet>570</a>                            <span class="string">"Timed out waiting for auth profile lock at {}"</span>,
+<a href=#571 id=571 data-nosnippet>571</a>                            <span class="self">self</span>.lock_path.display()
+<a href=#572 id=572 data-nosnippet>572</a>                        );
+<a href=#573 id=573 data-nosnippet>573</a>                    }
+<a href=#574 id=574 data-nosnippet>574</a>                    sleep(Duration::from_millis(LOCK_WAIT_MS)).<span class="kw">await</span>;
+<a href=#575 id=575 data-nosnippet>575</a>                    waited = waited.saturating_add(LOCK_WAIT_MS);
+<a href=#576 id=576 data-nosnippet>576</a>                }
+<a href=#577 id=577 data-nosnippet>577</a>                <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#578 id=578 data-nosnippet>578</a>                    <span class="kw">return </span><span class="prelude-val">Err</span>(e).with_context(|| {
+<a href=#579 id=579 data-nosnippet>579</a>                        <span class="macro">format!</span>(
+<a href=#580 id=580 data-nosnippet>580</a>                            <span class="string">"Failed to create auth profile lock at {}"</span>,
+<a href=#581 id=581 data-nosnippet>581</a>                            <span class="self">self</span>.lock_path.display()
+<a href=#582 id=582 data-nosnippet>582</a>                        )
+<a href=#583 id=583 data-nosnippet>583</a>                    });
+<a href=#584 id=584 data-nosnippet>584</a>                }
+<a href=#585 id=585 data-nosnippet>585</a>            }
+<a href=#586 id=586 data-nosnippet>586</a>        }
+<a href=#587 id=587 data-nosnippet>587</a>    }
+<a href=#588 id=588 data-nosnippet>588</a>
+<a href=#589 id=589 data-nosnippet>589</a>    <span class="doccomment">/// Cross-process exclusive lock around the token-refresh critical section.
+<a href=#590 id=590 data-nosnippet>590</a>    /// Uses flock(2): the kernel releases it on fd close / process death, so a
+<a href=#591 id=591 data-nosnippet>591</a>    /// daemon killed mid-refresh (SIGKILL/OOM/deploy) cannot brick auth with a
+<a href=#592 id=592 data-nosnippet>592</a>    /// stale lock file (unlike the O_EXCL `acquire_lock` above).
+<a href=#593 id=593 data-nosnippet>593</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>acquire_refresh_lock(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Result</span>&lt;RefreshLockGuard&gt; {
+<a href=#594 id=594 data-nosnippet>594</a>        <span class="kw">let </span>path = <span class="self">self</span>.refresh_lock_path();
+<a href=#595 id=595 data-nosnippet>595</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(parent) = path.parent() {
+<a href=#596 id=596 data-nosnippet>596</a>            fs::create_dir_all(parent).<span class="kw">await</span>.with_context(|| {
+<a href=#597 id=597 data-nosnippet>597</a>                <span class="macro">format!</span>(
+<a href=#598 id=598 data-nosnippet>598</a>                    <span class="string">"Failed to create refresh lock directory at {}"</span>,
+<a href=#599 id=599 data-nosnippet>599</a>                    parent.display()
+<a href=#600 id=600 data-nosnippet>600</a>                )
 <a href=#601 id=601 data-nosnippet>601</a>            })<span class="question-mark">?</span>;
 <a href=#602 id=602 data-nosnippet>602</a>        }
 <a href=#603 id=603 data-nosnippet>603</a>
@@ -848,118 +848,115 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" d
 <a href=#846 id=846 data-nosnippet>846</a>
 <a href=#847 id=847 data-nosnippet>847</a>        <span class="comment">// After s1 releases (Drop closes fd → kernel releases flock), s2 acquires fast.
 <a href=#848 id=848 data-nosnippet>848</a>        </span>drop(g);
-<a href=#849 id=849 data-nosnippet>849</a>        <span class="kw">let </span>g2 = tokio::time::timeout(
-<a href=#850 id=850 data-nosnippet>850</a>            std::time::Duration::from_secs(<span class="number">2</span>),
-<a href=#851 id=851 data-nosnippet>851</a>            s2.acquire_refresh_lock(),
-<a href=#852 id=852 data-nosnippet>852</a>        )
-<a href=#853 id=853 data-nosnippet>853</a>        .<span class="kw">await
-<a href=#854 id=854 data-nosnippet>854</a>        </span>.expect(<span class="string">"must not time out"</span>)
-<a href=#855 id=855 data-nosnippet>855</a>        .expect(<span class="string">"must acquire after release"</span>);
-<a href=#856 id=856 data-nosnippet>856</a>        drop(g2);
-<a href=#857 id=857 data-nosnippet>857</a>    }
-<a href=#858 id=858 data-nosnippet>858</a>
-<a href=#859 id=859 data-nosnippet>859</a>    <span class="attr">#[cfg(unix)]
-<a href=#860 id=860 data-nosnippet>860</a>    #[tokio::test]
-<a href=#861 id=861 data-nosnippet>861</a>    </span><span class="kw">async fn </span>upsert_through_symlink_preserves_link_and_updates_shared() {
-<a href=#862 id=862 data-nosnippet>862</a>        <span class="kw">let </span>shared = tempfile::tempdir().unwrap();
-<a href=#863 id=863 data-nosnippet>863</a>        <span class="kw">let </span>user = tempfile::tempdir().unwrap();
-<a href=#864 id=864 data-nosnippet>864</a>        <span class="kw">let </span>shared_file = shared.path().join(<span class="string">"auth-profiles.json"</span>);
-<a href=#865 id=865 data-nosnippet>865</a>        std::fs::write(<span class="kw-2">&amp;</span>shared_file, <span class="string">b"{\"schema_version\":1,\"profiles\":{}}"</span>).unwrap();
-<a href=#866 id=866 data-nosnippet>866</a>        std::os::unix::fs::symlink(<span class="kw-2">&amp;</span>shared_file, user.path().join(<span class="string">"auth-profiles.json"</span>)).unwrap();
-<a href=#867 id=867 data-nosnippet>867</a>
-<a href=#868 id=868 data-nosnippet>868</a>        <span class="kw">let </span>store = AuthProfilesStore::new(user.path(), <span class="bool-val">false</span>);
-<a href=#869 id=869 data-nosnippet>869</a>        <span class="kw">let </span>profile = AuthProfile::new_token(<span class="string">"openai-codex"</span>, <span class="string">"default"</span>, <span class="string">"tok123"</span>.into());
-<a href=#870 id=870 data-nosnippet>870</a>        store.upsert_profile(profile, <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
-<a href=#871 id=871 data-nosnippet>871</a>
-<a href=#872 id=872 data-nosnippet>872</a>        <span class="comment">// per-user path STILL a symlink
-<a href=#873 id=873 data-nosnippet>873</a>        </span><span class="macro">assert!</span>(
-<a href=#874 id=874 data-nosnippet>874</a>            std::fs::symlink_metadata(user.path().join(<span class="string">"auth-profiles.json"</span>))
-<a href=#875 id=875 data-nosnippet>875</a>                .unwrap()
-<a href=#876 id=876 data-nosnippet>876</a>                .file_type()
-<a href=#877 id=877 data-nosnippet>877</a>                .is_symlink()
-<a href=#878 id=878 data-nosnippet>878</a>        );
-<a href=#879 id=879 data-nosnippet>879</a>        <span class="comment">// shared file actually updated (contains the profile)
-<a href=#880 id=880 data-nosnippet>880</a>        </span><span class="kw">let </span>body = std::fs::read_to_string(<span class="kw-2">&amp;</span>shared_file).unwrap();
-<a href=#881 id=881 data-nosnippet>881</a>        <span class="macro">assert!</span>(body.contains(<span class="string">"openai-codex"</span>));
-<a href=#882 id=882 data-nosnippet>882</a>    }
-<a href=#883 id=883 data-nosnippet>883</a>
-<a href=#884 id=884 data-nosnippet>884</a>    <span class="attr">#[test]
-<a href=#885 id=885 data-nosnippet>885</a>    </span><span class="kw">fn </span>profile_id_format() {
-<a href=#886 id=886 data-nosnippet>886</a>        <span class="macro">assert_eq!</span>(
-<a href=#887 id=887 data-nosnippet>887</a>            profile_id(<span class="string">"openai-codex"</span>, <span class="string">"default"</span>),
-<a href=#888 id=888 data-nosnippet>888</a>            <span class="string">"openai-codex:default"
-<a href=#889 id=889 data-nosnippet>889</a>        </span>);
-<a href=#890 id=890 data-nosnippet>890</a>    }
-<a href=#891 id=891 data-nosnippet>891</a>
-<a href=#892 id=892 data-nosnippet>892</a>    <span class="attr">#[test]
-<a href=#893 id=893 data-nosnippet>893</a>    </span><span class="kw">fn </span>token_expiry_math() {
-<a href=#894 id=894 data-nosnippet>894</a>        <span class="kw">let </span>token_set = TokenSet {
-<a href=#895 id=895 data-nosnippet>895</a>            access_token: <span class="string">"token"</span>.into(),
-<a href=#896 id=896 data-nosnippet>896</a>            refresh_token: <span class="prelude-val">Some</span>(<span class="string">"refresh"</span>.into()),
-<a href=#897 id=897 data-nosnippet>897</a>            id_token: <span class="prelude-val">None</span>,
-<a href=#898 id=898 data-nosnippet>898</a>            expires_at: <span class="prelude-val">Some</span>(Utc::now() + chrono::Duration::seconds(<span class="number">10</span>)),
-<a href=#899 id=899 data-nosnippet>899</a>            token_type: <span class="prelude-val">Some</span>(<span class="string">"Bearer"</span>.into()),
-<a href=#900 id=900 data-nosnippet>900</a>            scope: <span class="prelude-val">None</span>,
-<a href=#901 id=901 data-nosnippet>901</a>        };
-<a href=#902 id=902 data-nosnippet>902</a>
-<a href=#903 id=903 data-nosnippet>903</a>        <span class="macro">assert!</span>(token_set.is_expiring_within(Duration::from_secs(<span class="number">15</span>)));
-<a href=#904 id=904 data-nosnippet>904</a>        <span class="macro">assert!</span>(!token_set.is_expiring_within(Duration::from_secs(<span class="number">1</span>)));
-<a href=#905 id=905 data-nosnippet>905</a>    }
-<a href=#906 id=906 data-nosnippet>906</a>
-<a href=#907 id=907 data-nosnippet>907</a>    <span class="attr">#[tokio::test]
-<a href=#908 id=908 data-nosnippet>908</a>    </span><span class="kw">async fn </span>store_roundtrip_with_encryption() {
-<a href=#909 id=909 data-nosnippet>909</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
-<a href=#910 id=910 data-nosnippet>910</a>        <span class="kw">let </span>store = AuthProfilesStore::new(tmp.path(), <span class="bool-val">true</span>);
-<a href=#911 id=911 data-nosnippet>911</a>
-<a href=#912 id=912 data-nosnippet>912</a>        <span class="kw">let </span><span class="kw-2">mut </span>profile = AuthProfile::new_oauth(
-<a href=#913 id=913 data-nosnippet>913</a>            <span class="string">"openai-codex"</span>,
-<a href=#914 id=914 data-nosnippet>914</a>            <span class="string">"default"</span>,
-<a href=#915 id=915 data-nosnippet>915</a>            TokenSet {
-<a href=#916 id=916 data-nosnippet>916</a>                access_token: <span class="string">"access-123"</span>.into(),
-<a href=#917 id=917 data-nosnippet>917</a>                refresh_token: <span class="prelude-val">Some</span>(<span class="string">"refresh-123"</span>.into()),
-<a href=#918 id=918 data-nosnippet>918</a>                id_token: <span class="prelude-val">None</span>,
-<a href=#919 id=919 data-nosnippet>919</a>                expires_at: <span class="prelude-val">Some</span>(Utc::now() + chrono::Duration::hours(<span class="number">1</span>)),
-<a href=#920 id=920 data-nosnippet>920</a>                token_type: <span class="prelude-val">Some</span>(<span class="string">"Bearer"</span>.into()),
-<a href=#921 id=921 data-nosnippet>921</a>                scope: <span class="prelude-val">Some</span>(<span class="string">"openid offline_access"</span>.into()),
-<a href=#922 id=922 data-nosnippet>922</a>            },
-<a href=#923 id=923 data-nosnippet>923</a>        );
-<a href=#924 id=924 data-nosnippet>924</a>        profile.account_id = <span class="prelude-val">Some</span>(<span class="string">"acct_123"</span>.into());
-<a href=#925 id=925 data-nosnippet>925</a>
-<a href=#926 id=926 data-nosnippet>926</a>        store.upsert_profile(profile.clone(), <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
+<a href=#849 id=849 data-nosnippet>849</a>        <span class="kw">let </span>g2 = tokio::time::timeout(std::time::Duration::from_secs(<span class="number">2</span>), s2.acquire_refresh_lock())
+<a href=#850 id=850 data-nosnippet>850</a>            .<span class="kw">await
+<a href=#851 id=851 data-nosnippet>851</a>            </span>.expect(<span class="string">"must not time out"</span>)
+<a href=#852 id=852 data-nosnippet>852</a>            .expect(<span class="string">"must acquire after release"</span>);
+<a href=#853 id=853 data-nosnippet>853</a>        drop(g2);
+<a href=#854 id=854 data-nosnippet>854</a>    }
+<a href=#855 id=855 data-nosnippet>855</a>
+<a href=#856 id=856 data-nosnippet>856</a>    <span class="attr">#[cfg(unix)]
+<a href=#857 id=857 data-nosnippet>857</a>    #[tokio::test]
+<a href=#858 id=858 data-nosnippet>858</a>    </span><span class="kw">async fn </span>upsert_through_symlink_preserves_link_and_updates_shared() {
+<a href=#859 id=859 data-nosnippet>859</a>        <span class="kw">let </span>shared = tempfile::tempdir().unwrap();
+<a href=#860 id=860 data-nosnippet>860</a>        <span class="kw">let </span>user = tempfile::tempdir().unwrap();
+<a href=#861 id=861 data-nosnippet>861</a>        <span class="kw">let </span>shared_file = shared.path().join(<span class="string">"auth-profiles.json"</span>);
+<a href=#862 id=862 data-nosnippet>862</a>        std::fs::write(<span class="kw-2">&amp;</span>shared_file, <span class="string">b"{\"schema_version\":1,\"profiles\":{}}"</span>).unwrap();
+<a href=#863 id=863 data-nosnippet>863</a>        std::os::unix::fs::symlink(<span class="kw-2">&amp;</span>shared_file, user.path().join(<span class="string">"auth-profiles.json"</span>)).unwrap();
+<a href=#864 id=864 data-nosnippet>864</a>
+<a href=#865 id=865 data-nosnippet>865</a>        <span class="kw">let </span>store = AuthProfilesStore::new(user.path(), <span class="bool-val">false</span>);
+<a href=#866 id=866 data-nosnippet>866</a>        <span class="kw">let </span>profile = AuthProfile::new_token(<span class="string">"openai-codex"</span>, <span class="string">"default"</span>, <span class="string">"tok123"</span>.into());
+<a href=#867 id=867 data-nosnippet>867</a>        store.upsert_profile(profile, <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
+<a href=#868 id=868 data-nosnippet>868</a>
+<a href=#869 id=869 data-nosnippet>869</a>        <span class="comment">// per-user path STILL a symlink
+<a href=#870 id=870 data-nosnippet>870</a>        </span><span class="macro">assert!</span>(
+<a href=#871 id=871 data-nosnippet>871</a>            std::fs::symlink_metadata(user.path().join(<span class="string">"auth-profiles.json"</span>))
+<a href=#872 id=872 data-nosnippet>872</a>                .unwrap()
+<a href=#873 id=873 data-nosnippet>873</a>                .file_type()
+<a href=#874 id=874 data-nosnippet>874</a>                .is_symlink()
+<a href=#875 id=875 data-nosnippet>875</a>        );
+<a href=#876 id=876 data-nosnippet>876</a>        <span class="comment">// shared file actually updated (contains the profile)
+<a href=#877 id=877 data-nosnippet>877</a>        </span><span class="kw">let </span>body = std::fs::read_to_string(<span class="kw-2">&amp;</span>shared_file).unwrap();
+<a href=#878 id=878 data-nosnippet>878</a>        <span class="macro">assert!</span>(body.contains(<span class="string">"openai-codex"</span>));
+<a href=#879 id=879 data-nosnippet>879</a>    }
+<a href=#880 id=880 data-nosnippet>880</a>
+<a href=#881 id=881 data-nosnippet>881</a>    <span class="attr">#[test]
+<a href=#882 id=882 data-nosnippet>882</a>    </span><span class="kw">fn </span>profile_id_format() {
+<a href=#883 id=883 data-nosnippet>883</a>        <span class="macro">assert_eq!</span>(
+<a href=#884 id=884 data-nosnippet>884</a>            profile_id(<span class="string">"openai-codex"</span>, <span class="string">"default"</span>),
+<a href=#885 id=885 data-nosnippet>885</a>            <span class="string">"openai-codex:default"
+<a href=#886 id=886 data-nosnippet>886</a>        </span>);
+<a href=#887 id=887 data-nosnippet>887</a>    }
+<a href=#888 id=888 data-nosnippet>888</a>
+<a href=#889 id=889 data-nosnippet>889</a>    <span class="attr">#[test]
+<a href=#890 id=890 data-nosnippet>890</a>    </span><span class="kw">fn </span>token_expiry_math() {
+<a href=#891 id=891 data-nosnippet>891</a>        <span class="kw">let </span>token_set = TokenSet {
+<a href=#892 id=892 data-nosnippet>892</a>            access_token: <span class="string">"token"</span>.into(),
+<a href=#893 id=893 data-nosnippet>893</a>            refresh_token: <span class="prelude-val">Some</span>(<span class="string">"refresh"</span>.into()),
+<a href=#894 id=894 data-nosnippet>894</a>            id_token: <span class="prelude-val">None</span>,
+<a href=#895 id=895 data-nosnippet>895</a>            expires_at: <span class="prelude-val">Some</span>(Utc::now() + chrono::Duration::seconds(<span class="number">10</span>)),
+<a href=#896 id=896 data-nosnippet>896</a>            token_type: <span class="prelude-val">Some</span>(<span class="string">"Bearer"</span>.into()),
+<a href=#897 id=897 data-nosnippet>897</a>            scope: <span class="prelude-val">None</span>,
+<a href=#898 id=898 data-nosnippet>898</a>        };
+<a href=#899 id=899 data-nosnippet>899</a>
+<a href=#900 id=900 data-nosnippet>900</a>        <span class="macro">assert!</span>(token_set.is_expiring_within(Duration::from_secs(<span class="number">15</span>)));
+<a href=#901 id=901 data-nosnippet>901</a>        <span class="macro">assert!</span>(!token_set.is_expiring_within(Duration::from_secs(<span class="number">1</span>)));
+<a href=#902 id=902 data-nosnippet>902</a>    }
+<a href=#903 id=903 data-nosnippet>903</a>
+<a href=#904 id=904 data-nosnippet>904</a>    <span class="attr">#[tokio::test]
+<a href=#905 id=905 data-nosnippet>905</a>    </span><span class="kw">async fn </span>store_roundtrip_with_encryption() {
+<a href=#906 id=906 data-nosnippet>906</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#907 id=907 data-nosnippet>907</a>        <span class="kw">let </span>store = AuthProfilesStore::new(tmp.path(), <span class="bool-val">true</span>);
+<a href=#908 id=908 data-nosnippet>908</a>
+<a href=#909 id=909 data-nosnippet>909</a>        <span class="kw">let </span><span class="kw-2">mut </span>profile = AuthProfile::new_oauth(
+<a href=#910 id=910 data-nosnippet>910</a>            <span class="string">"openai-codex"</span>,
+<a href=#911 id=911 data-nosnippet>911</a>            <span class="string">"default"</span>,
+<a href=#912 id=912 data-nosnippet>912</a>            TokenSet {
+<a href=#913 id=913 data-nosnippet>913</a>                access_token: <span class="string">"access-123"</span>.into(),
+<a href=#914 id=914 data-nosnippet>914</a>                refresh_token: <span class="prelude-val">Some</span>(<span class="string">"refresh-123"</span>.into()),
+<a href=#915 id=915 data-nosnippet>915</a>                id_token: <span class="prelude-val">None</span>,
+<a href=#916 id=916 data-nosnippet>916</a>                expires_at: <span class="prelude-val">Some</span>(Utc::now() + chrono::Duration::hours(<span class="number">1</span>)),
+<a href=#917 id=917 data-nosnippet>917</a>                token_type: <span class="prelude-val">Some</span>(<span class="string">"Bearer"</span>.into()),
+<a href=#918 id=918 data-nosnippet>918</a>                scope: <span class="prelude-val">Some</span>(<span class="string">"openid offline_access"</span>.into()),
+<a href=#919 id=919 data-nosnippet>919</a>            },
+<a href=#920 id=920 data-nosnippet>920</a>        );
+<a href=#921 id=921 data-nosnippet>921</a>        profile.account_id = <span class="prelude-val">Some</span>(<span class="string">"acct_123"</span>.into());
+<a href=#922 id=922 data-nosnippet>922</a>
+<a href=#923 id=923 data-nosnippet>923</a>        store.upsert_profile(profile.clone(), <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
+<a href=#924 id=924 data-nosnippet>924</a>
+<a href=#925 id=925 data-nosnippet>925</a>        <span class="kw">let </span>data = store.load().<span class="kw">await</span>.unwrap();
+<a href=#926 id=926 data-nosnippet>926</a>        <span class="kw">let </span>loaded = data.profiles.get(<span class="kw-2">&amp;</span>profile.id).unwrap();
 <a href=#927 id=927 data-nosnippet>927</a>
-<a href=#928 id=928 data-nosnippet>928</a>        <span class="kw">let </span>data = store.load().<span class="kw">await</span>.unwrap();
-<a href=#929 id=929 data-nosnippet>929</a>        <span class="kw">let </span>loaded = data.profiles.get(<span class="kw-2">&amp;</span>profile.id).unwrap();
-<a href=#930 id=930 data-nosnippet>930</a>
-<a href=#931 id=931 data-nosnippet>931</a>        <span class="macro">assert_eq!</span>(loaded.model_provider, <span class="string">"openai-codex"</span>);
-<a href=#932 id=932 data-nosnippet>932</a>        <span class="macro">assert_eq!</span>(loaded.profile_name, <span class="string">"default"</span>);
-<a href=#933 id=933 data-nosnippet>933</a>        <span class="macro">assert_eq!</span>(loaded.account_id.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"acct_123"</span>));
-<a href=#934 id=934 data-nosnippet>934</a>        <span class="macro">assert_eq!</span>(
-<a href=#935 id=935 data-nosnippet>935</a>            loaded
-<a href=#936 id=936 data-nosnippet>936</a>                .token_set
-<a href=#937 id=937 data-nosnippet>937</a>                .as_ref()
-<a href=#938 id=938 data-nosnippet>938</a>                .and_then(|t| t.refresh_token.as_deref()),
-<a href=#939 id=939 data-nosnippet>939</a>            <span class="prelude-val">Some</span>(<span class="string">"refresh-123"</span>)
-<a href=#940 id=940 data-nosnippet>940</a>        );
-<a href=#941 id=941 data-nosnippet>941</a>
-<a href=#942 id=942 data-nosnippet>942</a>        <span class="kw">let </span>raw = tokio::fs::read_to_string(store.path()).<span class="kw">await</span>.unwrap();
-<a href=#943 id=943 data-nosnippet>943</a>        <span class="macro">assert!</span>(raw.contains(<span class="string">"enc2:"</span>));
-<a href=#944 id=944 data-nosnippet>944</a>        <span class="macro">assert!</span>(!raw.contains(<span class="string">"refresh-123"</span>));
-<a href=#945 id=945 data-nosnippet>945</a>        <span class="macro">assert!</span>(!raw.contains(<span class="string">"access-123"</span>));
-<a href=#946 id=946 data-nosnippet>946</a>    }
-<a href=#947 id=947 data-nosnippet>947</a>
-<a href=#948 id=948 data-nosnippet>948</a>    <span class="attr">#[tokio::test]
-<a href=#949 id=949 data-nosnippet>949</a>    </span><span class="kw">async fn </span>atomic_write_replaces_file() {
-<a href=#950 id=950 data-nosnippet>950</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
-<a href=#951 id=951 data-nosnippet>951</a>        <span class="kw">let </span>store = AuthProfilesStore::new(tmp.path(), <span class="bool-val">false</span>);
+<a href=#928 id=928 data-nosnippet>928</a>        <span class="macro">assert_eq!</span>(loaded.model_provider, <span class="string">"openai-codex"</span>);
+<a href=#929 id=929 data-nosnippet>929</a>        <span class="macro">assert_eq!</span>(loaded.profile_name, <span class="string">"default"</span>);
+<a href=#930 id=930 data-nosnippet>930</a>        <span class="macro">assert_eq!</span>(loaded.account_id.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"acct_123"</span>));
+<a href=#931 id=931 data-nosnippet>931</a>        <span class="macro">assert_eq!</span>(
+<a href=#932 id=932 data-nosnippet>932</a>            loaded
+<a href=#933 id=933 data-nosnippet>933</a>                .token_set
+<a href=#934 id=934 data-nosnippet>934</a>                .as_ref()
+<a href=#935 id=935 data-nosnippet>935</a>                .and_then(|t| t.refresh_token.as_deref()),
+<a href=#936 id=936 data-nosnippet>936</a>            <span class="prelude-val">Some</span>(<span class="string">"refresh-123"</span>)
+<a href=#937 id=937 data-nosnippet>937</a>        );
+<a href=#938 id=938 data-nosnippet>938</a>
+<a href=#939 id=939 data-nosnippet>939</a>        <span class="kw">let </span>raw = tokio::fs::read_to_string(store.path()).<span class="kw">await</span>.unwrap();
+<a href=#940 id=940 data-nosnippet>940</a>        <span class="macro">assert!</span>(raw.contains(<span class="string">"enc2:"</span>));
+<a href=#941 id=941 data-nosnippet>941</a>        <span class="macro">assert!</span>(!raw.contains(<span class="string">"refresh-123"</span>));
+<a href=#942 id=942 data-nosnippet>942</a>        <span class="macro">assert!</span>(!raw.contains(<span class="string">"access-123"</span>));
+<a href=#943 id=943 data-nosnippet>943</a>    }
+<a href=#944 id=944 data-nosnippet>944</a>
+<a href=#945 id=945 data-nosnippet>945</a>    <span class="attr">#[tokio::test]
+<a href=#946 id=946 data-nosnippet>946</a>    </span><span class="kw">async fn </span>atomic_write_replaces_file() {
+<a href=#947 id=947 data-nosnippet>947</a>        <span class="kw">let </span>tmp = TempDir::new().unwrap();
+<a href=#948 id=948 data-nosnippet>948</a>        <span class="kw">let </span>store = AuthProfilesStore::new(tmp.path(), <span class="bool-val">false</span>);
+<a href=#949 id=949 data-nosnippet>949</a>
+<a href=#950 id=950 data-nosnippet>950</a>        <span class="kw">let </span>profile = AuthProfile::new_token(<span class="string">"anthropic"</span>, <span class="string">"default"</span>, <span class="string">"token-abc"</span>.into());
+<a href=#951 id=951 data-nosnippet>951</a>        store.upsert_profile(profile, <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
 <a href=#952 id=952 data-nosnippet>952</a>
-<a href=#953 id=953 data-nosnippet>953</a>        <span class="kw">let </span>profile = AuthProfile::new_token(<span class="string">"anthropic"</span>, <span class="string">"default"</span>, <span class="string">"token-abc"</span>.into());
-<a href=#954 id=954 data-nosnippet>954</a>        store.upsert_profile(profile, <span class="bool-val">true</span>).<span class="kw">await</span>.unwrap();
+<a href=#953 id=953 data-nosnippet>953</a>        <span class="kw">let </span>path = store.path().to_path_buf();
+<a href=#954 id=954 data-nosnippet>954</a>        <span class="macro">assert!</span>(path.exists());
 <a href=#955 id=955 data-nosnippet>955</a>
-<a href=#956 id=956 data-nosnippet>956</a>        <span class="kw">let </span>path = store.path().to_path_buf();
-<a href=#957 id=957 data-nosnippet>957</a>        <span class="macro">assert!</span>(path.exists());
-<a href=#958 id=958 data-nosnippet>958</a>
-<a href=#959 id=959 data-nosnippet>959</a>        <span class="kw">let </span>contents = tokio::fs::read_to_string(path).<span class="kw">await</span>.unwrap();
-<a href=#960 id=960 data-nosnippet>960</a>        <span class="macro">assert!</span>(contents.contains(<span class="string">"\"schema_version\": 1"</span>));
-<a href=#961 id=961 data-nosnippet>961</a>    }
-<a href=#962 id=962 data-nosnippet>962</a>}
+<a href=#956 id=956 data-nosnippet>956</a>        <span class="kw">let </span>contents = tokio::fs::read_to_string(path).<span class="kw">await</span>.unwrap();
+<a href=#957 id=957 data-nosnippet>957</a>        <span class="macro">assert!</span>(contents.contains(<span class="string">"\"schema_version\": 1"</span>));
+<a href=#958 id=958 data-nosnippet>958</a>    }
+<a href=#959 id=959 data-nosnippet>959</a>}
 </code></pre></div></section></main></body></html>
