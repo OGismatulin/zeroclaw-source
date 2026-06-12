@@ -3084,14 +3084,7 @@ fn build_override_provider(
     model_name: &str,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let empty_routes: &[zeroclaw_config::schema::ModelRouteConfig] = &[];
-    // Bare registry names (the only shape the webhook override accepts) get
-    // provider-agnostic options; credentials resolve through the fork's env
-    // candidates table inside the factory (api_key stays empty by policy).
-    let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
-        config,
-        provider_name,
-        &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-    );
+    let provider_runtime_options = override_provider_options(config, provider_name);
     zeroclaw_providers::create_routed_model_provider_with_options(
         config,
         provider_name,
@@ -3101,6 +3094,28 @@ fn build_override_provider(
         empty_routes,
         model_name,
         &provider_runtime_options,
+    )
+}
+
+/// Runtime options for the per-request override path. Bare registry names
+/// (the only shape the webhook override accepts) get provider-agnostic
+/// options; credentials resolve through the fork's env candidates table
+/// inside the factory (api_key stays empty by policy).
+///
+/// fork (patch #13): the fallback options must carry the process-wide
+/// settings from the global config — `zeroclaw_dir`, `secrets_encrypt`,
+/// reasoning. A bare `ModelProviderRuntimeOptions::default()` here left
+/// `zeroclaw_dir = None`, which made OAuth providers (openai-codex) resolve
+/// their auth store to `$HOME/.zeroclaw` instead of the per-user config dir
+/// (= the shared-auth symlink), reading a stale token copy.
+fn override_provider_options(
+    config: &zeroclaw_config::schema::Config,
+    provider_name: &str,
+) -> zeroclaw_providers::ModelProviderRuntimeOptions {
+    zeroclaw_providers::options_for_provider_ref(
+        config,
+        provider_name,
+        &zeroclaw_providers::model_provider_runtime_options_from_model_provider_entry(config, None),
     )
 }
 
@@ -4809,6 +4824,25 @@ mod tests {
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+
+    /// fork regression (patch #13): the per-request override path must
+    /// inherit process-wide settings from the global config. With a bare
+    /// `ModelProviderRuntimeOptions::default()` fallback, `zeroclaw_dir`
+    /// stayed `None` and OAuth providers resolved their auth store to
+    /// `$HOME/.zeroclaw` instead of the per-user config dir.
+    #[test]
+    fn override_provider_options_inherit_config_dir_for_bare_names() {
+        let config = Config {
+            config_path: std::path::PathBuf::from("/data/user/.zeroclaw/config.toml"),
+            ..Config::default()
+        };
+        let options = override_provider_options(&config, "openai-codex");
+        assert_eq!(
+            options.zeroclaw_dir.as_deref(),
+            Some(std::path::Path::new("/data/user/.zeroclaw"))
+        );
+        assert_eq!(options.secrets_encrypt, config.secrets.encrypt);
+    }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
