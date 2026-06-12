@@ -801,14 +801,21 @@ pub async fn run_gateway(
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
-        match zeroclaw_memory::create_memory_with_storage_and_routes(
-            &config.memory,
-            &config.embedding_routes,
-            config.resolve_active_storage(),
-            &config.data_dir,
+        // fork: scope the gateway-wide memory handle to the runtime agent.
+        // The V3 sqlite schema stamps every row with agent_id (NOT NULL),
+        // so an unscoped inner backend makes webhook autosave fail silently.
+        let runtime_agent_alias = config
+            .resolved_runtime_agent_alias()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "default".to_string());
+        match zeroclaw_memory::create_memory_for_agent(
+            &config,
+            &runtime_agent_alias,
             fallback.and_then(|e| e.api_key.as_deref()),
-        ) {
-            Ok(m) => Arc::from(m),
+        )
+        .await
+        {
+            Ok(m) => m,
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
