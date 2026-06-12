@@ -15041,15 +15041,16 @@ fn apply_legacy_provider_override_to_pre_v3_doc(
 /// `fold_providers_globals_into_models` then folds them into a single
 /// `providers.models.<family>.<alias>` entry using
 /// `normalize_provider_type(provider, "default")` (e.g. `opencode-go` →
-/// `opencode.go` with `model = deepseek-v4-flash`). The synthesized default
-/// agent must point at THAT entry. Without this it falls back to
-/// `iter_entries().next()` — the first populated typed slot in macro order,
-/// which for our per-user configs is an arbitrary SUBAGENT provider
-/// (`zai.agent_analyst_glm`), NOT the env default. We mirror the fold's
-/// `normalize_provider_type(.., "default")` call so the `(family, alias)` pair
-/// matches the folded entry, and only return the ref once we confirm the entry
-/// actually exists in `providers.models`.
-fn env_default_model_provider_ref(config: &Config) -> Option<String> {
+/// `opencode.go` with `model = deepseek-v4-flash`). Both the synthesized
+/// `default` agent (here in `load_or_init`) AND the gateway boot provider
+/// (`zeroclaw-gateway` `build_default_server`) must point at THAT entry.
+/// Without this they fall back to `iter_entries().next()` — the first populated
+/// typed slot in macro order, which for our per-user configs is an arbitrary
+/// SUBAGENT provider (`zai.agent_analyst_glm`), NOT the env default. We mirror
+/// the fold's `normalize_provider_type(.., "default")` call so the
+/// `(family, alias)` pair matches the folded entry, and only return the ref
+/// once we confirm the entry actually exists in `providers.models`.
+pub fn env_default_model_provider_ref(config: &Config) -> Option<String> {
     let provider = std::env::var("ZEROCLAW_PROVIDER")
         .ok()
         .map(|v| v.trim().to_string())

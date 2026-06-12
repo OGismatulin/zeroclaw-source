@@ -710,13 +710,37 @@ pub async fn run_gateway(
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let (boot_family, boot_alias, boot_entry) = config
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
-        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
+    // fork(v0.8.0 regressions): the webhook default path (no model/provider in
+    // body) answers with THIS boot provider (state.model_provider/state.model),
+    // not the per-turn agent's model_provider. Honor the env-pinned default
+    // (ZEROCLAW_PROVIDER/ZEROCLAW_MODEL, folded into providers.models by the
+    // pre-migration shim) here too — otherwise iter_entries().next() picks the
+    // first populated typed slot in macro order, which for our per-user configs
+    // is an arbitrary SUBAGENT provider (zai.agent_analyst_glm), and every
+    // default webhook turn would run on it instead of the env default. Mirrors
+    // the synthesized `default` agent pick (zeroclaw-config load_or_init).
+    let (boot_family, boot_alias, boot_entry) =
+        zeroclaw_config::schema::env_default_model_provider_ref(&config)
+            .and_then(|r| {
+                r.split_once('.')
+                    .map(|(f, a)| (f.to_string(), a.to_string()))
+            })
+            .and_then(|(f, a)| {
+                config
+                    .providers
+                    .models
+                    .find(&f, &a)
+                    .map(|e| (f, a, Some(e)))
+            })
+            .or_else(|| {
+                config
+                    .providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
+            })
+            .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
     let model_provider_name = boot_family.as_str();
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
