@@ -1229,6 +1229,15 @@ fn create_model_provider_inner(
     let (split_name, split_url) = split_v2_colon_url(raw_name);
     let legacy_kimi_code = is_legacy_kimi_code_alias(split_name);
     let api_url = api_url.or(split_url);
+    // fork: legacy "opencode-go" must keep the Go router endpoint —
+    // canonicalization folds it into the "opencode" family whose default
+    // URL is zen/v1 (a DIFFERENT billing realm; requests there fail with
+    // 401 CreditsError). v0.7.5 parity: zen/go/v1.
+    let api_url = if split_name == "opencode-go" && api_url.is_none() {
+        Some("https://opencode.ai/zen/go/v1")
+    } else {
+        api_url
+    };
     let name = canonicalize_v2_model_provider_name(split_name);
     let provider_kind = options
         .provider_kind

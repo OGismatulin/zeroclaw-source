@@ -628,8 +628,15 @@ fn normalize_provider_type(
         return (canonical.to_string(), incoming_alias.to_string(), extras);
     }
 
-    // opencode-go folds under opencode as alias=go
+    // opencode-go folds under opencode as alias=go.
+    // fork: pin the Go router endpoint — the opencode family default is
+    // zen/v1, a different billing realm that rejects Go-plan keys with
+    // 401 CreditsError. v0.7.5 parity: zen/go/v1.
     if raw == "opencode-go" {
+        extras.push((
+            "uri",
+            toml::Value::String("https://opencode.ai/zen/go/v1".to_string()),
+        ));
         return ("opencode".to_string(), "go".to_string(), extras);
     }
 
