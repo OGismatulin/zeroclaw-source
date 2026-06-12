@@ -2963,9 +2963,17 @@ async fn run_gateway_webhook_agentic(
 /// catalog. Adding a new PROVIDER itself still requires Rust changes
 /// (factory + registry) and is governed by zeroclaw-providers.
 fn provider_exists_in_registry(name: &str) -> bool {
+    // fork: accept legacy spellings the bot still sends (e.g. "opencode-go"
+    // → family "opencode") — the factory applies the same canonicalization,
+    // so anything accepted here constructs successfully.
+    // The bare codex family names keep their factory-level escape hatch.
+    if matches!(name, "openai-codex" | "openai_codex" | "codex") {
+        return true;
+    }
+    let canonical = zeroclaw_providers::canonicalize_v2_model_provider_name(name);
     zeroclaw_providers::list_model_providers()
         .iter()
-        .any(|p| p.name == name)
+        .any(|p| p.name == canonical)
 }
 
 fn registry_canonical_provider_names() -> Vec<&'static str> {

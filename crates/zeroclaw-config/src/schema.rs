@@ -15189,7 +15189,19 @@ impl Config {
         // cost records) and hygiene/state files. Per-agent identity
         // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
         // `Config::agent_workspace_dir(alias)` instead.
-        let data_dir = zeroclaw_dir.join("data");
+        // fork: gateway_manager's per-user layout sets ZEROCLAW_WORKSPACE to
+        // the legacy bind-mounted workspace (<root>/workspace, sibling of
+        // <root>/.zeroclaw). Use it as the data dir so brain.db / cron /
+        // logs / sessions stay exactly where the pre-V3 daemon kept them.
+        // Upstream default is <install>/data.
+        let data_dir = match std::env::var("ZEROCLAW_WORKSPACE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(ws) => expand_tilde_path(&ws),
+            None => zeroclaw_dir.join("data"),
+        };
         fs::create_dir_all(&data_dir).await.with_context(|| {
             format!(
                 "Failed to create data directory: {}",
