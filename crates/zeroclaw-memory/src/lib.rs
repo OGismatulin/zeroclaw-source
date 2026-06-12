@@ -227,15 +227,36 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
+/// fork: look up the provider-specific environment variable for common
+/// embedding providers, so that `OPENROUTER_API_KEY` (etc.) takes precedence
+/// over the caller-supplied key, which may come from the default (chat)
+/// provider and differ from the embedding provider. Restored v0.7.5
+/// behavior (issue #3083) — V3 dropped it, leaving embeddings keyless on
+/// env-credential deployments (our Fly setup keeps config api_key empty).
+fn embedding_provider_env_key(model_provider: &str) -> Option<String> {
+    let env_var = match model_provider.trim() {
+        "openai" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        _ => return None,
+    };
+    std::env::var(env_var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
 ) -> ResolvedEmbeddingConfig {
-    let fallback_api_key = api_key
+    let caller_api_key = api_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let fallback_api_key =
+        embedding_provider_env_key(config.embedding_provider.trim()).or(caller_api_key);
     let fallback = ResolvedEmbeddingConfig {
         model_provider: config.embedding_provider.trim().to_string(),
         model: config.embedding_model.trim().to_string(),
