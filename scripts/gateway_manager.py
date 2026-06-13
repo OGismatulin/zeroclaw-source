@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from typing import Callable, TextIO, TypedDict
 from urllib import error, request
 
@@ -533,6 +534,20 @@ class GatewayRegistry:
 
         workspace_root = self.bootstrapper.ensure_workspace(user_key, port)
         config_dir = workspace_root / ".zeroclaw"
+
+        # fork(stabilization): refuse to spawn on a config that drifted to
+        # schema_version>=3 — fork-patch P2 silently no-ops there, breaking the
+        # env-default provider (regression S2). Guard the SPAWN path only (live
+        # orphan reattach above already started). Deduped operator alert.
+        child_config = config_dir / "config.toml"
+        if _config_is_v3_on_disk(child_config):
+            msg = (
+                f"⛔ {user_key}: config.toml уехал в schema_version>=3 на диске — "
+                f"P2-shim no-op, env-провайдер сломан. Daemon не запущен."
+            )
+            print(f"[gateway_manager] ERROR: {msg}", flush=True)
+            _alert_operator_v3_guard(user_key, msg)
+            raise DaemonSpawnError(msg)
 
         try:
             proc = self.spawn_process(user_key, port, config_dir)
@@ -1073,6 +1088,7 @@ _EVENT_LLM_REQUEST = "llm_request"
 _EVENT_TURN_FINAL_RESPONSE = "turn_final_response"
 _EVENT_TURN_CANCELLED = "turn_cancelled"
 _EVENT_CONTEXT_STATE = "context_state"
+_EVENT_PROVIDER_FALLBACK = "provider_fallback"
 
 
 class _ToolEvent(TypedDict):
@@ -1216,11 +1232,21 @@ class ProgressNotifier:
         *,
         ctx_state: dict[str, _ContextFullnessState] | None = None,
         ctx_state_lock: threading.Lock | None = None,
+        operator_user_id: str = "",
+        fallback_state: dict[str, float] | None = None,
+        fallback_lock: threading.Lock | None = None,
+        fallback_window_secs: int = 1800,
     ) -> None:
         self.trace_path = trace_path
         self.user_id = user_id
         self.notify_url = notify_url
         self.notify_secret = notify_secret
+        self.operator_user_id = (operator_user_id or "").strip()
+        self._fallback_window_secs = fallback_window_secs
+        # shared manager-level dedup dict + lock, plumbed from build_default_server
+        # outer closure exactly like _ctx_state / _ctx_state_lock.
+        self._fallback_state = fallback_state  # dict[str, float] | None
+        self._fallback_lock = fallback_lock  # threading.Lock | None
         # Capture the webhook start time before forwarding the request.
         # The monitor thread may open the rolling trace a bit later, after the
         # daemon has already appended the first events for the current turn.
@@ -1420,6 +1446,10 @@ class ProgressNotifier:
 
                 if et == _EVENT_CONTEXT_STATE:
                     self._handle_context_state(event)
+                    continue
+
+                if et == _EVENT_PROVIDER_FALLBACK:
+                    self._handle_provider_fallback(event)
                     continue
 
                 if et == _EVENT_TOOL_CALL_START:
@@ -1644,14 +1674,9 @@ class ProgressNotifier:
             summary += f" — ошибок: {errors}"
         return summary
 
-    def _send_notify(self, message: str) -> None:
-        print(f"[ProgressNotifier] dispatching: {message}", flush=True)
-        self._last_sent_ts = time.monotonic()
+    def _post_notify(self, user_id: int, message: str) -> None:
         try:
-            payload = json.dumps({
-                "user_id": int(self.user_id),
-                "message": message,
-            }).encode()
+            payload = json.dumps({"user_id": user_id, "message": message}).encode()
             req = request.Request(
                 url=self.notify_url,
                 data=payload,
@@ -1662,9 +1687,50 @@ class ProgressNotifier:
                 },
             )
             with request.urlopen(req, timeout=5.0) as resp:
-                print(f"[ProgressNotifier] sent ({resp.status}): {message}", flush=True)
+                print(
+                    f"[ProgressNotifier] sent ({resp.status}) to {user_id}: {message}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(f"[ProgressNotifier] send failed: {exc}", flush=True)
+            print(f"[ProgressNotifier] send failed to {user_id}: {exc}", flush=True)
+
+    def _send_notify(self, message: str) -> None:
+        print(f"[ProgressNotifier] dispatching: {message}", flush=True)
+        self._last_sent_ts = time.monotonic()
+        self._post_notify(int(self.user_id), message)
+
+    def _handle_provider_fallback(self, event: dict) -> None:
+        # fork(stabilization): a reliability fallback answered this turn. Alert the
+        # OPERATOR (not the end user — their turn succeeded), deduped per
+        # (session, actual_provider) within the window. Silent if no operator set.
+        if not self.operator_user_id or not self.operator_user_id.isdigit():
+            return  # alerts disabled / misconfigured operator id (avoid int() ValueError)
+        payload = event.get("payload") or {}
+        sid = str(payload.get("session_id") or "")
+        actual_provider = str(payload.get("actual_provider") or "")
+        actual_model = str(payload.get("actual_model") or "")
+        req_provider = str(payload.get("requested_provider") or "")
+        req_model = str(payload.get("requested_model") or "")
+        if not actual_provider:
+            return
+        # Defense in depth: A1 already filters same-pair retries, but never alert
+        # on a recovery where the actual identity equals the requested one.
+        if actual_provider == req_provider and actual_model == req_model:
+            return
+        key = f"{sid}|{actual_provider}"
+        now = time.monotonic()
+        if self._fallback_state is not None and self._fallback_lock is not None:
+            with self._fallback_lock:
+                last = self._fallback_state.get(key, 0.0)
+                if now - last < self._fallback_window_secs:
+                    return  # deduped within window
+                self._fallback_state[key] = now
+        message = (
+            f"⚠ Провайдер деградировал у tg_{self.user_id}: "
+            f"запрошен {req_provider or '?'}/{req_model or '?'} → "
+            f"ответил {actual_provider}/{actual_model or '?'}"
+        )
+        self._post_notify(int(self.operator_user_id), message)
 
     def _handle_context_state(self, event: dict) -> None:
         payload = event.get("payload") or {}
@@ -1784,6 +1850,59 @@ def install_shutdown_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
 
 
+def _config_is_v3_on_disk(config_path: Path) -> bool:
+    """fork(stabilization): per-user configs MUST stay pre-V3 on disk — fork-patch
+    P2 (raw-doc provider override) silently no-ops on V3, breaking env-default
+    provider resolution (regression S2). Detect a config that drifted to
+    schema_version >= 3. Escape hatch: ZEROCLAW_ALLOW_V3_DISK_CONFIG=1."""
+    if os.environ.get("ZEROCLAW_ALLOW_V3_DISK_CONFIG", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    try:
+        with open(config_path, "rb") as f:
+            doc = tomllib.load(f)
+    except (FileNotFoundError, tomllib.TOMLDecodeError):
+        return False  # missing/unparseable handled by existing spawn logic
+    return int(doc.get("schema_version", 0) or 0) >= 3
+
+
+_V3_GUARD_ALERT_TS: dict[str, float] = {}
+_V3_GUARD_ALERT_LOCK = threading.Lock()
+
+
+def _alert_operator_v3_guard(user_key: str, message: str) -> None:
+    op = os.environ.get("ZEROCLAW_OPERATOR_USER_ID", "").strip()
+    url = os.environ.get("NOTIFY_URL", "").strip()
+    secret = os.environ.get("NOTIFY_SECRET", "").strip()
+    if not (op.isdigit() and url and secret):
+        return
+    window = int(os.environ.get("PROVIDER_FALLBACK_ALERT_WINDOW_SECS", "1800"))
+    key = f"{user_key}|v3_disk_guard"
+    now = time.monotonic()
+    with _V3_GUARD_ALERT_LOCK:
+        if now - _V3_GUARD_ALERT_TS.get(key, 0.0) < window:
+            return  # deduped within window
+        _V3_GUARD_ALERT_TS[key] = now
+    try:
+        data = json.dumps({"user_id": int(op), "message": message}).encode()
+        req = request.Request(
+            url=url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Secret": secret,
+            },
+        )
+        with request.urlopen(req, timeout=5.0):
+            pass
+    except Exception as exc:
+        print(f"[gateway_manager] operator alert failed: {exc}", flush=True)
+
+
 def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     legacy_bearer_token = os.getenv("ZEROCLAW_BEARER_TOKEN", "").strip()
     pairing_state = PairingState(
@@ -1800,6 +1919,16 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     notify_secret = os.getenv("NOTIFY_SECRET", "")
     ctx_state: dict[str, _ContextFullnessState] = {}
     ctx_state_lock = threading.Lock()
+    # fork(stabilization): operator alerts on provider fallback (A2). Shared
+    # manager-level dedup dict + lock, plumbed into every ProgressNotifier
+    # exactly like ctx_state. Operator id / window read from env (safe defaults:
+    # empty operator → alerts disabled).
+    operator_user_id = os.environ.get("ZEROCLAW_OPERATOR_USER_ID", "")
+    fallback_window_secs = int(
+        os.environ.get("PROVIDER_FALLBACK_ALERT_WINDOW_SECS", "1800")
+    )
+    fallback_state: dict[str, float] = {}
+    fallback_lock = threading.Lock()
 
     def _forward(
         instance: DaemonInstance,
@@ -1820,6 +1949,10 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 notify_secret=notify_secret,
                 ctx_state=ctx_state,
                 ctx_state_lock=ctx_state_lock,
+                operator_user_id=operator_user_id,
+                fallback_state=fallback_state,
+                fallback_lock=fallback_lock,
+                fallback_window_secs=fallback_window_secs,
             )
             notifier.start()
         try:
