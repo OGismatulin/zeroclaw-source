@@ -1721,8 +1721,12 @@ class ProgressNotifier:
         now = time.monotonic()
         if self._fallback_state is not None and self._fallback_lock is not None:
             with self._fallback_lock:
-                last = self._fallback_state.get(key, 0.0)
-                if now - last < self._fallback_window_secs:
+                # `None`/absent = never alerted → always fire. A 0.0 default would
+                # falsely dedup the FIRST alert when the host's monotonic clock is
+                # still below the window (e.g. a freshly-booted VM: now - 0.0 <
+                # window). Distinguish "never sent" from a real prior timestamp.
+                last = self._fallback_state.get(key)
+                if last is not None and now - last < self._fallback_window_secs:
                     return  # deduped within window
                 self._fallback_state[key] = now
         message = (
@@ -1883,7 +1887,10 @@ def _alert_operator_v3_guard(user_key: str, message: str) -> None:
     key = f"{user_key}|v3_disk_guard"
     now = time.monotonic()
     with _V3_GUARD_ALERT_LOCK:
-        if now - _V3_GUARD_ALERT_TS.get(key, 0.0) < window:
+        # `None`/absent = never alerted → always fire. A 0.0 default would falsely
+        # dedup the first alert on a freshly-booted host (now - 0.0 < window).
+        last = _V3_GUARD_ALERT_TS.get(key)
+        if last is not None and now - last < window:
             return  # deduped within window
         _V3_GUARD_ALERT_TS[key] = now
     try:
