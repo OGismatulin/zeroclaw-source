@@ -3806,8 +3806,12 @@ mod tests {
 
     #[test]
     fn git_dash_c_uppercase_is_allowed() {
-        // Regression test for #5809: git -C (change directory) must not be
-        // conflated with git -c (set config override) after arg lowercasing.
+        // Fork relaxation (docs/superpowers/plans/2026-05-06-relax-policy-git-python.md):
+        // ALL git args are permitted — `git -C` (directory selection) AND `git -c`
+        // (config override). Upstream #5809 re-added a -c/config/alias block; the fork
+        // explicitly KEEPS the relaxation (net-zero security: the agent already has
+        // free-form file_write + python3), and the code-repos workflow relies on
+        // `git -c user.name=… -c user.email=… commit`. See the is_args_safe `"git"` arm.
         let p = default_policy();
         assert!(
             p.is_command_allowed("git -C /home/user/repo status --short"),
@@ -3817,10 +3821,10 @@ mod tests {
             p.is_command_allowed("git -C /home/user/repo log --oneline -1"),
             "git -C with log should be allowed"
         );
-        // git -c (lowercase) is still blocked — config override injection
+        // git -c is ALSO allowed under the fork's git relaxation (trade-off accepted).
         assert!(
-            !p.is_command_allowed("git -c core.editor=\"rm -rf /\" commit"),
-            "git -c must remain blocked"
+            p.is_command_allowed("git -c core.editor=vim commit"),
+            "git -c is allowed under the fork's documented git relaxation"
         );
     }
 

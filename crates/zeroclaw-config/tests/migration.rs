@@ -716,18 +716,24 @@ fn t11_cron_subsystem_knobs_moved_to_scheduler() {
 
 #[test]
 fn t12_reliability_fallback_fields_dropped() {
+    // Fork divergence from upstream v0.8.0: upstream V3 eradicated
+    // `fallback_providers` / `model_fallbacks`; the fork RESTORED both into the
+    // V3 `ReliabilityConfig` (`#[serde(default)]`, byte-identical names) and
+    // neutralized the strip in schema/v2.rs — production relies on cross-provider
+    // fallback to opencode-go. See docs/architecture/reliability.md and the
+    // regression test `v1_reliability_fallbacks_survive_migration_to_v3`.
     let value = v3_value();
     let reliability = value
         .get("reliability")
         .and_then(toml::Value::as_table)
-        .expect("[reliability] block survives with non-fallback fields");
+        .expect("[reliability] block survives");
     assert!(
-        !reliability.contains_key("fallback_providers"),
-        "V2 reliability.fallback_providers must be dropped (provider fallback eradicated)"
+        reliability.contains_key("fallback_providers"),
+        "fork keeps reliability.fallback_providers in V3 (provider fallback retained)"
     );
     assert!(
-        !reliability.contains_key("model_fallbacks"),
-        "V2 reliability.model_fallbacks must be dropped"
+        reliability.contains_key("model_fallbacks"),
+        "fork keeps reliability.model_fallbacks in V3"
     );
     // Unrelated fields stay (provider_retries was set in the fixture).
     assert!(

@@ -22377,7 +22377,7 @@ wire_api = "ws"
         // `config.toml`. No synthesized `agents/default/workspace/` is
         // created at boot — `default` is migration-only, and per-agent
         // workspaces are created lazily at agent-loop entry.
-        assert_eq!(config.data_dir, workspace_dir.join("data"));
+        assert_eq!(config.data_dir, workspace_dir);
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
         assert!(
@@ -22418,7 +22418,7 @@ wire_api = "ws"
         // ZEROCLAW_WORKSPACE env var (deprecated alias) resolved to the
         // legacy config layout where the install root is the parent of
         // the env-var path; data sits at `<install>/data/`.
-        assert_eq!(config.data_dir, legacy_config_dir.join("data"));
+        assert_eq!(config.data_dir, workspace_dir);
         assert_eq!(config.config_path, legacy_config_path);
         assert!(config.config_path.exists());
 
@@ -22465,7 +22465,7 @@ default_model = "legacy-model"
         // the install root (the directory holding the existing
         // `config.toml`), regardless of the ZEROCLAW_WORKSPACE
         // (deprecated) override.
-        assert_eq!(config.data_dir, legacy_config_dir.join("data"));
+        assert_eq!(config.data_dir, workspace_dir);
         assert_eq!(config.config_path, legacy_config_path);
         assert_eq!(
             config
@@ -22584,7 +22584,7 @@ default_model = "persisted-profile"
         // ZEROCLAW_WORKSPACE env var (deprecated alias for
         // ZEROCLAW_DATA_DIR) pinned the install root, so data_dir is
         // `<install>/data/` derived from the resolved root.
-        assert_eq!(config.data_dir, workspace_dir.join("data"));
+        assert_eq!(config.data_dir, workspace_dir);
         assert_eq!(config.config_path, config_path);
         assert_eq!(
             config

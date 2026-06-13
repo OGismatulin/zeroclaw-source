@@ -272,7 +272,16 @@ pub fn record_event(
     };
 
     if let Err(err) = logger.append(&event) {
-        tracing::warn!("Failed to write runtime trace event: {err}");
+        // The legacy trace writer failed to persist. Report on the zeroclaw_log
+        // pipeline (a separate sink from the failing LegacyTraceLogger; this
+        // function is the only writer to the latter, so no recursion).
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({ "error": format!("{err}") })),
+            "Failed to write runtime trace event"
+        );
     }
 }
 

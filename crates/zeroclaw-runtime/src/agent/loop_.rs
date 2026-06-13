@@ -1573,7 +1573,10 @@ pub async fn run_tool_call_loop(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    silent: bool,
+    // Vestigial after the v0.8.0 streaming refactor: stdout suppression is now
+    // governed by `on_delta` presence (None = no streaming), so this bool is
+    // unused in the body. Kept in the signature for API/caller compatibility.
+    _silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
     channel_reply_target: Option<&str>,
