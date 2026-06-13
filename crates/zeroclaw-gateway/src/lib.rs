@@ -2448,6 +2448,41 @@ async fn run_gateway_chat_with_tools(
     }
 }
 
+/// fork(stabilization): emit a structured `provider_fallback` trace event when
+/// the reliability layer answered with a DIFFERENT (provider, model) than the
+/// one requested. Mirrors the `context_state` emission (record_event at
+/// lib.rs:2950) so the gateway_manager.py watchdog can alert the operator.
+/// The legacy `provider`/`model` columns carry the ACTUAL (winning) identity;
+/// the requested identity lives in the payload. id/timestamp are auto-filled.
+///
+/// CRITICAL: reliable.rs records ProviderFallbackInfo on `attempt > 0` too —
+/// i.e. a transient retry on the SAME provider+model. We must NOT alert on
+/// that (it's a recovery, not a degradation). Filter to real identity change.
+fn emit_provider_fallback_event(
+    fb: &zeroclaw_providers::reliable::ProviderFallbackInfo,
+    session_id: Option<&str>,
+) {
+    if fb.actual_provider == fb.requested_provider && fb.actual_model == fb.requested_model {
+        return; // same-pair retry/recovery — not a degradation, do not emit
+    }
+    zeroclaw_runtime::observability::runtime_trace::record_event(
+        "provider_fallback",
+        Some("webhook"),
+        Some(fb.actual_provider.as_str()),
+        Some(fb.actual_model.as_str()),
+        None,       // turn_id — webhook path has none at this site (best-effort)
+        Some(true), // success — the turn did complete (via fallback)
+        None,
+        serde_json::json!({
+            "requested_provider": fb.requested_provider,
+            "requested_model": fb.requested_model,
+            "actual_provider": fb.actual_provider,
+            "actual_model": fb.actual_model,
+            "session_id": session_id.unwrap_or_default(),
+        }),
+    );
+}
+
 /// Agentic webhook chat that preserves gateway auth/idempotency flow while
 /// executing the full tool loop with persistent per-session history.
 async fn run_gateway_webhook_agentic(
@@ -2798,34 +2833,50 @@ async fn run_gateway_webhook_agentic(
     // tool can identify the active session from inside the loop.
     let session_key_for_scope = session_id.map(str::to_owned);
     let cancellation_token = cancel_handle.as_ref().map(|(_, t)| t.clone());
-    let result = zeroclaw_runtime::agent::loop_::scope_session_key(
-        session_key_for_scope,
-        zeroclaw_runtime::agent::loop_::agent_turn(
-            provider,
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            model_name,
-            temperature,
-            true,
-            "webhook",
-            None,
-            &config.multimodal,
-            agent.resolved.max_tool_iterations,
-            Some(&approval_manager),
-            &excluded_tools,
-            &agent.resolved.tool_call_dedup_exempt,
-            activated_handle.as_ref(),
-            None,
-            agent.resolved.strict_tool_parsing,
-            agent.resolved.parallel_tools,
-            None, // channel: Option<&dyn Channel> — webhook path has no channel
-            cancellation_token,
-            state.hooks.as_deref(),
-        ),
-    )
-    .await;
+    let (result, provider_fallback) =
+        zeroclaw_providers::reliable::scope_provider_fallback(async {
+            // fork(stabilization): wrap the whole agent_turn(...).await so the
+            // task-local fallback scope covers run_tool_call_loop and every LLM
+            // call inside it (mirrors orchestrator/mod.rs:4476,4622). take_last_*
+            // MUST be called inside this same scope. See spec Risk #1 — holds
+            // only if LLM calls stay in the awaited chain (verified by GA1).
+            let result = zeroclaw_runtime::agent::loop_::scope_session_key(
+                session_key_for_scope,
+                zeroclaw_runtime::agent::loop_::agent_turn(
+                    provider,
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    model_name,
+                    temperature,
+                    true,
+                    "webhook",
+                    None,
+                    &config.multimodal,
+                    agent.resolved.max_tool_iterations,
+                    Some(&approval_manager),
+                    &excluded_tools,
+                    &agent.resolved.tool_call_dedup_exempt,
+                    activated_handle.as_ref(),
+                    None,
+                    agent.resolved.strict_tool_parsing,
+                    agent.resolved.parallel_tools,
+                    None, // channel: Option<&dyn Channel> — webhook path has no channel
+                    cancellation_token,
+                    state.hooks.as_deref(),
+                ),
+            )
+            .await;
+            let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
+            (result, fb)
+        })
+        .await;
+
+    // fork(stabilization): if the reliability layer fell back, make it observable.
+    if let Some(fb) = provider_fallback.as_ref() {
+        emit_provider_fallback_event(fb, session_id);
+    }
 
     // Branch on cancellation: a `ToolLoopCancelled` error means a follow-up
     // request (M2) superseded this one (M1). Append a `[turn cancelled]`
@@ -4842,6 +4893,74 @@ mod tests {
             Some(std::path::Path::new("/data/user/.zeroclaw"))
         );
         assert_eq!(options.secrets_encrypt, config.secrets.encrypt);
+    }
+
+    #[test]
+    fn provider_fallback_event_has_actual_and_requested_identity() {
+        use zeroclaw_config::schema::ObservabilityConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ObservabilityConfig {
+            log_persistence: "rolling".to_string(),
+            log_persistence_path: tmp
+                .path()
+                .join("trace.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            log_persistence_max_entries: 10,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&cfg, tmp.path());
+
+        let fb = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "openai-codex".into(),
+            requested_model: "gpt-5.4-mini".into(),
+            actual_provider: "opencode-go".into(),
+            actual_model: "deepseek-v4-flash".into(),
+        };
+        emit_provider_fallback_event(&fb, Some("tg_user_99999_s_test"));
+
+        let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
+        let line = raw.lines().filter(|l| !l.trim().is_empty()).last().unwrap();
+        let ev: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(ev["event_type"], "provider_fallback");
+        assert_eq!(ev["provider"], "opencode-go"); // legacy column = actual
+        assert_eq!(ev["payload"]["requested_provider"], "openai-codex");
+        assert_eq!(ev["payload"]["actual_model"], "deepseek-v4-flash");
+        assert_eq!(ev["payload"]["session_id"], "tg_user_99999_s_test");
+    }
+
+    #[test]
+    fn provider_fallback_same_pair_retry_does_not_emit() {
+        // reliable.rs records ProviderFallbackInfo on attempt>0 even for same
+        // provider+model (a retry/recovery). That MUST NOT produce a degradation
+        // event/alert — only a real identity change does.
+        use zeroclaw_config::schema::ObservabilityConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ObservabilityConfig {
+            log_persistence: "rolling".to_string(),
+            log_persistence_path: tmp
+                .path()
+                .join("trace.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            log_persistence_max_entries: 10,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&cfg, tmp.path());
+
+        let same = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "opencode-go".into(),
+            requested_model: "deepseek-v4-flash".into(),
+            actual_provider: "opencode-go".into(),
+            actual_model: "deepseek-v4-flash".into(),
+        };
+        emit_provider_fallback_event(&same, Some("s"));
+
+        let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap_or_default();
+        assert!(
+            !raw.contains("provider_fallback"),
+            "same-pair retry must not emit a provider_fallback event"
+        );
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
