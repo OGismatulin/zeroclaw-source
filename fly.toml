@@ -32,6 +32,11 @@ swap_size_mb = 512
   ZEROCLAW_AUTONOMY_LEVEL = 'full'
   ZEROCLAW_GATEWAY_TIMEOUT_SECS = '1800'
   ZEROCLAW_REASONING_EFFORT = 'medium'
+  # Provider-fallback observability (stabilization 2026-06-13): operator gets a
+  # deduped Telegram alert when a turn answered via a DIFFERENT provider/model.
+  # Empty operator → alerts disabled; this activates them. Oleg = 83292437.
+  ZEROCLAW_OPERATOR_USER_ID = '83292437'
+  PROVIDER_FALLBACK_ALERT_WINDOW_SECS = '1800'
   RUST_LOG = 'zeroclaw=trace,hyper=info'
   PG_STAGE_HOST = 'stage.postgres.kube-two.yallasvc.net'
   PG_STAGE_PORT = '6432'
