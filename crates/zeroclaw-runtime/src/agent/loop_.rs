@@ -9936,7 +9936,7 @@ This is an example, not an invocation."#;
         // before the final Russian answer in iter 3. The CoT prose leaked
         // to Telegram. After Variant A contract: only iter 3's final answer
         // reaches the user.
-        let provider = ScriptedProvider {
+        let provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
                 // Iter 1: read_skill(weather) + CoT
                 ChatResponse {
@@ -10012,7 +10012,7 @@ This is an example, not an invocation."#;
             &observer,
             "opencode-go",
             "deepseek-v4-flash",
-            0.0,
+            Some(0.0),
             true,
             None,
             "telegram",
@@ -10027,6 +10027,8 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
             0,
             0,
             None,
@@ -11284,6 +11286,8 @@ This is an example, not an invocation."#;
                 false,
                 false, // parallel_tools
                 None,  // channel
+                None,  // cancellation_token
+                None,  // hooks
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11350,6 +11354,8 @@ This is an example, not an invocation."#;
                 true,
                 false, // parallel_tools
                 None,  // channel
+                None,  // cancellation_token
+                None,  // hooks
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");

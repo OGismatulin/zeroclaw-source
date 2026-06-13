@@ -144,7 +144,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_serializes_usage_when_present() {
-        use zeroclaw_api::provider::TokenUsage;
+        use zeroclaw_api::model_provider::TokenUsage;
         let dir = tempfile::tempdir().unwrap();
         let hook = PromptTraceHook::new(dir.path().to_path_buf(), 50 * 1024 * 1024);
         let resp = ChatResponse {

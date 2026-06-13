@@ -590,6 +590,7 @@ impl AuthProfilesStore {
     /// Uses flock(2): the kernel releases it on fd close / process death, so a
     /// daemon killed mid-refresh (SIGKILL/OOM/deploy) cannot brick auth with a
     /// stale lock file (unlike the O_EXCL `acquire_lock` above).
+    #[cfg(unix)]
     pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard> {
         let path = self.refresh_lock_path();
         if let Some(parent) = path.parent() {
@@ -606,6 +607,7 @@ impl AuthProfilesStore {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false)
                 .open(&path)
                 .with_context(|| format!("Failed to open refresh lock at {}", path.display()))?;
 
@@ -644,11 +646,41 @@ impl AuthProfilesStore {
             }
         }
     }
+
+    /// Non-Unix fallback: `nix` flock(2) is Unix-only and the daemon only runs
+    /// on Linux (Fly) / macOS (local). Windows is a CI compile target only —
+    /// open the lock file so the path stays valid and return a guard without
+    /// kernel-level locking (no concurrent daemons exist on that target).
+    #[cfg(not(unix))]
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard> {
+        let path = self.refresh_lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "Failed to create refresh lock directory at {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open refresh lock at {}", path.display()))?;
+        Ok(RefreshLockGuard(file))
+    }
 }
 
 /// RAII guard for the cross-process refresh flock. Dropping it (or process
 /// death) closes the fd and releases the kernel advisory lock.
+#[cfg(unix)]
 pub(crate) struct RefreshLockGuard(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
+
+/// Non-Unix fallback guard: holds the open lock file (no kernel lock; Windows
+/// is a compile-only target, the daemon never runs there).
+#[cfg(not(unix))]
+pub(crate) struct RefreshLockGuard(#[allow(dead_code)] std::fs::File);
 
 struct AuthProfileLockGuard {
     lock_path: PathBuf,
