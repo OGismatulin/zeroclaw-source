@@ -1,14 +1,21 @@
 name: ZC Fly Deploy
 
-# Deploy the ghcr.io/ogismatulin/zeroclaw:latest image to Fly (ai-forge-zeroclaw).
-# Chained after zc-build-image success, or manual via workflow_dispatch.
-
+# Deploy a TESTED, SHA-pinned image to Fly. Gated on the Quality Gate (ci.yml)
+# passing for the commit — a red nextest now structurally blocks deploy.
 on:
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Explicit image tag to deploy (e.g. sha-abc1234 or latest). Manual escape hatch / rollback. Empty → current branch HEAD."
+        required: false
   workflow_run:
-    workflows: ["ZC Build and Push Image"]
+    workflows: ["Quality Gate"]      # REPLACES the old build-image-success trigger (deploy now gates on tests)
     types: [completed]
     branches: [master]
+
+permissions:
+  contents: read
+  packages: read        # for docker login / manifest inspect against GHCR
 
 jobs:
   deploy:
@@ -20,8 +27,49 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${{ inputs.image_tag }}" ]; then
+              echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            else
+              # manual run w/o tag: use the SHA the dispatch ran on (workflow_run
+              # context is null here — using head_sha would yield an empty sha-)
+              echo "tag=sha-$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "tag=sha-$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GHCR login: package is currently public (anon manifest inspect works),
+      # but authenticated requests dodge anonymous rate-limits (429) on the poll.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Wait for image in GHCR (build runs in parallel)
+        if: steps.tag.outputs.tag != 'latest'
+        run: |
+          IMG="ghcr.io/ogismatulin/zeroclaw:${{ steps.tag.outputs.tag }}"
+          echo "Waiting for $IMG ..."
+          # Budget MUST exceed realistic Rust release-build duration (build is
+          # usually slower than tests). 40 × 30s = 20 min. Tune to build p95.
+          for i in $(seq 1 40); do
+            if docker manifest inspect "$IMG" >/dev/null 2>&1; then
+              echo "image present after $((i*30))s"; exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::image $IMG not found within budget — refusing to deploy untested/unbuilt commit"
+          exit 1
+
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --image ghcr.io/ogismatulin/zeroclaw:latest
+      - run: flyctl deploy --image ghcr.io/ogismatulin/zeroclaw:${{ steps.tag.outputs.tag }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
