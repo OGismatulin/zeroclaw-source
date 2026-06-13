@@ -22379,7 +22379,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#22377 id=22377 data-nosnippet>22377</a>        // `config.toml`. No synthesized `agents/default/workspace/` is
 <a href=#22378 id=22378 data-nosnippet>22378</a>        // created at boot — `default` is migration-only, and per-agent
 <a href=#22379 id=22379 data-nosnippet>22379</a>        // workspaces are created lazily at agent-loop entry.
-<a href=#22380 id=22380 data-nosnippet>22380</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir.join(<span class="string">"data"</span>));
+<a href=#22380 id=22380 data-nosnippet>22380</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir);
 <a href=#22381 id=22381 data-nosnippet>22381</a>        <span class="macro">assert_eq!</span>(config.config_path, workspace_dir.join(<span class="string">"config.toml"</span>));
 <a href=#22382 id=22382 data-nosnippet>22382</a>        <span class="macro">assert!</span>(workspace_dir.join(<span class="string">"config.toml"</span>).exists());
 <a href=#22383 id=22383 data-nosnippet>22383</a>        <span class="macro">assert!</span>(
@@ -22420,7 +22420,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#22418 id=22418 data-nosnippet>22418</a>        // ZEROCLAW_WORKSPACE env var (deprecated alias) resolved to the
 <a href=#22419 id=22419 data-nosnippet>22419</a>        // legacy config layout where the install root is the parent of
 <a href=#22420 id=22420 data-nosnippet>22420</a>        // the env-var path; data sits at `&lt;install&gt;/data/`.
-<a href=#22421 id=22421 data-nosnippet>22421</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, legacy_config_dir.join(<span class="string">"data"</span>));
+<a href=#22421 id=22421 data-nosnippet>22421</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir);
 <a href=#22422 id=22422 data-nosnippet>22422</a>        <span class="macro">assert_eq!</span>(config.config_path, legacy_config_path);
 <a href=#22423 id=22423 data-nosnippet>22423</a>        <span class="macro">assert!</span>(config.config_path.exists());
 <a href=#22424 id=22424 data-nosnippet>22424</a>
@@ -22467,7 +22467,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#22465 id=22465 data-nosnippet>22465</a>        // the install root (the directory holding the existing
 <a href=#22466 id=22466 data-nosnippet>22466</a>        // `config.toml`), regardless of the ZEROCLAW_WORKSPACE
 <a href=#22467 id=22467 data-nosnippet>22467</a>        // (deprecated) override.
-<a href=#22468 id=22468 data-nosnippet>22468</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, legacy_config_dir.join(<span class="string">"data"</span>));
+<a href=#22468 id=22468 data-nosnippet>22468</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir);
 <a href=#22469 id=22469 data-nosnippet>22469</a>        <span class="macro">assert_eq!</span>(config.config_path, legacy_config_path);
 <a href=#22470 id=22470 data-nosnippet>22470</a>        <span class="macro">assert_eq!</span>(
 <a href=#22471 id=22471 data-nosnippet>22471</a>            config
@@ -22586,7 +22586,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#22584 id=22584 data-nosnippet>22584</a>        // ZEROCLAW_WORKSPACE env var (deprecated alias for
 <a href=#22585 id=22585 data-nosnippet>22585</a>        // ZEROCLAW_DATA_DIR) pinned the install root, so data_dir is
 <a href=#22586 id=22586 data-nosnippet>22586</a>        // `&lt;install&gt;/data/` derived from the resolved root.
-<a href=#22587 id=22587 data-nosnippet>22587</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir.join(<span class="string">"data"</span>));
+<a href=#22587 id=22587 data-nosnippet>22587</a>        </span><span class="macro">assert_eq!</span>(config.data_dir, workspace_dir);
 <a href=#22588 id=22588 data-nosnippet>22588</a>        <span class="macro">assert_eq!</span>(config.config_path, config_path);
 <a href=#22589 id=22589 data-nosnippet>22589</a>        <span class="macro">assert_eq!</span>(
 <a href=#22590 id=22590 data-nosnippet>22590</a>            config
