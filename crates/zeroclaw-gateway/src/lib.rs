@@ -2275,8 +2275,14 @@ pub(crate) async fn persist_pairing_tokens(
 /// concurrent webhook traffic that shares the same `CostTracker`.
 struct GatewayChatOutcome {
     response: String,
+    // Reserved for observer-event annotations (see doc comment above): callers
+    // currently destructure `{ response, .. }`, so the cost/token totals are
+    // captured but not yet read. Keep them populated for the planned wiring.
+    #[allow(dead_code)]
     input_tokens: Option<u64>,
+    #[allow(dead_code)]
     output_tokens: Option<u64>,
+    #[allow(dead_code)]
     cost_usd: Option<f64>,
 }
 
@@ -2500,11 +2506,11 @@ async fn run_gateway_webhook_agentic(
     // agent — its risk/runtime profiles supply what used to live in the
     // flat [autonomy] / [agent] sections.
     let agent_alias = resolve_gateway_chat_agent_alias(&config, None).ok_or_else(|| {
-        anyhow::anyhow!("webhook chat requires at least one configured [agents.<alias>] entry")
+        anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
     })?;
     let agent = config
         .resolved_agent_config(&agent_alias)
-        .ok_or_else(|| anyhow::anyhow!("agents.{agent_alias} missing from config"))?;
+        .ok_or_else(|| anyhow::Error::msg(format!("agents.{agent_alias} missing from config")))?;
     let risk_profile = config
         .risk_profile_for_agent(&agent_alias)
         .with_context(|| {
@@ -2602,7 +2608,13 @@ async fn run_gateway_webhook_agentic(
                 }
             }
             Err(e) => {
-                tracing::error!("Webhook MCP registry failed: {e:#}");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                    "Webhook MCP registry failed"
+                );
             }
         }
     }
@@ -2730,16 +2742,21 @@ async fn run_gateway_webhook_agentic(
         match tokio::time::timeout(lock_timeout, state.webhook_session.lock()).await {
             Ok(g) => g,
             Err(_) => {
-                tracing::warn!(
-                    "webhook_session lock timeout after {}s, returning previous_turn_stuck",
-                    lock_timeout.as_secs()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"timeout_secs": lock_timeout.as_secs()})),
+                    "webhook_session lock timeout, returning previous_turn_stuck"
                 );
                 // Token was registered in handle_webhook before we got here —
                 // CAS-remove so M3 can register fresh on a future request.
                 if let (Some((my_id, _)), Some(key)) = (cancel_handle.as_ref(), session_id) {
                     cas_remove_cancel_token(state, key, *my_id);
                 }
-                return Err(anyhow::anyhow!("previous_turn_stuck"));
+                // NOTE: message text "previous_turn_stuck" is matched verbatim by
+                // `e.to_string()` in handle_webhook's error branch — do not change.
+                return Err(anyhow::Error::msg("previous_turn_stuck"));
             }
         };
 
@@ -2794,22 +2811,31 @@ async fn run_gateway_webhook_agentic(
             .await
         {
             Ok(result) if result.compressed => {
-                tracing::info!(
-                    passes = result.passes_used,
-                    before = result.tokens_before,
-                    after = result.tokens_after,
-                    new_model = %model_name,
-                    new_provider = %provider_name,
-                    new_window = context_window,
-                    session_id = %session_id.unwrap_or_default(),
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "passes": result.passes_used,
+                            "before": result.tokens_before,
+                            "after": result.tokens_after,
+                            "new_model": model_name,
+                            "new_provider": provider_name,
+                            "new_window": context_window,
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
                     "Webhook pre-turn compaction (cross-model switch)"
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    session_id = %session_id.unwrap_or_default(),
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
                     "Webhook pre-turn compaction failed, continuing with full history"
                 );
             }
@@ -2896,8 +2922,12 @@ async fn run_gateway_webhook_agentic(
                 "superseded",
             );
 
-            tracing::info!(
-                session_id = session_id.unwrap_or_default(),
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id.unwrap_or_default(),
+                    })),
                 "webhook turn cancelled (superseded)"
             );
 
@@ -2933,15 +2963,20 @@ async fn run_gateway_webhook_agentic(
             .context_compression
             .model_windows
             .contains_key(model_name);
-        tracing::info!(
-            history_len = history_len,
-            context_window = context_window,
-            threshold = threshold,
-            threshold_ratio = agent.resolved.context_compression.threshold_ratio,
-            enabled = agent.resolved.context_compression.enabled,
-            registry_hit = registry_hit,
-            model = %model_name,
-            session_id = %session_id.unwrap_or_default(),
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "history_len": history_len,
+                    "context_window": context_window,
+                    "threshold": threshold,
+                    "threshold_ratio": agent.resolved.context_compression.threshold_ratio,
+                    "enabled": agent.resolved.context_compression.enabled,
+                    "registry_hit": registry_hit,
+                    "model": model_name,
+                    "session_id": session_id.unwrap_or_default(),
+                })
+            ),
             "Webhook post-turn compaction check (pre-call)"
         );
 
@@ -2960,22 +2995,31 @@ async fn run_gateway_webhook_agentic(
                 compressed_for_event = result.compressed;
                 passes_for_event = result.passes_used;
                 compression_succeeded = true;
-                tracing::info!(
-                    compressed = result.compressed,
-                    passes = result.passes_used,
-                    before = result.tokens_before,
-                    after = result.tokens_after,
-                    threshold = threshold,
-                    context_window = context_window,
-                    model = %model_name,
-                    session_id = %session_id.unwrap_or_default(),
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "compressed": result.compressed,
+                            "passes": result.passes_used,
+                            "before": result.tokens_before,
+                            "after": result.tokens_after,
+                            "threshold": threshold,
+                            "context_window": context_window,
+                            "model": model_name,
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
                     "Webhook post-turn compaction result"
                 );
             }
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    session_id = %session_id.unwrap_or_default(),
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
                     "Webhook post-turn context compression failed, falling back to history trim"
                 );
             }
@@ -3090,8 +3134,11 @@ pub(crate) enum ModelSelection {
     MissingModel,
     /// `model` set but `provider` missing → 400 missing_provider.
     MissingProvider,
-    /// `provider` not in ProviderInfo registry (canonical names only;
-    /// aliases are not accepted by validation — bot must send canonical).
+    /// `provider` does not resolve to any ProviderInfo registry entry. Per
+    /// fork patch #5, validation first canonicalizes the name
+    /// (`canonicalize_v2_model_provider_name`), so known aliases (e.g.
+    /// `z.ai` → `zai`, `opencode-go` → `opencode`) ARE accepted; only names
+    /// that fail to map onto a registry canonical land here.
     UnknownProvider {
         requested: String,
         available_providers: Vec<&'static str>,
@@ -3448,8 +3495,18 @@ async fn handle_webhook(
                 match build_override_provider(&config_snapshot, &provider, &model) {
                     Ok(p) => (ActiveProvider::Owned(p), provider, model),
                     Err(e) => {
-                        tracing::warn!(
-                            "Webhook: failed to init override provider {provider}: {e:#}"
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "provider": provider,
+                                "error": format!("{e:#}"),
+                            })),
+                            "Webhook: failed to init override provider"
                         );
                         let err = serde_json::json!({
                             "error": format!(
@@ -3625,7 +3682,12 @@ async fn handle_webhook(
             // timeout (`ZEROCLAW_WEBHOOK_LOCK_TIMEOUT_SECS`, default 5s).
             // Surface a machine-readable 503 so the bot can either retry or
             // signal "still busy" to the user.
-            tracing::warn!("Webhook lock timeout: previous_turn_stuck");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Webhook lock timeout: previous_turn_stuck"
+            );
             let body = serde_json::json!({
                 "error": "previous turn is still in flight, please retry",
                 "error_code": "previous_turn_stuck",
@@ -4920,7 +4982,7 @@ mod tests {
         emit_provider_fallback_event(&fb, Some("tg_user_99999_s_test"));
 
         let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
-        let line = raw.lines().filter(|l| !l.trim().is_empty()).last().unwrap();
+        let line = raw.lines().rfind(|l| !l.trim().is_empty()).unwrap();
         let ev: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(ev["event_type"], "provider_fallback");
         assert_eq!(ev["provider"], "opencode-go"); // legacy column = actual
@@ -5367,10 +5429,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_registry_validation_rejects_aliases_and_unknown() {
-        // Strict canonical only — aliases (e.g. "z.ai" → "zai") rejected.
-        assert!(!provider_exists_in_registry("z.ai"));
-        assert!(!provider_exists_in_registry("opencode-zen"));
+    fn provider_registry_validation_accepts_aliases_rejects_unknown() {
+        // fork patch #5: provider_exists_in_registry canonicalizes before
+        // matching, so known aliases that fold onto a registry canonical ARE
+        // accepted (z.ai → zai, opencode-zen → opencode; see
+        // zeroclaw-providers canonicalize_v2_model_provider_name). The factory
+        // applies the same mapping, so acceptance is safe by construction.
+        assert!(provider_exists_in_registry("z.ai"));
+        assert!(provider_exists_in_registry("opencode-zen"));
+        // Names that do not fold onto any registry canonical stay rejected.
         assert!(!provider_exists_in_registry("gpt-typo"));
         assert!(!provider_exists_in_registry(""));
     }
@@ -5438,22 +5505,29 @@ mod tests {
             } => {
                 assert_eq!(requested, "totally-fake-provider");
                 // Sanity check: a few expected canonical names must be in the list.
-                assert!(available_providers.contains(&"openai-codex"));
+                // v0.8.0 folded providers to canonical families: openai-codex →
+                // "openai", opencode-go → "opencode" (zeroclaw-providers list_*).
+                assert!(available_providers.contains(&"openai"));
                 assert!(available_providers.contains(&"zai"));
-                assert!(available_providers.contains(&"opencode-go"));
+                assert!(available_providers.contains(&"opencode"));
             }
             other => panic!("expected UnknownProvider, got {other:?}"),
         }
     }
 
     #[test]
-    fn classify_provider_selection_canonical_only_rejects_alias() {
-        // strict canonical: alias "z.ai" of canonical "zai" must be rejected.
+    fn classify_provider_selection_accepts_canonicalizable_alias() {
+        // fork patch #5: provider_exists_in_registry canonicalizes aliases
+        // (z.ai → zai, zeroclaw-providers/src/lib.rs:1147). The factory applies
+        // the same mapping, so anything accepted here constructs successfully.
+        // classify returns the provider string as-passed (see :3117), so the
+        // override carries "z.ai" verbatim.
         match classify_provider_selection(Some("glm-5.1"), Some("z.ai")) {
-            ModelSelection::UnknownProvider { requested, .. } => {
-                assert_eq!(requested, "z.ai");
+            ModelSelection::Override { model, provider } => {
+                assert_eq!(provider, "z.ai");
+                assert_eq!(model, "glm-5.1");
             }
-            other => panic!("expected UnknownProvider for alias, got {other:?}"),
+            other => panic!("expected Override for canonicalizable alias, got {other:?}"),
         }
     }
 
@@ -7960,9 +8034,9 @@ mod tests {
         let available = json["available_providers"]
             .as_array()
             .expect("available_providers must be an array");
-        // ProviderInfo registry includes both zai and openai-codex.
+        // ProviderInfo registry canonical names (v0.8.0 fold): zai + openai.
         assert!(available.iter().any(|v| v == "zai"));
-        assert!(available.iter().any(|v| v == "openai-codex"));
+        assert!(available.iter().any(|v| v == "openai"));
         // Agent loop not entered — provider never called.
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
@@ -8022,7 +8096,7 @@ mod tests {
 
         // Cancel after 50ms — well before the 2s slow_ms completes.
         let bg_token = token.clone();
-        tokio::spawn(async move {
+        ::zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             bg_token.cancel();
         });
