@@ -16,21 +16,15 @@ fallback_providers = ["opencode-go"]
 "glm-5-turbo"        = ["deepseek-v4-flash"]
 "glm-5.1"            = ["deepseek-v4-flash"]
 "minimax-m2.7"       = ["deepseek-v4-flash"]
-# Phase 2 (2026-05-28) — Native opencode-go models
-# Each model routes to a different upstream provider via opencode-go router;
-# upstream outage isolation makes deepseek-v4-flash a safe fallback (via DeepSeek upstream).
-# Middle-loop dedup in lib.rs:1868-1869 — no extra HTTP overhead.
-# Spec: docs/superpowers/specs/2026-05-28-opencode-go-native-fallback-design.md
+# Go-plan native opencode-go (2026-06-15) — re-synced to current Go catalog
+# Spec: docs/superpowers/specs/2026-06-15-opencode-go-go-plan-catalog-sync-design.md
 "mimo-v2.5-pro"      = ["deepseek-v4-flash"]
 "mimo-v2.5"          = ["deepseek-v4-flash"]
-"mimo-v2-pro"        = ["deepseek-v4-flash"]
-"mimo-v2-omni"       = ["deepseek-v4-flash"]
-"glm-5"              = ["deepseek-v4-flash"]
-"minimax-m2.5"       = ["deepseek-v4-flash"]
-"kimi-k2.5"          = ["deepseek-v4-flash"]
-"qwen3.6-plus"       = ["deepseek-v4-flash"]
-# 2026-05-29 — analyst ensemble (deepseek-v4-pro has no native upstream fallback)
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
+"qwen3.7-plus"       = ["deepseek-v4-flash"]
+"minimax-m3"         = ["deepseek-v4-flash"]
+"kimi-k2.7-code"     = ["deepseek-v4-flash"]
+"glm-5.2"            = ["deepseek-v4-flash"]
 
 [memory]
 backend = "sqlite"
@@ -55,22 +49,18 @@ protect_last_n = 10
 [agent.context_compression.model_windows]
 "mimo-v2.5-pro"           = 800_000
 "mimo-v2.5"               = 800_000
-"mimo-v2-pro"             = 800_000
-"mimo-v2-omni"            = 800_000
 "deepseek-v4-flash"       = 800_000
 "deepseek-v4-pro"         = 800_000
 "gemini-3-flash-preview"  = 800_000
-"qwen3.6-plus"            = 800_000
-"qwen3.5-plus"            = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.2"                 = 1_000_000
+"kimi-k2.7-code"          = 256_000
 "minimax-m2.7"            = 196_608
-"minimax-m2.5"            = 196_608
-"kimi-k2.6"               = 256_000
-"kimi-k2.5"               = 256_000
 "gpt-5.5"                 = 400_000
 "gpt-5.4"                 = 400_000
 "gpt-5.4-mini"            = 400_000
 "glm-5-turbo"             = 128_000
-"glm-5"                   = 128_000
 "glm-5.1"                 = 202_752
 # Capital "GLM-5.1" is a separate case-sensitive key (ZEROCLAW_MODEL ships the
 # model string as-is via env; model_windows.get() is case-sensitive). Same

@@ -352,18 +352,15 @@ fallback_providers = ["opencode-go"]
 "glm-5-turbo"        = ["deepseek-v4-flash"]
 "glm-5.1"            = ["deepseek-v4-flash"]
 "minimax-m2.7"       = ["deepseek-v4-flash"]
-# Phase 2 (2026-05-28) — native opencode-go fallback
-# Spec: docs/superpowers/specs/2026-05-28-opencode-go-native-fallback-design.md
+# Go-plan native opencode-go (2026-06-15) — re-synced to current Go catalog
+# Spec: docs/superpowers/specs/2026-06-15-opencode-go-go-plan-catalog-sync-design.md
 "mimo-v2.5-pro"      = ["deepseek-v4-flash"]
 "mimo-v2.5"          = ["deepseek-v4-flash"]
-"mimo-v2-pro"        = ["deepseek-v4-flash"]
-"mimo-v2-omni"       = ["deepseek-v4-flash"]
-"glm-5"              = ["deepseek-v4-flash"]
-"minimax-m2.5"       = ["deepseek-v4-flash"]
-"kimi-k2.5"          = ["deepseek-v4-flash"]
-"qwen3.6-plus"       = ["deepseek-v4-flash"]
-# 2026-05-29 — analyst ensemble (deepseek-v4-pro has no native upstream fallback)
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
+"qwen3.7-plus"       = ["deepseek-v4-flash"]
+"minimax-m3"         = ["deepseek-v4-flash"]
+"kimi-k2.7-code"     = ["deepseek-v4-flash"]
+"glm-5.2"            = ["deepseek-v4-flash"]
 
 """
 c = c.rstrip() + "\n\n" + canonical
@@ -1172,75 +1169,47 @@ protect_last_n = 10
 BASE_EOF
   fi
 
-  # Append [agent.context_compression.model_windows] registry block, if missing.
-  # Separate guard ensures partial state converges to full state on rerun.
-  if ! grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null; then
-    cat >> "$cfg" <<'WINDOWS_EOF'
-
-[agent.context_compression.model_windows]
-"mimo-v2.5-pro"           = 800_000
-"mimo-v2.5"               = 800_000
-"mimo-v2-pro"             = 800_000
-"mimo-v2-omni"            = 800_000
-"deepseek-v4-flash"       = 800_000
-"deepseek-v4-pro"         = 800_000
-"gemini-3-flash-preview"  = 800_000
-"qwen3.6-plus"            = 800_000
-"qwen3.5-plus"            = 800_000
-"minimax-m2.7"            = 196_608
-"minimax-m2.5"            = 196_608
-"kimi-k2.6"               = 256_000
-"kimi-k2.5"               = 256_000
-"gpt-5.5"                 = 400_000
-"gpt-5.4"                 = 400_000
-"gpt-5.4-mini"            = 400_000
-"glm-5-turbo"             = 128_000
-"glm-5"                   = 128_000
-"glm-5.1"                 = 202_752
-# Capital "GLM-5.1" is a separate case-sensitive key (ZEROCLAW_MODEL ships the
-# model string as-is). Same ZhiPu GLM-5.1, same ~200K window (verified 2026-06-02).
-"GLM-5.1"                 = 202_752
-"Qwen3.5-397B-A17B"       = 262_144
-WINDOWS_EOF
-  fi
-
-  # Insert wafer-specific entries (capital GLM-5.1 + Qwen3.5-397B-A17B) into
-  # existing model_windows section if missing. Idempotent — skips on rerun.
-  # Anchored to "glm-5.1" line (guaranteed present in WINDOWS_EOF) — keeps
-  # the insertion strictly inside the [agent.context_compression.model_windows]
-  # block and never lands in trailing TOML tables.
-  # Guard checks for the literal "= 202_752" value (unique to model_windows;
-  # not present in legacy reliability inline-table sections).
-  if grep -q '^\[agent\.context_compression\.model_windows\]' "$cfg" 2>/dev/null && \
-     ! grep -qE '"GLM-5\.1"\s*=\s*202_752' "$cfg" 2>/dev/null; then
-    python3 - "$cfg" <<'PY'
-import sys, re
-p = sys.argv[1]
-c = open(p).read()
-c = re.sub(
-    r'("glm-5\.1"\s*=\s*\d+(?:_\d+)?)',
-    r'\1\n"GLM-5.1"                 = 202_752\n"Qwen3.5-397B-A17B"       = 262_144',
-    c,
-    count=1,
-)
-open(p, 'w').write(c)
-PY
-  fi
-
-  # 2026-06-02: fix lowercase glm-5.1 window 128_000 -> 202_752 in EXISTING
-  # per-user model_windows blocks (append-if-missing above won't touch them).
-  # Idempotent: re.sub is a no-op once value is already 202_752. Anchored to the
-  # exact lowercase key so glm-5 / glm-5-turbo (also 128_000) stay untouched.
-  python3 - "$cfg" <<'PY_GLM_WINDOW'
+  # model_windows: strip existing [agent.context_compression.model_windows]
+  # subsection (legacy/partial state) and re-append canonical Go-plan registry.
+  # Idempotent: 2nd run replaces an already-canonical block with the same text.
+  # Strip-regex anchors on the FULL header so it cannot eat the parent
+  # [agent.context_compression] block (which sits ABOVE this subsection); the
+  # (?=^\[|\Z) lookahead stops at the next section header ([multimodal]/[skills])
+  # or EOF.
+  # Spec: docs/superpowers/specs/2026-06-15-opencode-go-go-plan-catalog-sync-design.md
+  python3 - "$cfg" <<'PY_WINDOWS'
 import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-new = re.sub(r'(?m)^("glm-5\.1"\s*=\s*)128_000\s*$', r'\g<1>202_752', c)
-if new != c:
-    p.write_text(new, encoding="utf-8")
-    print(f"[entrypoint] glm-5.1 window 128_000->202_752 in {p}")
-PY_GLM_WINDOW
+c = re.sub(
+    r'(?ms)^\[agent\.context_compression\.model_windows\].*?(?=^\[|\Z)',
+    '', c).rstrip()
+canonical = """
+
+[agent.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.2"                 = 1_000_000
+"kimi-k2.7-code"          = 256_000
+"minimax-m2.7"            = 196_608
+"gpt-5.5"                 = 400_000
+"gpt-5.4"                 = 400_000
+"gpt-5.4-mini"            = 400_000
+"glm-5-turbo"             = 128_000
+"glm-5.1"                 = 202_752
+"GLM-5.1"                 = 202_752
+"Qwen3.5-397B-A17B"       = 262_144
+"""
+c = c + canonical
+p.write_text(c, encoding="utf-8")
+print(f"[entrypoint] Configured model_windows in {p}")
+PY_WINDOWS
 done
 
 # Patch: agent-browser command + AGENT_BROWSER_* / ZEROCLAW_WORKSPACE passthrough.
