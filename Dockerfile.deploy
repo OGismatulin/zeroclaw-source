@@ -187,10 +187,11 @@ COPY scripts/code_repos_sync.py /usr/local/bin/code_repos_sync.py
 COPY scripts/fly_warmup.py /usr/local/bin/fly_warmup.py
 COPY scripts/cron_template_install.py /usr/local/bin/cron_template_install.py
 COPY scripts/bootstrap_default_cron_jobs.py /usr/local/bin/bootstrap_default_cron_jobs.py
+COPY scripts/backfill_cron_agent_alias.py /usr/local/bin/backfill_cron_agent_alias.py
 
 RUN pip install --no-cache-dir --break-system-packages requests pandas croniter psycopg2-binary httpx "mcp[cli]" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn yt-dlp
 
-RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py
+RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py /usr/local/bin/backfill_cron_agent_alias.py
 
 # agent-browser: native Rust browser-automation CLI (vercel-labs/agent-browser).
 # Baked as the real binary; a sh wrapper installed as `agent-browser` fronts it

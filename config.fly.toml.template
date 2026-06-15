@@ -218,6 +218,19 @@ timeout_secs = 30
 timeout_secs = 90
 agentic_timeout_secs = 600
 
+# Periodic heartbeat (HEARTBEAT.md tasks, e.g. Jira watchdog). v0.8.0 (schema V3)
+# flipped HeartbeatConfig.enabled default false and made `agent` required (it
+# must name a configured agent). Pre-V3 we relied on the default-true; without
+# this block the worker never spawns. `agent = "default"` = the synthesized
+# main agent. interval/two_phase set explicitly so an upstream default-flip
+# can't silently disable us again. target/to omitted on purpose — the watchdog
+# notifies via notify_telegram.py inside the task, no built-in channel needed.
+[heartbeat]
+enabled = true
+agent = "default"
+interval_minutes = 30
+two_phase = true
+
 [agents.worker]
 provider = "openai-codex"
 model = "gpt-5.4-mini"

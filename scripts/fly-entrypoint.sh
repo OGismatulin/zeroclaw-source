@@ -695,6 +695,49 @@ timeout_secs = 30
   fi
 done
 
+# Patch: ensure [heartbeat] section exists (enabled + owning agent).
+#  - v0.8.0 (schema V3) flipped HeartbeatConfig.enabled default to false and
+#    made `agent` required; pre-V3 we relied on the default-true, so existing
+#    per-user configs have NO [heartbeat] block and the worker stops spawning.
+#  - agent = "default" → the synthesized main agent (full toolset, main model).
+#  - template ($config_file) AND every per-user config get the same block.
+#  - idempotent: skip if section already present.
+#  - NO inline TOML tables; top-level [heartbeat] only.
+if ! grep -q '^\[heartbeat\]' "$config_file" 2>/dev/null; then
+  python3 -c "
+import sys
+p = sys.argv[1]
+with open(p, 'a') as f:
+    f.write('''
+
+[heartbeat]
+enabled = true
+agent = \"default\"
+interval_minutes = 30
+two_phase = true
+''')
+" "$config_file"
+fi
+
+for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$user_config" ] || continue
+  if ! grep -q '^\[heartbeat\]' "$user_config" 2>/dev/null; then
+    python3 -c "
+import sys
+p = sys.argv[1]
+with open(p, 'a') as f:
+    f.write('''
+
+[heartbeat]
+enabled = true
+agent = \"default\"
+interval_minutes = 30
+two_phase = true
+''')
+" "$user_config"
+  fi
+done
+
 # Patch: keep runtime allowlist aligned with config.toml and config.fly.toml.template
 for command in $baseline_allowed_commands; do
   ensure_multiline_array_item "allowed_commands" "$command"

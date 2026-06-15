@@ -221,6 +221,24 @@ def resolve_params(
     return resolved
 
 
+# Owning agent for bootstrap-installed cron jobs. The synthesized main agent
+# ("default" in the in-memory V3 config) carries the full toolset + main model,
+# unlike the restricted subagents (worker/coder/analyst_*).
+CRON_OWNING_AGENT = "default"
+
+
+def _ensure_agent_alias_column(conn: sqlite3.Connection) -> None:
+    """Defensive guard: the daemon's DB migration normally adds this column
+    before bootstrap runs (install happens after the daemon is healthy), but
+    add it if missing so the INSERT can't fail on a freshly-created db."""
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(cron_jobs)")]
+    # PRAGMA returns [] for a non-existent table; only ALTER an existing one.
+    if cols and "agent_alias" not in cols:
+        conn.execute(
+            "ALTER TABLE cron_jobs ADD COLUMN agent_alias TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def install_template(
     workspaces_root: Path,
     user_id: str,
@@ -262,6 +280,7 @@ def install_template(
 
     conn = sqlite3.connect(jobs_db)
     try:
+        _ensure_agent_alias_column(conn)
         existing = conn.execute(
             "SELECT id, expression FROM cron_jobs WHERE name = ?", (template.name,)
         ).fetchone()
@@ -269,14 +288,19 @@ def install_template(
             return InstallResult("existing", user_id, template.name, existing[0], existing[1])
         if existing and reinstall:
             conn.execute("DELETE FROM cron_jobs WHERE name = ?", (template.name,))
+        # V3 (schema_version 3, zeroclaw v0.8.0+) requires every cron job to be
+        # owned by an agent — the scheduler skips jobs with an empty
+        # `agent_alias` ("Cron job has no owning agent"). Bootstrap-inserted
+        # template jobs are owned by the synthesized main agent "default".
         conn.execute(
             """
             INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name,
                 session_target, model, enabled, delivery, delete_after_run,
-                created_at, next_run, last_run, last_status, last_output
+                created_at, next_run, last_run, last_status, last_output,
+                agent_alias
             ) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, 1, NULL, ?,
-                      ?, ?, NULL, NULL, NULL)
+                      ?, ?, NULL, NULL, NULL, ?)
             """,
             (
                 job_id, schedule, template.job_type, rendered_prompt,
@@ -285,6 +309,7 @@ def install_template(
                 1 if template.delete_after_run else 0,
                 (now or datetime.now(timezone.utc)).isoformat(),
                 next_run.isoformat(),
+                CRON_OWNING_AGENT,
             ),
         )
         conn.commit()
