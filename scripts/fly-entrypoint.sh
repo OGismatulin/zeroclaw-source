@@ -825,17 +825,28 @@ for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   fi
 done
 
-# Patch: append [shell_tool] section to raise shell timeout from 60s default to 600s
-# (long-running research scripts like skills/last30days/scripts/run.py).
+# gsheets_shell_timeout_migrate: migrate shell timeout from dead [shell_tool] to
+# [autonomy].shell_timeout_secs = 600 (the live path the runtime actually reads).
+# Removes [shell_tool] section if it only carries timeout_secs; inserts or
+# replaces shell_timeout_secs = 600 under [autonomy].
 for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   [ -f "$cfg" ] || continue
-  if ! grep -q '^\[shell_tool\]' "$cfg" 2>/dev/null; then
-    cat >> "$cfg" <<'SHELLTOOL'
-
-[shell_tool]
-timeout_secs = 600
-SHELLTOOL
-  fi
+  python3 - "$cfg" <<'PY_SHELL_TIMEOUT'
+import re, sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+# Remove dead [shell_tool] section (header + optional timeout_secs line + trailing blank).
+# NOTE: (?m) NOT (?ms) — DOTALL makes `.*` eat to EOF, deleting following sections.
+s = re.sub(r'(?m)^\[shell_tool\][ \t]*\n(?:timeout_secs[ \t]*=.*\n)?\n?', '', s)
+if re.search(r'(?m)^\[autonomy\]', s):
+    if re.search(r'(?m)^shell_timeout_secs\s*=', s):
+        s = re.sub(r'(?m)^shell_timeout_secs\s*=.*$', 'shell_timeout_secs = 600', s)
+    else:
+        s = re.sub(r'(?m)^(\[autonomy\]\s*\n)', r'\1shell_timeout_secs = 600\n', s, count=1)
+else:
+    sys.stderr.write(f"WARN: {p} has no [autonomy] section; skipping shell_timeout_secs\n")
+open(p, "w", encoding="utf-8").write(s)
+PY_SHELL_TIMEOUT
 done
 
 # Patch: append [multimodal] vision routing section if missing (idempotent).
