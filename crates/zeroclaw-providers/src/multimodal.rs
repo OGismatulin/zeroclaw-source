@@ -540,6 +540,25 @@ async fn prepare_messages_inner(
             continue;
         }
 
+        // Tool-result carriers (role=="tool" native results, or "[Tool results]"
+        // prompt carriers) cannot carry images as `image_url` content parts —
+        // OpenAI-compatible providers reject images in tool role, so normalizing
+        // the marker to a data URI only embeds useless base64 as TEXT (measured:
+        // 3 images → 437K tokens → empty vision response). Strip the markers to
+        // a `[media attachment]` placeholder instead; surrounding metadata text
+        // (e.g. image_info's File/Format/Size lines) survives. For native JSON
+        // tool-results `{"tool_call_id":"…","content":"…"}` the regex replaces
+        // only the marker inside the JSON string value — no quotes/braces in the
+        // replacement text — so the envelope remains valid JSON with tool_call_id
+        // intact. User-message images still flow through the image_url path below.
+        if is_tool_result_carrier(message) {
+            normalized_messages.push(ChatMessage {
+                role: message.role.clone(),
+                content: strip_media_markers(&message.content),
+            });
+            continue;
+        }
+
         // Native tool dispatchers wrap tool results as a JSON object
         // (`{"tool_call_id":"…","content":"…"}`) so that provider adapters
         // can recover `tool_call_id` via `serde_json::from_str` on
@@ -1453,12 +1472,12 @@ mod tests {
     }
 
     #[tokio::test]
-    // Covers the plain-text fallback path for `role == "tool"` messages
-    // whose `content` is not a native-dispatcher JSON payload (e.g.
-    // synthetic XML-shaped input or future non-JSON tool transports). The
-    // JSON-shaped native contract is exercised by
-    // `prepare_messages_preserves_native_tool_result_json_shape` below.
-    async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
+    // Covers the plain-text path for `role == "tool"` messages whose
+    // `content` is not a native-dispatcher JSON payload (e.g. synthetic
+    // XML-shaped input). Phase 2 fix: image markers are stripped to
+    // `[media attachment]` instead of base64-inlined, because OpenAI-compat
+    // providers reject `image_url` content parts in tool role.
+    async fn prepare_messages_tool_message_local_image_stripped_to_placeholder() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("tool-sample.png");
 
@@ -1477,28 +1496,66 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(prepared.contains_images);
+        // Phase 2: tool-result images are stripped, not inlined.
+        assert!(!prepared.contains_images);
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.messages[0].role, "tool");
 
-        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
-        assert!(cleaned.contains("<tool_result name=\"image_gen\">"));
-        assert!(cleaned.contains("Generated image"));
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
+        let out = &prepared.messages[0].content;
+        assert!(out.contains("<tool_result name=\"image_gen\">"));
+        assert!(out.contains("Generated image"));
+        assert!(out.contains("[media attachment]"));
+        assert!(!out.contains("data:image"));
+        assert!(!out.contains("[IMAGE:"));
+    }
+
+    #[tokio::test]
+    // Phase 2 coverage: the `[Tool results]` prompt-mode carrier (role="user",
+    // content starts with "[Tool results]") as the LATEST tool result must also
+    // be stripped to a placeholder by the new `is_tool_result_carrier` branch —
+    // not base64-inlined. (Distinct from the stale-path test above, where the
+    // carrier is not the latest message.)
+    async fn prepare_messages_latest_prompt_tool_result_image_stripped_to_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("latest-prompt-tool-result.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+            image_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_images);
+        let out = &prepared.messages[0].content;
+        assert!(out.contains("[Tool results]"));
+        assert!(out.contains("Generated"));
+        assert!(out.contains("[media attachment]"));
+        assert!(!out.contains("data:image"));
+        assert!(!out.contains("[IMAGE:"));
+        assert!(!out.contains("latest-prompt-tool-result.png"));
     }
 
     // Regression for the JSON-clobber bug surfaced on PR #6183: native tool
     // dispatchers serialize tool results as `{"tool_call_id":"…","content":"…"}`
     // and downstream adapters (e.g. `OpenAiCompatibleProvider::convert_messages_for_native`)
-    // recover `tool_call_id` via `serde_json::from_str` on the message
-    // content. The multimodal preprocessor must keep that JSON intact while
-    // still inlining any `[IMAGE:/path]` markers inside the inner `content`
-    // field. Asserts:
+    // recover `tool_call_id` via `serde_json::from_str` on the message content.
+    // Phase 2 fix: the preprocessor still keeps JSON intact and tool_call_id
+    // intact, but now strips `[IMAGE:/path]` markers to `[media attachment]`
+    // instead of inlining a base64 data URI. Inlining causes ~437K token bloat
+    // and empty vision responses from oa-compat providers that reject image_url
+    // in tool role. Asserts:
     //   1. Prepared content is still valid JSON.
     //   2. `tool_call_id` survives unchanged.
-    //   3. The inner `content` field carries `data:image/png;base64,…`
-    //      (marker rewritten) and keeps surrounding text.
+    //   3. The inner `content` field carries `[media attachment]` and keeps text.
+    //   4. No `data:image` appears (marker was not base64-inlined).
     #[tokio::test]
     async fn prepare_messages_preserves_native_tool_result_json_shape() {
         let temp = tempfile::tempdir().unwrap();
@@ -1521,7 +1578,8 @@ mod tests {
             .await
             .expect("preparation should succeed for native tool-result JSON");
 
-        assert!(prepared.contains_images);
+        // Phase 2: tool-result images are stripped, not inlined.
+        assert!(!prepared.contains_images);
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.messages[0].role, "tool");
 
@@ -1540,19 +1598,27 @@ mod tests {
             .expect("content must remain a JSON string");
         assert!(
             inner.contains("see attached"),
-            "surrounding text in tool content should survive normalization"
+            "surrounding text in tool content should survive"
         );
         assert!(
-            inner.contains("data:image/png;base64,"),
-            "local image path inside tool content should be rewritten to a data URI"
+            inner.contains("[media attachment]"),
+            "image marker should be replaced by placeholder; inner: {inner:?}"
+        );
+        assert!(
+            !inner.contains("data:image"),
+            "no base64 data URI should appear in tool-result; inner: {inner:?}"
         );
         assert!(
             !inner.contains("native-tool-result.png"),
-            "raw local path must not leak after normalization"
+            "raw local path must not leak after stripping"
         );
     }
 
     #[tokio::test]
+    // Phase 2: remote-URL image markers inside native JSON tool-results are
+    // stripped to `[media attachment]` (same as local paths) rather than
+    // producing a "could not be loaded" error message, because the strip
+    // happens before the normalize-image-reference path.
     async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
@@ -1565,7 +1631,7 @@ mod tests {
             &MultimodalConfig::default(),
         )
         .await
-        .expect("skipped native tool image should not fail message preparation");
+        .expect("native tool image should be stripped without error");
 
         assert!(!prepared.contains_images);
         assert_eq!(prepared.messages.len(), 1);
@@ -1582,12 +1648,17 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
         assert!(inner.contains("generated screenshot"));
-        assert!(inner.contains("1 attached image(s) could not be loaded"));
+        assert!(inner.contains("[media attachment]"));
         assert!(!inner.contains("[IMAGE:"));
         assert!(!inner.contains("https://example.com/missing.png"));
+        assert!(!inner.contains("data:image"));
     }
 
     #[tokio::test]
+    // Phase 2: both local and remote image markers inside native JSON tool-results
+    // are stripped to `[media attachment]`. Neither is base64-inlined; there is
+    // no "could not be loaded" error text because stripping happens before the
+    // normalize path.
     async fn prepare_messages_preserves_native_tool_json_with_mixed_images() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("mixed-native-tool-result.png");
@@ -1611,9 +1682,10 @@ mod tests {
             &MultimodalConfig::default(),
         )
         .await
-        .expect("valid native tool image should survive while bad ref is skipped");
+        .expect("native tool images should be stripped without error");
 
-        assert!(prepared.contains_images);
+        // Phase 2: markers stripped → no vision mode, no base64.
+        assert!(!prepared.contains_images);
         assert_eq!(prepared.messages.len(), 1);
 
         let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
@@ -1628,8 +1700,13 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("content should remain a JSON string");
         assert!(inner.contains("generated"));
-        assert!(inner.contains("data:image/png;base64,"));
-        assert!(inner.contains("1 of 2 attached image(s) could not be loaded"));
+        // Both markers replaced by placeholder.
+        assert_eq!(
+            inner.matches("[media attachment]").count(),
+            2,
+            "both image markers should be stripped to placeholder; inner: {inner:?}"
+        );
+        assert!(!inner.contains("data:image"));
         assert!(!inner.contains("mixed-native-tool-result.png"));
         assert!(!inner.contains("https://example.com/missing.png"));
     }
@@ -2217,5 +2294,147 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    // ── Phase 2: tool-result image marker stripping ───────────────────────────
+
+    /// A `role:"tool"` plain-text message with an image marker (e.g. the
+    /// `image_info` tool returning a local path) must be stripped to
+    /// `[media attachment]` instead of base64-inlined, because OpenAI-compat
+    /// providers reject `image_url` content parts inside `role:"tool"` messages.
+    /// The surrounding metadata text (File:, Format:, …) must survive.
+    #[tokio::test]
+    async fn prepare_messages_tool_result_image_stripped_to_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("tool-result-strip.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let content = format!(
+            "File: {}\nFormat: png\nSize: 145 KB\n[IMAGE:{}]",
+            image_path.display(),
+            image_path.display()
+        );
+        // Single tool message is the latest (and only) tool result.
+        let messages = vec![ChatMessage::tool(content)];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should not error");
+
+        assert!(
+            !prepared.contains_images,
+            "tool-result image should not put the request into vision mode"
+        );
+        let out = &prepared.messages[0].content;
+        assert!(
+            out.contains("[media attachment]"),
+            "image marker should be replaced by placeholder; got: {out:?}"
+        );
+        assert!(
+            !out.contains("data:image"),
+            "no base64 data URI should appear in tool-result; got: {out:?}"
+        );
+        assert!(
+            out.contains("File:"),
+            "surrounding metadata text must survive; got: {out:?}"
+        );
+        assert!(
+            out.contains("Format: png"),
+            "surrounding metadata text must survive; got: {out:?}"
+        );
+    }
+
+    /// A `role:"tool"` message carrying a native JSON envelope
+    /// `{"tool_call_id":"…","content":"…[IMAGE:…]…"}` must have its image
+    /// marker stripped to `[media attachment]` while keeping the JSON valid and
+    /// `tool_call_id` intact.
+    #[tokio::test]
+    async fn prepare_messages_native_json_tool_result_stripped_to_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("native-json-tool-strip.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let native_content = serde_json::json!({
+            "tool_call_id": "call_1",
+            "content": format!("meta info [IMAGE:{}]", image_path.display()),
+        })
+        .to_string();
+
+        let messages = vec![ChatMessage::tool(native_content)];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should not error");
+
+        assert!(!prepared.contains_images);
+
+        let out = &prepared.messages[0].content;
+        let value: serde_json::Value =
+            serde_json::from_str(out).expect("output must remain valid JSON; got: {out:?}");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_1"),
+            "tool_call_id must be preserved"
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content field must be a JSON string");
+        assert!(
+            inner.contains("[media attachment]"),
+            "image marker should be replaced by placeholder; inner: {inner:?}"
+        );
+        assert!(
+            !inner.contains("data:image"),
+            "no base64 data URI inside native JSON; inner: {inner:?}"
+        );
+        assert!(
+            inner.contains("meta info"),
+            "surrounding text must survive; inner: {inner:?}"
+        );
+    }
+
+    /// Regression: a user-message image must still be normalized to a data URI
+    /// (i.e. the `image_url` path is NOT affected by the tool-result stripping).
+    #[tokio::test]
+    async fn prepare_messages_user_image_still_normalized_to_data_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("user-image-regression.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            image_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("preparation should not error");
+
+        assert!(
+            prepared.contains_images,
+            "user image should keep the request in vision mode"
+        );
+        let out = &prepared.messages[0].content;
+        assert!(
+            out.contains("data:image"),
+            "user image must be converted to data URI (not stripped); got: {out:?}"
+        );
+        assert!(
+            !out.contains("[media attachment]"),
+            "user image must not be stripped to placeholder; got: {out:?}"
+        );
     }
 }
