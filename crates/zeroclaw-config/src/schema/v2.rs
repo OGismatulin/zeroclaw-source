@@ -1526,11 +1526,29 @@ fn synthesize_agent_brains(
             // dot-free and the URL lands in `uri`. Without this,
             // `split_once('.')` would tokenize at a URL dot like the one
             // inside `api.z.ai`.
-            let (provider_type, colon_url) = split_colon_url_provider(&raw_provider);
+            let (raw_type, colon_url) = split_colon_url_provider(&raw_provider);
+            // Per-agent alias is always "agent_<agent-alias>" regardless of
+            // which family the provider normalizes to.
             let provider_alias = format!("agent_{}", alias);
+            // Normalize the provider family: "opencode-go" → "opencode" (with
+            // go-plan URI extra), "openai-codex" → "openai" (with wire_api
+            // extras), etc. The alias returned by normalize_provider_type is
+            // discarded — we keep our own per-agent provider_alias so each
+            // agent gets its own isolated alias entry instead of colliding on
+            // the canonical alias (e.g. "go" or "codex").
+            let (provider_type, _norm_alias, extras) =
+                normalize_provider_type(&raw_type, "default");
             let mut entry = toml::Table::new();
+            // colon_url wins for `uri` (injected first); extras are inserted
+            // with `or_insert` afterward so they don't clobber the explicit URL.
             if let Some(url) = colon_url {
                 entry.insert("uri".to_string(), toml::Value::String(url));
+            }
+            // Inject provider-family extras (e.g. uri for opencode-go,
+            // wire_api + requires_openai_auth for openai-codex). Use
+            // `entry(...).or_insert` so a colon-URL `uri` set above wins.
+            for (field, value) in extras {
+                entry.entry(field.to_string()).or_insert(value);
             }
             if let Some(m) = model {
                 entry.insert("model".to_string(), m);

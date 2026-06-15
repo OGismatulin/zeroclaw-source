@@ -1444,8 +1444,8 @@ api_key = "sk-zai-agent"
         .split_once('.')
         .expect("model_provider must split cleanly on the type/alias dot");
     assert_eq!(
-        type_key, "anthropic-custom",
-        "type segment must be the dot-free prefix, not the colon-URL form"
+        type_key, "anthropic",
+        "anthropic-custom provider must normalize family to 'anthropic'"
     );
     assert_eq!(alias_key, "agent_researcher");
     assert!(
@@ -1453,8 +1453,8 @@ api_key = "sk-zai-agent"
         "the URL must not bleed into the alias segment, got alias `{alias_key}`"
     );
 
-    let synthesized = lookup_dotted(&v3, "providers.models.anthropic-custom.agent_researcher")
-        .expect("providers.models.anthropic-custom.agent_researcher synthesized");
+    let synthesized = lookup_dotted(&v3, "providers.models.anthropic.agent_researcher")
+        .expect("providers.models.anthropic.agent_researcher synthesized");
     assert_eq!(
         synthesized.get("uri").and_then(toml::Value::as_str),
         Some("https://api.z.ai/api/anthropic"),
@@ -1467,6 +1467,141 @@ api_key = "sk-zai-agent"
     assert_eq!(
         synthesized.get("api_key").and_then(toml::Value::as_str),
         Some("sk-zai-agent")
+    );
+}
+
+#[test]
+fn synthesize_agent_brains_normalizes_provider_family() {
+    // synthesize_agent_brains must call normalize_provider_type so that
+    // provider aliases like "opencode-go" (family "opencode") and
+    // "openai-codex" (family "openai") produce correct V3 keys.
+    // Without the fix the table key and model_provider both contain the
+    // raw un-normalized string, causing dangling_reference on V3 load.
+    let raw = r#"
+schema_version = 2
+
+[agents.analyst_mimo]
+provider = "opencode-go"
+model = "mimo-v2.5-pro"
+
+[agents.worker]
+provider = "openai-codex"
+model = "gpt-5.4-mini"
+
+[agents.analyst_glm]
+provider = "zai"
+model = "glm-5"
+
+[agents.analyst_deepseek]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+"#;
+    let v3 = migrate_v2(raw);
+
+    // ── analyst_mimo: opencode-go → family "opencode", alias go ──────────
+    let analyst_mp = v3
+        .get("agents")
+        .and_then(|v| v.get("analyst_mimo"))
+        .and_then(|a| a.get("model_provider"))
+        .and_then(|v| v.as_str())
+        .expect("agents.analyst_mimo.model_provider must be a string");
+    let (analyst_type, analyst_alias) = analyst_mp
+        .split_once('.')
+        .expect("model_provider must split on type/alias dot");
+    assert_eq!(
+        analyst_type, "opencode",
+        "opencode-go provider must normalize family to 'opencode', got '{analyst_type}'"
+    );
+    assert_eq!(analyst_alias, "agent_analyst_mimo");
+
+    let analyst_entry =
+        lookup_dotted(&v3, "providers.models.opencode.agent_analyst_mimo")
+            .expect("providers.models.opencode.agent_analyst_mimo must exist");
+    assert_eq!(
+        analyst_entry.get("uri").and_then(toml::Value::as_str),
+        Some("https://opencode.ai/zen/go/v1"),
+        "opencode-go must inject the go-plan URI on the synthesized alias entry"
+    );
+    assert_eq!(
+        analyst_entry.get("model").and_then(toml::Value::as_str),
+        Some("mimo-v2.5-pro")
+    );
+
+    // ── worker: openai-codex → family "openai", codex extras ─────────────
+    let worker_mp = v3
+        .get("agents")
+        .and_then(|v| v.get("worker"))
+        .and_then(|a| a.get("model_provider"))
+        .and_then(|v| v.as_str())
+        .expect("agents.worker.model_provider must be a string");
+    let (worker_type, worker_alias) = worker_mp
+        .split_once('.')
+        .expect("model_provider must split on type/alias dot");
+    assert_eq!(
+        worker_type, "openai",
+        "openai-codex provider must normalize family to 'openai', got '{worker_type}'"
+    );
+    assert_eq!(worker_alias, "agent_worker");
+
+    let worker_entry =
+        lookup_dotted(&v3, "providers.models.openai.agent_worker")
+            .expect("providers.models.openai.agent_worker must exist");
+    assert_eq!(
+        worker_entry.get("wire_api").and_then(toml::Value::as_str),
+        Some("responses"),
+        "openai-codex must inject wire_api=responses on the synthesized alias entry"
+    );
+    assert_eq!(
+        worker_entry
+            .get("requires_openai_auth")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "openai-codex must inject requires_openai_auth=true on the synthesized alias entry"
+    );
+    assert_eq!(
+        worker_entry.get("model").and_then(toml::Value::as_str),
+        Some("gpt-5.4-mini")
+    );
+
+    // ── analyst_glm: passthrough "zai" → family "zai" + endpoint extra ───
+    // zai is its own canonical family (token == family), but
+    // normalize_provider_type still returns an `endpoint = "global"` extra
+    // that must be injected onto the per-agent entry so the synthesized
+    // provider resolves the correct (global) zai endpoint.
+    let glm_mp = v3
+        .get("agents")
+        .and_then(|v| v.get("analyst_glm"))
+        .and_then(|a| a.get("model_provider"))
+        .and_then(|v| v.as_str())
+        .expect("agents.analyst_glm.model_provider must be a string");
+    assert_eq!(glm_mp, "zai.agent_analyst_glm");
+    let glm_entry = lookup_dotted(&v3, "providers.models.zai.agent_analyst_glm")
+        .expect("providers.models.zai.agent_analyst_glm must exist");
+    assert_eq!(
+        glm_entry.get("endpoint").and_then(toml::Value::as_str),
+        Some("global"),
+        "zai must inject endpoint=global on the synthesized alias entry"
+    );
+
+    // ── analyst_deepseek: passthrough "deepseek" → family unchanged, no
+    // spurious extras (empty extras → injection loop is a no-op) ─────────
+    let ds_mp = v3
+        .get("agents")
+        .and_then(|v| v.get("analyst_deepseek"))
+        .and_then(|a| a.get("model_provider"))
+        .and_then(|v| v.as_str())
+        .expect("agents.analyst_deepseek.model_provider must be a string");
+    assert_eq!(ds_mp, "deepseek.agent_analyst_deepseek");
+    let ds_entry =
+        lookup_dotted(&v3, "providers.models.deepseek.agent_analyst_deepseek")
+            .expect("providers.models.deepseek.agent_analyst_deepseek must exist");
+    assert_eq!(
+        ds_entry.get("model").and_then(toml::Value::as_str),
+        Some("deepseek-v4-flash")
+    );
+    assert!(
+        ds_entry.get("endpoint").is_none(),
+        "deepseek passthrough must not inject a spurious endpoint extra"
     );
 }
 
