@@ -2508,6 +2508,24 @@ pub async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Guard: an empty final completion must never be delivered silently.
+            // Emit a dedicated trace event and substitute an i18n fallback.
+            let final_text = if display_text.trim().is_empty() {
+                runtime_trace::record_event(
+                    "empty_final_response",
+                    Some(channel_name),
+                    Some(active_model_provider_name),
+                    Some(active_model),
+                    Some(&turn_id),
+                    Some(false),
+                    None,
+                    serde_json::json!({ "iteration": iteration + 1 }),
+                );
+                crate::i18n::get_required_cli_string("channel-runtime-empty-final-response")
+            } else {
+                display_text
+            };
+
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -2515,7 +2533,7 @@ pub async fn run_tool_call_loop(
                     .with_attrs(::serde_json::json!({
                         "model": model,
                         "iteration": iteration + 1,
-                        "text": scrub_credentials(&display_text),
+                        "text": scrub_credentials(&final_text),
                         "trace_id": turn_id,
                     })),
                 "turn_final_response"
@@ -2530,11 +2548,11 @@ pub async fn run_tool_call_loop(
                 None,
                 serde_json::json!({
                     "iteration": iteration + 1,
-                    "text": scrub_credentials(&display_text),
+                    "text": scrub_credentials(&final_text),
                 }),
             );
             // No tool calls — this is the final response.
-            accumulated_display_text.push_str(&display_text);
+            accumulated_display_text.push_str(&final_text);
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.
@@ -2543,7 +2561,7 @@ pub async fn run_tool_call_loop(
                 && !protocol_suppressed
             {
                 let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
+                for word in final_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
                         .as_ref()
                         .is_some_and(CancellationToken::is_cancelled)
@@ -13477,6 +13495,64 @@ Let me check the result."#;
         assert!(
             after_deny.contains(&"file_read"),
             "non-excluded file_read must remain, got {after_deny:?}"
+        );
+    }
+
+    /// When the LLM returns an empty completion on the final iteration,
+    /// `run_tool_call_loop` must return a non-empty i18n fallback message
+    /// instead of silently returning an empty string to the caller.
+    #[tokio::test]
+    async fn empty_final_response_yields_fallback_not_silence() {
+        // Single empty response — the loop hits the final-response path immediately.
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![""]);
+
+        let mut history = vec![ChatMessage::user("describe these screenshots".to_string())];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "scripted",
+            "scripted-model",
+            Some(0.0),
+            true,
+            None,
+            "cli",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+        )
+        .await
+        .expect("empty response should not error — it should fall back to i18n message");
+
+        let expected =
+            crate::i18n::get_required_cli_string("channel-runtime-empty-final-response");
+        assert!(
+            !result.trim().is_empty(),
+            "empty final response must not be delivered as empty string"
+        );
+        assert_eq!(
+            result, expected,
+            "empty final response must equal the i18n fallback key"
         );
     }
 }

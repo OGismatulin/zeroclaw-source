@@ -628,3 +628,6 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── channel runtime errors ──
+channel-runtime-empty-final-response = ⚠️ Модель вернула пустой ответ. Попробуй переформулировать запрос или прислать картинку ещё раз.
