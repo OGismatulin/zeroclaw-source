@@ -13544,8 +13544,7 @@ Let me check the result."#;
         .await
         .expect("empty response should not error — it should fall back to i18n message");
 
-        let expected =
-            crate::i18n::get_required_cli_string("channel-runtime-empty-final-response");
+        let expected = crate::i18n::get_required_cli_string("channel-runtime-empty-final-response");
         assert!(
             !result.trim().is_empty(),
             "empty final response must not be delivered as empty string"

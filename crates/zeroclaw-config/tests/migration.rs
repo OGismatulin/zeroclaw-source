@@ -1514,9 +1514,8 @@ model = "deepseek-v4-flash"
     );
     assert_eq!(analyst_alias, "agent_analyst_mimo");
 
-    let analyst_entry =
-        lookup_dotted(&v3, "providers.models.opencode.agent_analyst_mimo")
-            .expect("providers.models.opencode.agent_analyst_mimo must exist");
+    let analyst_entry = lookup_dotted(&v3, "providers.models.opencode.agent_analyst_mimo")
+        .expect("providers.models.opencode.agent_analyst_mimo must exist");
     assert_eq!(
         analyst_entry.get("uri").and_then(toml::Value::as_str),
         Some("https://opencode.ai/zen/go/v1"),
@@ -1543,9 +1542,8 @@ model = "deepseek-v4-flash"
     );
     assert_eq!(worker_alias, "agent_worker");
 
-    let worker_entry =
-        lookup_dotted(&v3, "providers.models.openai.agent_worker")
-            .expect("providers.models.openai.agent_worker must exist");
+    let worker_entry = lookup_dotted(&v3, "providers.models.openai.agent_worker")
+        .expect("providers.models.openai.agent_worker must exist");
     assert_eq!(
         worker_entry.get("wire_api").and_then(toml::Value::as_str),
         Some("responses"),
@@ -1592,9 +1590,8 @@ model = "deepseek-v4-flash"
         .and_then(|v| v.as_str())
         .expect("agents.analyst_deepseek.model_provider must be a string");
     assert_eq!(ds_mp, "deepseek.agent_analyst_deepseek");
-    let ds_entry =
-        lookup_dotted(&v3, "providers.models.deepseek.agent_analyst_deepseek")
-            .expect("providers.models.deepseek.agent_analyst_deepseek must exist");
+    let ds_entry = lookup_dotted(&v3, "providers.models.deepseek.agent_analyst_deepseek")
+        .expect("providers.models.deepseek.agent_analyst_deepseek must exist");
     assert_eq!(
         ds_entry.get("model").and_then(toml::Value::as_str),
         Some("deepseek-v4-flash")
