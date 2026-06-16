@@ -922,6 +922,7 @@ fn provider_env_candidates(name: &str) -> &'static [&'static str] {
         "zai" => &["ZAI_API_KEY", "GLM_API_KEY"],
         "glm" => &["GLM_API_KEY", "ZAI_API_KEY"],
         "minimax" => &["MINIMAX_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
         _ => &[],
     }
 }
@@ -2384,6 +2385,16 @@ mod tests {
         // Canonical family name as passed by create_model_provider_with_options.
         let resolved = resolve_model_provider_credential("opencode", None);
         assert_eq!(resolved.as_deref(), Some("go-test-key"));
+    }
+
+    #[test]
+    fn resolve_model_provider_credential_deepseek_env() {
+        let _env_lock = env_lock();
+        let _provider_guard = EnvGuard::set("DEEPSEEK_API_KEY", Some("deepseek-test-key"));
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let resolved = resolve_model_provider_credential("deepseek", None);
+        assert_eq!(resolved.as_deref(), Some("deepseek-test-key"));
     }
 
     #[test]

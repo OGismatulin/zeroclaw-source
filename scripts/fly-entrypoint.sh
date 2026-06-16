@@ -1029,7 +1029,7 @@ if new != text:
 PYEOF
 done
 
-# Patch: subagents roster v3 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
+# Patch: subagents roster v5 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
 # Idempotent bounded strip-and-replace of [delegate] + every [agents.*] section.
 # Guard: version marker. Removal regex stops at next ^[ so it never touches
 # [agent.context_compression] / [reliability] (which sit AFTER agents at runtime).
@@ -1041,18 +1041,19 @@ import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-MARKER = "# subagents-v4"
+MARKER = "# subagents-v5"
 if MARKER in c:
     sys.exit(0)  # already migrated
 # Strip orphan old marker lines left above [delegate] by prior migrations.
 c = c.replace("# subagents-v2-ensemble\n", "")
 c = c.replace("# subagents-v3\n", "")
+c = c.replace("# subagents-v4\n", "")
 # Remove [delegate] and every [agents.<name>] section: header -> next ^[ or EOF.
 c = re.sub(r'(?ms)^\[delegate\].*?(?=^\[|\Z)', '', c)
 c = re.sub(r'(?ms)^\[agents\.[^\]]+\].*?(?=^\[|\Z)', '', c)
 # MARKER is the LITERAL first line of canonical (not %s) so runtime guard and
 # the test regex anchor on the same string.
-canonical = """# subagents-v4
+canonical = """# subagents-v5
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 600
@@ -1239,7 +1240,7 @@ allowed_tools = [
 """
 c = c.rstrip() + "\n\n" + canonical.lstrip("\n")
 p.write_text(c, encoding="utf-8")
-print(f"[entrypoint] subagents roster v3 applied to {p}")
+print(f"[entrypoint] subagents roster v5 applied to {p}")
 PY_SUBAGENTS
 done
 
