@@ -33,6 +33,10 @@ embedding_provider = "openrouter"
 embedding_model = "openai/text-embedding-3-small"
 embedding_dimensions = 1536
 sqlite_open_timeout_secs = 30
+# Core-memory durability: export category='core' → MEMORY_SNAPSHOT.md at each daemon
+# spawn (snapshot.rs:363); auto_hydrate (default true) restores on cold-boot.
+snapshot_enabled = true
+snapshot_on_hygiene = true
 
 [agent]
 compact_context = false

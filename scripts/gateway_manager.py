@@ -247,7 +247,7 @@ class WorkspaceBootstrapper:
                 workspace_dir,
                 ignore=shutil.ignore_patterns(
                     "memory", "state", "logs", "cron", "uploads",
-                    "*.db", "*.db-shm", "*.db-wal",
+                    "*.db", "*.db-shm", "*.db-wal", "MEMORY_SNAPSHOT.md",
                 ),
             )
         else:
@@ -291,6 +291,9 @@ class WorkspaceBootstrapper:
 
     _RUNTIME_DIRS = {"memory", "state", "logs", "cron", "uploads"}
     _RUNTIME_EXTS = {".db", ".db-shm", ".db-wal"}
+    # Per-user runtime artifacts at workspace root that must never propagate
+    # from template → user (one user's Core-memory "soul" is private).
+    _RUNTIME_NAMES = {"MEMORY_SNAPSHOT.md"}
 
     @classmethod
     def _sync_missing_from_template(
@@ -302,6 +305,8 @@ class WorkspaceBootstrapper:
         """
         for item in template_dir.iterdir():
             if item.name in cls._RUNTIME_DIRS:
+                continue
+            if item.name in cls._RUNTIME_NAMES:
                 continue
             if any(item.name.endswith(ext) for ext in cls._RUNTIME_EXTS):
                 continue
@@ -319,6 +324,7 @@ class WorkspaceBootstrapper:
                     ignore=shutil.ignore_patterns(
                         "memory", "state", "logs", "cron", "uploads",
                         "*.db", "*.db-shm", "*.db-wal", "__pycache__",
+                        "MEMORY_SNAPSHOT.md",
                     ),
                 )
             else:

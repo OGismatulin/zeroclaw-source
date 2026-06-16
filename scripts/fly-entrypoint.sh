@@ -854,6 +854,16 @@ for user_config in "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   fi
 done
 
+# Patch: enable Core-memory snapshot durability (MEMORY_SNAPSHOT.md export at each daemon
+# spawn via snapshot.rs:363 + native auto-hydrate on cold-boot). Template AND every
+# per-user config; idempotent (skips if snapshot_enabled already present).
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  if ! grep -q 'snapshot_enabled' "$cfg" 2>/dev/null; then
+    sed -i '/^\[memory\]/a snapshot_enabled = true\nsnapshot_on_hygiene = true' "$cfg"
+  fi
+done
+
 # Patch: set allowed_roots for code-repos access via content_search/glob_search
 if grep -q 'allowed_roots = \[\]' "$config_file" 2>/dev/null; then
   sed -i 's/allowed_roots = \[\]/allowed_roots = ["\/zeroclaw-data\/code-repos"]/' "$config_file"

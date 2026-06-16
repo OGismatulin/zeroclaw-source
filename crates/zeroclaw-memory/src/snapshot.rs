@@ -147,7 +147,8 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
         CREATE TABLE IF NOT EXISTS embedding_cache (
             content_hash TEXT PRIMARY KEY,
             embedding    BLOB NOT NULL,
-            created_at   TEXT NOT NULL
+            created_at   TEXT NOT NULL,
+            accessed_at  TEXT NOT NULL
         );",
     )?;
 
@@ -493,5 +494,54 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         let count = hydrate_from_snapshot(tmp.path()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Regression: a hydrated `brain.db` must be openable by the real
+    /// `SqliteMemory` backend (which runs `init_schema` + V3 migration) and
+    /// the restored Core memory must be recallable.
+    ///
+    /// Pre-fix the hydrate schema created `embedding_cache` without the
+    /// `accessed_at` column, so `init_schema`'s `idx_cache_accessed` index
+    /// failed → `SqliteMemory` construction errored → the gateway silently
+    /// fell back to `NoneMemory` (memory bricked instead of restored).
+    /// Verified end-to-end on a local v0.8.0 daemon (2026-06-16).
+    #[tokio::test]
+    async fn hydrated_snapshot_opens_and_recalls_through_sqlite_memory() {
+        use crate::sqlite::SqliteMemory;
+        use crate::traits::{Memory, MemoryCategory};
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+
+        // 1. Real backend writes a Core memory, then export the snapshot.
+        {
+            let mem = SqliteMemory::new("sqlite", ws).unwrap();
+            mem.store("fav_language", "User loves Rust", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(export_snapshot(ws).unwrap(), 1);
+
+        // 2. Simulate brain.db loss (the cold-boot / corruption scenario).
+        let mem_dir = ws.join("memory");
+        let _ = std::fs::remove_file(mem_dir.join("brain.db-wal"));
+        let _ = std::fs::remove_file(mem_dir.join("brain.db-shm"));
+        std::fs::remove_file(mem_dir.join("brain.db")).unwrap();
+        assert!(should_hydrate(ws));
+
+        // 3. Hydrate from the snapshot.
+        assert_eq!(hydrate_from_snapshot(ws).unwrap(), 1);
+
+        // 4. REGRESSION GUARD: opening the real backend over the hydrated db
+        //    must succeed (pre-fix this returned Err → NoneMemory fallback).
+        let mem = SqliteMemory::new("sqlite", ws)
+            .expect("SqliteMemory::new over hydrated brain.db must not fail");
+
+        // 5. The restored Core memory is actually recallable.
+        let hits = mem.recall("Rust", 5, None, None, None).await.unwrap();
+        assert!(
+            hits.iter().any(|e| e.key == "fav_language"),
+            "hydrated Core memory not recalled: {hits:?}"
+        );
     }
 }
