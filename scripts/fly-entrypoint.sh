@@ -1029,7 +1029,7 @@ if new != text:
 PYEOF
 done
 
-# Patch: subagents roster v5 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
+# Patch: subagents roster v6 (6 agents: worker/coder + 4 analysts for error-analysis ensemble)
 # Idempotent bounded strip-and-replace of [delegate] + every [agents.*] section.
 # Guard: version marker. Removal regex stops at next ^[ so it never touches
 # [agent.context_compression] / [reliability] (which sit AFTER agents at runtime).
@@ -1041,24 +1041,26 @@ import sys, re
 from pathlib import Path
 p = Path(sys.argv[1])
 c = p.read_text(encoding="utf-8")
-MARKER = "# subagents-v5"
+MARKER = "# subagents-v6"
 if MARKER in c:
     sys.exit(0)  # already migrated
 # Strip orphan old marker lines left above [delegate] by prior migrations.
 c = c.replace("# subagents-v2-ensemble\n", "")
 c = c.replace("# subagents-v3\n", "")
 c = c.replace("# subagents-v4\n", "")
+c = c.replace("# subagents-v5\n", "")
 # Remove [delegate] and every [agents.<name>] section: header -> next ^[ or EOF.
 c = re.sub(r'(?ms)^\[delegate\].*?(?=^\[|\Z)', '', c)
 c = re.sub(r'(?ms)^\[agents\.[^\]]+\].*?(?=^\[|\Z)', '', c)
 # MARKER is the LITERAL first line of canonical (not %s) so runtime guard and
 # the test regex anchor on the same string.
-canonical = """# subagents-v5
+canonical = """# subagents-v6
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 600
 
 [agents.worker]
+risk_profile = "default"
 provider = "openai-codex"
 model = "gpt-5.4-mini"
 api_key = ""
@@ -1089,6 +1091,7 @@ allowed_tools = [
 ]
 
 [agents.coder]
+risk_profile = "default"
 provider = "openai-codex"
 model = "gpt-5.5"
 api_key = ""
@@ -1119,6 +1122,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_mimo]
+risk_profile = "default"
 provider = "opencode-go"
 model = "mimo-v2.5-pro"
 api_key = ""
@@ -1149,6 +1153,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_pro]
+risk_profile = "default"
 provider = "deepseek"
 model = "deepseek-v4-pro"
 api_key = ""
@@ -1179,6 +1184,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_flash]
+risk_profile = "default"
 provider = "deepseek"
 model = "deepseek-v4-flash"
 api_key = ""
@@ -1209,6 +1215,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_glm]
+risk_profile = "default"
 provider = "zai"
 model = "glm-5.1"
 api_key = ""
@@ -1240,7 +1247,7 @@ allowed_tools = [
 """
 c = c.rstrip() + "\n\n" + canonical.lstrip("\n")
 p.write_text(c, encoding="utf-8")
-print(f"[entrypoint] subagents roster v5 applied to {p}")
+print(f"[entrypoint] subagents roster v6 applied to {p}")
 PY_SUBAGENTS
 done
 
