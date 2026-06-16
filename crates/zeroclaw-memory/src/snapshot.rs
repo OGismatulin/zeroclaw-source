@@ -516,9 +516,14 @@ Rule 3: Protect the user.
         // 1. Real backend writes a Core memory, then export the snapshot.
         {
             let mem = SqliteMemory::new("sqlite", ws).unwrap();
-            mem.store("fav_language", "User loves Rust", MemoryCategory::Core, None)
-                .await
-                .unwrap();
+            mem.store(
+                "fav_language",
+                "User loves Rust",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(export_snapshot(ws).unwrap(), 1);
 
