@@ -518,33 +518,38 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#516 id=516 data-nosnippet>516</a>        <span class="comment">// 1. Real backend writes a Core memory, then export the snapshot.
 <a href=#517 id=517 data-nosnippet>517</a>        </span>{
 <a href=#518 id=518 data-nosnippet>518</a>            <span class="kw">let </span>mem = SqliteMemory::new(<span class="string">"sqlite"</span>, ws).unwrap();
-<a href=#519 id=519 data-nosnippet>519</a>            mem.store(<span class="string">"fav_language"</span>, <span class="string">"User loves Rust"</span>, MemoryCategory::Core, <span class="prelude-val">None</span>)
-<a href=#520 id=520 data-nosnippet>520</a>                .<span class="kw">await
-<a href=#521 id=521 data-nosnippet>521</a>                </span>.unwrap();
-<a href=#522 id=522 data-nosnippet>522</a>        }
-<a href=#523 id=523 data-nosnippet>523</a>        <span class="macro">assert_eq!</span>(export_snapshot(ws).unwrap(), <span class="number">1</span>);
-<a href=#524 id=524 data-nosnippet>524</a>
-<a href=#525 id=525 data-nosnippet>525</a>        <span class="comment">// 2. Simulate brain.db loss (the cold-boot / corruption scenario).
-<a href=#526 id=526 data-nosnippet>526</a>        </span><span class="kw">let </span>mem_dir = ws.join(<span class="string">"memory"</span>);
-<a href=#527 id=527 data-nosnippet>527</a>        <span class="kw">let _ </span>= std::fs::remove_file(mem_dir.join(<span class="string">"brain.db-wal"</span>));
-<a href=#528 id=528 data-nosnippet>528</a>        <span class="kw">let _ </span>= std::fs::remove_file(mem_dir.join(<span class="string">"brain.db-shm"</span>));
-<a href=#529 id=529 data-nosnippet>529</a>        std::fs::remove_file(mem_dir.join(<span class="string">"brain.db"</span>)).unwrap();
-<a href=#530 id=530 data-nosnippet>530</a>        <span class="macro">assert!</span>(should_hydrate(ws));
-<a href=#531 id=531 data-nosnippet>531</a>
-<a href=#532 id=532 data-nosnippet>532</a>        <span class="comment">// 3. Hydrate from the snapshot.
-<a href=#533 id=533 data-nosnippet>533</a>        </span><span class="macro">assert_eq!</span>(hydrate_from_snapshot(ws).unwrap(), <span class="number">1</span>);
-<a href=#534 id=534 data-nosnippet>534</a>
-<a href=#535 id=535 data-nosnippet>535</a>        <span class="comment">// 4. REGRESSION GUARD: opening the real backend over the hydrated db
-<a href=#536 id=536 data-nosnippet>536</a>        //    must succeed (pre-fix this returned Err → NoneMemory fallback).
-<a href=#537 id=537 data-nosnippet>537</a>        </span><span class="kw">let </span>mem = SqliteMemory::new(<span class="string">"sqlite"</span>, ws)
-<a href=#538 id=538 data-nosnippet>538</a>            .expect(<span class="string">"SqliteMemory::new over hydrated brain.db must not fail"</span>);
+<a href=#519 id=519 data-nosnippet>519</a>            mem.store(
+<a href=#520 id=520 data-nosnippet>520</a>                <span class="string">"fav_language"</span>,
+<a href=#521 id=521 data-nosnippet>521</a>                <span class="string">"User loves Rust"</span>,
+<a href=#522 id=522 data-nosnippet>522</a>                MemoryCategory::Core,
+<a href=#523 id=523 data-nosnippet>523</a>                <span class="prelude-val">None</span>,
+<a href=#524 id=524 data-nosnippet>524</a>            )
+<a href=#525 id=525 data-nosnippet>525</a>            .<span class="kw">await
+<a href=#526 id=526 data-nosnippet>526</a>            </span>.unwrap();
+<a href=#527 id=527 data-nosnippet>527</a>        }
+<a href=#528 id=528 data-nosnippet>528</a>        <span class="macro">assert_eq!</span>(export_snapshot(ws).unwrap(), <span class="number">1</span>);
+<a href=#529 id=529 data-nosnippet>529</a>
+<a href=#530 id=530 data-nosnippet>530</a>        <span class="comment">// 2. Simulate brain.db loss (the cold-boot / corruption scenario).
+<a href=#531 id=531 data-nosnippet>531</a>        </span><span class="kw">let </span>mem_dir = ws.join(<span class="string">"memory"</span>);
+<a href=#532 id=532 data-nosnippet>532</a>        <span class="kw">let _ </span>= std::fs::remove_file(mem_dir.join(<span class="string">"brain.db-wal"</span>));
+<a href=#533 id=533 data-nosnippet>533</a>        <span class="kw">let _ </span>= std::fs::remove_file(mem_dir.join(<span class="string">"brain.db-shm"</span>));
+<a href=#534 id=534 data-nosnippet>534</a>        std::fs::remove_file(mem_dir.join(<span class="string">"brain.db"</span>)).unwrap();
+<a href=#535 id=535 data-nosnippet>535</a>        <span class="macro">assert!</span>(should_hydrate(ws));
+<a href=#536 id=536 data-nosnippet>536</a>
+<a href=#537 id=537 data-nosnippet>537</a>        <span class="comment">// 3. Hydrate from the snapshot.
+<a href=#538 id=538 data-nosnippet>538</a>        </span><span class="macro">assert_eq!</span>(hydrate_from_snapshot(ws).unwrap(), <span class="number">1</span>);
 <a href=#539 id=539 data-nosnippet>539</a>
-<a href=#540 id=540 data-nosnippet>540</a>        <span class="comment">// 5. The restored Core memory is actually recallable.
-<a href=#541 id=541 data-nosnippet>541</a>        </span><span class="kw">let </span>hits = mem.recall(<span class="string">"Rust"</span>, <span class="number">5</span>, <span class="prelude-val">None</span>, <span class="prelude-val">None</span>, <span class="prelude-val">None</span>).<span class="kw">await</span>.unwrap();
-<a href=#542 id=542 data-nosnippet>542</a>        <span class="macro">assert!</span>(
-<a href=#543 id=543 data-nosnippet>543</a>            hits.iter().any(|e| e.key == <span class="string">"fav_language"</span>),
-<a href=#544 id=544 data-nosnippet>544</a>            <span class="string">"hydrated Core memory not recalled: {hits:?}"
-<a href=#545 id=545 data-nosnippet>545</a>        </span>);
-<a href=#546 id=546 data-nosnippet>546</a>    }
-<a href=#547 id=547 data-nosnippet>547</a>}
+<a href=#540 id=540 data-nosnippet>540</a>        <span class="comment">// 4. REGRESSION GUARD: opening the real backend over the hydrated db
+<a href=#541 id=541 data-nosnippet>541</a>        //    must succeed (pre-fix this returned Err → NoneMemory fallback).
+<a href=#542 id=542 data-nosnippet>542</a>        </span><span class="kw">let </span>mem = SqliteMemory::new(<span class="string">"sqlite"</span>, ws)
+<a href=#543 id=543 data-nosnippet>543</a>            .expect(<span class="string">"SqliteMemory::new over hydrated brain.db must not fail"</span>);
+<a href=#544 id=544 data-nosnippet>544</a>
+<a href=#545 id=545 data-nosnippet>545</a>        <span class="comment">// 5. The restored Core memory is actually recallable.
+<a href=#546 id=546 data-nosnippet>546</a>        </span><span class="kw">let </span>hits = mem.recall(<span class="string">"Rust"</span>, <span class="number">5</span>, <span class="prelude-val">None</span>, <span class="prelude-val">None</span>, <span class="prelude-val">None</span>).<span class="kw">await</span>.unwrap();
+<a href=#547 id=547 data-nosnippet>547</a>        <span class="macro">assert!</span>(
+<a href=#548 id=548 data-nosnippet>548</a>            hits.iter().any(|e| e.key == <span class="string">"fav_language"</span>),
+<a href=#549 id=549 data-nosnippet>549</a>            <span class="string">"hydrated Core memory not recalled: {hits:?}"
+<a href=#550 id=550 data-nosnippet>550</a>        </span>);
+<a href=#551 id=551 data-nosnippet>551</a>    }
+<a href=#552 id=552 data-nosnippet>552</a>}
 </code></pre></div></section></main></body></html>
