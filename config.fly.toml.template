@@ -231,7 +231,43 @@ agent = "default"
 interval_minutes = 30
 two_phase = true
 
+[risk_profiles.default]
+# Regression #16 (v0.8.0): delegation re-enablement. V3 forbids delegation by
+# default AND ties allowed_tools to the risk_profile; the delegate gate requires
+# caller and target to share the SAME risk_profile. So main agent + all subagents
+# sit on "default" and this list is the shared toolset. The MAIN agent runs at
+# level=Full and ignores this allowlist (gateway path filters only excluded_tools
+# when level != Full), so it stays unconstrained; delegate targets (execute_agentic)
+# REQUIRE a non-empty allowed_tools and use it as their tool filter — this is the
+# superset of every subagent toolset, giving subagents the same powers as main.
+allowed_tools = [
+    "file_read", "file_write", "file_edit", "content_search",
+    "glob_search", "shell", "http_request", "web_fetch",
+    "web_search_tool", "text_browser", "memory_recall", "memory_store",
+    "memory_forget", "memory_export", "read_skill", "tool_search",
+    "knowledge", "delegate", "swarm", "cron_add",
+    "cron_list", "cron_remove", "cron_run", "cron_runs",
+    "cron_update", "schedule", "model_switch", "model_routing_config",
+    "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
+    "image_gen", "image_info", "pdf_read", "screenshot",
+    "sessions_history", "sessions_list", "sessions_send", "workspace",
+    "calculator", "counting", "project_intel", "llm_task",
+    "report_template", "execute_pipeline", "git_operations", "sop_advance",
+    "sop_approve", "sop_execute", "sop_list", "sop_status",
+    "security_ops", "vi_verify", "notion", "jira",
+    "linkedin", "google_workspace", "microsoft365", "discord_search",
+    "composio", "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query",
+    "lalafo-db__query_file", "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases",
+    "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
+    "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
+    "graylog__by_user", "graylog__search_to_file",
+]
+
+[risk_profiles.default.delegation_policy]
+mode = "allow"
+
 [agents.worker]
+risk_profile = "default"
 provider = "openai-codex"
 model = "gpt-5.4-mini"
 api_key = ""
@@ -262,6 +298,7 @@ allowed_tools = [
 ]
 
 [agents.coder]
+risk_profile = "default"
 provider = "openai-codex"
 model = "gpt-5.5"
 api_key = ""
@@ -292,6 +329,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_mimo]
+risk_profile = "default"
 provider = "opencode-go"
 model = "mimo-v2.5-pro"
 api_key = ""
@@ -322,6 +360,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_pro]
+risk_profile = "default"
 provider = "deepseek"
 model = "deepseek-v4-pro"
 api_key = ""
@@ -352,6 +391,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_deepseek_flash]
+risk_profile = "default"
 provider = "deepseek"
 model = "deepseek-v4-flash"
 api_key = ""
@@ -382,6 +422,7 @@ allowed_tools = [
 ]
 
 [agents.analyst_glm]
+risk_profile = "default"
 provider = "zai"
 model = "glm-5.1"
 api_key = ""

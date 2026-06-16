@@ -738,6 +738,74 @@ two_phase = true
   fi
 done
 
+# Patch: enable subagent delegation (regression #16) — template + every per-user config.
+#  v0.8.0 (schema V3) made delegation forbidden-by-default AND ties allowed_tools to
+#  the risk_profile, while the delegate gate requires caller and target to share the
+#  SAME risk_profile (crates/.../delegate.rs). Three edits re-open delegation:
+#   (1) every [agents.<x>] references risk_profile="default" — caller(main)+targets
+#       share "default", so the gate passes.
+#   (2) [risk_profiles.default].allowed_tools = union of all subagent toolsets — the
+#       delegate path (execute_agentic) REQUIRES a non-empty allowed_tools and uses it
+#       as the target's tool filter. Computed from THIS config so it self-heals.
+#   (3) [risk_profiles.default.delegation_policy] mode="allow" — opens the caller gate.
+#  The MAIN agent runs at level=Full and ignores allowed_tools (gateway path filters
+#  only excluded_tools when level != Full), so it stays unconstrained; subagents thereby
+#  get the same powers as main. Idempotent, in-place. tomllib parse is best-effort:
+#  on failure the block is skipped (no crash-loop) rather than written malformed.
+for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
+  [ -f "$cfg" ] || continue
+  python3 - "$cfg" <<'PY_DELEGATION'
+import re, sys, tomllib
+p = sys.argv[1]
+raw = open(p, encoding="utf-8").read()
+
+# union of every [agents.<x>].allowed_tools, order-preserving (best-effort parse).
+union = []
+try:
+    parsed = tomllib.loads(raw)
+    seen = set()
+    for agent in parsed.get("agents", {}).values():
+        for tool in agent.get("allowed_tools", []):
+            if tool not in seen:
+                seen.add(tool)
+                union.append(tool)
+except Exception:
+    union = []
+
+# (1) inject risk_profile = "default" into each top-level [agents.<x>] block.
+lines = raw.splitlines(keepends=True)
+out, i, n = [], 0, len(lines)
+while i < n:
+    line = lines[i]
+    out.append(line)
+    if re.match(r'^\[agents\.[^\].]+\]\s*$', line):
+        j, has_rp = i + 1, False
+        while j < n and not lines[j].lstrip().startswith('['):
+            if re.match(r'^\s*risk_profile\s*=', lines[j]):
+                has_rp = True
+                break
+            j += 1
+        if not has_rp:
+            out.append('risk_profile = "default"\n')
+    i += 1
+text = "".join(out)
+
+# (2)+(3) ensure [risk_profiles.default] with allowed_tools + delegation_policy.
+# Skip if the parent table already exists, or if we couldn't derive a toolset.
+if union and not re.search(r'(?m)^\[risk_profiles\.default\]\s*$', text):
+    arr = "".join('    "%s",\n' % t for t in union)
+    block = (
+        "[risk_profiles.default]\n"
+        "allowed_tools = [\n" + arr + "]\n\n"
+        "[risk_profiles.default.delegation_policy]\n"
+        'mode = "allow"\n'
+    )
+    text = text.rstrip("\n") + "\n\n" + block
+
+open(p, "w", encoding="utf-8").write(text)
+PY_DELEGATION
+done
+
 # Patch: keep runtime allowlist aligned with config.toml and config.fly.toml.template
 for command in $baseline_allowed_commands; do
   ensure_multiline_array_item "allowed_commands" "$command"
