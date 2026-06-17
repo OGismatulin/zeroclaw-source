@@ -3569,10 +3569,22 @@ pub async fn run(
     overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    // fork(#17): build the agent via `resolved_agent_config` (not the raw
+    // `config.agent()`), so `agent.resolved.*` carries the runtime-profile
+    // overrides — most importantly `max_tool_iterations`. The stored
+    // `AliasedAgentConfig.resolved` is `ResolvedRuntime::default()`
+    // (schema.rs:3232; comment at 3033 "never deserialized, populated by
+    // resolved_agent_config"), so the previous `config.agent()` path left
+    // `agent.resolved.max_tool_iterations` at the ResolvedRuntime default of
+    // 10 (== DEFAULT_MAX_TOOL_ITERATIONS) regardless of the runtime profile.
+    // The gateway/webhook path already
+    // resolves correctly (lib.rs `resolved_agent_config`); cron + CLI
+    // `zeroclaw agent` + daemon all funnel through `run()`/`process_message()`
+    // and were silently capped at 10 — heavy cron digests exhausted the loop
+    // before their final notify/send tool call. See project_cron_iteration_cap_10.
     let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+        .resolved_agent_config(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
@@ -5013,10 +5025,13 @@ pub async fn process_message(
     session_id: Option<&str>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    // fork(#17): resolve runtime-profile overrides into `agent.resolved.*`
+    // (notably `max_tool_iterations`). See the matching comment in `run()` and
+    // project_cron_iteration_cap_10 — raw `config.agent()` leaves resolved at
+    // default (max_tool_iterations 0 → loop's DEFAULT_MAX_TOOL_ITERATIONS=10).
     let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+        .resolved_agent_config(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)

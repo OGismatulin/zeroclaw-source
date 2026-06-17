@@ -1109,8 +1109,16 @@ impl Agent {
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
     ) -> Result<Self> {
+        // fork(#17): resolve runtime-profile overrides into `agent_cfg.resolved.*`
+        // (max_tool_iterations, tool_dispatcher, …). Raw `config.agent()` returns
+        // the stored agent whose `.resolved` is `ResolvedRuntime::default()`
+        // (max_tool_iterations = 10), so the `Agent` struct's own loop
+        // (`self.config.resolved.max_tool_iterations`) was capped at 10 on the
+        // interactive `zeroclaw agent` / TUI / ACP paths regardless of the
+        // profile. Mirrors the fix in loop_.rs `run()`/`process_message()`.
+        // See project_cron_iteration_cap_10.
         let agent_cfg = config
-            .agent(agent_alias)
+            .resolved_agent_config(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
         let risk_profile = config
             .risk_profile_for_agent(agent_alias)
