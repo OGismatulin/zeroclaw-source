@@ -846,13 +846,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Namespace + session double filter
+        // Namespace still filters; the session filter no longer isolates Core.
+        // Fork patch (Core-global recall): Core memories are cross-session, so
+        // both ns1 Core entries surface regardless of the `sess-a` filter, while
+        // the ns2 entry stays excluded by the namespace filter.
         let results = mem
             .recall_namespaced("ns1", "fact", 10, Some("sess-a"), None, None)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].key, "k1");
+        let keys: std::collections::HashSet<&str> =
+            results.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(results.len(), 2);
+        assert!(keys.contains("k1") && keys.contains("k2"));
+        assert!(!keys.contains("k3"));
     }
 
     #[tokio::test]
