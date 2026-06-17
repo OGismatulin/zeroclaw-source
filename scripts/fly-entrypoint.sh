@@ -864,6 +864,13 @@ for cfg in "$config_file" "$workspaces_dir"/tg_*/.zeroclaw/config.toml; do
   fi
 done
 
+# NOTE: native per-turn consolidation (`[memory] consolidation_enabled`) is
+# DELIBERATELY not migrated here. It is off-baseline (serde default false) with
+# per-user opt-in: we enable it by editing a single user's
+# .zeroclaw/config.toml. A force-set migration would clobber that per-user
+# `true` back to `false` on every deploy. Fresh configs inherit `false` from the
+# template; existing configs without the key resolve to false via serde default.
+
 # Patch: set allowed_roots for code-repos access via content_search/glob_search
 if grep -q 'allowed_roots = \[\]' "$config_file" 2>/dev/null; then
   sed -i 's/allowed_roots = \[\]/allowed_roots = ["\/zeroclaw-data\/code-repos"]/' "$config_file"

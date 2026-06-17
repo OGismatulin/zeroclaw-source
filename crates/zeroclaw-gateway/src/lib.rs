@@ -3644,6 +3644,60 @@ async fn handle_webhook(
                 },
             );
 
+            // Fire-and-forget per-turn memory consolidation (fork patch).
+            // Mirrors the WS path (`ws.rs`): only on a fully answered turn
+            // (this `Ok` branch; Cancelled never reaches here, so
+            // latest-message-wins is preserved), gated on global `auto_save`
+            // AND the `consolidation_enabled` flag. Uses the daemon provider
+            // (`opencode-go/deepseek-v4-flash` on Fly) with an optional model
+            // override; does not block the response.
+            if state.auto_save && config_snapshot.memory.consolidation_enabled {
+                let mem = state.mem.clone();
+                let model_provider = state.model_provider.clone();
+                let model = config_snapshot
+                    .memory
+                    .consolidation_model
+                    .clone()
+                    .unwrap_or_else(|| state.model.clone());
+                let temperature = state.temperature;
+                let user_msg = message.to_string();
+                let assistant_resp = response.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    match zeroclaw_memory::consolidation::consolidate_turn(
+                        model_provider.as_ref(),
+                        &model,
+                        temperature,
+                        mem.as_ref(),
+                        &user_msg,
+                        &assistant_resp,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                "webhook memory consolidation done"
+                            );
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "webhook memory consolidation skipped"
+                            );
+                        }
+                    }
+                });
+            }
+
             let body = serde_json::json!({
                 "status": "ok",
                 "response": response,

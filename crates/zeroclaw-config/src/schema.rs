@@ -9192,6 +9192,18 @@ pub struct MemoryConfig {
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
 
+    // ── Per-turn Consolidation (fork) ───────────────────────────
+    /// Enable LLM-driven per-turn memory consolidation on the webhook
+    /// path. When true, each answered turn is consolidated (fire-and-forget)
+    /// into Daily (history_entry) + Core (memory_update, with conflict dedup).
+    /// Additionally gated on `auto_save`. Default off.
+    #[serde(default)]
+    pub consolidation_enabled: bool,
+    /// Optional model override for consolidation, on the same provider as the
+    /// turn (`state.model_provider`). When None, uses the daemon's `model`.
+    #[serde(default)]
+    pub consolidation_model: Option<String>,
+
     // ── Audit Trail ─────────────────────────────────────────────
     /// Enable audit logging of memory operations.
     #[serde(default)]
@@ -9334,6 +9346,8 @@ impl Default for MemoryConfig {
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
+            consolidation_enabled: false,
+            consolidation_model: None,
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),

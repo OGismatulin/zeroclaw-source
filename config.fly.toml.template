@@ -37,6 +37,10 @@ sqlite_open_timeout_secs = 30
 # spawn (snapshot.rs:363); auto_hydrate (default true) restores on cold-boot.
 snapshot_enabled = true
 snapshot_on_hygiene = true
+# Native per-turn consolidation (fork): Daily history_entry + Core memory_update
+# with conflict dedup. Off baseline; per-user opt-in. Coexists with nightly-retro.
+# Spec: docs/superpowers/specs/2026-06-16-native-per-turn-consolidation-design.md
+consolidation_enabled = false
 
 [agent]
 compact_context = false

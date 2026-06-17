@@ -28,12 +28,17 @@ pub struct ConsolidationResult {
     pub trend: Option<String>,
 }
 
-const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
-1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
-2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
+// Fork patch: prompt rewritten so extracted facts come back in the
+// conversation's language (this deployment is Russian-centric). EN facts in a
+// RU context surface in `[Memory context]` of RU turns and degrade recall
+// (EN-fact ↔ RU-query embedding similarity is lower).
+const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"Ты — движок консолидации памяти. По одному ходу диалога извлеки:
+1. "history_entry": краткое summary того, что произошло в этом ходе (1–2 предложения). Укажи ключевую тему или действие.
+2. "memory_update": любые НОВЫЕ факты, предпочтения, решения или обязательства, которые стоит запомнить надолго. Верни null, если ничего нового не узнал.
 
-Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
-Do not include any text outside the JSON object."#;
+Пиши history_entry и memory_update на ТОМ ЖЕ ЯЗЫКЕ, на котором идёт диалог (обычно русский).
+Ответь ТОЛЬКО валидным JSON: {"history_entry": "...", "memory_update": "..." или null}
+Не добавляй никакого текста вне JSON-объекта."#;
 
 /// Run two-phase LLM-driven consolidation on a conversation turn.
 ///
@@ -112,8 +117,14 @@ pub async fn consolidate_turn(
         // Compute importance score heuristically.
         let imp = importance::compute_importance(update, &MemoryCategory::Core);
 
-        // Check for conflicts with existing Core memories.
-        if let Err(e) = conflict::check_and_resolve_conflicts(
+        // Detect conflicting Core memories BEFORE storing the new entry, so the
+        // new entry itself is never a candidate for being superseded.
+        //
+        // Fork patch: upstream discards this Vec (only `Err` is handled) and
+        // never calls `mark_superseded`, so conflict detection was a no-op —
+        // stale Core facts were never retired and recall surfaced both old and
+        // new. We capture the ids and mark them superseded after the store.
+        let superseded_ids = match conflict::check_and_resolve_conflicts(
             memory,
             &mem_key,
             update,
@@ -122,13 +133,17 @@ pub async fn consolidate_turn(
         )
         .await
         {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "conflict check skipped"
-            );
-        }
+            Ok(ids) => ids,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "conflict check skipped"
+                );
+                Vec::new()
+            }
+        };
 
         // Store with importance metadata.
         memory
@@ -141,6 +156,23 @@ pub async fn consolidate_turn(
                 Some(imp),
             )
             .await?;
+
+        // Retire the older conflicting facts: recall filters
+        // `superseded_by IS NULL`, so this is what actually de-duplicates Core.
+        // The marker value is the new entry's key — only NULL-ness gates recall
+        // (no FK/JOIN reads the value), and the new row's internal id is not
+        // available here without an extra round-trip.
+        if !superseded_ids.is_empty() {
+            let refs: Vec<&str> = superseded_ids.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = memory.mark_superseded(&refs, &mem_key).await {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "mark_superseded skipped"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -238,5 +270,92 @@ mod tests {
                 .is_char_boundary(result.history_entry.len())
         );
         assert!(result.history_entry.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::sqlite::SqliteMemory;
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use zeroclaw_api::model_provider::ModelProvider;
+
+    /// Returns a fixed JSON reply. `chat` keeps its trait default (unused here).
+    struct StubProvider {
+        reply: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for StubProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for StubProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StubProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidate_turn_writes_daily_and_core() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let provider = StubProvider {
+            reply: r#"{"history_entry": "Обсудили деплой.", "memory_update": "Олег предпочитает деплой через CI."}"#.to_string(),
+        };
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &mem,
+            "Как деплоить?",
+            "Через CI.",
+        )
+        .await
+        .unwrap();
+
+        let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+        assert_eq!(daily.len(), 1, "one Daily history_entry");
+        assert_eq!(daily[0].content, "Обсудили деплой.");
+
+        let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert_eq!(core.len(), 1, "one Core memory_update");
+        assert!(core[0].content.contains("CI"));
+    }
+
+    #[tokio::test]
+    async fn consolidate_turn_null_update_writes_only_daily() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let provider = StubProvider {
+            reply: r#"{"history_entry": "Дежурное приветствие.", "memory_update": null}"#
+                .to_string(),
+        };
+
+        consolidate_turn(&provider, "test-model", None, &mem, "Привет", "Привет!")
+            .await
+            .unwrap();
+
+        let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
+        assert_eq!(daily.len(), 1);
+        let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert!(core.is_empty(), "no Core entry when memory_update is null");
     }
 }

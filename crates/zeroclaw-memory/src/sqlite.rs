@@ -594,7 +594,11 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
+            // Fork patch (Core-global recall): Core memories are cross-session
+            // "soul" facts and must surface regardless of the session filter
+            // (and survive `/new`). Safe alongside a category filter: a row
+            // cannot satisfy both `category = ?cat` and `category = 'core'`.
+            let _ = write!(sql, " AND (session_id = ?{idx} OR category = 'core')");
             param_values.push(Box::new(sid.to_string()));
         }
 
@@ -649,7 +653,9 @@ impl SqliteMemory {
             let mut idx = 1;
 
             if let Some(sid) = sid.as_deref() {
-                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                // Fork patch (Core-global recall): Core is cross-session — see
+                // vector_search.
+                let _ = write!(sql, " AND (m.session_id = ?{idx} OR m.category = 'core')");
                 param_values.push(Box::new(sid.to_string()));
                 idx += 1;
             }
@@ -870,7 +876,10 @@ impl Memory for SqliteMemory {
                             agent_alias: alias,
                             agent_id: aid,
                         };
+                        // Fork patch (Core-global recall): Core entries are
+                        // cross-session and bypass the session filter.
                         if let Some(filter_sid) = session_ref
+                            && entry.category != MemoryCategory::Core
                             && entry.session_id.as_deref() != Some(filter_sid) {
                                 continue;
                             }
@@ -963,7 +972,9 @@ impl Memory for SqliteMemory {
                     })?;
                     for row in rows {
                         let entry = row?;
+                        // Fork patch (Core-global recall): Core is cross-session.
                         if let Some(sid) = session_ref
+                            && entry.category != MemoryCategory::Core
                             && entry.session_id.as_deref() != Some(sid) {
                                 continue;
                             }
@@ -1564,6 +1575,24 @@ impl Memory for SqliteMemory {
         })
         .await?
     }
+
+    async fn mark_superseded(
+        &self,
+        superseded_ids: &[&str],
+        superseded_by: &str,
+    ) -> anyhow::Result<()> {
+        if superseded_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let ids: Vec<String> = superseded_ids.iter().map(|s| (*s).to_string()).collect();
+        let new_id = superseded_by.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            crate::conflict::mark_superseded(&conn, &ids, &new_id)
+        })
+        .await?
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SqliteMemory {
@@ -1626,6 +1655,87 @@ mod tests {
         let entry = mem.get("pref").await.unwrap().unwrap();
         assert_eq!(entry.content, "loves Rust");
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_excludes_entry_from_recall_and_list() {
+        // Regression for the consolidation dedup fork patch: a Core fact
+        // marked superseded must drop out of both list() and recall(), while
+        // the superseding fact survives. Before the patch there was no way to
+        // set superseded_by from the consolidation path.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("old", "Олег предпочитает Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("new", "Олег предпочитает Go", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let before = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert_eq!(before.len(), 2);
+        let old_id = before.iter().find(|e| e.key == "old").unwrap().id.clone();
+
+        mem.mark_superseded(&[old_id.as_str()], "new")
+            .await
+            .unwrap();
+
+        let after = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert_eq!(after.len(), 1, "superseded entry filtered out of list");
+        assert_eq!(after[0].key, "new");
+
+        let recalled = mem
+            .recall("Олег предпочитает", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().all(|e| e.key != "old"),
+            "superseded entry filtered out of recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_empty_ids_is_noop() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.mark_superseded(&[], "x").await.unwrap();
+        assert_eq!(mem.list(Some(&MemoryCategory::Core), None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn core_recall_is_cross_session_but_others_stay_scoped() {
+        // Fork patch (Core-global recall): a Core fact written with no session
+        // (or any session) must surface under a DIFFERENT session filter — this
+        // is how consolidated Core facts reach the model across `/new`. A
+        // non-Core entry from another session must stay filtered out.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("pref", "Олег предпочитает Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "chat",
+            "Олег спросил про Rust вчера",
+            MemoryCategory::Conversation,
+            Some("sess-A"),
+        )
+        .await
+        .unwrap();
+
+        // Recall under a different session than either entry was stored with.
+        let hits = mem
+            .recall("Rust", 10, Some("sess-B"), None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            hits.iter().any(|e| e.key == "pref"),
+            "Core fact surfaces cross-session"
+        );
+        assert!(
+            hits.iter().all(|e| e.key != "chat"),
+            "non-Core entry from another session stays filtered out"
+        );
     }
 
     #[tokio::test]
@@ -2745,16 +2855,33 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_recall_with_session_id() {
+        // Session filtering applies to non-Core categories. (Core is
+        // cross-session by design — see cross_session_recall_isolation.)
         let (_tmp, mem) = temp_sqlite();
-        mem.store("k1", "session A fact", MemoryCategory::Core, Some("sess-a"))
-            .await
-            .unwrap();
-        mem.store("k2", "session B fact", MemoryCategory::Core, Some("sess-b"))
-            .await
-            .unwrap();
-        mem.store("k3", "no session fact", MemoryCategory::Core, None)
-            .await
-            .unwrap();
+        mem.store(
+            "k1",
+            "session A fact",
+            MemoryCategory::Conversation,
+            Some("sess-a"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "k2",
+            "session B fact",
+            MemoryCategory::Conversation,
+            Some("sess-b"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "k3",
+            "no session fact",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Recall with session-a filter returns only session-a entry
         let results = mem
@@ -2786,29 +2913,53 @@ mod tests {
 
     #[tokio::test]
     async fn cross_session_recall_isolation() {
+        // Fork patch (Core-global recall): Core is intentionally cross-session
+        // (survives `/new`); non-Core categories stay session-isolated. Before
+        // the patch this test asserted Core was session-isolated too.
         let (_tmp, mem) = temp_sqlite();
         mem.store(
             "secret",
             "session A secret data",
+            MemoryCategory::Conversation,
+            Some("sess-a"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "soul",
+            "durable identity fact",
             MemoryCategory::Core,
             Some("sess-a"),
         )
         .await
         .unwrap();
 
-        // Session B cannot see session A data
+        // Session B cannot see session A's non-Core data.
         let results = mem
             .recall("secret", 10, Some("sess-b"), None, None)
             .await
             .unwrap();
-        assert!(results.is_empty());
+        assert!(
+            results.iter().all(|e| e.key != "secret"),
+            "non-Core stays session-isolated"
+        );
 
-        // Session A can see its own data
+        // ...but Core facts are visible cross-session.
+        let results = mem
+            .recall("durable identity", 10, Some("sess-b"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|e| e.key == "soul"),
+            "Core is cross-session"
+        );
+
+        // Session A still sees its own non-Core data.
         let results = mem
             .recall("secret", 10, Some("sess-a"), None, None)
             .await
             .unwrap();
-        assert_eq!(results.len(), 1);
+        assert!(results.iter().any(|e| e.key == "secret"));
     }
 
     #[tokio::test]

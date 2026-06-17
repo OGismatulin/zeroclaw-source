@@ -426,6 +426,26 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
     }
+
+    /// Mark a set of memory entries as superseded by a newer entry.
+    ///
+    /// Sets the `superseded_by` column on each row identified by
+    /// `superseded_ids` (entry `id`s) to `superseded_by` (an identifier of
+    /// the replacing entry — its key or id). Recall filters out rows with a
+    /// non-NULL `superseded_by`, so this is how conflict resolution retires
+    /// stale Core facts. Only NULL-ness gates recall; the stored value is
+    /// informational (no FK / JOIN reads it).
+    ///
+    /// Default: no-op. Backends with a `superseded_by` column (SqliteMemory,
+    /// PostgresMemory) override this; backends without it keep the default so
+    /// fire-and-forget consolidation never errors on an unsupported backend.
+    async fn mark_superseded(
+        &self,
+        _superseded_ids: &[&str],
+        _superseded_by: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// High-level memory lifecycle policy.
