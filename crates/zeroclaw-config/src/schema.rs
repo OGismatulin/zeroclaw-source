@@ -19805,6 +19805,48 @@ runtime_profile = "fast"
     }
 
     #[test]
+    async fn resolved_agent_config_bakes_runtime_profile_max_tool_iterations() {
+        // fork(#17) regression guard. `agent::run()` / `process_message()`
+        // (cron, CLI `zeroclaw agent`, daemon) build the agent via
+        // `resolved_agent_config`, NOT raw `config.agent()`. The stored
+        // `.resolved` is `ResolvedRuntime::default()` (max_tool_iterations = 10),
+        // so reading it directly silently capped those turns at 10 even when the
+        // runtime profile granted more — heavy cron digests exhausted the tool
+        // loop before their final notify/send call. See
+        // project_cron_iteration_cap_10. The gateway/webhook path was already
+        // correct because it uses `resolved_agent_config`.
+        let raw = r#"
+[runtime_profiles.fast]
+max_tool_iterations = 80
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        // The trap: the raw stored agent is unbaked (ResolvedRuntime default).
+        assert_eq!(
+            parsed
+                .agent("default")
+                .unwrap()
+                .resolved
+                .max_tool_iterations,
+            10,
+            "raw config.agent().resolved is the unbaked default"
+        );
+        // The contract `run()` depends on: resolved_agent_config bakes the
+        // runtime-profile value into `.resolved`.
+        assert_eq!(
+            parsed
+                .resolved_agent_config("default")
+                .unwrap()
+                .resolved
+                .max_tool_iterations,
+            80,
+            "resolved_agent_config must bake the runtime profile's max_tool_iterations"
+        );
+    }
+
+    #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();
         assert!(cfg.step_timeout_secs.is_none());
