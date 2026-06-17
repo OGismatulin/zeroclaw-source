@@ -38,9 +38,10 @@ sqlite_open_timeout_secs = 30
 snapshot_enabled = true
 snapshot_on_hygiene = true
 # Native per-turn consolidation (fork): Daily history_entry + Core memory_update
-# with conflict dedup. Off baseline; per-user opt-in. Coexists with nightly-retro.
+# with conflict dedup. On by default (since 2026-06-17; serde default also true).
+# Set false to opt a user out. Coexists with nightly-retro.
 # Spec: docs/superpowers/specs/2026-06-16-native-per-turn-consolidation-design.md
-consolidation_enabled = false
+consolidation_enabled = true
 
 [agent]
 compact_context = false

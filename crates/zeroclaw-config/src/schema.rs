@@ -9196,8 +9196,10 @@ pub struct MemoryConfig {
     /// Enable LLM-driven per-turn memory consolidation on the webhook
     /// path. When true, each answered turn is consolidated (fire-and-forget)
     /// into Daily (history_entry) + Core (memory_update, with conflict dedup).
-    /// Additionally gated on `auto_save`. Default off.
-    #[serde(default)]
+    /// Additionally gated on `auto_save`. **Default on (since 2026-06-17)** —
+    /// configs lacking the field inherit `true`, so existing per-user configs
+    /// turn it on at the next daemon spawn; set `false` explicitly to opt out.
+    #[serde(default = "default_true")]
     pub consolidation_enabled: bool,
     /// Optional model override for consolidation, on the same provider as the
     /// turn (`state.model_provider`). When None, uses the daemon's `model`.
@@ -9346,7 +9348,7 @@ impl Default for MemoryConfig {
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
-            consolidation_enabled: false,
+            consolidation_enabled: true,
             consolidation_model: None,
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
