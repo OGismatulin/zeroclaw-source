@@ -1700,7 +1700,13 @@ mod tests {
             .await
             .unwrap();
         mem.mark_superseded(&[], "x").await.unwrap();
-        assert_eq!(mem.list(Some(&MemoryCategory::Core), None).await.unwrap().len(), 1);
+        assert_eq!(
+            mem.list(Some(&MemoryCategory::Core), None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2874,14 +2880,9 @@ mod tests {
         )
         .await
         .unwrap();
-        mem.store(
-            "k3",
-            "no session fact",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
+        mem.store("k3", "no session fact", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
 
         // Recall with session-a filter returns only session-a entry
         let results = mem
