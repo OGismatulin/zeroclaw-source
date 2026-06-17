@@ -19,7 +19,6 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 from typing import Callable, TextIO, TypedDict
 from urllib import error, request
 
@@ -36,6 +35,11 @@ class DaemonCapacityError(RuntimeError):
 REQUEST_CONTEXT_USER_ID_PATTERN = re.compile(r"(?m)^- user_id:\s*(\d+)\s*$")
 
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
+
+# Bumped whenever the per-user config layout changes so existing on-disk
+# configs are cut over to the latest template on next spawn. v3-1 = native
+# schema_version=3 template (Phase 1).
+CURRENT_CONFIG_MARKER = "v3-1"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -256,17 +260,31 @@ class WorkspaceBootstrapper:
         for runtime_dir in ("memory", "state", "logs", "cron", "uploads"):
             (workspace_dir / runtime_dir).mkdir(exist_ok=True)
 
+        template_config = template_config_dir / "config.toml"
         child_config = config_dir / "config.toml"
         if not child_config.exists():
-            config_text = (template_config_dir / "config.toml").read_text(
-                encoding="utf-8"
-            )
+            config_text = template_config.read_text(encoding="utf-8")
             config_text = self._rewrite_gateway_config(
                 config_text,
                 host=self.settings.child_host,
                 port=port,
             )
-            child_config.write_text(config_text, encoding="utf-8")
+            config_text = config_text.rstrip("\n") + (
+                f"\n\n# config-gen = {CURRENT_CONFIG_MARKER}\n"
+            )
+            tmp = child_config.with_suffix(".toml.tmp")
+            tmp.write_text(config_text, encoding="utf-8")
+            os.replace(tmp, child_config)
+        else:
+            # Cut an existing per-user config over to the current template
+            # (no-op once the marker matches). Preserves the unique port.
+            self.cutover_peruser_config(
+                child_config,
+                template_config,
+                port,
+                CURRENT_CONFIG_MARKER,
+                host=self.settings.child_host,
+            )
 
         for name in ("auth-profiles.json", ".secret_key"):
             source = shared_auth_dir / name
@@ -427,6 +445,47 @@ class WorkspaceBootstrapper:
 
         return "\n".join(output).rstrip() + "\n"
 
+    @staticmethod
+    def cutover_peruser_config(
+        cfg: Path,
+        template: Path,
+        port: int,
+        marker: str,
+        host: str,
+    ) -> bool:
+        """Cut an existing per-user config.toml over to the current V3 template,
+        preserving the user's unique gateway port.
+
+        The per-user config's only meaningful delta vs the (already
+        secret-substituted) on-volume template is the gateway/webhook port, so
+        cutover = copy template + re-inject port via _rewrite_gateway_config.
+
+        Idempotent: a config already carrying `# config-gen = {marker}` is left
+        untouched and returns False. The ORIGINAL pre-V3 config is preserved in
+        `config.toml.backup` for rollback — never overwritten by a later
+        cutover. Returns True when the config was (re)written.
+        """
+        if cfg.exists() and f"# config-gen = {marker}" in cfg.read_text(
+            encoding="utf-8"
+        ):
+            return False
+
+        backup = cfg.parent / "config.toml.backup"
+        if not backup.exists():
+            shutil.copy2(cfg, backup)
+
+        rendered = WorkspaceBootstrapper._rewrite_gateway_config(
+            template.read_text(encoding="utf-8"),
+            host=host,
+            port=port,
+        )
+        rendered = rendered.rstrip("\n") + f"\n\n# config-gen = {marker}\n"
+
+        tmp = cfg.with_suffix(".toml.tmp")
+        tmp.write_text(rendered, encoding="utf-8")
+        os.replace(tmp, cfg)
+        return True
+
 
 SpawnProcess = Callable[[str, int, Path], subprocess.Popen[str]]
 WaitUntilHealthy = Callable[[int], None]
@@ -540,20 +599,6 @@ class GatewayRegistry:
 
         workspace_root = self.bootstrapper.ensure_workspace(user_key, port)
         config_dir = workspace_root / ".zeroclaw"
-
-        # fork(stabilization): refuse to spawn on a config that drifted to
-        # schema_version>=3 — fork-patch P2 silently no-ops there, breaking the
-        # env-default provider (regression S2). Guard the SPAWN path only (live
-        # orphan reattach above already started). Deduped operator alert.
-        child_config = config_dir / "config.toml"
-        if _config_is_v3_on_disk(child_config):
-            msg = (
-                f"⛔ {user_key}: config.toml уехал в schema_version>=3 на диске — "
-                f"P2-shim no-op, env-провайдер сломан. Daemon не запущен."
-            )
-            print(f"[gateway_manager] ERROR: {msg}", flush=True)
-            _alert_operator_v3_guard(user_key, msg)
-            raise DaemonSpawnError(msg)
 
         try:
             proc = self.spawn_process(user_key, port, config_dir)
@@ -1858,62 +1903,6 @@ def _raise_keyboard_interrupt(_signum: int, _frame: object | None) -> None:
 def install_shutdown_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
-
-
-def _config_is_v3_on_disk(config_path: Path) -> bool:
-    """fork(stabilization): per-user configs MUST stay pre-V3 on disk — fork-patch
-    P2 (raw-doc provider override) silently no-ops on V3, breaking env-default
-    provider resolution (regression S2). Detect a config that drifted to
-    schema_version >= 3. Escape hatch: ZEROCLAW_ALLOW_V3_DISK_CONFIG=1."""
-    if os.environ.get("ZEROCLAW_ALLOW_V3_DISK_CONFIG", "").strip() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        return False
-    try:
-        with open(config_path, "rb") as f:
-            doc = tomllib.load(f)
-    except (FileNotFoundError, tomllib.TOMLDecodeError):
-        return False  # missing/unparseable handled by existing spawn logic
-    return int(doc.get("schema_version", 0) or 0) >= 3
-
-
-_V3_GUARD_ALERT_TS: dict[str, float] = {}
-_V3_GUARD_ALERT_LOCK = threading.Lock()
-
-
-def _alert_operator_v3_guard(user_key: str, message: str) -> None:
-    op = os.environ.get("ZEROCLAW_OPERATOR_USER_ID", "").strip()
-    url = os.environ.get("NOTIFY_URL", "").strip()
-    secret = os.environ.get("NOTIFY_SECRET", "").strip()
-    if not (op.isdigit() and url and secret):
-        return
-    window = int(os.environ.get("PROVIDER_FALLBACK_ALERT_WINDOW_SECS", "1800"))
-    key = f"{user_key}|v3_disk_guard"
-    now = time.monotonic()
-    with _V3_GUARD_ALERT_LOCK:
-        # `None`/absent = never alerted → always fire. A 0.0 default would falsely
-        # dedup the first alert on a freshly-booted host (now - 0.0 < window).
-        last = _V3_GUARD_ALERT_TS.get(key)
-        if last is not None and now - last < window:
-            return  # deduped within window
-        _V3_GUARD_ALERT_TS[key] = now
-    try:
-        data = json.dumps({"user_id": int(op), "message": message}).encode()
-        req = request.Request(
-            url=url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-Webhook-Secret": secret,
-            },
-        )
-        with request.urlopen(req, timeout=5.0):
-            pass
-    except Exception as exc:
-        print(f"[gateway_manager] operator alert failed: {exc}", flush=True)
 
 
 def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:

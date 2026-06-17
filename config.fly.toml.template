@@ -1,8 +1,72 @@
-api_key = ""
-default_provider = "openrouter"
-default_model = "google/gemini-3-flash-preview"
-default_temperature = 0.7
+# Native schema_version = 3 config (Fly volume seed for fresh deploys).
+#
+# Pre-V3 configs were V1→V3 migrated in-memory every boot; this template is
+# authored natively in V3 shape so no migration runs. Spike 0 proved a
+# hand-authored native-V3 config boots and resolves the boot-provider
+# deterministically from [providers.models.opencode.go].
+#
+# Secret placeholders __ZEROCLAW_BEARER_TOKEN__ / __ZEROCLAW_WEBHOOK_SECRET__
+# are substituted by the entrypoint/init sed at deploy time. api_key = "" stays
+# empty everywhere (credentials resolve through env / Fly secrets), so a
+# provider-specific placeholder never leaks to another provider.
+schema_version = 3
 
+# ── Providers ───────────────────────────────────────────────────────────────
+# Boot-default = [providers.models.opencode.go]. normalize_provider_type(
+# "opencode-go", "default") → opencode.go; the synthesized agents.default points
+# its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
+# ignores that env override).
+
+[providers.models.opencode.go]
+model = "deepseek-v4-flash"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
+
+# Subagent analyst_mimo runs mimo-v2.5-pro on the same opencode-go endpoint.
+[providers.models.opencode.mimo]
+model = "mimo-v2.5-pro"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
+
+# Codex subagents fold under the `openai` family with the codex OAuth runtime
+# (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
+# migration applies to "openai-codex"). worker = gpt-5.4-mini, coder = gpt-5.5.
+[providers.models.openai.codex_worker]
+model = "gpt-5.4-mini"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+
+[providers.models.openai.codex_coder]
+model = "gpt-5.5"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+
+# deepseek subagents: pro (deepseek-v4-pro) and flash (deepseek-v4-flash).
+[providers.models.deepseek.pro]
+model = "deepseek-v4-pro"
+api_key = ""
+
+[providers.models.deepseek.flash]
+model = "deepseek-v4-flash"
+api_key = ""
+
+[providers.models.zai.default]
+model = "glm-5.1"
+api_key = ""
+
+# Bootstrap reference for fresh deploys; production overrides provider/model in
+# fly.toml [env] (but V3 ignores ZEROCLAW_MODEL — boot default is opencode.go).
+[providers.models.openrouter.default]
+model = "google/gemini-3-flash-preview"
+api_key = ""
+
+[providers.models.minimax.default]
+model = "minimax-m2.7"
+api_key = ""
+
+# ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
 fallback_providers = ["opencode-go"]
 
@@ -26,73 +90,46 @@ fallback_providers = ["opencode-go"]
 "kimi-k2.7-code"     = ["deepseek-v4-flash"]
 "glm-5.2"            = ["deepseek-v4-flash"]
 
+# ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
 backend = "sqlite"
 auto_save = true
 embedding_provider = "openrouter"
 embedding_model = "openai/text-embedding-3-small"
 embedding_dimensions = 1536
-sqlite_open_timeout_secs = 30
-# Core-memory durability: export category='core' → MEMORY_SNAPSHOT.md at each daemon
-# spawn (snapshot.rs:363); auto_hydrate (default true) restores on cold-boot.
+# Core-memory durability: export category='core' → MEMORY_SNAPSHOT.md at each
+# daemon spawn; auto_hydrate (default true) restores on cold-boot.
 snapshot_enabled = true
 snapshot_on_hygiene = true
-# Native per-turn consolidation (fork): Daily history_entry + Core memory_update
-# with conflict dedup. On by default (since 2026-06-17; serde default also true).
-# Set false to opt a user out. Coexists with nightly-retro.
+# Native per-turn consolidation (fork): each answered turn → Daily history_entry
+# + Core memory_update with conflict dedup (superseded_by). On by default (since
+# 2026-06-17; serde default also true). Set false to opt a user out. Coexists
+# with nightly-retrospective.
 # Spec: docs/superpowers/specs/2026-06-16-native-per-turn-consolidation-design.md
 consolidation_enabled = true
 
-[agent]
-compact_context = false
-max_tool_iterations = 100
-max_history_messages = 200
-max_context_tokens = 128_000
-parallel_tools = true
-tool_dispatcher = "native"
+# sqlite_open_timeout_secs moved to [storage.<backend>.<alias>] in V3; [memory]
+# backend = "sqlite" resolves to sqlite.default.
+[storage.sqlite.default]
+open_timeout_secs = 30
 
-[agent.context_compression]
-threshold_ratio = 0.70
-protect_last_n = 10
-
-[agent.context_compression.model_windows]
-"mimo-v2.5-pro"           = 800_000
-"mimo-v2.5"               = 800_000
-"deepseek-v4-flash"       = 800_000
-"deepseek-v4-pro"         = 800_000
-"gemini-3-flash-preview"  = 800_000
-"qwen3.7-plus"            = 1_000_000
-"minimax-m3"              = 1_000_000
-"glm-5.2"                 = 1_000_000
-"kimi-k2.7-code"          = 256_000
-"minimax-m2.7"            = 196_608
-"gpt-5.5"                 = 400_000
-"gpt-5.4"                 = 400_000
-"gpt-5.4-mini"            = 400_000
-"glm-5-turbo"             = 128_000
-"glm-5.1"                 = 202_752
-# Capital "GLM-5.1" is a separate case-sensitive key (ZEROCLAW_MODEL ships the
-# model string as-is via env; model_windows.get() is case-sensitive). Same
-# underlying ZhiPu GLM-5.1, same ~200K window — value verified 2026-06-02
-# (OpenRouter z-ai/glm-5.1 = 202_752).
-"GLM-5.1"                 = 202_752
-"Qwen3.5-397B-A17B"       = 262_144
-
-[multimodal]
-max_images = 4
-max_image_size_mb = 20
-vision_provider = "openrouter"
-vision_model = "google/gemini-3.1-flash-lite-preview"
-
+# ── Skills ──────────────────────────────────────────────────────────────────
 [skills]
 prompt_injection_mode = "compact"
 
+# ── Observability ───────────────────────────────────────────────────────────
+# MANDATORY (Spike 0): without it runtime-trace.jsonl stops writing and later
+# gates fail. V3 field names log_persistence* are aliases of the old
+# runtime_trace_* keys.
 [observability]
 backend = "none"
-runtime_trace_mode = "rolling"
-runtime_trace_path = "logs/runtime-trace.jsonl"
-runtime_trace_max_entries = 500
+log_persistence = "rolling"
+log_persistence_path = "logs/runtime-trace.jsonl"
+log_persistence_max_entries = 500
 
+# ── Gateway ───────────────────────────────────────────────────────────────
+# require_pairing = false (Spike 0): else child daemons 401 the manager's
+# forwarded bearer token.
 [gateway]
 port = 3000
 host = "127.0.0.1"
@@ -106,9 +143,14 @@ rate_limit_max_keys = 10000
 idempotency_ttl_secs = 300
 idempotency_max_keys = 10000
 
-[tunnel]
-provider = "none"
+# Tunnel defaults to "none" in V3 (tunnel.tunnel_provider); no section needed.
 
+# Webhook section stays spelled [channels_config.webhook]: the V3 runtime treats
+# it as a legacy section and skips it (the embedded webhook channel is dead code
+# here — the live path is the gateway crate's handle_webhook bound to [gateway]
+# port), but gateway_manager._rewrite_gateway_config matches this literal block
+# to inject each daemon's per-user port. Keep the literal name (do NOT rename to
+# [channels.webhook.default] — that breaks the manager's port rewrite).
 [channels_config]
 cli = true
 
@@ -116,7 +158,76 @@ cli = true
 port = 3000
 secret = "__ZEROCLAW_WEBHOOK_SECRET__"
 
-[autonomy]
+# ── Multimodal ──────────────────────────────────────────────────────────────
+[multimodal]
+max_images = 4
+max_image_size_mb = 20
+vision_provider = "openrouter"
+vision_model = "google/gemini-3.1-flash-lite-preview"
+
+# ── HTTP request tool ─────────────────────────────────────────────────────
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+max_response_size = 100000
+timeout_secs = 30
+
+# ── Jira tool ───────────────────────────────────────────────────────────────
+[jira]
+enabled = true
+base_url = "https://yallaclassifieds.atlassian.net"
+email = "oleg.gismatulin@lalafo.com"
+api_token = ""
+allowed_actions = ["get_ticket", "search_tickets", "comment_ticket"]
+timeout_secs = 30
+
+# ── Delegate ──────────────────────────────────────────────────────────────
+[delegate]
+timeout_secs = 90
+agentic_timeout_secs = 600
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────
+# Periodic HEARTBEAT.md tasks (e.g. Jira watchdog). V3 made `enabled` default
+# false and `agent` required (must name a configured agent). agent = "default"
+# = the synthesized main agent. interval/two_phase set explicitly so an
+# upstream default-flip can't silently disable us again.
+[heartbeat]
+enabled = true
+agent = "default"
+interval_minutes = 30
+two_phase = true
+
+# ── MCP ─────────────────────────────────────────────────────────────────────
+[mcp]
+enabled = true
+deferred_loading = false
+
+[[mcp.servers]]
+name = "context7"
+transport = "http"
+url = "https://mcp.context7.com/mcp"
+tool_timeout_secs = 60
+
+[[mcp.servers]]
+name = "lalafo-db"
+transport = "http"
+url = "http://localhost:4000/mcp"
+tool_timeout_secs = 120
+
+[[mcp.servers]]
+name = "graylog"
+transport = "http"
+url = "http://localhost:4001/mcp"
+tool_timeout_secs = 120
+
+# ── Risk profile (default) ──────────────────────────────────────────────────
+# Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full
+# and ignores allowed_tools (gateway filters only excluded_tools when level !=
+# Full); delegate targets REQUIRE a non-empty allowed_tools and use it as their
+# filter — this superset of every subagent toolset gives subagents the same
+# powers as main (regression #16 fix). delegation_policy.mode = "allow" + shared
+# risk_profile is what makes the delegate gate pass.
+[risk_profiles.default]
 level = "full"
 workspace_only = false
 allowed_commands = [
@@ -170,11 +281,8 @@ forbidden_paths = [
     "~/.config",
     "/zeroclaw-data/mcp_graylog",
 ]
-max_actions_per_hour = 20
-max_cost_per_day_cents = 500
 require_approval_for_medium_risk = false
 block_high_risk_commands = false
-shell_timeout_secs = 600
 shell_env_passthrough = ["NOTIFY_URL", "NOTIFY_SECRET", "NOTIFY_FILE_URL", "OPENROUTER_API_KEY", "CREATIO_BASE_URL", "CREATIO_USERNAME", "CREATIO_PASSWORD", "PG_PROD_HOST", "PG_PROD_PORT", "PG_PROD_USER", "PG_PROD_PASSWORD", "PG_STAGE_HOST", "PG_STAGE_PORT", "PG_STAGE_USER", "PG_STAGE_PASSWORD", "GITLAB_DEPLOY_USER", "GITLAB_DEPLOY_TOKEN", "GOOGLE_SERVICE_ACCOUNT_JSON", "SCRAPECREATORS_API_KEY", "XAI_API_KEY", "BRAVE_API_KEY", "JIRA_API_TOKEN", "JWT_SIGNING_SECRET", "AGENT_BROWSER_PROFILE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_EXECUTABLE_PATH", "AGENT_BROWSER_ARGS", "ZEROCLAW_WORKSPACE", "GITHUB_TOKEN", "GITHUB_USER", "GITLAB_TOKEN", "GITLAB_HOST", "IMAGE_UPLOAD_AWS_ACCESS_KEY_ID", "IMAGE_UPLOAD_AWS_SECRET_ACCESS_KEY", "ADMIN_BASIC_USER", "ADMIN_BASIC_PASSWORD", "ADMIN_APP_EMAIL", "ADMIN_APP_PASSWORD", "ADMIN_OAUTH2_COOKIE"]
 auto_approve = [
     "file_read",
@@ -185,70 +293,6 @@ auto_approve = [
 ]
 always_ask = []
 allowed_roots = ["/zeroclaw-data/code-repos"]
-non_cli_excluded_tools = []
-
-[mcp]
-enabled = true
-deferred_loading = false
-
-[[mcp.servers]]
-name = "context7"
-transport = "http"
-url = "https://mcp.context7.com/mcp"
-tool_timeout_secs = 60
-
-[[mcp.servers]]
-name = "lalafo-db"
-transport = "http"
-url = "http://localhost:4000/mcp"
-tool_timeout_secs = 120
-
-[[mcp.servers]]
-name = "graylog"
-transport = "http"
-url = "http://localhost:4001/mcp"
-tool_timeout_secs = 120
-
-[http_request]
-enabled = true
-allowed_domains = ["*"]
-max_response_size = 100000
-timeout_secs = 30
-
-[jira]
-enabled = true
-base_url = "https://yallaclassifieds.atlassian.net"
-email = "oleg.gismatulin@lalafo.com"
-api_token = ""
-allowed_actions = ["get_ticket", "search_tickets", "comment_ticket"]
-timeout_secs = 30
-
-[delegate]
-timeout_secs = 90
-agentic_timeout_secs = 600
-
-# Periodic heartbeat (HEARTBEAT.md tasks, e.g. Jira watchdog). v0.8.0 (schema V3)
-# flipped HeartbeatConfig.enabled default false and made `agent` required (it
-# must name a configured agent). Pre-V3 we relied on the default-true; without
-# this block the worker never spawns. `agent = "default"` = the synthesized
-# main agent. interval/two_phase set explicitly so an upstream default-flip
-# can't silently disable us again. target/to omitted on purpose — the watchdog
-# notifies via notify_telegram.py inside the task, no built-in channel needed.
-[heartbeat]
-enabled = true
-agent = "default"
-interval_minutes = 30
-two_phase = true
-
-[risk_profiles.default]
-# Regression #16 (v0.8.0): delegation re-enablement. V3 forbids delegation by
-# default AND ties allowed_tools to the risk_profile; the delegate gate requires
-# caller and target to share the SAME risk_profile. So main agent + all subagents
-# sit on "default" and this list is the shared toolset. The MAIN agent runs at
-# level=Full and ignores this allowlist (gateway path filters only excluded_tools
-# when level != Full), so it stays unconstrained; delegate targets (execute_agentic)
-# REQUIRE a non-empty allowed_tools and use it as their tool filter — this is the
-# superset of every subagent toolset, giving subagents the same powers as main.
 allowed_tools = [
     "file_read", "file_write", "file_edit", "content_search",
     "glob_search", "shell", "http_request", "web_fetch",
@@ -275,188 +319,121 @@ allowed_tools = [
 [risk_profiles.default.delegation_policy]
 mode = "allow"
 
-[agents.worker]
-risk_profile = "default"
-provider = "openai-codex"
-model = "gpt-5.4-mini"
-api_key = ""
+# ── Runtime profiles ──────────────────────────────────────────────────────
+# Replaces the pre-V3 top-level [agent] block. context_compression +
+# model_windows are nested here (V3 home — a top-level [agent] section would be
+# silently ignored by the V3 runtime). summary_model intentionally unset so the
+# summarizer uses the session's current main model (webhook /model switching).
+
+[runtime_profiles.default]
 agentic = true
-max_iterations = 80
-system_prompt = "You are a fast, focused task executor. Run the delegated sub-task independently using the tools available. Return a concise, structured result."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "swarm", "cron_add",
-    "cron_list", "cron_remove", "cron_run", "cron_runs",
-    "cron_update", "schedule", "model_switch", "model_routing_config",
-    "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
-    "image_gen", "image_info", "pdf_read", "screenshot",
-    "sessions_history", "sessions_list", "sessions_send", "workspace",
-    "calculator", "counting", "project_intel", "llm_task",
-    "report_template", "execute_pipeline", "git_operations", "sop_advance",
-    "sop_approve", "sop_execute", "sop_list", "sop_status",
-    "security_ops", "vi_verify", "notion", "jira",
-    "linkedin", "google_workspace", "microsoft365", "discord_search",
-    "composio", "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query",
-    "lalafo-db__query_file", "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases",
-    "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
-    "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
-    "graylog__by_user", "graylog__search_to_file",
-]
+compact_context = false
+max_tool_iterations = 100
+max_history_messages = 200
+max_context_tokens = 128_000
+parallel_tools = true
+tool_dispatcher = "native"
+shell_timeout_secs = 600
+
+[runtime_profiles.default.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+
+[runtime_profiles.default.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.2"                 = 1_000_000
+"kimi-k2.7-code"          = 256_000
+"minimax-m2.7"            = 196_608
+"gpt-5.5"                 = 400_000
+"gpt-5.4"                 = 400_000
+"gpt-5.4-mini"            = 400_000
+"glm-5-turbo"             = 128_000
+"glm-5.1"                 = 202_752
+# Capital "GLM-5.1" is a separate case-sensitive key (model string ships as-is;
+# model_windows.get() is case-sensitive). Same ZhiPu GLM-5.1, same ~200K window.
+"GLM-5.1"                 = 202_752
+"Qwen3.5-397B-A17B"       = 262_144
+
+# Subagent runtime profile: 80-iteration cap (matches pre-V3 max_iterations=80).
+# Shares default's context_compression + model_windows so cross-model windows
+# still resolve.
+[runtime_profiles.agent_default]
+agentic = true
+compact_context = false
+max_tool_iterations = 80
+max_history_messages = 200
+max_context_tokens = 128_000
+parallel_tools = true
+tool_dispatcher = "native"
+shell_timeout_secs = 600
+
+[runtime_profiles.agent_default.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+
+[runtime_profiles.agent_default.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.2"                 = 1_000_000
+"kimi-k2.7-code"          = 256_000
+"minimax-m2.7"            = 196_608
+"gpt-5.5"                 = 400_000
+"gpt-5.4"                 = 400_000
+"gpt-5.4-mini"            = 400_000
+"glm-5-turbo"             = 128_000
+"glm-5.1"                 = 202_752
+"GLM-5.1"                 = 202_752
+"Qwen3.5-397B-A17B"       = 262_144
+
+# ── Agents ──────────────────────────────────────────────────────────────────
+# Each agent carries ONLY model_provider / risk_profile / runtime_profile. Dead
+# per-agent allowed_tools + system_prompt dropped (behavior-neutral: the main
+# agent runs Full and ignores allowed_tools; subagents inherit the shared
+# risk_profile allowlist). All agents share risk_profile = "default" so the
+# delegate gate (caller+target same profile) passes.
+
+[agents.default]
+model_provider = "opencode.go"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.worker]
+model_provider = "openai.codex_worker"
+risk_profile = "default"
+runtime_profile = "agent_default"
 
 [agents.coder]
+model_provider = "openai.codex_coder"
 risk_profile = "default"
-provider = "openai-codex"
-model = "gpt-5.5"
-api_key = ""
-agentic = true
-max_iterations = 80
-system_prompt = "You are a senior engineer. Read code with content_search/glob_search, reason carefully, make precise edits, run tests via shell. Treat the task description and any cited prior logic as a CLAIM to verify against the real code, not ground truth — trace callers to confirm you are editing the right path. Before treating something as a bug to fix, check whether it is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Before and after editing, state the blast radius: what else calls this code, which other paths/configs/countries are affected, what could regress. Explicitly flag anything you could not verify instead of filling the gap with a plausible guess. Report concisely what you changed and why."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "swarm", "cron_add",
-    "cron_list", "cron_remove", "cron_run", "cron_runs",
-    "cron_update", "schedule", "model_switch", "model_routing_config",
-    "claude_code", "codex_cli", "gemini_cli", "opencode_cli",
-    "image_gen", "image_info", "pdf_read", "screenshot",
-    "sessions_history", "sessions_list", "sessions_send", "workspace",
-    "calculator", "counting", "project_intel", "llm_task",
-    "report_template", "execute_pipeline", "git_operations", "sop_advance",
-    "sop_approve", "sop_execute", "sop_list", "sop_status",
-    "security_ops", "vi_verify", "notion", "jira",
-    "linkedin", "google_workspace", "microsoft365", "discord_search",
-    "composio", "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query",
-    "lalafo-db__query_file", "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases",
-    "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
-    "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
-    "graylog__by_user", "graylog__search_to_file",
-]
+runtime_profile = "agent_default"
 
 [agents.analyst_mimo]
+model_provider = "opencode.mimo"
 risk_profile = "default"
-provider = "opencode-go"
-model = "mimo-v2.5-pro"
-api_key = ""
-agentic = true
-max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "cron_add", "cron_list",
-    "cron_remove", "cron_run", "cron_runs", "cron_update",
-    "schedule", "model_switch", "model_routing_config", "claude_code",
-    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
-    "image_info", "pdf_read", "screenshot", "sessions_history",
-    "sessions_list", "sessions_send", "workspace", "calculator",
-    "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
-    "sop_execute", "sop_list", "sop_status", "security_ops",
-    "vi_verify", "notion", "jira", "linkedin",
-    "google_workspace", "microsoft365", "discord_search", "composio",
-    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
-    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
-    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
-    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
-    "graylog__search_to_file",
-]
+runtime_profile = "agent_default"
 
 [agents.analyst_deepseek_pro]
+model_provider = "deepseek.pro"
 risk_profile = "default"
-provider = "deepseek"
-model = "deepseek-v4-pro"
-api_key = ""
-agentic = true
-max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "cron_add", "cron_list",
-    "cron_remove", "cron_run", "cron_runs", "cron_update",
-    "schedule", "model_switch", "model_routing_config", "claude_code",
-    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
-    "image_info", "pdf_read", "screenshot", "sessions_history",
-    "sessions_list", "sessions_send", "workspace", "calculator",
-    "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
-    "sop_execute", "sop_list", "sop_status", "security_ops",
-    "vi_verify", "notion", "jira", "linkedin",
-    "google_workspace", "microsoft365", "discord_search", "composio",
-    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
-    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
-    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
-    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
-    "graylog__search_to_file",
-]
+runtime_profile = "agent_default"
 
 [agents.analyst_deepseek_flash]
+model_provider = "deepseek.flash"
 risk_profile = "default"
-provider = "deepseek"
-model = "deepseek-v4-flash"
-api_key = ""
-agentic = true
-max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "cron_add", "cron_list",
-    "cron_remove", "cron_run", "cron_runs", "cron_update",
-    "schedule", "model_switch", "model_routing_config", "claude_code",
-    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
-    "image_info", "pdf_read", "screenshot", "sessions_history",
-    "sessions_list", "sessions_send", "workspace", "calculator",
-    "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
-    "sop_execute", "sop_list", "sop_status", "security_ops",
-    "vi_verify", "notion", "jira", "linkedin",
-    "google_workspace", "microsoft365", "discord_search", "composio",
-    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
-    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
-    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
-    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
-    "graylog__search_to_file",
-]
+runtime_profile = "agent_default"
 
 [agents.analyst_glm]
+model_provider = "zai.default"
 risk_profile = "default"
-provider = "zai"
-model = "glm-5.1"
-api_key = ""
-agentic = true
-max_iterations = 80
-system_prompt = "You are an independent diagnostic analyst. From ONLY the error context in the user message plus the tools available, perform a thorough root-cause analysis. You have NO access to prior conversation, personal files, or stored memory — work strictly from what is given. Investigate with content_search/glob_search/shell, DB (lalafo-db__*), logs (graylog__*) and docs (context7__*) where relevant. Treat the reporter's described actual/expected behaviour and any cited prior logic as a CLAIM to verify against the real code, not ground truth — confirm the suspect code path actually produces the symptom by tracing its callers. Before declaring a bug, check whether the suspect code is intentional (git blame, comments, other call sites, other countries/configs); distinguish a real defect from code that merely looks wrong but is deliberate. Return a structured result: ROOT CAUSE / EVIDENCE / ALTERNATIVES / FIX / CONFIDENCE / UNVERIFIED. In FIX, state the blast radius: what else calls this code, which other countries/configs/paths are affected, what could regress. In UNVERIFIED, list every claim you could not confirm and why (no DB access, path not found, needs runtime data); never present an inferred gap as fact. Be concise and specific. Do not fabricate findings."
-allowed_tools = [
-    "file_read", "file_write", "file_edit", "content_search",
-    "glob_search", "shell", "http_request", "web_fetch",
-    "web_search_tool", "text_browser", "memory_recall", "memory_store",
-    "memory_forget", "memory_export", "read_skill", "tool_search",
-    "knowledge", "delegate", "cron_add", "cron_list",
-    "cron_remove", "cron_run", "cron_runs", "cron_update",
-    "schedule", "model_switch", "model_routing_config", "claude_code",
-    "codex_cli", "gemini_cli", "opencode_cli", "image_gen",
-    "image_info", "pdf_read", "screenshot", "sessions_history",
-    "sessions_list", "sessions_send", "workspace", "calculator",
-    "counting", "project_intel", "llm_task", "report_template",
-    "execute_pipeline", "git_operations", "sop_advance", "sop_approve",
-    "sop_execute", "sop_list", "sop_status", "security_ops",
-    "vi_verify", "notion", "jira", "linkedin",
-    "google_workspace", "microsoft365", "discord_search", "composio",
-    "context7__resolve-library-id", "context7__query-docs", "lalafo-db__query", "lalafo-db__query_file",
-    "lalafo-db__databases", "lalafo-db__ch_query", "lalafo-db__ch_databases", "lalafo-db__ch_tables",
-    "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health", "graylog__health",
-    "graylog__count", "graylog__search", "graylog__by_request_id", "graylog__by_user",
-    "graylog__search_to_file",
-]
+runtime_profile = "agent_default"
