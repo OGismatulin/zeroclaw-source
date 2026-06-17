@@ -38,8 +38,13 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 
 # Bumped whenever the per-user config layout changes so existing on-disk
 # configs are cut over to the latest template on next spawn. v3-1 = native
-# schema_version=3 template (Phase 1).
-CURRENT_CONFIG_MARKER = "v3-1"
+# schema_version=3 template (Phase 1). v3-2 = fix-forward: the first v3-disk
+# deploy cut per-user configs over from a STALE V1 volume template (the
+# entrypoint's first-boot-only `[ ! -f ]` gate skipped re-seeding the template
+# to V3 on the existing volume). The entrypoint now re-seeds the template
+# unconditionally; bump the marker so cutover re-runs against the now-V3
+# template. backup-only-if-not-exists keeps the original pre-V3 backup intact.
+CURRENT_CONFIG_MARKER = "v3-2"
 
 
 def sanitize_filename(filename: str) -> str:

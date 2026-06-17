@@ -127,21 +127,26 @@ for auth_file in auth-profiles.json .secret_key; do
   fi
 done
 
-# Seed the template config from the native V3 template on first boot. The
-# config is no longer patched after this — all settings are already in the
-# template; only the secret placeholders are substituted here.
-if [ ! -f "$config_file" ]; then
-  if [ -z "${ZEROCLAW_WEBHOOK_SECRET:-}" ]; then
-    echo "ZEROCLAW_WEBHOOK_SECRET is required to initialize Fly runtime config." >&2
-    exit 1
-  fi
-
-  sed -e "s|__ZEROCLAW_WEBHOOK_SECRET__|$ZEROCLAW_WEBHOOK_SECRET|g" \
-      -e "s|__OPENROUTER_API_KEY__|${OPENROUTER_API_KEY:-}|g" \
-      -e "s|__ZEROCLAW_BEARER_TOKEN__|${ZEROCLAW_BEARER_TOKEN:-}|g" \
-      "$template_file" > "$config_file"
-  chmod 0600 "$config_file"
+# (Re)seed the template config from the baked native-V3 template on EVERY boot.
+# The config is no longer patched after this — all settings are already in the
+# template; only the secret placeholders are substituted here. This MUST run
+# unconditionally (not just on first boot): the template config is a derived
+# seed (NOT per-user data — per-user configs live under workspaces/ and are
+# handled by the manager's marker-gated cutover), so re-seeding it to match the
+# deployed image is how a new template (e.g. this V3 migration) actually reaches
+# an EXISTING volume. A `[ ! -f ]` gate would skip the update on every upgrade,
+# leaving the volume template stale (regression observed on the v3-disk deploy:
+# the V3 template never replaced the V1 one, so cutover regenerated V1). Idempotent
+# (same baked template + same secrets) and also keeps rotated secrets in sync.
+if [ -z "${ZEROCLAW_WEBHOOK_SECRET:-}" ]; then
+  echo "ZEROCLAW_WEBHOOK_SECRET is required to initialize Fly runtime config." >&2
+  exit 1
 fi
+sed -e "s|__ZEROCLAW_WEBHOOK_SECRET__|$ZEROCLAW_WEBHOOK_SECRET|g" \
+    -e "s|__OPENROUTER_API_KEY__|${OPENROUTER_API_KEY:-}|g" \
+    -e "s|__ZEROCLAW_BEARER_TOKEN__|${ZEROCLAW_BEARER_TOKEN:-}|g" \
+    "$template_file" > "$config_file"
+chmod 0600 "$config_file"
 
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
