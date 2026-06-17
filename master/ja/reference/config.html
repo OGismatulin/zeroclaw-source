@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-f420dc6e.js";
+            window.path_to_searchindex_js = "../searchindex-ab5e1bad.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8e2df50e.js"></script>
@@ -1265,7 +1265,7 @@
 <tr><td><code>backend</code>*</td><td>string</td><td>—</td><td>アクティブなストレージインスタンスへのドット表記による参照: <code>&lt;backend&gt;.&lt;alias&gt;</code></td></tr>
 <tr><td><code>chunk_max_tokens</code></td><td>整数</td><td><code>512</code></td><td>ドキュメント分割用のチャンクあたりの最大トークン数</td></tr>
 <tr><td><code>conflict_threshold</code></td><td>number</td><td><code>0.85</code></td><td>競合検出のコサイン類似度閾値（0.0–1.0）。</td></tr>
-<tr><td><code>consolidation_enabled</code></td><td>ブール値</td><td><code>false</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
+<tr><td><code>consolidation_enabled</code></td><td>ブール値</td><td><code>true</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
 <tr><td><code>consolidation_model</code></td><td>string?</td><td><code>null</code></td><td>Optional model override for consolidation, on the same provider as the</td></tr>
 <tr><td><code>conversation_retention_days</code></td><td>整数</td><td><code>30</code></td><td>sqlite バックエンドのみ — DB を軽量に保つため、この日数より古い会話行を削除します。コアメモリやノートには影響しません。</td></tr>
 <tr><td><code>default_namespace</code></td><td>string</td><td><code>"default"</code></td><td>メモリエントリのデフォルト名前空間。</td></tr>

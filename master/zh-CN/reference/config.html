@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-2689d752.js";
+            window.path_to_searchindex_js = "../searchindex-d6cf8cdb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-9364d956.js"></script>
@@ -1265,7 +1265,7 @@
 <tr><td><code>后端</code>*</td><td>字符串</td><td>—</td><td>对活动存储实例的点号引用：<code>&lt;backend&gt;.&lt;alias&gt;</code></td></tr>
 <tr><td><code>chunk_max_tokens</code></td><td>整数</td><td><code>512</code></td><td>文档拆分时每个块的最大令牌数</td></tr>
 <tr><td><code>conflict_threshold</code></td><td>数字</td><td><code>0.85</code></td><td>用于冲突检测的余弦相似度阈值（0.0–1.0）。</td></tr>
-<tr><td><code>consolidation_enabled</code></td><td>布尔</td><td><code>false</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
+<tr><td><code>consolidation_enabled</code></td><td>布尔</td><td><code>true</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
 <tr><td><code>consolidation_model</code></td><td>字符串？</td><td><code>null</code></td><td>Optional model override for consolidation, on the same provider as the</td></tr>
 <tr><td><code>conversation_retention_days</code></td><td>整数</td><td><code>30</code></td><td>仅适用于 sqlite 后端——删除超过指定天数的对话记录，以保持数据库精简。不会影响核心记忆或笔记。</td></tr>
 <tr><td><code>default_namespace</code></td><td>字符串</td><td><code>"默认"</code></td><td>内存条目的默认命名空间。</td></tr>

@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-ad9be12e.js";
+            window.path_to_searchindex_js = "../searchindex-2fabe2ad.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b3eb20a.js"></script>
@@ -1340,7 +1340,7 @@ instance to use via the <code>backend</code> dotted reference.</p>
 <tr><td><code>backend</code>*</td><td>string</td><td><code>—</code></td><td>Dotted reference to the active storage instance: <code>&lt;backend&gt;.&lt;alias&gt;</code></td></tr>
 <tr><td><code>chunk_max_tokens</code></td><td>integer</td><td><code>512</code></td><td>Max tokens per chunk for document splitting</td></tr>
 <tr><td><code>conflict_threshold</code></td><td>number</td><td><code>0.85</code></td><td>Cosine similarity threshold for conflict detection (0.0–1.0).</td></tr>
-<tr><td><code>consolidation_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
+<tr><td><code>consolidation_enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
 <tr><td><code>consolidation_model</code></td><td>string?</td><td><code>null</code></td><td>Optional model override for consolidation, on the same provider as the</td></tr>
 <tr><td><code>conversation_retention_days</code></td><td>integer</td><td><code>30</code></td><td>For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn’t touch core memories or notes.</td></tr>
 <tr><td><code>default_namespace</code></td><td>string</td><td><code>"default"</code></td><td>Default namespace for memory entries.</td></tr>

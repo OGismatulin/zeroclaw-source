@@ -37,7 +37,7 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-c36c163c.js";
+            window.path_to_searchindex_js = "../searchindex-3433c532.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-f27dd488.js"></script>
@@ -1265,7 +1265,7 @@
 <tr><td><code>backend</code>*</td><td>cadena</td><td><code>—</code></td><td>Referencia con puntos a la instancia de almacenamiento activa: <code>&lt;backend&gt;.&lt;alias&gt;</code></td></tr>
 <tr><td><code>chunk_max_tokens</code></td><td>entero</td><td><code>512</code></td><td>Máximo de tokens por fragmento para la división de documentos</td></tr>
 <tr><td><code>conflict_threshold</code></td><td>número</td><td><code>0.85</code></td><td>Umbral de similitud coseno para la detección de conflictos (0.0–1.0).</td></tr>
-<tr><td><code>consolidation_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
+<tr><td><code>consolidation_enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable LLM-driven per-turn memory consolidation on the webhook</td></tr>
 <tr><td><code>consolidation_model</code></td><td>string?</td><td><code>null</code></td><td>Optional model override for consolidation, on the same provider as the</td></tr>
 <tr><td><code>conversation_retention_days</code></td><td>entero</td><td><code>30</code></td><td>Solo para el backend sqlite — elimina las filas de conversación con más de estos días de antigüedad para mantener la BD ligera. No afecta a los recuerdos principales ni a las notas.</td></tr>
 <tr><td><code>default_namespace</code></td><td>cadena</td><td><code>"predeterminado"</code></td><td>Espacio de nombres predeterminado para las entradas de memoria.</td></tr>
