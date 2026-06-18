@@ -44,7 +44,8 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # to V3 on the existing volume). The entrypoint now re-seeds the template
 # unconditionally; bump the marker so cutover re-runs against the now-V3
 # template. backup-only-if-not-exists keeps the original pre-V3 backup intact.
-CURRENT_CONFIG_MARKER = "v3-2"
+# v3-3 = + MICROSOFT_SESSION_COOKIES passthrough (admin SSO perimeter)
+CURRENT_CONFIG_MARKER = "v3-3"
 
 
 def sanitize_filename(filename: str) -> str:
