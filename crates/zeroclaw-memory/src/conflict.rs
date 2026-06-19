@@ -1,14 +1,105 @@
 //! Conflict resolution for memory entries.
 //!
-//! Before storing Core memories, performs a semantic similarity check against
-//! existing entries. If cosine similarity exceeds a threshold but content
-//! differs, the old entry is marked as superseded.
+//! On the consolidation path (#18), `judge_conflicts` asks an LLM which existing
+//! Core facts a new fact makes obsolete (direct contradiction / same-attribute
+//! replacement), then those are marked superseded. This replaced the older
+//! similarity-threshold check (`check_and_resolve_conflicts`, retained below for
+//! any other/no callers) — a measurement showed cosine similarity cannot cleanly
+//! separate contradiction from mere relatedness.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use zeroclaw_api::model_provider::ModelProvider;
+
+/// System prompt for the Core-dedup LLM judge (#18).
+///
+/// Conservative on purpose: a measurement showed cosine similarity cannot
+/// cleanly separate "contradiction" from "mere relatedness" (cos between
+/// "language is Python" and "language is Rust" was only 0.78). The judge is
+/// asked to mark ONLY facts whose attribute value the new fact replaces.
+///
+/// The marker word "устаревшими" is what the test stub matches on to detect
+/// the judge prompt — keep it present.
+const JUDGE_SYSTEM_PROMPT: &str = r#"Ты — строгий арбитр памяти. Тебе дают НОВЫЙ факт о пользователе и пронумерованный список СУЩЕСТВУЮЩИХ фактов.
+
+Определи, какие из существующих фактов новый факт делает устаревшими — то есть прямо противоречит им или заменяет значение того же самого атрибута (например, сменился основной язык программирования, город, должность, имя, предпочтение).
+
+ПРАВИЛА:
+- Помечай факт только если новый факт ЗАМЕНЯЕТ значение того же атрибута или прямо ему противоречит.
+- НЕ помечай факты, которые просто связаны по теме, дополняют новый факт или относятся к другому атрибуту.
+- Если ни один факт не устарел — верни пустой массив.
+
+Ответь СТРОГО JSON-массивом номеров устаревших фактов, например: [2]
+Если устаревших нет: []
+Не добавляй никакого текста вне JSON-массива."#;
+
+/// Ask an LLM which existing Core facts the new fact makes outdated (#18).
+///
+/// Returns the `id`s of `candidates` the judge marks as superseded. This is a
+/// safe, best-effort operation: any provider error or unparseable reply yields
+/// an empty Vec (supersede nothing) — it never propagates an error, never
+/// panics, and never supersedes on doubt.
+pub async fn judge_conflicts(
+    provider: &dyn ModelProvider,
+    model: &str,
+    temperature: Option<f64>,
+    new_content: &str,
+    candidates: &[MemoryEntry],
+) -> anyhow::Result<Vec<String>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build a 1-based numbered list of existing facts.
+    let mut list = String::new();
+    for (i, c) in candidates.iter().enumerate() {
+        list.push_str(&format!("{}. {}\n", i + 1, c.content));
+    }
+    let msg = format!(
+        "НОВЫЙ факт:\n{new_content}\n\nСУЩЕСТВУЮЩИЕ факты:\n{list}\nКакие существующие факты устарели?"
+    );
+
+    let raw = match provider
+        .chat_with_system(Some(JUDGE_SYSTEM_PROMPT), &msg, model, temperature)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "judge_conflicts provider call failed; superseding nothing"
+            );
+            return Ok(Vec::new());
+        }
+    };
+
+    // Tolerant parse: slice from the first `[` to the LAST `]` (widest span,
+    // tolerates surrounding prose) and parse as Vec<i64>. Not a balanced-bracket
+    // parser: a nested array in that span fails to parse and yields []. Any
+    // failure is safe here — it means "supersede nothing".
+    let indices: Vec<i64> = match (raw.find('['), raw.rfind(']')) {
+        (Some(start), Some(end)) if end > start => {
+            serde_json::from_str::<Vec<i64>>(&raw[start..=end]).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Map valid 1-based indices in range to candidate ids.
+    let mut superseded = Vec::new();
+    for n in indices {
+        if n >= 1 && (n as usize) <= candidates.len() {
+            superseded.push(candidates[(n as usize) - 1].id.clone());
+        }
+    }
+
+    Ok(superseded)
+}
 
 /// Check for conflicting memories and mark old ones as superseded.
 ///
 /// Returns the list of entry IDs that were superseded.
+// NOTE: superseded by judge_conflicts on the consolidation path (#18); retained for any other/no callers.
 pub async fn check_and_resolve_conflicts(
     memory: &dyn Memory,
     key: &str,
@@ -110,6 +201,111 @@ pub fn find_text_conflicts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn core_entry(id: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: id.into(),
+            key: id.into(),
+            content: content.into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.7),
+            superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    /// Returns a fixed judge reply for any chat_with_system call.
+    struct JudgeStub {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for JudgeStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for JudgeStub {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "JudgeStub"
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_conflicts_empty_candidates_short_circuits() {
+        let provider = JudgeStub {
+            reply: "[1]".into(),
+        };
+        let ids = judge_conflicts(&provider, "m", None, "new fact", &[])
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn judge_conflicts_maps_index_to_id() {
+        let provider = JudgeStub {
+            reply: "[1]".into(),
+        };
+        let candidates = vec![core_entry("a", "lang Python"), core_entry("b", "city NYC")];
+        let ids = judge_conflicts(&provider, "m", None, "lang Rust", &candidates)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn judge_conflicts_empty_array_supersedes_nothing() {
+        let provider = JudgeStub { reply: "[]".into() };
+        let candidates = vec![core_entry("a", "lang Python")];
+        let ids = judge_conflicts(&provider, "m", None, "lang Rust", &candidates)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn judge_conflicts_garbage_reply_supersedes_nothing() {
+        let provider = JudgeStub {
+            reply: "не json вовсе".into(),
+        };
+        let candidates = vec![core_entry("a", "lang Python")];
+        let ids = judge_conflicts(&provider, "m", None, "lang Rust", &candidates)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn judge_conflicts_out_of_range_index_ignored() {
+        let provider = JudgeStub {
+            reply: "[5, 1]".into(),
+        };
+        let candidates = vec![core_entry("a", "lang Python")];
+        let ids = judge_conflicts(&provider, "m", None, "lang Rust", &candidates)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["a".to_string()]);
+    }
 
     #[test]
     fn jaccard_identical_strings() {

@@ -120,30 +120,27 @@ pub async fn consolidate_turn(
         // Detect conflicting Core memories BEFORE storing the new entry, so the
         // new entry itself is never a candidate for being superseded.
         //
-        // Fork patch: upstream discards this Vec (only `Err` is handled) and
-        // never calls `mark_superseded`, so conflict detection was a no-op —
-        // stale Core facts were never retired and recall surfaced both old and
-        // new. We capture the ids and mark them superseded after the store.
-        let superseded_ids = match conflict::check_and_resolve_conflicts(
-            memory,
-            &mem_key,
-            update,
-            &MemoryCategory::Core,
-            0.85,
-        )
-        .await
-        {
-            Ok(ids) => ids,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "conflict check skipped"
-                );
-                Vec::new()
-            }
-        };
+        // Fork patch #18: a hardcoded similarity threshold cannot cleanly
+        // separate "contradiction" from "mere relatedness" (cos between
+        // "language is Python" and "language is Rust" was only 0.78). Instead,
+        // recall the nearest Core candidates and let an LLM judge decide which
+        // the new fact makes outdated. `judge_conflicts` is best-effort and
+        // returns empty on any provider/parse error (supersede nothing).
+        let candidates: Vec<_> = memory
+            .recall(update, 10, None, None, None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                matches!(c.category, MemoryCategory::Core)
+                    && c.key != mem_key
+                    && c.content != *update
+            })
+            .collect();
+        let superseded_ids =
+            conflict::judge_conflicts(model_provider, model, temperature, update, &candidates)
+                .await
+                .unwrap_or_default();
 
         // Store with importance metadata.
         memory
@@ -163,6 +160,29 @@ pub async fn consolidate_turn(
         // (no FK/JOIN reads the value), and the new row's internal id is not
         // available here without an extra round-trip.
         if !superseded_ids.is_empty() {
+            // Observability (#18): record what the judge retired and why.
+            let update_preview: String = update.chars().take(120).collect();
+            let superseded_contents: Vec<String> = superseded_ids
+                .iter()
+                .filter_map(|id| {
+                    candidates
+                        .iter()
+                        .find(|c| &c.id == id)
+                        .map(|c| c.content.chars().take(120).collect::<String>())
+                })
+                .collect();
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "new_key": mem_key,
+                        "new_content": update_preview,
+                        "superseded_ids": superseded_ids,
+                        "superseded_contents": superseded_contents,
+                    })),
+                "judge superseded Core facts"
+            );
+
             let refs: Vec<&str> = superseded_ids.iter().map(|s| s.as_str()).collect();
             if let Err(e) = memory.mark_superseded(&refs, &mem_key).await {
                 ::zeroclaw_log::record!(
@@ -281,21 +301,45 @@ mod integration_tests {
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::ModelProvider;
 
-    /// Returns a fixed JSON reply. `chat` keeps its trait default (unused here).
+    /// Returns a canned reply chosen by inspecting the system prompt: the
+    /// consolidation extraction prompt vs the Core-dedup judge prompt. The
+    /// judge prompt is detected by its unique marker word ("устаревшими").
+    /// `chat` keeps its trait default (unused here).
     struct StubProvider {
-        reply: String,
+        extraction_reply: String,
+        judge_reply: String,
     }
 
     #[async_trait]
     impl ModelProvider for StubProvider {
         async fn chat_with_system(
             &self,
-            _system_prompt: Option<&str>,
+            system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok(self.reply.clone())
+            let is_judge = system_prompt
+                .map(|p| p.contains("устаревшими"))
+                .unwrap_or(false);
+            if is_judge {
+                // Sentinel: pick the 1-based index of the candidate line that
+                // mentions "Python", so the test is independent of recall order.
+                if self.judge_reply == "AUTO_PYTHON" {
+                    for line in _message.lines() {
+                        if line.contains("Python")
+                            && let Some((num, _)) = line.split_once('.')
+                            && let Ok(n) = num.trim().parse::<i64>()
+                        {
+                            return Ok(format!("[{n}]"));
+                        }
+                    }
+                    return Ok("[]".into());
+                }
+                Ok(self.judge_reply.clone())
+            } else {
+                Ok(self.extraction_reply.clone())
+            }
         }
     }
 
@@ -317,7 +361,8 @@ mod integration_tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let provider = StubProvider {
-            reply: r#"{"history_entry": "Обсудили деплой.", "memory_update": "Олег предпочитает деплой через CI."}"#.to_string(),
+            extraction_reply: r#"{"history_entry": "Обсудили деплой.", "memory_update": "Олег предпочитает деплой через CI."}"#.to_string(),
+            judge_reply: "[]".into(),
         };
 
         consolidate_turn(
@@ -345,8 +390,9 @@ mod integration_tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let provider = StubProvider {
-            reply: r#"{"history_entry": "Дежурное приветствие.", "memory_update": null}"#
-                .to_string(),
+            extraction_reply:
+                r#"{"history_entry": "Дежурное приветствие.", "memory_update": null}"#.to_string(),
+            judge_reply: "[]".into(),
         };
 
         consolidate_turn(&provider, "test-model", None, &mem, "Привет", "Привет!")
@@ -357,5 +403,191 @@ mod integration_tests {
         assert_eq!(daily.len(), 1);
         let core = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
         assert!(core.is_empty(), "no Core entry when memory_update is null");
+    }
+
+    /// Seed two Core facts; consolidation introduces a fact that genuinely
+    /// contradicts one of them (language Python -> Rust). The judge targets the
+    /// Python fact, which must drop out of recall, while the adjacent
+    /// non-conflicting PHP fact and the new Rust fact survive.
+    #[tokio::test]
+    async fn consolidate_supersedes_real_contradiction() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+        mem.store_with_metadata(
+            "core_python",
+            "Основной язык программирования пользователя — Python.",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+        mem.store_with_metadata(
+            "core_php",
+            "Пользователь пишет микросервисы на PHP.",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+
+        let provider = StubProvider {
+            extraction_reply: r#"{"history_entry": "Сменил основной язык.", "memory_update": "Основной язык программирования пользователя — Rust."}"#.to_string(),
+            judge_reply: "AUTO_PYTHON".into(),
+        };
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &mem,
+            "Теперь пишу на Rust",
+            "Понял, основной язык — Rust.",
+        )
+        .await
+        .unwrap();
+
+        let recalled = mem
+            .recall("основной язык программирования", 20, None, None, None)
+            .await
+            .unwrap();
+        let contents: Vec<&str> = recalled.iter().map(|e| e.content.as_str()).collect();
+
+        assert!(
+            !contents.iter().any(|c| c.contains("Python")),
+            "superseded Python fact must not surface in recall: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains("Rust")),
+            "new Rust fact must surface: {contents:?}"
+        );
+
+        // The adjacent PHP fact is on a different topic, so it only surfaces for
+        // a PHP-matching query — assert it is still recallable (not superseded).
+        let php = mem
+            .recall("микросервисы PHP", 20, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            php.iter().any(|e| e.content.contains("PHP")),
+            "adjacent non-conflicting PHP fact must be kept: {:?}",
+            php.iter().map(|e| e.content.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Same seed as the contradiction test, but the judge returns `[]` — nothing
+    /// is superseded and both pre-existing Core facts remain recallable.
+    #[tokio::test]
+    async fn consolidate_keeps_adjacent_when_judge_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+        mem.store_with_metadata(
+            "core_python",
+            "Основной язык программирования пользователя — Python.",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+        mem.store_with_metadata(
+            "core_php",
+            "Пользователь пишет микросервисы на PHP.",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+
+        let provider = StubProvider {
+            extraction_reply: r#"{"history_entry": "Сменил основной язык.", "memory_update": "Основной язык программирования пользователя — Rust."}"#.to_string(),
+            judge_reply: "[]".into(),
+        };
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &mem,
+            "Теперь пишу на Rust",
+            "Понял.",
+        )
+        .await
+        .unwrap();
+
+        let recalled = mem
+            .recall("основной язык программирования", 20, None, None, None)
+            .await
+            .unwrap();
+        let contents: Vec<&str> = recalled.iter().map(|e| e.content.as_str()).collect();
+
+        assert!(
+            contents.iter().any(|c| c.contains("Python")),
+            "judge returned empty -> Python fact must remain: {contents:?}"
+        );
+
+        let php = mem
+            .recall("микросервисы PHP", 20, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            php.iter().any(|e| e.content.contains("PHP")),
+            "PHP fact must remain: {:?}",
+            php.iter().map(|e| e.content.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The judge returns non-JSON garbage. `judge_conflicts` must fall back to
+    /// "supersede nothing" — no pre-existing Core fact is retired.
+    #[tokio::test]
+    async fn consolidate_safe_fallback_on_judge_garbage() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+        mem.store_with_metadata(
+            "core_python",
+            "Основной язык программирования пользователя — Python.",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+
+        let provider = StubProvider {
+            extraction_reply: r#"{"history_entry": "Сменил язык.", "memory_update": "Основной язык программирования пользователя — Rust."}"#.to_string(),
+            judge_reply: "не json".into(),
+        };
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &mem,
+            "Теперь пишу на Rust",
+            "Понял.",
+        )
+        .await
+        .unwrap();
+
+        let recalled = mem
+            .recall("основной язык программирования", 20, None, None, None)
+            .await
+            .unwrap();
+        let contents: Vec<&str> = recalled.iter().map(|e| e.content.as_str()).collect();
+
+        assert!(
+            contents.iter().any(|c| c.contains("Python")),
+            "garbage judge reply -> safe fallback, Python fact must remain: {contents:?}"
+        );
     }
 }
