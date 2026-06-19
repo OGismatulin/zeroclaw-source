@@ -3092,13 +3092,36 @@ async fn run_gateway_webhook_agentic(
 /// through unvalidated to the provider, which fails fast on its own
 /// catalog. Adding a new PROVIDER itself still requires Rust changes
 /// (factory + registry) and is governed by zeroclaw-providers.
-fn provider_exists_in_registry(name: &str) -> bool {
+fn provider_exists_in_registry(config: &Config, name: &str) -> bool {
     // fork: accept legacy spellings the bot still sends (e.g. "opencode-go"
     // → family "opencode") — the factory applies the same canonicalization,
     // so anything accepted here constructs successfully.
     // The bare codex family names keep their factory-level escape hatch.
     if matches!(name, "openai-codex" | "openai_codex" | "codex") {
         return true;
+    }
+    // fork patch #19: accept a dotted `<family>.<alias>` ref when the family
+    // canonicalizes to a registry provider AND the alias actually exists in
+    // `[providers.models.<family>.<alias>]`. This is the only shape that lets
+    // the bot's per-request override reach a custom-URL endpoint (family
+    // `custom`), whose `uri` lives on the alias, not on a bare registry name.
+    // The build path (`options_for_provider_ref` / `create_resilient_model_
+    // provider_from_ref`) already resolves the dotted form via `split_once('.')`;
+    // this gate was the sole blocker. Spec: 2026-06-19-neuralwatt-custom-provider.
+    //
+    // NOTE: do NOT `return false` from the dotted branch on a miss — fall
+    // through to the bare-name check. Some canonical aliases legitimately
+    // contain a dot (`z.ai` → `zai`, fork patch #5); those are NOT
+    // `family.alias` refs and must still resolve as whole-name canonicals.
+    if let Some((family, alias)) = name.split_once('.') {
+        let canonical = zeroclaw_providers::canonicalize_v2_model_provider_name(family);
+        if zeroclaw_providers::list_model_providers()
+            .iter()
+            .any(|p| p.name == canonical)
+            && config.providers.models.find(canonical, alias).is_some()
+        {
+            return true;
+        }
     }
     let canonical = zeroclaw_providers::canonicalize_v2_model_provider_name(name);
     zeroclaw_providers::list_model_providers()
@@ -3146,6 +3169,7 @@ pub(crate) enum ModelSelection {
 }
 
 pub(crate) fn classify_provider_selection(
+    config: &Config,
     model: Option<&str>,
     provider: Option<&str>,
 ) -> ModelSelection {
@@ -3158,7 +3182,7 @@ pub(crate) fn classify_provider_selection(
         (Some(_), None) => ModelSelection::MissingProvider,
         (None, Some(_)) => ModelSelection::MissingModel,
         (Some(m), Some(p)) => {
-            if provider_exists_in_registry(p) {
+            if provider_exists_in_registry(config, p) {
                 ModelSelection::Override {
                     model: m.to_string(),
                     provider: p.to_string(),
@@ -3479,6 +3503,7 @@ async fn handle_webhook(
     let config_snapshot = state.config.read().clone();
     let (active, provider_name, model_name): (ActiveProvider, String, String) =
         match classify_provider_selection(
+            &config_snapshot,
             webhook_body.model.as_deref(),
             webhook_body.provider.as_deref(),
         ) {
@@ -5473,13 +5498,98 @@ mod tests {
         assert!(parsed.model.is_none());
     }
 
+    /// fork patch #19 fixture: a V3 Config carrying a custom-URL alias
+    /// `[providers.models.custom.neuralwatt]` with `uri` set and NO `model`
+    /// (the no-model invariant keeps `push_pinned_entries` on the unpinned
+    /// branch so the per-request model flows through — see spec §3.2.1).
+    fn nw_cfg() -> Config {
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "neuralwatt".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("https://api.neuralwatt.com/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn nw_alias_has_no_model_so_request_model_flows_through() {
+        // Guard against re-introducing model-pinning: with `model = None` the
+        // alias build path (push_pinned_entries) pushes a single UNPINNED entry,
+        // so a request for kimi-k2.7-code is NOT silently rewritten to another
+        // model. If someone adds `model =` to the alias, this fails loudly.
+        let cfg = nw_cfg();
+        let entry = cfg
+            .providers
+            .models
+            .find("custom", "neuralwatt")
+            .expect("neuralwatt alias present");
+        assert!(entry.model.is_none(), "custom.neuralwatt must NOT pin a model");
+        assert_eq!(entry.uri.as_deref(), Some("https://api.neuralwatt.com/v1"));
+    }
+
+    #[test]
+    fn build_override_provider_resolves_dotted_custom_alias() {
+        // The dotted ref must build (uri resolved from the alias) — proving the
+        // full override path works once classify accepts it (patch #19).
+        let cfg = nw_cfg();
+        assert!(
+            build_override_provider(&cfg, "custom.neuralwatt", "kimi-k2.7-code").is_ok(),
+            "dotted custom alias with resolvable uri must build"
+        );
+    }
+
+    #[test]
+    fn provider_exists_accepts_dotted_custom_alias_and_rejects_unknown() {
+        let cfg = nw_cfg();
+        // configured dotted alias → accepted
+        assert!(provider_exists_in_registry(&cfg, "custom.neuralwatt"));
+        // family in registry but alias absent → rejected
+        assert!(!provider_exists_in_registry(&cfg, "custom.bogus"));
+        // unknown family with a dot → rejected
+        assert!(!provider_exists_in_registry(&cfg, "nope.x"));
+    }
+
+    #[test]
+    fn classify_accepts_dotted_custom_alias() {
+        match classify_provider_selection(
+            &nw_cfg(),
+            Some("glm-5.2-fast"),
+            Some("custom.neuralwatt"),
+        ) {
+            ModelSelection::Override { model, provider } => {
+                assert_eq!(provider, "custom.neuralwatt");
+                assert_eq!(model, "glm-5.2-fast");
+            }
+            other => panic!("expected Override for dotted custom alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_rejects_dotted_unknown_alias() {
+        match classify_provider_selection(&nw_cfg(), Some("m"), Some("custom.bogus")) {
+            ModelSelection::UnknownProvider {
+                requested,
+                available_providers,
+            } => {
+                assert_eq!(requested, "custom.bogus");
+                assert!(!available_providers.is_empty());
+            }
+            other => panic!("expected UnknownProvider for custom.bogus, got {other:?}"),
+        }
+    }
+
     #[test]
     fn provider_registry_validation_accepts_canonical_names() {
         // Sample of canonical names that must exist in ProviderInfo registry.
-        assert!(provider_exists_in_registry("openai-codex"));
-        assert!(provider_exists_in_registry("zai"));
-        assert!(provider_exists_in_registry("opencode-go"));
-        assert!(provider_exists_in_registry("openrouter"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "openai-codex"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "zai"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "opencode-go"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "openrouter"));
     }
 
     #[test]
@@ -5489,24 +5599,24 @@ mod tests {
         // accepted (z.ai → zai, opencode-zen → opencode; see
         // zeroclaw-providers canonicalize_v2_model_provider_name). The factory
         // applies the same mapping, so acceptance is safe by construction.
-        assert!(provider_exists_in_registry("z.ai"));
-        assert!(provider_exists_in_registry("opencode-zen"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "z.ai"));
+        assert!(provider_exists_in_registry(&nw_cfg(), "opencode-zen"));
         // Names that do not fold onto any registry canonical stay rejected.
-        assert!(!provider_exists_in_registry("gpt-typo"));
-        assert!(!provider_exists_in_registry(""));
+        assert!(!provider_exists_in_registry(&nw_cfg(), "gpt-typo"));
+        assert!(!provider_exists_in_registry(&nw_cfg(), ""));
     }
 
     #[test]
     fn classify_provider_selection_none_returns_default() {
         assert!(matches!(
-            classify_provider_selection(None, None),
+            classify_provider_selection(&nw_cfg(), None, None),
             ModelSelection::Default
         ));
     }
 
     #[test]
     fn classify_provider_selection_pair_returns_override() {
-        match classify_provider_selection(Some("kimi-k2.6"), Some("opencode-go")) {
+        match classify_provider_selection(&nw_cfg(), Some("kimi-k2.6"), Some("opencode-go")) {
             ModelSelection::Override { model, provider } => {
                 assert_eq!(model, "kimi-k2.6");
                 assert_eq!(provider, "opencode-go");
@@ -5519,24 +5629,24 @@ mod tests {
     fn classify_provider_selection_empty_or_whitespace_rejects() {
         // Empty model with provider set
         assert!(matches!(
-            classify_provider_selection(Some(""), Some("zai")),
+            classify_provider_selection(&nw_cfg(), Some(""), Some("zai")),
             ModelSelection::InvalidEmpty
         ));
         // Empty provider with model set
         assert!(matches!(
-            classify_provider_selection(Some("glm-5.1"), Some("")),
+            classify_provider_selection(&nw_cfg(), Some("glm-5.1"), Some("")),
             ModelSelection::InvalidEmpty
         ));
         // Both whitespace
         assert!(matches!(
-            classify_provider_selection(Some("   "), Some("\t")),
+            classify_provider_selection(&nw_cfg(), Some("   "), Some("\t")),
             ModelSelection::InvalidEmpty
         ));
     }
 
     #[test]
     fn classify_provider_selection_missing_provider() {
-        match classify_provider_selection(Some("glm-5.1"), None) {
+        match classify_provider_selection(&nw_cfg(), Some("glm-5.1"), None) {
             ModelSelection::MissingProvider => {}
             other => panic!("expected MissingProvider, got {other:?}"),
         }
@@ -5544,7 +5654,7 @@ mod tests {
 
     #[test]
     fn classify_provider_selection_missing_model() {
-        match classify_provider_selection(None, Some("zai")) {
+        match classify_provider_selection(&nw_cfg(), None, Some("zai")) {
             ModelSelection::MissingModel => {}
             other => panic!("expected MissingModel, got {other:?}"),
         }
@@ -5552,7 +5662,7 @@ mod tests {
 
     #[test]
     fn classify_provider_selection_unknown_provider_reports_available() {
-        match classify_provider_selection(Some("kimi-k2.6"), Some("totally-fake-provider")) {
+        match classify_provider_selection(&nw_cfg(), Some("kimi-k2.6"), Some("totally-fake-provider")) {
             ModelSelection::UnknownProvider {
                 requested,
                 available_providers,
@@ -5576,7 +5686,7 @@ mod tests {
         // the same mapping, so anything accepted here constructs successfully.
         // classify returns the provider string as-passed (see :3117), so the
         // override carries "z.ai" verbatim.
-        match classify_provider_selection(Some("glm-5.1"), Some("z.ai")) {
+        match classify_provider_selection(&nw_cfg(), Some("glm-5.1"), Some("z.ai")) {
             ModelSelection::Override { model, provider } => {
                 assert_eq!(provider, "z.ai");
                 assert_eq!(model, "glm-5.1");
@@ -5588,7 +5698,7 @@ mod tests {
     #[test]
     fn classify_provider_selection_trims_before_matching() {
         // Leading/trailing whitespace must not cause Unknown when canonical name is correct.
-        match classify_provider_selection(Some("  kimi-k2.6  "), Some("  opencode-go  ")) {
+        match classify_provider_selection(&nw_cfg(), Some("  kimi-k2.6  "), Some("  opencode-go  ")) {
             ModelSelection::Override { model, provider } => {
                 assert_eq!(model, "kimi-k2.6");
                 assert_eq!(provider, "opencode-go");

@@ -48,7 +48,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-4 = runtime_profiles.{default,agent_default}: max_actions_per_hour=1_000_000
 #        (was absent → schema default 20, throttled heavy cron digests + at/after
 #        jobs once patch #17 lifted the iteration cap) + max_tool_iterations=200.
-CURRENT_CONFIG_MARKER = "v3-4"
+# v3-5 = + [providers.models.custom.neuralwatt] alias (neuralwatt custom-URL
+#        provider, reached via bot /model override; fork patch #19). Spec
+#        2026-06-19-neuralwatt-custom-provider-model-switching-design.md.
+CURRENT_CONFIG_MARKER = "v3-5"
 
 
 def sanitize_filename(filename: str) -> str:

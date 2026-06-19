@@ -66,6 +66,16 @@ api_key = ""
 model = "minimax-m2.7"
 api_key = ""
 
+# Custom-URL provider (neuralwatt, OpenAI-compatible). Reached ONLY via the bot's
+# per-request /model override (provider="custom.neuralwatt"); not the daemon
+# default. NO `model` key on purpose: a pinned model would make ModelPinnedProvider
+# rewrite every request to it — without it the request model flows through
+# (glm-5.2-fast / kimi-k2.7-code). Key via env ZEROCLAW_API_KEY (generic fallback).
+# Spec: docs/superpowers/specs/2026-06-19-neuralwatt-custom-provider-model-switching-design.md
+[providers.models.custom.neuralwatt]
+uri = "https://api.neuralwatt.com/v1"
+api_key = ""
+
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
 fallback_providers = ["opencode-go"]
@@ -89,6 +99,8 @@ fallback_providers = ["opencode-go"]
 "minimax-m3"         = ["deepseek-v4-flash"]
 "kimi-k2.7-code"     = ["deepseek-v4-flash"]
 "glm-5.2"            = ["deepseek-v4-flash"]
+# neuralwatt custom-URL (2026-06-19) — only glm-5.2-fast is new; kimi-k2.7-code above
+"glm-5.2-fast"       = ["deepseek-v4-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
@@ -355,6 +367,7 @@ protect_last_n = 10
 "qwen3.7-plus"            = 1_000_000
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
+"glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
 "minimax-m2.7"            = 196_608
 "gpt-5.5"                 = 400_000
@@ -394,6 +407,7 @@ protect_last_n = 10
 "qwen3.7-plus"            = 1_000_000
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
+"glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
 "minimax-m2.7"            = 196_608
 "gpt-5.5"                 = 400_000
