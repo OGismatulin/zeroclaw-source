@@ -482,6 +482,17 @@ impl Memory for AgentScopedMemory {
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
         self.inner.ensure_agent_uuid(alias).await
     }
+
+    /// Forward supersede to the inner backend. The trait default is a no-op,
+    /// so without this override the agent-scoped wrapper silently drops every
+    /// `mark_superseded` call (this is what made consolidation dedup do nothing
+    /// on the live agent-scoped path, #18). Supersede is keyed by row `id`
+    /// (global, not agent-scoped), so a plain forward is correct.
+    async fn mark_superseded(&self, superseded_ids: &[&str], superseded_by: &str) -> Result<()> {
+        self.inner
+            .mark_superseded(superseded_ids, superseded_by)
+            .await
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for AgentScopedMemory {
@@ -539,6 +550,50 @@ mod tests {
         assert!(
             hits.iter().any(|e| e.key == "k1"),
             "wrapper recall must find rows it just stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_forwards_through_wrapper() {
+        // Regression (#18): the trait default `mark_superseded` is a no-op, so
+        // without an explicit forward the agent-scoped wrapper silently drops
+        // the call and consolidation dedup retires nothing on the live path.
+        let (_tmp, inner) = fresh_sqlite();
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+        let wrapper = AgentScopedMemory::new(as_dyn(inner.clone()), &alpha, Vec::<String>::new());
+
+        wrapper
+            .store(
+                "old",
+                "Любимый редактор кода — Vim.",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let hit = wrapper
+            .recall("редактор", 10, None, None, None)
+            .await
+            .unwrap();
+        let id = hit
+            .iter()
+            .find(|e| e.key == "old")
+            .expect("stored row must recall")
+            .id
+            .clone();
+
+        wrapper
+            .mark_superseded(&[id.as_str()], "new")
+            .await
+            .unwrap();
+
+        let after = wrapper
+            .recall("редактор", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !after.iter().any(|e| e.key == "old"),
+            "superseded row must be excluded from recall through the agent-scoped wrapper"
         );
     }
 
