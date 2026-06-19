@@ -51,7 +51,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-5 = + [providers.models.custom.neuralwatt] alias (neuralwatt custom-URL
 #        provider, reached via bot /model override; fork patch #19). Spec
 #        2026-06-19-neuralwatt-custom-provider-model-switching-design.md.
-CURRENT_CONFIG_MARKER = "v3-5"
+# v3-6 = neuralwatt alias native_tools=true (custom family disables native tools
+#        by default -> glm-5.2-fast leaked malformed <tool_call> text; prod
+#        incident 2026-06-20). neuralwatt verified to support native tool-calling.
+CURRENT_CONFIG_MARKER = "v3-6"
 
 
 def sanitize_filename(filename: str) -> str:

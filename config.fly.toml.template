@@ -75,6 +75,11 @@ api_key = ""
 [providers.models.custom.neuralwatt]
 uri = "https://api.neuralwatt.com/v1"
 api_key = ""
+# neuralwatt supports native OpenAI tool-calling (verified via curl). The custom
+# family disables native tools by default (text <tool_call> protocol), which
+# glm-5.2-fast emits malformed -> parser drops it -> raw text leaks to the user
+# (prod incident 2026-06-20). Opt back into native tool-calling.
+native_tools = true
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
