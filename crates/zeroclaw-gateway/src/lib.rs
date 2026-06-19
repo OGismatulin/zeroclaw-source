@@ -5528,7 +5528,10 @@ mod tests {
             .models
             .find("custom", "neuralwatt")
             .expect("neuralwatt alias present");
-        assert!(entry.model.is_none(), "custom.neuralwatt must NOT pin a model");
+        assert!(
+            entry.model.is_none(),
+            "custom.neuralwatt must NOT pin a model"
+        );
         assert_eq!(entry.uri.as_deref(), Some("https://api.neuralwatt.com/v1"));
     }
 
@@ -5662,7 +5665,11 @@ mod tests {
 
     #[test]
     fn classify_provider_selection_unknown_provider_reports_available() {
-        match classify_provider_selection(&nw_cfg(), Some("kimi-k2.6"), Some("totally-fake-provider")) {
+        match classify_provider_selection(
+            &nw_cfg(),
+            Some("kimi-k2.6"),
+            Some("totally-fake-provider"),
+        ) {
             ModelSelection::UnknownProvider {
                 requested,
                 available_providers,
@@ -5698,7 +5705,8 @@ mod tests {
     #[test]
     fn classify_provider_selection_trims_before_matching() {
         // Leading/trailing whitespace must not cause Unknown when canonical name is correct.
-        match classify_provider_selection(&nw_cfg(), Some("  kimi-k2.6  "), Some("  opencode-go  ")) {
+        match classify_provider_selection(&nw_cfg(), Some("  kimi-k2.6  "), Some("  opencode-go  "))
+        {
             ModelSelection::Override { model, provider } => {
                 assert_eq!(model, "kimi-k2.6");
                 assert_eq!(provider, "opencode-go");
