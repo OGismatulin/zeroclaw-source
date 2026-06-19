@@ -328,7 +328,14 @@ mode = "allow"
 [runtime_profiles.default]
 agentic = true
 compact_context = false
-max_tool_iterations = 100
+max_tool_iterations = 200
+# max_actions_per_hour: per-sender sliding-window cap on "act" tool ops
+# (shell/file_write/http_request/notify/send_file). Absent → schema default 20,
+# which throttled heavy cron digests + at/after jobs once patch #17 raised the
+# iteration cap 10→200 and turns finally reached 20+ act-ops mid-turn (the
+# "action budget exhausted" / "Файл отправится после снятия rate limit" symptom).
+# Set effectively-unlimited for background/cron and interactive turns alike.
+max_actions_per_hour = 1_000_000
 max_history_messages = 200
 max_context_tokens = 128_000
 parallel_tools = true
@@ -360,13 +367,14 @@ protect_last_n = 10
 "GLM-5.1"                 = 202_752
 "Qwen3.5-397B-A17B"       = 262_144
 
-# Subagent runtime profile: 80-iteration cap (matches pre-V3 max_iterations=80).
-# Shares default's context_compression + model_windows so cross-model windows
-# still resolve.
+# Subagent runtime profile. Shares default's context_compression + model_windows
+# so cross-model windows still resolve. Subagents do real work inside cron
+# digests too, so they get the same generous budgets as the main profile.
 [runtime_profiles.agent_default]
 agentic = true
 compact_context = false
-max_tool_iterations = 80
+max_tool_iterations = 200
+max_actions_per_hour = 1_000_000
 max_history_messages = 200
 max_context_tokens = 128_000
 parallel_tools = true
