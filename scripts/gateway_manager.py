@@ -54,7 +54,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-6 = neuralwatt alias native_tools=true (custom family disables native tools
 #        by default -> glm-5.2-fast leaked malformed <tool_call> text; prod
 #        incident 2026-06-20). neuralwatt verified to support native tool-calling.
-CURRENT_CONFIG_MARKER = "v3-6"
+# v3-7 = neuralwatt alias `fallback = ["opencode.go"]` — alias build path
+#        ignores global model_fallbacks; per-alias fallback degrades a
+#        neuralwatt 429 (rate-limit) to deepseek-v4-flash instead of error.
+CURRENT_CONFIG_MARKER = "v3-7"
 
 
 def sanitize_filename(filename: str) -> str:

@@ -80,6 +80,12 @@ api_key = ""
 # glm-5.2-fast emits malformed -> parser drops it -> raw text leaks to the user
 # (prod incident 2026-06-20). Opt back into native tool-calling.
 native_tools = true
+# Per-alias fallback: the alias build path (create_resilient_model_provider_for_alias)
+# does NOT wire global [reliability.model_fallbacks]/fallback_providers — only this
+# `fallback` chain. Without it a neuralwatt 429 (concurrency/TPM limit) = hard
+# "All providers/models failed" -> "временно недоступен". opencode.go serves
+# deepseek-v4-flash, so a rate-limited turn degrades gracefully instead.
+fallback = ["opencode.go"]
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
