@@ -41,6 +41,12 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// Liveness heartbeat, populated ON READ by `check_result`/`list_results`
+    /// from the `{task_id}.progress.json` sidecar when the task is still
+    /// running. Never written into `{task_id}.json` by the task itself
+    /// (stays `None` there → skipped), so it cannot race the final write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 /// Status of a background delegate task.
@@ -109,6 +115,13 @@ pub struct DelegateTool {
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// Live background-task cancellation registry: `task_id -> child token`.
+    /// Lets `cancel_task` actually STOP a running detached delegation (the
+    /// spawned `select!` observes the token and records `Cancelled` itself),
+    /// instead of only marking the result file. In-memory: effective only
+    /// within the lifetime of the DelegateTool instance that spawned the
+    /// task; cross-instance cancel falls back to cosmetic file-marking.
+    background_tasks: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl DelegateTool {
@@ -153,6 +166,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            background_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -199,6 +213,7 @@ impl DelegateTool {
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
             caller_alias: String::new(),
+            background_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1030,6 +1045,7 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
+            updated_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
@@ -1060,6 +1076,17 @@ impl DelegateTool {
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
 
+        // Register this task's cancellation token so `cancel_task` can actually
+        // stop it (the spawned `select!` observes the token and records
+        // `Cancelled` itself), not merely mark the result file. Cloned into the
+        // spawned task for deregistration when the task reaches a terminal state.
+        if let Ok(mut reg) = self.background_tasks.lock() {
+            reg.insert(task_id.clone(), child_token.clone());
+        }
+        let bg_registry = Arc::clone(&self.background_tasks);
+        let progress_path = results_dir.join(format!("{task_id}.progress.json"));
+        let hb_started_at = started_at.clone();
+
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
@@ -1080,12 +1107,45 @@ impl DelegateTool {
                     skill_bundles,
                     root_config,
                     caller_alias,
+                    // Nested sub-agent delegations get their own fresh registry
+                    // (separate cancellation scope from the parent turn).
+                    background_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 };
 
                 let args_inner = json!({
                     "agent": agent_name_owned,
                     "prompt": full_prompt,
                 });
+
+                // Liveness heartbeat: while the task runs, periodically stamp
+                // `updated_at` into the {task_id}.progress.json sidecar (atomic
+                // temp+rename). Writes ONLY the sidecar — never the result file
+                // — so it cannot race the final write. `check_result` /
+                // `list_results` merge it on read to prove the task is alive.
+                let hb_cancel = CancellationToken::new();
+                let hb_handle = {
+                    let hb_cancel = hb_cancel.clone();
+                    let hb_path = progress_path.clone();
+                    let hb_started = hb_started_at.clone();
+                    zeroclaw_spawn::spawn!(async move {
+                        loop {
+                            tokio::select! {
+                                () = hb_cancel.cancelled() => break,
+                                () = tokio::time::sleep(Duration::from_secs(15)) => {
+                                    let snap = json!({
+                                        "updated_at": chrono::Utc::now().to_rfc3339(),
+                                        "started_at": hb_started,
+                                    })
+                                    .to_string();
+                                    let tmp = hb_path.with_extension("json.tmp");
+                                    if tokio::fs::write(&tmp, &snap).await.is_ok() {
+                                        let _ = tokio::fs::rename(&tmp, &hb_path).await;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                };
 
                 // Race the delegation against cancellation
                 let outcome = tokio::select! {
@@ -1106,6 +1166,13 @@ impl DelegateTool {
                     }
                 };
 
+                // Task reached a terminal state: stop the heartbeat and remove
+                // the sidecar so check_result/list_results stop reporting stale
+                // liveness for a finished task.
+                hb_cancel.cancel();
+                let _ = hb_handle.await;
+                let _ = tokio::fs::remove_file(&progress_path).await;
+
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 let final_result = match outcome {
                     Ok(output) => BackgroundDelegateResult {
@@ -1116,6 +1183,7 @@ impl DelegateTool {
                         error: None,
                         started_at,
                         finished_at: Some(finished_at),
+                        updated_at: None,
                     },
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
@@ -1131,12 +1199,18 @@ impl DelegateTool {
                             error: Some(err),
                             started_at,
                             finished_at: Some(finished_at),
+                            updated_at: None,
                         }
                     }
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
                 let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
+
+                // Deregister: token is no longer cancellable once terminal.
+                if let Ok(mut reg) = bg_registry.lock() {
+                    reg.remove(&task_id_clone);
+                }
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1299,6 +1373,7 @@ impl DelegateTool {
                         skill_bundles,
                         root_config,
                         caller_alias,
+                        background_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
@@ -1401,16 +1476,35 @@ impl DelegateTool {
         }
 
         let content = tokio::fs::read_to_string(&result_path).await?;
-        let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
+        let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
+        // While still running, surface the heartbeat from the sidecar so the
+        // orchestrator can tell "alive" from "stuck" (two polls, growing
+        // updated_at = alive). Sidecar absent for short tasks (<heartbeat
+        // interval) — that's fine.
+        if result.status == BackgroundTaskStatus::Running {
+            let progress_path = self.results_dir().join(format!("{task_id}.progress.json"));
+            if let Ok(p) = tokio::fs::read_to_string(&progress_path).await
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&p)
+                && let Some(ts) = v.get("updated_at").and_then(|x| x.as_str())
+            {
+                result.updated_at = Some(ts.to_string());
+            }
+        }
+
+        // A still-running poll is a SUCCESSFUL query ("in progress"), NOT a
+        // tool error — only Failed/Cancelled are errors. (Pre-fix this returned
+        // success=false for Running, so a healthy poll rendered as `Error:` and
+        // pushed weak orchestrators to cancel live sub-agents.)
+        let output = serde_json::to_string_pretty(&result)?;
+        let (success, error) = match result.status {
+            BackgroundTaskStatus::Completed | BackgroundTaskStatus::Running => (true, None),
+            _ => (false, result.error),
+        };
         Ok(ToolResult {
-            success: result.status == BackgroundTaskStatus::Completed,
-            output: serde_json::to_string_pretty(&result)?,
-            error: if result.status == BackgroundTaskStatus::Completed {
-                None
-            } else {
-                result.error
-            },
+            success,
+            output,
+            error,
         })
     }
 
@@ -1430,17 +1524,37 @@ impl DelegateTool {
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
+            // Skip the heartbeat sidecars; only result files deserialize here
+            // (they'd fail the parse guard anyway, this just avoids the read).
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".progress.json"))
+            {
+                continue;
+            }
             if path.extension().and_then(|e| e.to_str()) == Some("json")
                 && let Ok(content) = tokio::fs::read_to_string(&path).await
                 && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
             {
-                results.push(json!({
+                let mut row = json!({
                     "task_id": result.task_id,
                     "agent": result.agent,
                     "status": result.status,
                     "started_at": result.started_at,
                     "finished_at": result.finished_at,
-                }));
+                });
+                // Surface heartbeat for still-running tasks (alive vs stuck).
+                if result.status == BackgroundTaskStatus::Running {
+                    let pp = results_dir.join(format!("{}.progress.json", result.task_id));
+                    if let Ok(p) = tokio::fs::read_to_string(&pp).await
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&p)
+                        && let Some(ts) = v.get("updated_at").and_then(|x| x.as_str())
+                    {
+                        row["updated_at"] = json!(ts);
+                    }
+                }
+                results.push(row);
             }
         }
 
@@ -1508,19 +1622,45 @@ impl DelegateTool {
             });
         }
 
-        // Cancel via the parent token — this will cascade to all child tokens
-        // Note: individual task cancellation uses the shared parent token, which
-        // cancels all background tasks. For per-task cancellation, each background
-        // task uses a child token, and the parent token cancels all.
-        // We update the result file to reflect the cancellation request.
+        // Real cancellation: if the task is live in this instance's registry,
+        // cancel its per-task child token. The spawned `select!` observes it,
+        // drops the sub-agent future, and writes `Cancelled` itself — so the
+        // task stays the sole writer of {task_id}.json (no final↔cancel race),
+        // and the sub-agent actually stops burning provider/VM.
+        let cancelled_live = self
+            .background_tasks
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get(task_id).cloned())
+            .map(|tok| {
+                tok.cancel();
+                true
+            })
+            .unwrap_or(false);
+
+        if cancelled_live {
+            return Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Task '{task_id}' cancellation signalled; the agent will stop and record Cancelled."
+                ),
+                error: None,
+            });
+        }
+
+        // Fallback: task not in the live registry (spawned by a prior tool
+        // instance, e.g. an earlier turn / after daemon respawn). The detached
+        // task is unreachable, so we can only cosmetically mark the file.
         result.status = BackgroundTaskStatus::Cancelled;
-        result.error = Some("Cancelled by user request".into());
+        result.error = Some("Cancelled by user request (marked; process not reachable)".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
 
         Ok(ToolResult {
             success: true,
-            output: format!("Task '{task_id}' cancellation requested."),
+            output: format!(
+                "Task '{task_id}' marked Cancelled (process not reachable from this instance)."
+            ),
             error: None,
         })
     }
@@ -3620,6 +3760,114 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("No task found"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Write a result file directly (no real agent) for handler contract tests.
+    fn write_bg_result(results_dir: &Path, r: &BackgroundDelegateResult) {
+        std::fs::create_dir_all(results_dir).unwrap();
+        std::fs::write(
+            results_dir.join(format!("{}.json", r.task_id)),
+            serde_json::to_string(r).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn running_result(task_id: &str) -> BackgroundDelegateResult {
+        BackgroundDelegateResult {
+            task_id: task_id.to_string(),
+            agent: "researcher".into(),
+            status: BackgroundTaskStatus::Running,
+            output: None,
+            error: None,
+            started_at: "2026-06-20T00:00:00Z".into(),
+            finished_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn check_result_running_reports_success_not_error() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_running_ok_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(
+            &workspace.join("delegate_results"),
+            &running_result(&task_id),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+
+        // A still-running poll is a SUCCESSFUL query, NOT a tool error.
+        assert!(result.success, "running poll must be success, not Error");
+        assert!(result.error.is_none());
+        assert!(result.output.contains("running"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn check_result_running_merges_heartbeat_updated_at() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_delegate_hb_{}", uuid::Uuid::new_v4()));
+        let results_dir = workspace.join("delegate_results");
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(&results_dir, &running_result(&task_id));
+        // Heartbeat sidecar written by the live task's ticker.
+        std::fs::write(
+            results_dir.join(format!("{task_id}.progress.json")),
+            json!({"updated_at": "2026-06-20T12:34:56Z"}).to_string(),
+        )
+        .unwrap();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("2026-06-20T12:34:56Z"),
+            "running check_result must surface heartbeat updated_at: {}",
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_running_not_in_registry_falls_back_to_file_mark() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_cancel_fb_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let results_dir = workspace.join("delegate_results");
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(&results_dir, &running_result(&task_id));
+
+        // Fresh tool — task_id is NOT in its live registry, so cancel_task
+        // must take the fallback path and cosmetically mark the file.
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({"action": "cancel_task", "task_id": task_id}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let content = std::fs::read_to_string(results_dir.join(format!("{task_id}.json"))).unwrap();
+        let r: BackgroundDelegateResult = serde_json::from_str(&content).unwrap();
+        assert_eq!(r.status, BackgroundTaskStatus::Cancelled);
 
         let _ = std::fs::remove_dir_all(workspace);
     }
