@@ -53,7 +53,7 @@ model = "deepseek-v4-flash"
 api_key = ""
 
 [providers.models.zai.default]
-model = "glm-5.1"
+model = "glm-5.2"
 api_key = ""
 
 # Bootstrap reference for fresh deploys; production overrides provider/model in
@@ -85,6 +85,18 @@ native_tools = true
 # `fallback` chain. Without it a neuralwatt 429 (concurrency/TPM limit) = hard
 # "All providers/models failed" -> "временно недоступен". opencode.go serves
 # deepseek-v4-flash, so a rate-limited turn degrades gracefully instead.
+fallback = ["opencode.go"]
+
+# Pinned neuralwatt alias for the analyst_glm_nwt subagent. Unlike the
+# flow-through alias above, this one MUST pin `model`: subagents resolve their
+# model from the provider entry, and pinning here is exactly the desired
+# behavior (ModelPinnedProvider rewriting to glm-5.2 is the point).
+# glm-5.2 on neuralwatt = zai-org/GLM-5.2-FP8 (tool-calling smoke-verified 2026-07-05).
+[providers.models.custom.neuralwatt_glm]
+model = "glm-5.2"
+uri = "https://api.neuralwatt.com/v1"
+api_key = ""
+native_tools = true
 fallback = ["opencode.go"]
 
 # ── Reliability ───────────────────────────────────────────────────────────
@@ -468,5 +480,10 @@ runtime_profile = "agent_default"
 
 [agents.analyst_glm]
 model_provider = "zai.default"
+risk_profile = "default"
+runtime_profile = "agent_default"
+
+[agents.analyst_glm_nwt]
+model_provider = "custom.neuralwatt_glm"
 risk_profile = "default"
 runtime_profile = "agent_default"

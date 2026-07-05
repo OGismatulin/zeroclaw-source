@@ -57,7 +57,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-7 = neuralwatt alias `fallback = ["opencode.go"]` — alias build path
 #        ignores global model_fallbacks; per-alias fallback degrades a
 #        neuralwatt 429 (rate-limit) to deepseek-v4-flash instead of error.
-CURRENT_CONFIG_MARKER = "v3-7"
+# v3-8 = analyst_glm bumped glm-5.1 -> glm-5.2 (zai) + new subagent
+#        analyst_glm_nwt on pinned alias [providers.models.custom.neuralwatt_glm]
+#        (glm-5.2 via neuralwatt, native_tools + per-alias fallback).
+CURRENT_CONFIG_MARKER = "v3-8"
 
 
 def sanitize_filename(filename: str) -> str:
