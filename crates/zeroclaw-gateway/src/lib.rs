@@ -8788,19 +8788,19 @@ mod tests {
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -9875,6 +9875,12 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            // fork fields
+            provider_name: "test".into(),
+            cancel_token_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            webhook_lock_timeout_secs: 5,
+            webhook_session: Arc::new(TokioMutex::new(None)),
+            hooks: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

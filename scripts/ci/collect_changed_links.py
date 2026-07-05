@@ -59,6 +59,14 @@ def infer_docs_files(base_sha: str, provided: list[str]) -> list[str]:
         path = line.strip()
         if not path:
             continue
+        # fork: skip upstream's mdBook (`docs/book/`). We don't maintain it, it
+        # ships only in upstream's own docs pipeline, and its fenced PowerShell
+        # snippets (e.g. `[Environment]::SetEnvironmentVariable(...)` in
+        # setup/windows.md) trip the inline-link regex as false-positive broken
+        # links. Our operational docs/ (analysis, superpowers, guides) still get
+        # checked.
+        if path.startswith("docs/book/"):
+            continue
         if DOC_PATH_RE.search(path) or path in {"LICENSE", ".github/pull_request_template.md"}:
             files.append(path)
     return files
