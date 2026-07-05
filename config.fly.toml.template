@@ -467,23 +467,36 @@ runtime_profile = "agent_default"
 model_provider = "opencode.mimo"
 risk_profile = "default"
 runtime_profile = "agent_default"
+# Neutral analyst persona instead of the main-user identity: an explicit
+# workspace.path survives fork patch #2 (schema.rs is_none() guard), so
+# delegate's identity loop loads personas/analyst/IDENTITY.md here.
+[agents.analyst_mimo.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_deepseek_pro]
 model_provider = "deepseek.pro"
 risk_profile = "default"
 runtime_profile = "agent_default"
+[agents.analyst_deepseek_pro.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_deepseek_flash]
 model_provider = "deepseek.flash"
 risk_profile = "default"
 runtime_profile = "agent_default"
+[agents.analyst_deepseek_flash.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]
 model_provider = "zai.default"
 risk_profile = "default"
 runtime_profile = "agent_default"
+[agents.analyst_glm.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm_nwt]
 model_provider = "custom.neuralwatt_glm"
 risk_profile = "default"
 runtime_profile = "agent_default"
+[agents.analyst_glm_nwt.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"

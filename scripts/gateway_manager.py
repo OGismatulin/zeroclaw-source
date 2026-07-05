@@ -60,7 +60,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-8 = analyst_glm bumped glm-5.1 -> glm-5.2 (zai) + new subagent
 #        analyst_glm_nwt on pinned alias [providers.models.custom.neuralwatt_glm]
 #        (glm-5.2 via neuralwatt, native_tools + per-alias fallback).
-CURRENT_CONFIG_MARKER = "v3-8"
+# v3-9 = 5 analyst subagents pinned to neutral persona workspace
+#        ([agents.analyst_*.workspace] path -> template personas/analyst;
+#        replaces the main-user identity in analyst system prompts).
+CURRENT_CONFIG_MARKER = "v3-9"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -271,7 +274,7 @@ class WorkspaceBootstrapper:
                 template_workspace_dir,
                 workspace_dir,
                 ignore=shutil.ignore_patterns(
-                    "memory", "state", "logs", "cron", "uploads",
+                    "memory", "state", "logs", "cron", "uploads", "personas",
                     "*.db", "*.db-shm", "*.db-wal", "MEMORY_SNAPSHOT.md",
                 ),
             )
@@ -333,6 +336,9 @@ class WorkspaceBootstrapper:
     # Per-user runtime artifacts at workspace root that must never propagate
     # from template → user (one user's Core-memory "soul" is private).
     _RUNTIME_NAMES = {"MEMORY_SNAPSHOT.md"}
+    # Template-only content: per-user configs point at the shared template
+    # path (agents.analyst_*.workspace.path); never copy into user workspaces.
+    _TEMPLATE_ONLY_DIRS = {"personas"}
 
     @classmethod
     def _sync_missing_from_template(
@@ -344,6 +350,8 @@ class WorkspaceBootstrapper:
         """
         for item in template_dir.iterdir():
             if item.name in cls._RUNTIME_DIRS:
+                continue
+            if item.name in cls._TEMPLATE_ONLY_DIRS:
                 continue
             if item.name in cls._RUNTIME_NAMES:
                 continue
@@ -363,7 +371,7 @@ class WorkspaceBootstrapper:
                     ignore=shutil.ignore_patterns(
                         "memory", "state", "logs", "cron", "uploads",
                         "*.db", "*.db-shm", "*.db-wal", "__pycache__",
-                        "MEMORY_SNAPSHOT.md",
+                        "MEMORY_SNAPSHOT.md", "personas",
                     ),
                 )
             else:
