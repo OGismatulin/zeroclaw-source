@@ -63,7 +63,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-9 = 5 analyst subagents pinned to neutral persona workspace
 #        ([agents.analyst_*.workspace] path -> template personas/analyst;
 #        replaces the main-user identity in analyst system prompts).
-CURRENT_CONFIG_MARKER = "v3-9"
+CURRENT_CONFIG_MARKER = "v3-10"
 
 
 def sanitize_filename(filename: str) -> str:

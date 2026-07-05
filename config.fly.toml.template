@@ -255,6 +255,14 @@ transport = "http"
 url = "http://localhost:4001/mcp"
 tool_timeout_secs = 120
 
+# ── MCP bundles ─────────────────────────────────────────────────────────────
+# v0.8.2 is secure-by-default: an agent with no `mcp_bundles` receives NO MCP
+# servers (omission is not a grant — schema.rs mcp_servers_for_bundles). Pre-v0.8.2
+# every agent got every [[mcp.servers]] globally; this bundle + per-agent
+# `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
+[mcp_bundles.all]
+servers = ["context7", "lalafo-db", "graylog"]
+
 # ── Risk profile (default) ──────────────────────────────────────────────────
 # Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full
 # and ignores allowed_tools (gateway filters only excluded_tools when level !=
@@ -452,21 +460,25 @@ protect_last_n = 10
 model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "default"
+mcp_bundles = ["all"]
 
 [agents.worker]
 model_provider = "openai.codex_worker"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 
 [agents.coder]
 model_provider = "openai.codex_coder"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 
 [agents.analyst_mimo]
 model_provider = "opencode.mimo"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 # Neutral analyst persona instead of the main-user identity: an explicit
 # workspace.path survives fork patch #2 (schema.rs is_none() guard), so
 # delegate's identity loop loads personas/analyst/IDENTITY.md here.
@@ -477,6 +489,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 model_provider = "deepseek.pro"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
@@ -484,6 +497,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 model_provider = "deepseek.flash"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 [agents.analyst_deepseek_flash.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
@@ -491,6 +505,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 model_provider = "zai.default"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 [agents.analyst_glm.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
@@ -498,5 +513,6 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 model_provider = "custom.neuralwatt_glm"
 risk_profile = "default"
 runtime_profile = "agent_default"
+mcp_bundles = ["all"]
 [agents.analyst_glm_nwt.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
