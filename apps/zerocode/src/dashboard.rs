@@ -26,6 +26,10 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// of the conversation. Long sessions never load the full history.
 const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
+pub(crate) enum DashboardMouseAction {
+    OpenAgentConfig(String),
+}
+
 // ── Tab enum ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,6 +127,7 @@ pub(crate) struct Dashboard {
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
+    overview_agents_area: Rect,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
 }
@@ -167,6 +172,7 @@ impl Dashboard {
             search_query_saved: String::new(),
             tab_area: Rect::default(),
             list_area: Rect::default(),
+            overview_agents_area: Rect::default(),
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
         }
@@ -357,7 +363,7 @@ impl Dashboard {
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(mouse::HELP_HINT, theme::dim_style())),
             chunks[3],
         );
     }
@@ -460,7 +466,7 @@ impl Dashboard {
 
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -573,6 +579,7 @@ impl Dashboard {
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
         let agents_inner = agents_block.inner(chunks[1]);
+        self.overview_agents_area = chunks[1];
         frame.render_widget(agents_block, chunks[1]);
 
         let items: Vec<ListItem> = self
@@ -591,14 +598,10 @@ impl Dashboard {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        if a.persisted_sessions > 0 {
-                            format!(
-                                "  ({} live, {} saved)",
-                                a.live_sessions, a.persisted_sessions
-                            )
-                        } else {
-                            format!("  ({} live)", a.live_sessions)
-                        },
+                        format!(
+                            "  ({} live, {} persisted)",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -885,14 +888,10 @@ impl Dashboard {
                         status_style,
                     ),
                     Span::styled(
-                        if a.persisted_sessions > 0 {
-                            format!(
-                                "  {} live / {} saved",
-                                a.live_sessions, a.persisted_sessions
-                            )
-                        } else {
-                            format!("  {} live", a.live_sessions)
-                        },
+                        format!(
+                            "  live: {}, persisted: {}",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -945,8 +944,11 @@ impl Dashboard {
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-live-sessions"),
-                &a.live_sessions.to_string(),
+                &crate::i18n::t("zc-dashboard-detail-sessions"),
+                &format!(
+                    "{} live, {} persisted",
+                    a.live_sessions, a.persisted_sessions
+                ),
             ),
         ];
         if a.persisted_sessions > 0 {
@@ -1875,7 +1877,11 @@ impl Dashboard {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(&mut self, evt: MouseEvent, _content_area: Rect) {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        evt: MouseEvent,
+        _content_area: Rect,
+    ) -> Option<DashboardMouseAction> {
         use crossterm::event::MouseButton;
 
         let col = evt.column;
@@ -1883,6 +1889,19 @@ impl Dashboard {
 
         match evt.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tab == Tab::Overview
+                    && mouse::in_rect(col, row, self.overview_agents_area)
+                    && let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.overview_agents_area,
+                        0,
+                        self.agents.len(),
+                    )
+                    && let Some(agent) = self.agents.get(idx)
+                {
+                    return Some(DashboardMouseAction::OpenAgentConfig(agent.alias.clone()));
+                }
+
                 // Tab bar clicks
                 let labels: Vec<String> = TABS
                     .iter()
@@ -1891,7 +1910,7 @@ impl Dashboard {
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
                     self.tab = TABS[idx];
-                    return;
+                    return None;
                 }
 
                 // List clicks
@@ -1934,6 +1953,7 @@ impl Dashboard {
             }
             _ => {}
         }
+        None
     }
 
     // ── Navigation helpers ───────────────────────────────────────
@@ -2049,64 +2069,36 @@ impl Dashboard {
 
 impl crate::widgets::HelpContext for Dashboard {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::help::entries_for;
+        use crate::keymap::DashboardTabAction as D;
         use crate::widgets::{HelpEntry as E, HelpNode};
 
-        // Global tab-switching always available.
-        let tab_nav = vec![
-            E::new(
-                vec!["Tab", "l", "→"],
-                crate::i18n::t("zc-dashboard-help-next-tab"),
-            ),
-            E::new(
-                vec!["Shift+Tab", "h", "←"],
-                crate::i18n::t("zc-dashboard-help-prev-tab"),
-            ),
-            E::key("1–7", crate::i18n::t("zc-dashboard-help-jump-tab")),
-            E::key("r", crate::i18n::t("zc-dashboard-help-refresh")),
-            E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
-        ];
-
         if self.search_active {
-            return HelpNode::entries(vec![
-                E::key("Enter", crate::i18n::t("zc-dashboard-help-apply-search")),
-                E::key("Esc", crate::i18n::t("zc-dashboard-help-cancel-search")),
-            ]);
+            return HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]));
         }
 
+        // Global tab-switching always available.
+        let tab_nav = entries_for([D::NextTab, D::PrevTab, D::Tab1, D::Refresh]);
+
         if self.detail_open {
-            let mut entries = vec![
-                E::new(
-                    vec!["Esc", "Enter"],
-                    crate::i18n::t("zc-dashboard-help-close-detail"),
-                ),
-                E::new(
-                    vec!["j", "k"],
-                    crate::i18n::t("zc-dashboard-help-move-cursor"),
-                ),
-                E::new(
-                    vec!["J", "K"],
-                    crate::i18n::t("zc-dashboard-help-scroll-detail"),
-                ),
-                E::new(
-                    vec!["Shift+↑", "Shift+↓"],
-                    crate::i18n::t("zc-dashboard-help-scroll-detail"),
-                ),
-                E::key(
-                    "Shift+←/→",
-                    crate::i18n::t("zc-dashboard-help-resize-detail"),
-                ),
-                E::key("r", crate::i18n::t("zc-dashboard-help-refresh-short")),
-                E::key("/", crate::i18n::t("zc-dashboard-help-search")),
-                E::key("c", crate::i18n::t("zc-dashboard-help-clear-search")),
-                E::key("?", crate::i18n::t("zc-dashboard-help-this-help")),
+            let mut detail = vec![
+                D::CloseDetail,
+                D::Up,
+                D::Down,
+                D::DetailScrollUp,
+                D::DetailScrollDown,
+                D::DetailWidenLeft,
+                D::DetailWidenRight,
+                D::Refresh,
+                D::BeginSearch,
             ];
             if self.tab == Tab::Sessions {
-                entries.push(E::key(
-                    "X",
-                    crate::i18n::t("zc-dashboard-help-kill-session"),
-                ));
+                detail.push(D::KillSession);
             }
-            return HelpNode::entries(entries);
+            return HelpNode::entries(entries_for(detail));
         }
 
         // Per-tab bindings — only show what actually works on this tab.
@@ -2117,30 +2109,14 @@ impl crate::widgets::HelpContext for Dashboard {
             }
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron => {
                 entries.push(E::spacer());
-                entries.push(E::new(
-                    vec!["j", "k", "↑↓"],
-                    crate::i18n::t("zc-dashboard-help-move-cursor-list"),
-                ));
-                entries.push(E::new(
-                    vec!["G", "End"],
-                    crate::i18n::t("zc-dashboard-help-jump-bottom"),
-                ));
-                entries.push(E::new(
-                    vec!["g", "Home"],
-                    crate::i18n::t("zc-dashboard-help-jump-top"),
-                ));
-                entries.push(E::key(
-                    "Enter",
-                    crate::i18n::t("zc-dashboard-help-open-detail"),
-                ));
-                entries.push(E::key(
-                    "/",
-                    crate::i18n::t("zc-dashboard-help-search-filter"),
-                ));
-                entries.push(E::key(
-                    "c",
-                    crate::i18n::t("zc-dashboard-help-clear-search"),
-                ));
+                entries.extend(entries_for([
+                    D::Up,
+                    D::Down,
+                    D::JumpEnd,
+                    D::JumpStart,
+                    D::OpenDetail,
+                    D::BeginSearch,
+                ]));
             }
         }
         HelpNode::entries(entries)

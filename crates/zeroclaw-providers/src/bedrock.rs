@@ -132,19 +132,16 @@ impl AwsCredentials {
             anyhow::Error::msg(format!("No credential_process in [{profile}]"))
         })?;
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "bedrock: failed to spawn credential_process"
-                );
-                anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
-            })?;
+        let output = run_credential_process_command(&cmd).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "bedrock: failed to spawn credential_process"
+            );
+            anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
+        })?;
         anyhow::ensure!(
             output.status.success(),
             "credential_process exited with {}: {}",
@@ -348,6 +345,25 @@ impl AwsCredentials {
             None => false,
         }
     }
+}
+
+#[cfg(windows)]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut command = std::process::Command::new("cmd.exe");
+    command
+        .raw_arg("/C")
+        .raw_arg(format!("\"{cmd}\""))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
+#[cfg(not(windows))]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sh").args(["-c", cmd]).output()
 }
 
 fn env_required(name: &str) -> anyhow::Result<String> {
@@ -1245,9 +1261,8 @@ impl BedrockModelProvider {
             .to_string();
         let result = value
             .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map(Self::tool_result_content_text)
+            .unwrap_or_default();
         Some(ConverseMessage {
             role: "user".to_string(),
             content: vec![ContentBlock::ToolResult(ToolResultWrapper {
@@ -1258,6 +1273,15 @@ impl BedrockModelProvider {
                 },
             })],
         })
+    }
+
+    // Bedrock toolResult content is text-only. Preserve string tool output as-is;
+    // encode structured output compactly so object/array results are not dropped.
+    fn tool_result_content_text(value: &serde_json::Value) -> String {
+        value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string())
     }
 
     // ── Tool conversion ─────────────────────────────────────────
@@ -2411,6 +2435,38 @@ mod tests {
         assert!(msg.is_some());
         if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");
+            assert_eq!(wrapper.tool_result.content[0].text, "ok");
+        } else {
+            panic!("Expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn parse_tool_result_preserves_structured_content_as_json_text() {
+        let object_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"obj","content":{"ok":true,"count":2}}"#,
+        )
+        .expect("object content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = object_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "obj");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"{"count":2,"ok":true}"#
+            );
+        } else {
+            panic!("Expected ToolResult");
+        }
+
+        let array_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"arr","content":["alpha",{"beta":1}]}"#,
+        )
+        .expect("array content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = array_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "arr");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"["alpha",{"beta":1}]"#
+            );
         } else {
             panic!("Expected ToolResult");
         }
@@ -2540,20 +2596,20 @@ credential_process=some-command
 
     #[test]
     fn from_credential_process_parses_json_output() {
-        // Verify config parsing + JSON shape by using `echo` as the command.
-        let config = "\
-[default]
-credential_process=echo '{\"Version\":1,\"AccessKeyId\":\"AKIA\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"tok\"}'
-region=ap-southeast-1
-";
-        let (cmd, region) = AwsCredentials::parse_aws_config(config, "default").unwrap();
-        assert!(cmd.starts_with("echo"));
+        let credential_json =
+            r#"{"Version":1,"AccessKeyId":"AKIA","SecretAccessKey":"secret","SessionToken":"tok"}"#;
+        #[cfg(windows)]
+        let credential_command = format!("echo {credential_json}");
+        #[cfg(not(windows))]
+        let credential_command = format!("printf '%s\\n' '{credential_json}'");
+        let config =
+            format!("[default]\ncredential_process={credential_command}\nregion=ap-southeast-1\n");
+
+        let (cmd, region) = AwsCredentials::parse_aws_config(&config, "default").unwrap();
+        assert_eq!(cmd, credential_command);
         assert_eq!(region.as_deref(), Some("ap-southeast-1"));
 
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .output()
-            .unwrap();
+        let output = run_credential_process_command(&cmd).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["AccessKeyId"].as_str(), Some("AKIA"));
         assert_eq!(json["SecretAccessKey"].as_str(), Some("secret"));

@@ -31,6 +31,7 @@ COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
 COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
 COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
 COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
+COPY crates/zeroclaw-eval/Cargo.toml crates/zeroclaw-eval/Cargo.toml
 COPY crates/zeroclaw-log/Cargo.toml crates/zeroclaw-log/Cargo.toml
 COPY crates/zeroclaw-spawn/Cargo.toml crates/zeroclaw-spawn/Cargo.toml
 COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
@@ -58,7 +59,7 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
          robot-kit aardvark-sys zeroclaw-api zeroclaw-infra zeroclaw-config \
          zeroclaw-log zeroclaw-spawn \
          zeroclaw-providers zeroclaw-memory zeroclaw-channels zeroclaw-tools \
-         zeroclaw-runtime zeroclaw-plugins zeroclaw-gateway \
+         zeroclaw-runtime zeroclaw-eval zeroclaw-plugins zeroclaw-gateway \
          zeroclaw-hardware zeroclaw-tool-call-parser; do \
        mkdir -p "crates/$crate_dir/src" && \
        echo "pub fn placeholder() {}" > "crates/$crate_dir/src/lib.rs"; \

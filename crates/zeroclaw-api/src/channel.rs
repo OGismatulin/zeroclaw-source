@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
@@ -79,6 +80,56 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+}
+
+/// Cross-channel room visibility used by room-management APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomVisibility {
+    Private,
+    Public,
+}
+
+impl RoomVisibility {
+    pub const SCHEMA_VALUES: &'static [&'static str] = &["private", "public"];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+}
+
+impl fmt::Display for RoomVisibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RoomVisibility {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "private" => Ok(Self::Private),
+            "public" => Ok(Self::Public),
+            other => {
+                anyhow::bail!("unsupported room visibility '{other}': expected private or public")
+            }
+        }
+    }
+}
+
+/// Room creation options shared by channel implementations that support
+/// creating group conversations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomCreationOptions {
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub invites: Vec<String>,
+    pub visibility: Option<RoomVisibility>,
+    pub encryption: Option<bool>,
 }
 
 impl SendMessage {
@@ -288,6 +339,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
+    /// Whether an inbound message is a direct, one-to-one conversation
+    /// with the bot (a DM/IM), as opposed to a group or broadcast
+    /// channel. A direct message is definitionally addressed to the
+    /// bot, so the orchestrator skips the reply-intent classifier and
+    /// goes straight to the tool-capable agent turn.
+    ///
+    /// Default `false`: channels that cannot prove a one-to-one context
+    /// keep the classifier precheck. Channels that distinguish DMs from
+    /// group traffic override this.
+    fn is_direct_message(&self, _msg: &ChannelMessage) -> bool {
+        false
+    }
+
     /// Whether this channel supports multi-message streaming delivery.
     fn supports_multi_message_streaming(&self) -> bool {
         false
@@ -378,6 +442,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Create a new platform room/conversation when the channel supports it.
+    async fn create_room(&self, _options: &RoomCreationOptions) -> anyhow::Result<String> {
+        anyhow::bail!("channel does not support room creation")
+    }
+
+    /// Invite a user to an existing platform room/conversation.
+    async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support room invites")
+    }
+
     /// Request interactive tool-call approval from the channel operator.
     ///
     /// Returns `Ok(Some(response))` when the operator answers within the
@@ -399,6 +473,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         Ok(None)
+    }
+
+    /// The name of the back-channel that produced the most recent
+    /// [`Channel::request_approval`] decision, when this channel fans a single
+    /// request out to several registered back-channels (the agent's approval
+    /// bridge does this so an ACP editor and a WebSocket dashboard can both
+    /// answer). Ordinary single channels return `None` — their own
+    /// [`Channel::name`] already identifies the deciding surface — so the
+    /// approval audit trail can record the channel that actually decided
+    /// instead of the turn loop's static channel name.
+    fn last_decision_channel(&self) -> Option<String> {
+        None
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.
@@ -521,6 +607,48 @@ mod tests {
         let reply = SendMessage::reply_to(&inbound, "pong");
         assert!(reply.subject.is_none());
         assert_eq!(reply.in_reply_to.as_deref(), Some("msg-003"));
+    }
+
+    #[test]
+    fn room_visibility_parses_supported_values() {
+        assert_eq!(
+            "private".parse::<RoomVisibility>().unwrap(),
+            RoomVisibility::Private
+        );
+        assert_eq!(
+            "PUBLIC".parse::<RoomVisibility>().unwrap(),
+            RoomVisibility::Public
+        );
+    }
+
+    #[test]
+    fn room_visibility_rejects_unknown_values() {
+        let err = "shared".parse::<RoomVisibility>().unwrap_err();
+        assert!(err.to_string().contains("expected private or public"));
+    }
+
+    #[tokio::test]
+    async fn room_management_defaults_report_unsupported() {
+        let channel = StubChannel { handle: None };
+
+        let create = channel
+            .create_room(&RoomCreationOptions {
+                name: Some("ops".into()),
+                ..RoomCreationOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            create
+                .to_string()
+                .contains("does not support room creation")
+        );
+
+        let invite = channel
+            .invite_user("!room:example.org", "@alice:example.org")
+            .await
+            .unwrap_err();
+        assert!(invite.to_string().contains("does not support room invites"));
     }
 
     #[test]

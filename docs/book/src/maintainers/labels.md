@@ -14,27 +14,27 @@ Labels are portable metadata. They should answer what kind of work this is, what
 
 When Project board automation is added, use it as an automated planning board,
 not as a second PR review queue. The board should answer slower-moving planning
-questions: what is ready to pick up, who owns it, what tracker or milestone it
-belongs to, and what is blocked. Native GitHub PR state should continue to
-answer fast-moving review and merge questions.
+questions: what is ready to pick up, what routing evidence keeps it active,
+what tracker or milestone it belongs to, and what is blocked. Native GitHub PR
+state should continue to answer fast-moving review and merge questions.
 
 Keep the split based on update frequency:
 
 - Labels own durable classification: work type, scope/component, review risk, measured PR size, and stale exemption.
-- Project board fields are appropriate for issue planning stage, active owner or steward path, dependency state, stale-exemption reason, and roadmap grouping when those fields are actively maintained.
+- Project board fields are appropriate for issue planning stage, visible routing evidence, dependency state, stale-exemption reason, and roadmap grouping when those fields are actively maintained.
 - Native GitHub PR state owns fast-changing review state: review decision, required checks, mergeability, conflicts, and stale approvals.
 
 The board should reduce maintainer work. If a field would need manual upkeep after every PR push or review, prefer labels, milestones, or native GitHub state instead.
 
-Labels can suggest likely ownership, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security`, or `docs` label identifies the surface that probably needs attention. Contributor-visible owner-source rules live in the [Project board contract](./pr-workflow.md#project-board-contract).
+Labels can suggest likely routing, but they are not ownership. A `channel:*`, `provider:*`, `tool:*`, `security`, or `docs` label identifies the surface that probably needs attention. Contributor-visible routing-evidence rules live in the [Project board contract](./pr-workflow.md#issue-routing-evidence).
 
-Use assignees for active work. Use area stewardship for routing responsibility when nobody is implementing yet. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes.
+Use assignees for active work. Use issue comments, issue body sections, public fields, or linked trackers for routing evidence when a special stale, tracker, or deferred-decision state needs explanation. `status:blocked` uses the recorded-blocker rule. The [Project board contract](./pr-workflow.md#issue-routing-evidence) defines the accepted evidence sources and routing outcomes.
 
 ## Canonical spelling
 
-Use the live no-space module spelling for scoped module labels: `provider:openai`, `channel:telegram`, `security:policy`, and similar labels. The size, risk, and most type families currently keep a space after the colon: `size: XS`, `risk: low`, `risk: medium`, `risk: high`, and `type: docs`.
+Use no-space colon spelling for scoped labels: `provider:openai`, `channel:telegram`, `security:policy`, `risk:high`, `size:XS`, `type:docs`, and similar labels. Phrase labels without a namespace stay phrase-like: `good first issue`, `help wanted`, `trusted contributor`, and `stale-candidate`.
 
-Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Future no-space spelling for size, risk, or type labels is also a migration question, not a casual rename. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Live spaced labels such as `risk: high`, `size: XS`, and `type: docs` are migration candidates only after the approved packet creates or confirms the no-space canonical labels. Some legacy labels may remain live during a staged migration; until the migration packet lands, copy the exact live label spelling from the GitHub UI when documenting current labels. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
 
 ## Automation contract
 
@@ -44,7 +44,7 @@ Dependabot also seeds configured labels on its own PRs from `.github/dependabot.
 
 Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
 
-If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk: manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
+If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk:manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
 
 ## Cleanup protocol
 
@@ -54,7 +54,7 @@ Use this sequence:
 
 1. Refresh live label usage before acting.
 2. Split candidates into zero-history deletes, zero-open duplicate deletes, migrate-first active labels, and policy holdbacks.
-3. For labels with open refs, add the canonical label to each open issue/PR, remove the legacy label, verify the legacy label has zero open refs, then delete it.
+3. For labels with open refs, after the approved cleanup batch creates or confirms the canonical label, add the canonical label to each open issue/PR, remove the legacy label, verify the legacy label has zero open refs, then delete it.
 4. Do not delete governance labels, stale-policy labels, contributor-tier labels, or default GitHub labels as part of module-label cleanup.
 
 Every live cleanup batch needs exact maintainer approval for the labels and issue/PR refs being changed.
@@ -63,11 +63,13 @@ Every live cleanup batch needs exact maintainer approval for the labels and issu
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
 
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+
 | Label | Purpose |
 |---|---|
-| `type: ci` | CI, workflow, or repository automation work |
-| `type: dependencies` | Dependency or lockfile maintenance |
-| `type: docs` | Documentation-only or docs-primary work |
+| `type:ci` | CI, workflow, or repository automation work |
+| `type:dependencies` | Dependency or lockfile maintenance |
+| `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
 
 ## Path labels
@@ -145,6 +147,11 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 
 ### Per-provider labels
 
+Provider-specific labels match dedicated provider source files. Shared registry
+or factory files should receive the base `provider` label only; maintainers can
+add a provider-specific label manually when a shared-file change is truly scoped
+to one provider.
+
 | Label | Matches |
 |---|---|
 | `provider:anthropic` | `anthropic.rs` |
@@ -185,24 +192,28 @@ Tools are grouped by logical function rather than one label per file.
 
 Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
 
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+
 | Label | Threshold |
 |---|---|
-| `size: XS` | ≤ 80 lines |
-| `size: S` | ≤ 250 lines |
-| `size: M` | ≤ 500 lines |
-| `size: L` | ≤ 1000 lines |
-| `size: XL` | > 1000 lines |
+| `size:XS` | ≤ 80 lines |
+| `size:S` | ≤ 250 lines |
+| `size:M` | ≤ 500 lines |
+| `size:L` | ≤ 1000 lines |
+| `size:XL` | > 1000 lines |
 
 ## Risk labels
 
 For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**. Future risk automation should follow the [automation contract](#automation-contract).
 
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+
 | Label | Meaning |
 |---|---|
-| `risk: low` | No high-risk paths touched, small change |
-| `risk: medium` | Behavioral `crates/*/src/**` changes without boundary or security impact |
-| `risk: high` | Touches a high-risk path, or large security-adjacent change |
-| `risk: manual` | Maintainer override that freezes automated risk recalculation |
+| `risk:low` | No high-risk paths touched, small change |
+| `risk:medium` | Behavioral `crates/*/src/**` changes without boundary or security impact |
+| `risk:high` | Touches a high-risk path, or large security-adjacent change |
+| `risk:manual` | Maintainer override that freezes automated risk recalculation |
 
 High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
 
@@ -229,7 +240,7 @@ Track lifecycle state of RFCs and tracked work items. Applied manually unless a 
 | `status:blocked` | Work is valid but waiting on an external dependency, maintainer decision, or linked prerequisite. Exempt from stale while the blocker is recorded and unresolved. Do not pair with `status:no-stale` for the same blocker. |
 | `status:in-progress` | An open PR is actively targeting this issue. Reconcile against live PR state during stale passes; the label is not a permanent exemption after the PR closes. |
 | `status:stale` | No author activity for the stale window; may close if not refreshed |
-| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-ownership-path) has a contributor-visible stale-exemption reason and owner path. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
+| `status:no-stale` | Explicit stale exemption for accepted or otherwise long-lived work that is not already protected by another stale exclusion. Target policy: use only when the [Project board contract](./pr-workflow.md#issue-routing-evidence) has a contributor-visible stale-exemption reason and routing evidence. Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Existing exemptions missing those facts should be audited and repaired before stale sweeps stop honoring them. |
 
 ## Resolution labels
 

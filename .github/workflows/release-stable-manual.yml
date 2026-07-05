@@ -88,7 +88,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 24
+          node-version-file: '.nvmrc'
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build web dashboard
@@ -327,7 +327,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -383,7 +383,7 @@ jobs:
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 24
+          node-version-file: '.nvmrc'
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked

@@ -460,7 +460,10 @@ impl AnthropicModelProvider {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+                continue;
+            }
             match msg.role.as_str() {
                 "system" => {
                     if system_text.is_none() {
@@ -1252,6 +1255,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1268,13 +1272,24 @@ impl ModelProvider for AnthropicModelProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "non-streaming API request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": thinking_config.is_some(),
+                    })),
+                "anthropic provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -1435,6 +1450,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1463,7 +1479,15 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"model": model})),
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                    })),
                 "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
@@ -1555,13 +1579,24 @@ impl ModelProvider for AnthropicModelProvider {
             .boxed();
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "stream_chat request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": true,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": false,
+                    })),
+                "anthropic streaming provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,

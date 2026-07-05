@@ -34,12 +34,13 @@ pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
-        log_persistence: config.log_persistence.clone(),
+        log_persistence: config.log_persistence.as_wire().to_string(),
         log_persistence_path: config.log_persistence_path.clone(),
         log_persistence_max_entries: config.log_persistence_max_entries,
-        log_tool_io: config.log_tool_io.clone(),
+        log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
+        log_llm_request_payload: config.log_llm_request_payload.as_wire().to_string(),
     }
 }
 
@@ -54,7 +55,7 @@ pub fn init_from_config(
 ) {
     zeroclaw_log::init_from_config(&to_log_config(config), workspace_dir);
 
-    let mode = LegacyStorageMode::from_raw(&config.log_persistence);
+    let mode = LegacyStorageMode::from_raw(config.log_persistence.as_wire());
     let path = resolve_trace_path(config, workspace_dir);
     let logger = match mode {
         LegacyStorageMode::None => None,
@@ -316,11 +317,11 @@ pub fn record_turn_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::ObservabilityConfig;
+    use zeroclaw_config::schema::{LogPersistence, ObservabilityConfig};
 
     fn test_observability_config(dir: &Path) -> ObservabilityConfig {
         ObservabilityConfig {
-            log_persistence: "rolling".to_string(),
+            log_persistence: LogPersistence::Rolling,
             log_persistence_path: dir.join("trace.jsonl").to_string_lossy().into_owned(),
             log_persistence_max_entries: 2,
             ..ObservabilityConfig::default()

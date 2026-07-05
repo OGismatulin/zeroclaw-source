@@ -1,6 +1,8 @@
 //! Tool implementations for agent-callable capabilities.
 
 pub mod attribution;
+pub mod helpers;
+pub(crate) mod i18n;
 pub mod microsoft365;
 pub mod util_helpers;
 
@@ -11,6 +13,7 @@ pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
+pub mod channel_room;
 pub mod claude_code;
 pub mod claude_code_runner;
 pub mod cli_discovery;
@@ -21,6 +24,9 @@ pub mod composio;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
+pub mod email_imap;
+pub mod email_read;
+pub mod email_search;
 pub mod escalate;
 pub mod file_download;
 pub mod file_edit;

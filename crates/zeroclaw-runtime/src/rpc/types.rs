@@ -19,6 +19,7 @@ use serde_json::Value;
 // Consumers can `use zeroclaw_runtime::rpc::types::*` and get everything.
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
+pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
@@ -100,6 +101,21 @@ rpc_type! {
 }
 
 // Health: no params, result is `Value` from `health::snapshot_json()`.
+
+rpc_type! {
+    pub struct DoctorSummary {
+        pub ok: usize,
+        pub warnings: usize,
+        pub errors: usize,
+    }
+}
+
+rpc_type! {
+    pub struct DoctorRunResult {
+        pub results: Vec<DiagResult>,
+        pub summary: DoctorSummary,
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // ── TUI ──────────────────────────────────────────────────────────────
@@ -619,6 +635,19 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct ConfigResolveAliasSourceParams {
+        pub source: zeroclaw_config::traits::AliasSource,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceResult {
+        pub source: zeroclaw_config::traits::AliasSource,
+        pub values: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct ConfigMapKeyCreateParams {
         pub path: String,
         pub key: String,
@@ -662,6 +691,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub warnings: Vec<String>,
     }
 }
 
@@ -789,6 +820,34 @@ rpc_type! {
 rpc_type! {
     pub struct SkillsListResult {
         pub skills: Vec<SkillListEntry>,
+    }
+}
+
+rpc_type! {
+    /// One skill in an agent's *effective* set (the runtime's four-source
+    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
+    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
+    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
+    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
+    pub struct AgentSkillEntry {
+        pub name: String,
+        pub description: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plugin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bundle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
+        pub editable: bool,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillsResult {
+        pub agent: String,
+        pub skills: Vec<AgentSkillEntry>,
     }
 }
 
@@ -999,6 +1058,8 @@ rpc_type! {
         /// backend picker).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shape: Option<zeroclaw_config::sections::SectionShape>,
+        #[serde(default)]
+        pub cost_category: String,
     }
 }
 
@@ -1152,6 +1213,11 @@ rpc_type! {
         pub until_ts: Option<String>,
         #[serde(default)]
         pub until_id: Option<String>,
+        /// Byte offset to resume reading from. Set from the previous
+        /// `LogsQueryResult::next_cursor_line_offset` for deterministic
+        /// pagination regardless of id ordering.
+        #[serde(default)]
+        pub until_line_offset: Option<u64>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1174,7 +1240,19 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
+        /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
+        #[deprecated(
+            since = "0.8.0",
+            note = "tie-breaks by lexicographic id and can silently drop events; \
+                    use `next_cursor_line_offset` / `until_line_offset` instead. \
+                    Removal tracked in zeroclaw-labs/zeroclaw#8012."
+        )]
         pub next_cursor: Option<(String, String)>,
+        /// Byte offset past the last event on this page. Callers should
+        /// pass this back as `until_line_offset` on the next request to
+        /// resume without re-scanning already-read bytes.
+        pub next_cursor_line_offset: Option<u64>,
         pub at_end: bool,
     }
 }
@@ -1250,6 +1328,17 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+    },
+    /// Emitted whenever older whole turns were dropped from the context window
+    /// to fit the token budget. Surfaces a user-visible "context was cut here"
+    /// marker so trimming is never silent. `dropped_messages` is the count of
+    /// conversation messages removed; `kept_turns` is how many whole turns
+    /// remained after the cut.
+    HistoryTrimmed {
+        session_id: String,
+        dropped_messages: usize,
+        kept_turns: usize,
+        reason: String,
     },
 }
 
