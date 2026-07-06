@@ -255,13 +255,28 @@ transport = "http"
 url = "http://localhost:4001/mcp"
 tool_timeout_secs = 120
 
+# codemap: remote code-index MCP over the internet (Fly iad -> Hetzner EU).
+# graph of the Lalafo monorepa (graphify). Bearer secret is seeded from
+# CODEMAP_API_KEY via the __CODEMAP_API_KEY__ placeholder (no env-subst in
+# MCP headers — mcp_transport.rs). Design: docs/superpowers/specs/2026-07-06-*.
+[[mcp.servers]]
+name = "codemap"
+transport = "http"
+url = "https://178-104-197-112.sslip.io/mcp"
+tool_timeout_secs = 120
+
+# WARNING: this sub-table attaches to the LAST mcp.servers entry above (codemap).
+# Add new MCP servers ABOVE the codemap block, or move these headers with it.
+[mcp.servers.headers]
+Authorization = "Bearer __CODEMAP_API_KEY__"
+
 # ── MCP bundles ─────────────────────────────────────────────────────────────
 # v0.8.2 is secure-by-default: an agent with no `mcp_bundles` receives NO MCP
 # servers (omission is not a grant — schema.rs mcp_servers_for_bundles). Pre-v0.8.2
 # every agent got every [[mcp.servers]] globally; this bundle + per-agent
 # `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
 [mcp_bundles.all]
-servers = ["context7", "lalafo-db", "graylog"]
+servers = ["context7", "lalafo-db", "graylog", "codemap"]
 
 # ── Risk profile (default) ──────────────────────────────────────────────────
 # Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full
@@ -357,6 +372,8 @@ allowed_tools = [
     "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
     "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
     "graylog__by_user", "graylog__search_to_file",
+    "codemap__query_graph", "codemap__get_node", "codemap__get_neighbors", "codemap__get_community",
+    "codemap__god_nodes", "codemap__graph_stats", "codemap__shortest_path",
 ]
 
 [risk_profiles.default.delegation_policy]

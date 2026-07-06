@@ -63,7 +63,11 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-9 = 5 analyst subagents pinned to neutral persona workspace
 #        ([agents.analyst_*.workspace] path -> template personas/analyst;
 #        replaces the main-user identity in analyst system prompts).
-CURRENT_CONFIG_MARKER = "v3-10"
+# v3-10 = D1 fix: [mcp_bundles.all] + mcp_bundles=["all"] restored to all agents
+#         (v0.8.2 secure-by-default regression — context7/lalafo-db/graylog).
+# v3-11 = + codemap remote HTTP MCP (bundle grant + allowed_tools codemap__* +
+#         Bearer header via __CODEMAP_API_KEY__ placeholder).
+CURRENT_CONFIG_MARKER = "v3-11"
 
 
 def sanitize_filename(filename: str) -> str:
