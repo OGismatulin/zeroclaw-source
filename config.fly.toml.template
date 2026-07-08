@@ -255,6 +255,20 @@ transport = "http"
 url = "http://localhost:4001/mcp"
 tool_timeout_secs = 120
 
+# codemap-semantic: second remote MCP on the SAME box — natural-language semantic
+# search over the monorepa (claude-context + Zilliz), for "how does X work / where is
+# the logic for Y" where the symbol name is unknown. Its [mcp.servers.headers] MUST sit
+# immediately below THIS block (headers attach to the last [[mcp.servers]]). Bearer seeded
+# from CODEMAP_SEMANTIC_API_KEY via placeholder. Design: docs/superpowers/specs/2026-07-07-*.
+[[mcp.servers]]
+name = "codemap-semantic"
+transport = "http"
+url = "https://178-104-197-112.sslip.io/semantic/mcp"
+tool_timeout_secs = 120
+
+[mcp.servers.headers]
+Authorization = "Bearer __CODEMAP_SEMANTIC_API_KEY__"
+
 # codemap: remote code-index MCP over the internet (Fly iad -> Hetzner EU).
 # graph of the Lalafo monorepa (graphify). Bearer secret is seeded from
 # CODEMAP_API_KEY via the __CODEMAP_API_KEY__ placeholder (no env-subst in
@@ -276,7 +290,7 @@ Authorization = "Bearer __CODEMAP_API_KEY__"
 # every agent got every [[mcp.servers]] globally; this bundle + per-agent
 # `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
 [mcp_bundles.all]
-servers = ["context7", "lalafo-db", "graylog", "codemap"]
+servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic"]
 
 # ── Risk profile (default) ──────────────────────────────────────────────────
 # Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full
@@ -374,6 +388,9 @@ allowed_tools = [
     "graylog__by_user", "graylog__search_to_file",
     "codemap__query_graph", "codemap__get_node", "codemap__get_neighbors", "codemap__get_community",
     "codemap__god_nodes", "codemap__graph_stats", "codemap__shortest_path",
+    # codemap-semantic: read-only tools only (O3). index_codebase (heavy) + clear_index
+    # (destructive) are operator/cron-only, NOT granted to the agent.
+    "codemap-semantic__search_code", "codemap-semantic__get_indexing_status",
 ]
 
 [risk_profiles.default.delegation_policy]

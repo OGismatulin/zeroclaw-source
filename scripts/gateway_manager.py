@@ -67,7 +67,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         (v0.8.2 secure-by-default regression — context7/lalafo-db/graylog).
 # v3-11 = + codemap remote HTTP MCP (bundle grant + allowed_tools codemap__* +
 #         Bearer header via __CODEMAP_API_KEY__ placeholder).
-CURRENT_CONFIG_MARKER = "v3-11"
+# v3-12 = + codemap-semantic remote HTTP MCP (claude-context semantic search;
+#         bundle grant + allowed_tools codemap-semantic__{search_code,get_indexing_status}
+#         + Bearer via __CODEMAP_SEMANTIC_API_KEY__ placeholder).
+CURRENT_CONFIG_MARKER = "v3-12"
 
 
 def sanitize_filename(filename: str) -> str:
