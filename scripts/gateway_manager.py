@@ -70,7 +70,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-12 = + codemap-semantic remote HTTP MCP (claude-context semantic search;
 #         bundle grant + allowed_tools codemap-semantic__{search_code,get_indexing_status}
 #         + Bearer via __CODEMAP_SEMANTIC_API_KEY__ placeholder).
-CURRENT_CONFIG_MARKER = "v3-12"
+CURRENT_CONFIG_MARKER = "v3-13"
 
 
 def sanitize_filename(filename: str) -> str:

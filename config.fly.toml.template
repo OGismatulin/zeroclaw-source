@@ -80,12 +80,14 @@ api_key = ""
 # glm-5.2-fast emits malformed -> parser drops it -> raw text leaks to the user
 # (prod incident 2026-06-20). Opt back into native tool-calling.
 native_tools = true
-# Per-alias fallback: the alias build path (create_resilient_model_provider_for_alias)
-# does NOT wire global [reliability.model_fallbacks]/fallback_providers — only this
-# `fallback` chain. Without it a neuralwatt 429 (concurrency/TPM limit) = hard
-# "All providers/models failed" -> "временно недоступен". opencode.go serves
-# deepseek-v4-flash, so a rate-limited turn degrades gracefully instead.
-fallback = ["opencode.go"]
+# NO per-alias `fallback`: v0.8.2 broke the alias fallback-build path
+# (create_resilient_model_provider_for_alias -> append_fallback_chain) — it now demands a
+# "profile-resolved credential" and can't resolve opencode.go's env key (OPENCODE_GO_API_KEY),
+# so a `fallback = ["opencode.go"]` here makes the WHOLE override init fail ("failed to init
+# override provider") -> hard "временно недоступен" on EVERY neuralwatt request (prod incident
+# 2026-07-09, all users). Removed. Trade-off: a real neuralwatt 429 now hard-fails instead of
+# degrading to deepseek. Restoring graceful-degrade needs a fork fix to the alias credential
+# resolution, not this line.
 
 # Pinned neuralwatt alias for the analyst_glm_nwt subagent. Unlike the
 # flow-through alias above, this one MUST pin `model`: subagents resolve their
@@ -97,7 +99,8 @@ model = "glm-5.2"
 uri = "https://api.neuralwatt.com/v1"
 api_key = ""
 native_tools = true
-fallback = ["opencode.go"]
+# NO per-alias fallback — same v0.8.2 alias-fallback-build regression as neuralwatt above
+# (opencode.go env credential unresolvable in append_fallback_chain -> init fails). Removed 2026-07-09.
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
