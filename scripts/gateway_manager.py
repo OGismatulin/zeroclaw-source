@@ -923,7 +923,18 @@ class GatewayRegistry:
 
     @staticmethod
     def _wait_until_healthy(port: int) -> None:
-        deadline = time.monotonic() + 10.0
+        # Cold-start of a per-user daemon includes MCP bundle init (context7,
+        # lalafo-db, graylog), which can take ~15-20s on first spawn — longer
+        # than the old hardcoded 10s, causing a spurious "did not become
+        # healthy" 503 on the first request after idle. Default 25s covers it;
+        # override via ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS.
+        try:
+            budget = float(
+                os.getenv("ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS", "25")
+            )
+        except ValueError:
+            budget = 25.0
+        deadline = time.monotonic() + budget
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
