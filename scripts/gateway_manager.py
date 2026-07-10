@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -550,7 +551,7 @@ class WorkspaceBootstrapper:
 
 
 SpawnProcess = Callable[[str, int, Path], subprocess.Popen[str]]
-WaitUntilHealthy = Callable[[int], None]
+WaitUntilHealthy = Callable[[int, subprocess.Popen[str] | None], None]
 ForwardWebhook = Callable[[DaemonInstance], tuple[int, dict[str, object]]]
 
 
@@ -664,17 +665,24 @@ class GatewayRegistry:
 
         try:
             proc = self.spawn_process(user_key, port, config_dir)
-            self.wait_until_healthy(port)
+            self.wait_until_healthy(port, proc)
         except Exception as exc:
             if "proc" in locals() and hasattr(proc, "terminate"):
                 try:
                     proc.terminate()
                     proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            raise DaemonSpawnError(
-                f"child daemon on port {port} did not become healthy"
-            ) from exc
+            # Surface the real startup cause (health timeout / early exit /
+            # rc) up to warmup/webhook; cleanup must not mask it.
+            reason = str(exc) or exc.__class__.__name__
+            raise DaemonSpawnError(reason) from exc
 
         self._ensure_default_cron_jobs(user_key)
 
@@ -948,29 +956,48 @@ class GatewayRegistry:
         return process
 
     @staticmethod
-    def _wait_until_healthy(port: int) -> None:
-        # Cold-start of a per-user daemon includes MCP bundle init (context7,
-        # lalafo-db, graylog), which can take ~15-20s on first spawn — longer
-        # than the old hardcoded 10s, causing a spurious "did not become
-        # healthy" 503 on the first request after idle. Default 25s covers it;
-        # override via ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS.
+    def _wait_until_healthy(
+        port: int, proc: subprocess.Popen[str] | None = None
+    ) -> None:
+        # Cold-start of a per-user daemon initializes 5 MCP servers, all over
+        # HTTP and sequentially: context7 (hosted https), lalafo-db (:4000),
+        # graylog (:4001), codemap + codemap-semantic (remote Hetzner). When
+        # several daemons cold-boot at once after a deploy/restart, observed
+        # sequential connect/listing attempts pushed daemon /health readiness
+        # past the old 25s. Default 90s matches the empirical mitigation; it is
+        # not a proven upper bound. Override via
+        # ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS. `proc`, when provided, lets us
+        # fail fast if the child exits early instead of waiting the full budget.
         try:
             budget = float(
-                os.getenv("ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS", "25")
+                os.getenv("ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS", "90")
             )
         except ValueError:
-            budget = 25.0
+            budget = 90.0
+        if not math.isfinite(budget) or budget <= 0:
+            budget = 90.0
         deadline = time.monotonic() + budget
         last_error: Exception | None = None
         while time.monotonic() < deadline:
+            if proc is not None:
+                return_code = proc.poll()
+                if return_code is not None:
+                    raise RuntimeError(
+                        f"child daemon on port {port} exited early "
+                        f"rc={return_code}"
+                    ) from last_error
             try:
-                with request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0) as response:
+                with request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=1.0
+                ) as response:
                     if response.status == 200:
                         return
             except (error.URLError, TimeoutError) as exc:
                 last_error = exc
-                time.sleep(0.2)
-        raise RuntimeError(f"child daemon on port {port} did not become healthy") from last_error
+            time.sleep(0.2)
+        raise RuntimeError(
+            f"child daemon on port {port} did not become healthy"
+        ) from last_error
 
 
 class GatewayManagerServer:
