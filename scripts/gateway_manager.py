@@ -73,7 +73,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-14 = + GPT-5.6 codex family (gpt-5.6-sol/terra/luna) in reliability.model_fallbacks
 #         + both runtime_profile model_windows (400_000). OpenAI GA on Codex 2026-07-09;
 #         bot /model buttons cdx/gpt-5.6-{sol,terra,luna}.
-CURRENT_CONFIG_MARKER = "v3-14"
+# v3-15 = drop gpt-5.6-luna (Fly smoke 2026-07-10: Codex OAuth backend returns
+#         404 invalid_request_error for it — cheap tier is API-only, not on Codex).
+#         Keeps gpt-5.6-sol + gpt-5.6-terra (both verified answering via codex).
+CURRENT_CONFIG_MARKER = "v3-15"
 
 
 def sanitize_filename(filename: str) -> str:
