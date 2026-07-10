@@ -28,6 +28,10 @@ swap_size_mb = 512
   ZEROCLAW_MANAGER_BASE_PORT = '3001'
   ZEROCLAW_MANAGER_REQUEST_TIMEOUT_SECS = '1800'
   ZEROCLAW_MANAGER_MAX_INSTANCES = '6'
+  # Cold daemon boot loads 5 MCP servers (deferred_loading=false); 25s default
+  # is too short when all daemons cold-boot at once after a deploy/restart
+  # (warmed=0 incident 2026-07-10). See analysis 2026-07-10-cold-boot-health-window.
+  ZEROCLAW_MANAGER_HEALTH_TIMEOUT_SECS = '90'
   ZEROCLAW_CHILD_HOST = '127.0.0.1'
   ZEROCLAW_AUTONOMY_LEVEL = 'full'
   ZEROCLAW_GATEWAY_TIMEOUT_SECS = '1800'
