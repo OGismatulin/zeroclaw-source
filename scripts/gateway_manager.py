@@ -88,7 +88,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         Rust side reads cfg.request_timeout_secs directly. Cutover re-seeds
 #         existing per-user configs from the template before the next daemon spawn,
 #         so there is no 30s-default window.
-CURRENT_CONFIG_MARKER = "v3-17"
+CURRENT_CONFIG_MARKER = "v3-18"
 
 
 def sanitize_filename(filename: str) -> str:

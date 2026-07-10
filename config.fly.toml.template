@@ -170,7 +170,7 @@ prompt_injection_mode = "compact"
 backend = "none"
 log_persistence = "rolling"
 log_persistence_path = "logs/runtime-trace.jsonl"
-log_persistence_max_entries = 500
+log_persistence_max_entries = 5000
 
 # ── Gateway ───────────────────────────────────────────────────────────────
 # require_pairing = false (Spike 0): else child daemons 401 the manager's
