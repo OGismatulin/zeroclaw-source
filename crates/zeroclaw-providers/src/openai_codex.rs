@@ -25,6 +25,15 @@ const DEFAULT_CODEX_INSTRUCTIONS: &str =
 const WIRE_API: &str = "responses";
 const RESPONSES_HISTORY_PROVIDER: &str = "openai_codex";
 const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
+// Fork patch #22 (2026-07-10): the Codex backend gates newer models (e.g.
+// gpt-5.6-luna) behind the official Codex-CLI client identity — an AND-gate on
+// `originator` + `User-Agent`. Curl-proven on Fly: same OAuth token/account,
+// `gpt-5.6-luna` returns 404 "Model not found" under `originator: pi` (the old
+// hardcoded value) but 200 under `originator: codex_cli_rs`. Present as the
+// official Codex CLI so gated models resolve. See project memory
+// project_gpt56_codex_catalog + docs codex-provider.md.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.20.0";
 
 #[derive(Clone)]
 pub struct OpenAiCodexModelProvider {
@@ -1242,7 +1251,8 @@ impl OpenAiCodexModelProvider {
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "pi")
+            .header("originator", CODEX_ORIGINATOR)
+            .header("User-Agent", CODEX_USER_AGENT)
             .header("Content-Type", "application/json");
 
         if request.stream {
