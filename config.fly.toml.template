@@ -187,6 +187,11 @@ webhook_rate_limit_per_minute = 0
 rate_limit_max_keys = 10000
 idempotency_ttl_secs = 300
 idempotency_max_keys = 10000
+# Webhook turns run long (heavy tool loops); pin the timeout in typed config
+# instead of the former env-first fork shim. Fly still sets
+# ZEROCLAW_GATEWAY_TIMEOUT_SECS for the Python manager's own request timeout.
+request_timeout_secs = 1800
+long_running_request_timeout_secs = 600
 
 # Tunnel defaults to "none" in V3 (tunnel.tunnel_provider); no section needed.
 

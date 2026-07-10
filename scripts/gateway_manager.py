@@ -81,7 +81,14 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         SKU (terra works on our account). Codex backend just hadn't rolled luna to
 #         our endpoint during the 24h GA window. Dormant → self-heals; degrades to
 #         deepseek-v4-flash until live. Re-smoke to confirm flip.
-CURRENT_CONFIG_MARKER = "v3-16"
+# v3-17 = [gateway] request_timeout_secs=1800 + long_running_request_timeout_secs=600
+#         pinned in the template. Retires fork patch #8 (env-first timeout shim in
+#         the Rust gateway): the shim only existed because per-user configs lacked
+#         the field, so env delivered 1800. Now the typed field carries it and the
+#         Rust side reads cfg.request_timeout_secs directly. Cutover re-seeds
+#         existing per-user configs from the template before the next daemon spawn,
+#         so there is no 30s-default window.
+CURRENT_CONFIG_MARKER = "v3-17"
 
 
 def sanitize_filename(filename: str) -> str:
