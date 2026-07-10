@@ -88,7 +88,15 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         Rust side reads cfg.request_timeout_secs directly. Cutover re-seeds
 #         existing per-user configs from the template before the next daemon spawn,
 #         so there is no 30s-default window.
-CURRENT_CONFIG_MARKER = "v3-18"
+# v3-18 = log_persistence_max_entries 500 -> 5000 (nightly-retro trace retention;
+#         500 ≈ 2h of events, yesterday was evicted by the 03:00 retro run).
+# v3-19 = GPT-5.6 subagent rollout: worker slot [providers.models.openai.codex_worker]
+#         gpt-5.4-mini -> gpt-5.6-luna (cheap tier; needs fork patch #22
+#         originator=codex_cli_rs) + 2 new analysts analyst_sol / analyst_terra
+#         on new codex slots [providers.models.openai.codex_{sol,terra}]
+#         (gpt-5.6-sol frontier / gpt-5.6-terra balance), both pinned to the
+#         neutral analyst persona workspace like the other 5 analysts.
+CURRENT_CONFIG_MARKER = "v3-19"
 
 
 def sanitize_filename(filename: str) -> str:

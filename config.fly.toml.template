@@ -30,15 +30,32 @@ api_key = ""
 
 # Codex subagents fold under the `openai` family with the codex OAuth runtime
 # (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
-# migration applies to "openai-codex"). worker = gpt-5.4-mini, coder = gpt-5.5.
+# migration applies to "openai-codex"). worker = gpt-5.6-luna (cheap GPT-5.6
+# tier; reachable on Codex only via fork patch #22 originator=codex_cli_rs —
+# 404 under the old `pi` identity), coder = gpt-5.5.
 [providers.models.openai.codex_worker]
-model = "gpt-5.4-mini"
+model = "gpt-5.6-luna"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
 
 [providers.models.openai.codex_coder]
 model = "gpt-5.5"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+
+# GPT-5.6 analyst slots on the same codex OAuth runtime (GA on Codex
+# 2026-07-09). sol = frontier tier, terra = balance tier (≈5.5 quality,
+# 2x cheaper). Referenced by [agents.analyst_sol] / [agents.analyst_terra].
+[providers.models.openai.codex_sol]
+model = "gpt-5.6-sol"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+
+[providers.models.openai.codex_terra]
+model = "gpt-5.6-terra"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -570,4 +587,20 @@ risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]
 [agents.analyst_glm_nwt.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.analyst_sol]
+model_provider = "openai.codex_sol"
+risk_profile = "default"
+runtime_profile = "agent_default"
+mcp_bundles = ["all"]
+[agents.analyst_sol.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.analyst_terra]
+model_provider = "openai.codex_terra"
+risk_profile = "default"
+runtime_profile = "agent_default"
+mcp_bundles = ["all"]
+[agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
