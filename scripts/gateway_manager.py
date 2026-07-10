@@ -76,7 +76,12 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-15 = drop gpt-5.6-luna (Fly smoke 2026-07-10: Codex OAuth backend returns
 #         404 invalid_request_error for it — cheap tier is API-only, not on Codex).
 #         Keeps gpt-5.6-sol + gpt-5.6-terra (both verified answering via codex).
-CURRENT_CONFIG_MARKER = "v3-15"
+# v3-16 = re-add gpt-5.6-luna. Root cause of the v3-15 404 is GA rollout lag, NOT a
+#         bad id: id is confirmed correct (OpenAI docs) and luna shares terra's Codex
+#         SKU (terra works on our account). Codex backend just hadn't rolled luna to
+#         our endpoint during the 24h GA window. Dormant → self-heals; degrades to
+#         deepseek-v4-flash until live. Re-smoke to confirm flip.
+CURRENT_CONFIG_MARKER = "v3-16"
 
 
 def sanitize_filename(filename: str) -> str:
