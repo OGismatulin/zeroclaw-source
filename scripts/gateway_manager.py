@@ -70,7 +70,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-12 = + codemap-semantic remote HTTP MCP (claude-context semantic search;
 #         bundle grant + allowed_tools codemap-semantic__{search_code,get_indexing_status}
 #         + Bearer via __CODEMAP_SEMANTIC_API_KEY__ placeholder).
-CURRENT_CONFIG_MARKER = "v3-13"
+# v3-14 = + GPT-5.6 codex family (gpt-5.6-sol/terra/luna) in reliability.model_fallbacks
+#         + both runtime_profile model_windows (400_000). OpenAI GA on Codex 2026-07-09;
+#         bot /model buttons cdx/gpt-5.6-{sol,terra,luna}.
+CURRENT_CONFIG_MARKER = "v3-14"
 
 
 def sanitize_filename(filename: str) -> str:
