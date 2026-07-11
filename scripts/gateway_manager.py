@@ -669,6 +669,31 @@ class GatewayRegistry:
         else:
             port = self._allocate_port()
 
+        # Reap the previous (unresponsive) daemon BEFORE spawning its
+        # replacement. The replacement almost always reuses the same port; if
+        # the old process is still bound to it, the new daemon loses the bind
+        # ("Address already in use") and never becomes healthy — while the old
+        # process would only be reaped after the new one is healthy. That is a
+        # deadlock keeping the user offline until the stuck turn ends on its
+        # own (2026-07-11 outage). If the old process cannot be safely reaped
+        # (unknown pid, e.g. a reattached daemon), do not reuse its port —
+        # spawn the replacement on a fresh one instead of colliding.
+        if old_instance is not None and not self._reap_process(old_instance):
+            old_port = port
+            port = self._allocate_port()
+            config_path = (
+                self.settings.workspaces_root
+                / user_key
+                / ".zeroclaw"
+                / "config.toml"
+            )
+            self._rewrite_port_in_config(config_path, port)
+            print(
+                f"[gateway-manager] could not reap prior daemon for {user_key}"
+                f" on port {old_port}; spawning replacement on {port}",
+                flush=True,
+            )
+
         workspace_root = self.bootstrapper.ensure_workspace(user_key, port)
         config_dir = workspace_root / ".zeroclaw"
 
@@ -695,10 +720,8 @@ class GatewayRegistry:
 
         self._ensure_default_cron_jobs(user_key)
 
-        # Success: terminate old process, replace entry
-        if old_instance is not None:
-            self._terminate_process(old_instance)
-
+        # The previous daemon was already reaped before this spawn (see above);
+        # replace the registry entry with the fresh instance.
         now = self.clock()
         pid = proc.pid if hasattr(proc, "pid") else proc
         process = proc if hasattr(proc, "terminate") else None
@@ -789,11 +812,60 @@ class GatewayRegistry:
                 instance.process.wait(timeout=2)
             except OSError:
                 pass
-        else:
+        elif instance.pid and instance.pid > 1:
+            # Guard: pid 0 → os.kill would signal the whole process group,
+            # taking down the manager and every sibling daemon.
             try:
                 os.kill(instance.pid, signal.SIGTERM)
             except OSError:
                 pass
+
+    @staticmethod
+    def _reap_process(instance: DaemonInstance) -> bool:
+        """Reap a replaced/unresponsive daemon and wait for it to exit so its
+        port is released before the replacement is spawned.
+
+        Returns True if the process is gone afterwards, False if it could not
+        be safely reaped (unknown pid — must never ``os.kill(0)``, which would
+        signal the whole process group). When it returns False the caller must
+        not reuse the old daemon's port, since the old process may still hold
+        it (2026-07-11 respawn deadlock)."""
+        proc = instance.process
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except OSError:
+                pass
+            return True
+        pid = instance.pid
+        if not pid or pid <= 1:
+            return False
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True  # already gone
+        except OSError:
+            return False
+        # Wait (bounded) for the kernel to release the port on exit.
+        for _ in range(50):  # ~5s
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            time.sleep(0.1)
+        # Still alive after SIGTERM — force it so the port is freed.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return True
 
     def stop_all(self) -> None:
         for user_key in list(self._instances):
