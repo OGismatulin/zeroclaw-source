@@ -17,6 +17,25 @@ use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
+/// True only when `cmd` is a bare wait with no other side effects:
+/// `python[3] -c "import time; time.sleep(N)"` (the form the runtime agent can
+/// actually run) or `sleep N` (defense-in-depth; bare `sleep` is policy-blocked
+/// for the agent). Anything with extra statements/commands is NOT a pure sleep,
+/// so real loops around sleeps stay detectable. Deliberately does not match
+/// exotic phrasings (e.g. `import time as t`) — those fall back to detection;
+/// the stopgap sleep-bump keeps their frequency low. See design §4/§8.
+fn is_pure_sleep_command(cmd: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"^\s*(sleep\s+\d+(\.\d+)?|python3?\s+-c\s+["']\s*import time\s*;\s*time\.sleep\(\s*\d+(\.\d+)?\s*\)\s*["'])\s*$"#,
+        )
+        .expect("static sleep-command regex is valid")
+    });
+    re.is_match(cmd)
+}
+
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
     /// Per-call `(tool_call_id, output)` so native-mode history can emit one
@@ -216,4 +235,27 @@ pub(crate) fn check_identical_output_abort(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pure_sleep_command_matches_only_bare_waits() {
+        // reachable form (python one-liner)
+        assert!(is_pure_sleep_command(r#"python3 -c "import time; time.sleep(30)""#));
+        assert!(is_pure_sleep_command(r#"python -c 'import time; time.sleep(120)'"#));
+        assert!(is_pure_sleep_command("  python3 -c \"import time; time.sleep(5)\"  "));
+        // defense-in-depth bare sleep
+        assert!(is_pure_sleep_command("sleep 30"));
+        assert!(is_pure_sleep_command("sleep 0.5"));
+        // NOT pure sleeps — must stay detectable
+        assert!(!is_pure_sleep_command("ls"));
+        assert!(!is_pure_sleep_command("rm -rf /tmp/x"));
+        assert!(!is_pure_sleep_command("echo hi; sleep 5"));
+        assert!(!is_pure_sleep_command("sleep 5 && do_thing"));
+        assert!(!is_pure_sleep_command(r#"python3 -c "import os; os.system('x')""#));
+        assert!(!is_pure_sleep_command(r#"python3 -c "import time; time.sleep(5); hack()""#));
+    }
 }
