@@ -36,6 +36,24 @@ fn is_pure_sleep_command(cmd: &str) -> bool {
     re.is_match(cmd)
 }
 
+/// A tool call that is *waiting for* async work rather than *doing* work.
+/// Polling a background delegate legitimately repeats these; feeding them to
+/// the loop detector would trip the circuit breaker on a healthy wait. Narrow
+/// by design — real work (`delegate` action, arbitrary `shell`) still counts.
+fn is_wait_poll_call(tool: &str, args: &serde_json::Value) -> bool {
+    match tool {
+        "delegate" => matches!(
+            args.get("action").and_then(|v| v.as_str()),
+            Some("check_result") | Some("list_results")
+        ),
+        "shell" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_pure_sleep_command),
+        _ => false,
+    }
+}
+
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
     /// Per-call `(tool_call_id, output)` so native-mode history can emit one
@@ -257,5 +275,22 @@ mod tests {
         assert!(!is_pure_sleep_command("sleep 5 && do_thing"));
         assert!(!is_pure_sleep_command(r#"python3 -c "import os; os.system('x')""#));
         assert!(!is_pure_sleep_command(r#"python3 -c "import time; time.sleep(5); hack()""#));
+    }
+
+    #[test]
+    fn wait_poll_call_covers_delegate_polls_and_sleep_only() {
+        use serde_json::json;
+        // delegate poll actions -> exempt
+        assert!(is_wait_poll_call("delegate", &json!({"action": "check_result", "task_id": "t1"})));
+        assert!(is_wait_poll_call("delegate", &json!({"action": "list_results"})));
+        // delegate real work / cancel -> NOT exempt
+        assert!(!is_wait_poll_call("delegate", &json!({"action": "delegate", "agent": "coder"})));
+        assert!(!is_wait_poll_call("delegate", &json!({"action": "cancel_task", "task_id": "t1"})));
+        assert!(!is_wait_poll_call("delegate", &json!({}))); // absent action == default "delegate"
+        // shell: only pure sleeps exempt
+        assert!(is_wait_poll_call("shell", &json!({"command": r#"python3 -c "import time; time.sleep(30)""#})));
+        assert!(!is_wait_poll_call("shell", &json!({"command": "ls -la"})));
+        // unrelated tools -> never exempt
+        assert!(!is_wait_poll_call("file_read", &json!({"path": "x"})));
     }
 }
