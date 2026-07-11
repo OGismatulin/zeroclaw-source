@@ -251,7 +251,7 @@ timeout_secs = 30
 # ── Delegate ──────────────────────────────────────────────────────────────
 [delegate]
 timeout_secs = 90
-agentic_timeout_secs = 600
+agentic_timeout_secs = 3600
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────
 # Periodic HEARTBEAT.md tasks (e.g. Jira watchdog). V3 made `enabled` default

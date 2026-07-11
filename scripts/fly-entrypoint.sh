@@ -150,6 +150,14 @@ sed -e "s|__ZEROCLAW_WEBHOOK_SECRET__|$ZEROCLAW_WEBHOOK_SECRET|g" \
     "$template_file" > "$config_file"
 chmod 0600 "$config_file"
 
+# Heavy Jira/code-analysis delegates routinely exceed ten minutes. Keep the
+# baked one-hour safety cap explicit so an incomplete mirror cannot silently
+# restore the old 600s limit on an existing Fly volume.
+if ! grep -Eq '^[[:space:]]*agentic_timeout_secs[[:space:]]*=[[:space:]]*3600([[:space:]]*(#.*)?)?$' "$config_file"; then
+  echo "Fly runtime config must set delegate.agentic_timeout_secs=3600." >&2
+  exit 1
+fi
+
 # --- OpenVPN ---
 if [ -f /zeroclaw-data/vpn/client.ovpn ] && command -v openvpn > /dev/null 2>&1; then
     openvpn --config /zeroclaw-data/vpn/client.ovpn --daemon --log "$openvpn_log_path"

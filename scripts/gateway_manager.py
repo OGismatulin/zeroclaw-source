@@ -97,7 +97,11 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         on new codex slots [providers.models.openai.codex_{sol,terra}]
 #         (gpt-5.6-sol frontier / gpt-5.6-terra balance), both pinned to the
 #         neutral analyst persona workspace like the other 5 analysts.
-CURRENT_CONFIG_MARKER = "v3-19"
+# v3-20 = [delegate] agentic_timeout_secs 600 -> 3600. Production DV-34269
+#         needed 32m51s end-to-end and live analysts were killed at the former
+#         600s cap. The one-hour value is a runtime safety cap, not an analysis
+#         deadline; Jira orchestration waits for terminal status/heartbeat.
+CURRENT_CONFIG_MARKER = "v3-20"
 
 
 def sanitize_filename(filename: str) -> str:
