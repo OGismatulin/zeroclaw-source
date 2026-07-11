@@ -24,6 +24,8 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 /// so real loops around sleeps stay detectable. Deliberately does not match
 /// exotic phrasings (e.g. `import time as t`) — those fall back to detection;
 /// the stopgap sleep-bump keeps their frequency low. See design §4/§8.
+// wired into collect_tool_results by the exemption task; expect removed there
+// (no expect here: is_wait_poll_call references it, so it is not a dead-code root)
 fn is_pure_sleep_command(cmd: &str) -> bool {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -40,6 +42,9 @@ fn is_pure_sleep_command(cmd: &str) -> bool {
 /// Polling a background delegate legitimately repeats these; feeding them to
 /// the loop detector would trip the circuit breaker on a healthy wait. Narrow
 /// by design — real work (`delegate` action, arbitrary `shell`) still counts.
+// wired into collect_tool_results by the exemption task; expect removed there
+// (not(test): the tests module already uses it, which would unfulfill the expect)
+#[cfg_attr(not(test), expect(dead_code))]
 fn is_wait_poll_call(tool: &str, args: &serde_json::Value) -> bool {
     match tool {
         "delegate" => matches!(
@@ -262,9 +267,15 @@ mod tests {
     #[test]
     fn pure_sleep_command_matches_only_bare_waits() {
         // reachable form (python one-liner)
-        assert!(is_pure_sleep_command(r#"python3 -c "import time; time.sleep(30)""#));
-        assert!(is_pure_sleep_command(r#"python -c 'import time; time.sleep(120)'"#));
-        assert!(is_pure_sleep_command("  python3 -c \"import time; time.sleep(5)\"  "));
+        assert!(is_pure_sleep_command(
+            r#"python3 -c "import time; time.sleep(30)""#
+        ));
+        assert!(is_pure_sleep_command(
+            r#"python -c 'import time; time.sleep(120)'"#
+        ));
+        assert!(is_pure_sleep_command(
+            "  python3 -c \"import time; time.sleep(5)\"  "
+        ));
         // defense-in-depth bare sleep
         assert!(is_pure_sleep_command("sleep 30"));
         assert!(is_pure_sleep_command("sleep 0.5"));
@@ -273,22 +284,41 @@ mod tests {
         assert!(!is_pure_sleep_command("rm -rf /tmp/x"));
         assert!(!is_pure_sleep_command("echo hi; sleep 5"));
         assert!(!is_pure_sleep_command("sleep 5 && do_thing"));
-        assert!(!is_pure_sleep_command(r#"python3 -c "import os; os.system('x')""#));
-        assert!(!is_pure_sleep_command(r#"python3 -c "import time; time.sleep(5); hack()""#));
+        assert!(!is_pure_sleep_command(
+            r#"python3 -c "import os; os.system('x')""#
+        ));
+        assert!(!is_pure_sleep_command(
+            r#"python3 -c "import time; time.sleep(5); hack()""#
+        ));
     }
 
     #[test]
     fn wait_poll_call_covers_delegate_polls_and_sleep_only() {
         use serde_json::json;
         // delegate poll actions -> exempt
-        assert!(is_wait_poll_call("delegate", &json!({"action": "check_result", "task_id": "t1"})));
-        assert!(is_wait_poll_call("delegate", &json!({"action": "list_results"})));
+        assert!(is_wait_poll_call(
+            "delegate",
+            &json!({"action": "check_result", "task_id": "t1"})
+        ));
+        assert!(is_wait_poll_call(
+            "delegate",
+            &json!({"action": "list_results"})
+        ));
         // delegate real work / cancel -> NOT exempt
-        assert!(!is_wait_poll_call("delegate", &json!({"action": "delegate", "agent": "coder"})));
-        assert!(!is_wait_poll_call("delegate", &json!({"action": "cancel_task", "task_id": "t1"})));
+        assert!(!is_wait_poll_call(
+            "delegate",
+            &json!({"action": "delegate", "agent": "coder"})
+        ));
+        assert!(!is_wait_poll_call(
+            "delegate",
+            &json!({"action": "cancel_task", "task_id": "t1"})
+        ));
         assert!(!is_wait_poll_call("delegate", &json!({}))); // absent action == default "delegate"
         // shell: only pure sleeps exempt
-        assert!(is_wait_poll_call("shell", &json!({"command": r#"python3 -c "import time; time.sleep(30)""#})));
+        assert!(is_wait_poll_call(
+            "shell",
+            &json!({"command": r#"python3 -c "import time; time.sleep(30)""#})
+        ));
         assert!(!is_wait_poll_call("shell", &json!({"command": "ls -la"})));
         // unrelated tools -> never exempt
         assert!(!is_wait_poll_call("file_read", &json!({"path": "x"})));
