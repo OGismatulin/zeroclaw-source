@@ -437,13 +437,41 @@ impl DelegateTool {
             if options.zeroclaw_dir.is_none() {
                 options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
             }
-            return zeroclaw_providers::create_model_provider_for_alias(
-                config, family, alias, credential, &options,
+            // D2: wrap in ReliableModelProvider (same harness as the
+            // orchestrator) so a transient transport error gets same-provider
+            // retry instead of killing the subagent on the first blip. The
+            // `_for_alias` builder does NOT call `with_model_fallbacks`, so the
+            // analyst failure-domain is preserved — no cross-provider collapse
+            // into deepseek. `api_url = None` keeps the prior behavior (the
+            // URI is resolved from the alias config).
+            return zeroclaw_providers::create_resilient_model_provider_for_alias(
+                config,
+                family,
+                alias,
+                credential,
+                None,
+                &config.reliability,
+                &options,
             );
         }
-        zeroclaw_providers::create_model_provider_with_options(
+        // Bare-name fall-through (no dotted alias / no root_config). NOTE:
+        // `create_resilient_model_provider_with_options` DOES apply the global
+        // `[reliability] model_fallbacks` map, which would collapse a failing
+        // provider into deepseek. That is fine here because analysts always
+        // use dotted aliases and therefore hit the `_for_alias` branch above
+        // (which does NOT call `with_model_fallbacks`). Do NOT unify the two
+        // branches onto this fallback-collapse path — it would erase the
+        // analyst failure-domain separation.
+        let reliability = self
+            .root_config
+            .as_deref()
+            .map(|c| c.reliability.clone())
+            .unwrap_or_default();
+        zeroclaw_providers::create_resilient_model_provider_with_options(
             provider_type,
             credential,
+            None,
+            &reliability,
             &self.provider_runtime_options,
         )
     }
@@ -5696,7 +5724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+    async fn delegate_wraps_target_provider_in_resilient_harness() {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
         };
@@ -5724,34 +5752,54 @@ mod tests {
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_root_config(Arc::clone(&config));
 
-        // Drives the exact build path `run` takes. With root_config + a
-        // dotted model_provider, the alias-aware factory must read the
-        // target's `custom.vllm` entry and honor wire_api = responses.
+        // Drives the exact build path `run` takes: dotted alias + root_config
+        // → the alias-aware factory. D2 fix: the returned provider must now be
+        // wrapped in ReliableModelProvider so a transient transport error
+        // (e.g. "connection closed before message completed") gets
+        // same-provider retry instead of killing the subagent on the first
+        // blip.
         let provider = tool
             .build_target_provider("custom.vllm", "custom", None)
             .expect("target provider builds offline");
+
+        // Observability limitation: `Box<dyn ModelProvider>` is opaque — we
+        // cannot downcast to ReliableModelProvider, and the wrapper
+        // transparently forwards role()/alias() to its primary inner
+        // provider. The one method the wrapper does NOT override is
+        // `default_wire_api()`: it returns the trait baseline
+        // ("chat_completions", `BASELINE_WIRE_API`), whereas the raw
+        // custom.vllm provider returns its declared "responses". That
+        // divergence is the load-bearing proof that build_target_provider now
+        // returns the resilient wrapper and not the bare provider.
         assert_eq!(
             provider.default_wire_api(),
-            "responses",
-            "delegate must build the target with its declared responses wire API"
+            "chat_completions",
+            "delegate must return the ReliableModelProvider wrapper (baseline \
+             wire api), not the raw provider"
         );
 
-        // Regression guard: the pre-fix path (bare factory, no config/alias
-        // context) cannot see the per-alias config — for the custom family it
-        // errors on the missing uri it can't resolve, which is exactly the
-        // "error in the provider" the bug report described. Either way it does
-        // not yield a working responses provider.
-        let stale = zeroclaw_providers::create_model_provider_with_options(
-            "custom",
-            None,
-            &tool.provider_runtime_options,
+        // Sanity anchor: the bare (unwrapped) alias provider still honors its
+        // declared responses wire API. Proves the alias config is read AND
+        // that the only reason build_target_provider now differs is the
+        // resilient wrapper swallowing the inner wire-api introspection.
+        let mut options =
+            zeroclaw_providers::provider_runtime_options_for_alias(&config, "custom", "vllm");
+        if options.zeroclaw_dir.is_none() {
+            options.zeroclaw_dir = tool.provider_runtime_options.zeroclaw_dir.clone();
+        }
+        let raw = zeroclaw_providers::create_model_provider_for_alias(
+            &config, "custom", "vllm", None, &options,
+        )
+        .expect("raw alias provider builds offline");
+        assert_eq!(
+            raw.default_wire_api(),
+            "responses",
+            "raw alias provider must honor its declared responses wire API"
         );
-        let stale_is_responses = stale
-            .map(|p| p.default_wire_api() == "responses")
-            .unwrap_or(false);
-        assert!(
-            !stale_is_responses,
-            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+        assert_ne!(
+            provider.default_wire_api(),
+            raw.default_wire_api(),
+            "wrapped delegate provider must differ from the raw provider — proves wrapping"
         );
     }
 
