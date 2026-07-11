@@ -467,12 +467,17 @@ protect_last_n = 10
 "glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
 "minimax-m2.7"            = 196_608
-"gpt-5.5"                 = 400_000
-"gpt-5.4"                 = 400_000
-"gpt-5.4-mini"            = 400_000
-"gpt-5.6-sol"             = 400_000
-"gpt-5.6-terra"           = 400_000
-"gpt-5.6-luna"            = 400_000
+# Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
+# Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
+# ~258K (gpt-5.x) / ~353K (gpt-5.6). At 400K the 0.70 trigger (280K) sat ABOVE the
+# ~258K real limit → codex rejected input before compaction ran (DV-34269 overflow,
+# 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
+"gpt-5.5"                 = 256_000
+"gpt-5.4"                 = 256_000
+"gpt-5.4-mini"            = 256_000
+"gpt-5.6-sol"             = 353_000
+"gpt-5.6-terra"           = 353_000
+"gpt-5.6-luna"            = 353_000
 "glm-5-turbo"             = 128_000
 "glm-5.1"                 = 202_752
 # Capital "GLM-5.1" is a separate case-sensitive key (model string ships as-is;
@@ -510,12 +515,17 @@ protect_last_n = 10
 "glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
 "minimax-m2.7"            = 196_608
-"gpt-5.5"                 = 400_000
-"gpt-5.4"                 = 400_000
-"gpt-5.4-mini"            = 400_000
-"gpt-5.6-sol"             = 400_000
-"gpt-5.6-terra"           = 400_000
-"gpt-5.6-luna"            = 400_000
+# Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
+# Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
+# ~258K (gpt-5.x) / ~353K (gpt-5.6). At 400K the 0.70 trigger (280K) sat ABOVE the
+# ~258K real limit → codex rejected input before compaction ran (DV-34269 overflow,
+# 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
+"gpt-5.5"                 = 256_000
+"gpt-5.4"                 = 256_000
+"gpt-5.4-mini"            = 256_000
+"gpt-5.6-sol"             = 353_000
+"gpt-5.6-terra"           = 353_000
+"gpt-5.6-luna"            = 353_000
 "glm-5-turbo"             = 128_000
 "glm-5.1"                 = 202_752
 "GLM-5.1"                 = 202_752

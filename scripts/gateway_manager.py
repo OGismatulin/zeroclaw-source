@@ -101,7 +101,12 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         needed 32m51s end-to-end and live analysts were killed at the former
 #         600s cap. The one-hour value is a runtime safety cap, not an analysis
 #         deadline; Jira orchestration waits for terminal status/heartbeat.
-CURRENT_CONFIG_MARKER = "v3-20"
+# v3-21 = codex model_windows lowered to codex-effective caps (gpt-5.x 400K->256K,
+#         gpt-5.6 400K->353K). The ChatGPT Codex backend caps far below the API
+#         1.05M / 400K published window (reserves ~128K output + ~5% headroom), so
+#         the old 0.70 trigger (280K) sat ABOVE the ~258K real limit → codex
+#         rejected input before compaction ran (DV-34269 overflow, 2026-07-11).
+CURRENT_CONFIG_MARKER = "v3-21"
 
 
 def sanitize_filename(filename: str) -> str:
