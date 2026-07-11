@@ -24,8 +24,6 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 /// so real loops around sleeps stay detectable. Deliberately does not match
 /// exotic phrasings (e.g. `import time as t`) — those fall back to detection;
 /// the stopgap sleep-bump keeps their frequency low. See design §4/§8.
-// wired into collect_tool_results by the exemption task; expect removed there
-// (no expect here: is_wait_poll_call references it, so it is not a dead-code root)
 fn is_pure_sleep_command(cmd: &str) -> bool {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -42,9 +40,6 @@ fn is_pure_sleep_command(cmd: &str) -> bool {
 /// Polling a background delegate legitimately repeats these; feeding them to
 /// the loop detector would trip the circuit breaker on a healthy wait. Narrow
 /// by design — real work (`delegate` action, arbitrary `shell`) still counts.
-// wired into collect_tool_results by the exemption task; expect removed there
-// (not(test): the tests module already uses it, which would unfulfill the expect)
-#[cfg_attr(not(test), expect(dead_code))]
 fn is_wait_poll_call(tool: &str, args: &serde_json::Value) -> bool {
     match tool {
         "delegate" => matches!(
@@ -97,14 +92,20 @@ pub(crate) fn collect_tool_results(
         .enumerate()
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
-        if !loop_ignore_tools.contains(tool_name.as_str()) {
+        // Bind args before the guard: needed for both the wait/poll exemption
+        // and the loop detector.
+        let args = tool_calls
+            .get(result_index)
+            .map(|c| &c.arguments)
+            .unwrap_or(&serde_json::Value::Null);
+        // Skip loop detection for (a) explicitly ignored tools and (b) wait/poll
+        // calls that legitimately repeat while polling a background delegate.
+        // Putting the skip on this guard also skips detection_relevant_output,
+        // which is correct (a wait produced no progress signal).
+        if !loop_ignore_tools.contains(tool_name.as_str()) && !is_wait_poll_call(&tool_name, args) {
             detection_relevant_output.push_str(&outcome.output);
 
             // Feed the pattern-based loop detector with name + args + result.
-            let args = tool_calls
-                .get(result_index)
-                .map(|c| &c.arguments)
-                .unwrap_or(&serde_json::Value::Null);
             let det_result = loop_detector.record(&tool_name, args, &outcome.output);
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
@@ -322,5 +323,94 @@ mod tests {
         assert!(!is_wait_poll_call("shell", &json!({"command": "ls -la"})));
         // unrelated tools -> never exempt
         assert!(!is_wait_poll_call("file_read", &json!({"path": "x"})));
+    }
+
+    fn detector() -> LoopDetector {
+        LoopDetector::new(crate::agent::loop_detector::LoopDetectorConfig {
+            enabled: true,
+            window_size: 20,
+            max_repeats: 3,
+        })
+    }
+
+    fn run_round(
+        det: &mut LoopDetector,
+        tool: &str,
+        args: serde_json::Value,
+        out: &str,
+    ) -> anyhow::Result<()> {
+        let call = ParsedToolCall {
+            name: tool.to_string(),
+            arguments: args,
+            tool_call_id: None,
+        };
+        let outcome = ToolExecutionOutcome {
+            output: out.to_string(),
+            success: true,
+            error_reason: None,
+            duration: std::time::Duration::from_secs(0),
+            receipt: None,
+        };
+        let ordered = vec![Some((tool.to_string(), Some("id".to_string()), outcome))];
+        let mut history = Vec::new();
+        let ignore: HashSet<&str> = HashSet::new();
+        collect_tool_results(
+            ordered,
+            std::slice::from_ref(&call),
+            &mut history,
+            det,
+            &ignore,
+            8192,
+            None,
+            "test-model",
+            0,
+            "test-turn",
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn polling_a_delegate_does_not_trip_the_circuit_breaker() {
+        let mut det = detector();
+        for _ in 0..8 {
+            run_round(
+                &mut det,
+                "delegate",
+                serde_json::json!({"action": "check_result", "task_id": "t1"}),
+                "(no output)",
+            )
+            .expect("poll must never bail");
+            run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": r#"python3 -c "import time; time.sleep(30)""#}),
+                "(no output)",
+            )
+            .expect("sleep must never bail");
+        }
+    }
+
+    #[test]
+    fn a_real_identical_result_loop_still_breaks() {
+        let mut det = detector();
+        let mut bailed = false;
+        for i in 0..8 {
+            // real work: shell with a non-sleep command, DIFFERENT args each
+            // round, IDENTICAL output -> detect_no_progress must fire.
+            let r = run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": format!("ls /x/{i}")}),
+                "same output",
+            );
+            if r.is_err() {
+                bailed = true;
+                break;
+            }
+        }
+        assert!(
+            bailed,
+            "real no-progress loop must still trip the circuit breaker"
+        );
     }
 }
