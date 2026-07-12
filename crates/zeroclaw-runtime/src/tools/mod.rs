@@ -1099,14 +1099,19 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Standalone image generation tool (config-gated)
+    // Standalone image generation tool (config-gated, dual-backend)
     if root_config.image_gen.enabled {
+        let codex_state_dir = zeroclaw_providers::auth::state_dir_from_config(root_config);
         tool_arcs.push(Arc::new(ImageGenTool::new_with_persistence(
             security.clone(),
             workspace_dir.to_path_buf(),
-            root_config.image_gen.default_model.clone(),
+            root_config.image_gen.fal_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
+            root_config.image_gen.default_backend.clone(),
+            root_config.image_gen.codex_model.clone(),
+            codex_state_dir,
+            root_config.secrets.encrypt,
         )));
     }
 
