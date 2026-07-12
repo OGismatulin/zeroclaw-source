@@ -1755,10 +1755,7 @@ data: not-json-garbage\n\
 event: response.completed\n\
 data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\"},{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n\
 data: [DONE]\n\n";
-        assert_eq!(
-            extract_image_b64_from_sse(sse).as_deref(),
-            Some("ZmluYWw=")
-        );
+        assert_eq!(extract_image_b64_from_sse(sse).as_deref(), Some("ZmluYWw="));
     }
 
     #[test]
