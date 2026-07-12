@@ -27,10 +27,12 @@ fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
 
 /// Format the tool output for a saved image.
 ///
-/// Emits the saved path in BOTH a durable `File:` line (survives marker
-/// stripping in older turns) and an explicit `[IMAGE:<path>]` marker the
-/// multimodal pipeline inlines. Both carry the same path so the runtime
-/// canonicalizer dedups them.
+/// Emits the saved path in a durable `File:` line ONLY — deliberately no
+/// routable `[IMAGE:<path>]` marker. A marker would make the multimodal
+/// pipeline detour the turn into a vision provider mid-tool-loop, poisoning
+/// the transcript with a cross-provider `tool_call_id` / `reasoning_content`
+/// mismatch and breaking delivery. The agent reads the `File:` path and
+/// delivers the image explicitly via `send_file_telegram.py` instead.
 fn format_image_tool_output(
     path_display: &str,
     size_kb: usize,
@@ -42,8 +44,7 @@ fn format_image_tool_output(
          File: {path_display}\n\
          Size: {size_kb} KB\n\
          Model: {model}\n\
-         Prompt: {prompt}\n\
-         [IMAGE:{path_display}]",
+         Prompt: {prompt}",
     )
 }
 
@@ -127,8 +128,9 @@ pub(crate) fn map_size_codex(p: &str) -> &'static str {
 ///
 /// `quality: fast` (default) routes to fal.ai (FLUX family); `quality: high`
 /// routes to the ChatGPT Codex `image_generation` tool. Both save the PNG to
-/// `{workspace}/images/{filename}.png` and return its path via the shared
-/// `File:` + `[IMAGE:]` contract.
+/// `{workspace}/images/{filename}.png` and return its path via a durable
+/// `File:` line (no routable `[IMAGE:]` marker — see
+/// `format_image_tool_output`).
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
@@ -310,11 +312,11 @@ impl ImageGenTool {
         }
 
         let size_kb = bytes.len() / 1024;
-        // Emit a durable `File:` line (survives marker-stripping in older turns)
-        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
-        // Both carry the same path string so the promoter
-        // (`canonicalize_tool_result_media_markers`) dedups the bare path
-        // against the already-wrapped marker and does not double-count.
+        // Emit a durable `File:` line ONLY — no routable `[IMAGE:…]` marker.
+        // A marker would make the multimodal pipeline detour the turn into a
+        // vision provider mid-tool-loop, poisoning the transcript with a
+        // cross-provider tool_call_id / reasoning mismatch and breaking
+        // delivery. The agent delivers the file via send_file_telegram.py.
         let path_display = output_path.display().to_string();
         let output = format_image_tool_output(&path_display, size_kb, model, prompt);
         Ok(ToolResult {
@@ -815,12 +817,13 @@ mod tests {
     }
 
     #[test]
-    fn image_output_emits_matching_file_line_and_image_marker() {
-        // Exercises the PRODUCTION output formatter (#7874): the saved path must
-        // appear in BOTH the durable `File:` line and the `[IMAGE:<path>]`
-        // marker, with the same concrete path, so the multimodal pipeline can
-        // inline the attachment and the canonicalizer dedups them. Fails if the
-        // marker (or the matching path) is dropped.
+    fn image_output_emits_file_line_without_image_marker() {
+        // Exercises the PRODUCTION output formatter: the saved path must appear
+        // in the durable `File:` line, and the output must NOT carry a routable
+        // `[IMAGE:<path>]` marker. A marker would make the multimodal pipeline
+        // detour the turn into a vision provider mid-tool-loop, poisoning the
+        // transcript (cross-provider tool_call_id / reasoning mismatch) and
+        // breaking delivery. The agent delivers the file via the `File:` path.
         let path = "/ws/images/generated_image_42.png";
         let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
         assert!(
@@ -828,8 +831,8 @@ mod tests {
             "output must carry a durable File: line: {out}"
         );
         assert!(
-            out.contains(&format!("[IMAGE:{path}]")),
-            "output must carry a matching [IMAGE:<path>] marker: {out}"
+            !out.contains("[IMAGE:"),
+            "output must NOT carry a routable [IMAGE:<path>] marker: {out}"
         );
     }
 

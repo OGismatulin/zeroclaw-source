@@ -424,8 +424,12 @@ mod tests {
     // tool that merely *lists* a local image path must NOT have that path
     // rewritten into a routable `[IMAGE:...]` marker - otherwise it falsely
     // triggers vision routing and a provider-capability error on a text-only
-    // provider. A genuine image-producing tool (e.g. `image_gen`) MUST still be
-    // canonicalized. Both dispatchers gate via the shared
+    // provider. A genuine image-fetching tool (e.g. `file_download`) MUST still
+    // be canonicalized. `image_gen` is a deliberate exception: it produces an
+    // image but is denylisted, because routing its output to a vision provider
+    // mid-tool-loop detours the turn cross-provider and poisons the transcript
+    // (the agent delivers via send_file_telegram.py instead). Both dispatchers
+    // gate via the shared
     // `canonicalize_tool_result_media_markers_for(tool_name, ...)` helper.
 
     /// Write a throwaway PNG and return its absolute path string. An existing
@@ -509,9 +513,10 @@ mod tests {
 
     #[test]
     fn format_results_still_promotes_image_producing_tool_paths() {
-        // Default-allow: a genuinely image-producing tool keeps canonicalization
-        // in BOTH dispatchers, so real tool-produced images still route to a
-        // vision provider.
+        // Default-allow: a genuinely image-fetching tool (`file_download`) keeps
+        // canonicalization in BOTH dispatchers, so real tool-fetched images
+        // still route to a vision provider. (`image_gen` is denylisted - see
+        // format_results_denies_image_gen_promotion.)
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp_image(dir.path(), "generated.png");
         let expected = format!("[IMAGE:{path}]");
@@ -520,7 +525,7 @@ mod tests {
         let rendered = xml_format_results_text(
             &xml,
             ToolExecutionResult {
-                name: "image_gen".into(),
+                name: "file_download".into(),
                 output: format!("saved to {path}"),
                 success: true,
                 tool_call_id: None,
@@ -528,14 +533,14 @@ mod tests {
         );
         assert!(
             rendered.contains(&expected),
-            "image_gen output must be canonicalized into a marker (XML)"
+            "file_download output must be canonicalized into a marker (XML)"
         );
 
         let native = NativeToolDispatcher;
         let content = native_format_results_content(
             &native,
             ToolExecutionResult {
-                name: "image_gen".into(),
+                name: "file_download".into(),
                 output: format!("saved to {path}"),
                 success: true,
                 tool_call_id: Some("tc1".into()),
@@ -543,7 +548,57 @@ mod tests {
         );
         assert!(
             content.contains(&expected),
-            "image_gen output must be canonicalized into a marker (native)"
+            "file_download output must be canonicalized into a marker (native)"
+        );
+    }
+
+    #[test]
+    fn format_results_denies_image_gen_promotion() {
+        // `image_gen` is denylisted: its output path must NOT be promoted to a
+        // routable `[IMAGE:...]` marker in either dispatcher. Routing a
+        // generated image to a vision provider mid-tool-loop detours the turn
+        // cross-provider and poisons the transcript (foreign tool_call_id /
+        // stale reasoning_content), causing a deterministic 400. The agent
+        // delivers the file via the durable `File:` path + send_file_telegram.py.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_image(dir.path(), "generated.png");
+
+        let xml = XmlToolDispatcher;
+        let rendered = xml_format_results_text(
+            &xml,
+            ToolExecutionResult {
+                name: "image_gen".into(),
+                output: format!("File: {path}"),
+                success: true,
+                tool_call_id: None,
+            },
+        );
+        assert!(
+            !rendered.contains("[IMAGE:"),
+            "image_gen output must NOT be promoted to a marker (XML): {rendered}"
+        );
+        assert!(
+            rendered.contains(&path),
+            "image_gen output must still carry the literal File: path (XML)"
+        );
+
+        let native = NativeToolDispatcher;
+        let content = native_format_results_content(
+            &native,
+            ToolExecutionResult {
+                name: "image_gen".into(),
+                output: format!("File: {path}"),
+                success: true,
+                tool_call_id: Some("tc1".into()),
+            },
+        );
+        assert!(
+            !content.contains("[IMAGE:"),
+            "image_gen output must NOT be promoted to a marker (native): {content}"
+        );
+        assert!(
+            content.contains(&path),
+            "image_gen output must still carry the literal File: path (native)"
         );
     }
 
@@ -593,10 +648,34 @@ mod tests {
     }
 
     #[test]
-    fn native_image_gen_path_still_promotes_through_to_provider_messages() {
-        // Default-allow preserved across the round trip: a real generated image
-        // still becomes an `[IMAGE:...]` marker, so it routes to a vision
-        // provider as before.
+    fn native_image_fetch_path_still_promotes_through_to_provider_messages() {
+        // Default-allow preserved across the round trip: a real fetched image
+        // (`file_download`) still becomes an `[IMAGE:...]` marker, so it routes
+        // to a vision provider as before.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_image(dir.path(), "fetched.png");
+        let native = NativeToolDispatcher;
+
+        let rendered = native_round_trip_tool_content(
+            &native,
+            ToolExecutionResult {
+                name: "file_download".into(),
+                output: format!("saved to {path}"),
+                success: true,
+                tool_call_id: Some("tc1".into()),
+            },
+        );
+        assert!(
+            rendered.contains(&format!("[IMAGE:{path}]")),
+            "file_download image must still canonicalize through the round trip"
+        );
+    }
+
+    #[test]
+    fn native_image_gen_path_denied_through_to_provider_messages() {
+        // `image_gen` is denylisted across the round trip too: its output path
+        // must NOT re-promote to an `[IMAGE:...]` marker on the read side, so
+        // the turn never detours cross-provider into a vision provider.
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp_image(dir.path(), "generated.png");
         let native = NativeToolDispatcher;
@@ -605,14 +684,18 @@ mod tests {
             &native,
             ToolExecutionResult {
                 name: "image_gen".into(),
-                output: format!("saved to {path}"),
+                output: format!("File: {path}"),
                 success: true,
                 tool_call_id: Some("tc1".into()),
             },
         );
         assert!(
-            rendered.contains(&format!("[IMAGE:{path}]")),
-            "image_gen image must still canonicalize through the round trip"
+            !rendered.contains("[IMAGE:"),
+            "image_gen path must NOT re-promote through the round trip: {rendered}"
+        );
+        assert!(
+            rendered.contains(&path),
+            "image_gen provider-visible content must keep the literal path"
         );
     }
 

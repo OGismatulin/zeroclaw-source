@@ -227,23 +227,32 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     rewritten
 }
 
-/// Tools whose output merely *lists* or *quotes* local filesystem paths
-/// (search hits, glob matches) rather than presenting an image as visual
-/// content. Their incidental image-file paths must NOT be auto-promoted to
-/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
-/// tool-result markers (`multimodal::count_image_markers`) when deciding
-/// whether to switch to a vision provider, so a path echo here falsely
-/// triggers vision routing - producing a provider-capability error on a
-/// text-only provider. See PR #7345.
+/// Tools whose output path must NOT be auto-promoted to an `[IMAGE:...]`
+/// marker. The agent loop counts the current iteration's tool-result markers
+/// (`multimodal::count_image_markers`) when deciding whether to switch to a
+/// vision provider, so a promoted path here falsely triggers vision routing.
+///
+/// Two reasons a tool lands here:
+///   * `content_search` / `glob_search` merely *list* or *quote* local paths
+///     (search hits, glob matches) rather than presenting an image as visual
+///     content - promoting produces a provider-capability error on a
+///     text-only provider (see PR #7345);
+///   * `image_gen` genuinely produces an image, but routing that image to a
+///     vision provider mid-tool-loop detours the turn cross-provider and
+///     poisons the transcript (foreign `tool_call_id` / stale
+///     `reasoning_content` / `content: null`), causing a deterministic
+///     `400 Upstream request failed` and losing delivery. The agent instead
+///     reads the durable `File:` path and delivers the image explicitly via
+///     `send_file_telegram.py`.
 ///
 /// This is a denylist (default-allow): any other tool - including ones that
 /// genuinely *generate* or *fetch* an image and print its path (e.g.
-/// `image_gen`, `file_download`) - keeps canonicalization, so real
-/// tool-produced images still route to a configured vision provider.
+/// `file_download`) - keeps canonicalization, so real tool-produced images
+/// still route to a configured vision provider.
 fn is_path_listing_tool(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "content_search" | "glob_search"
+        "content_search" | "glob_search" | "image_gen"
     )
 }
 
@@ -511,15 +520,19 @@ mod tests {
 
     #[test]
     fn canonicalize_for_skips_path_listing_tools() {
-        // A search/listing tool that surfaces a real image path must be left
-        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
-        // routing (PR #7345).
+        // Denylisted tools that surface a real image path must be left
+        // untouched - promoting to [IMAGE:...] would falsely trigger vision
+        // routing. `content_search`/`glob_search` merely list paths (PR #7345);
+        // `image_gen` genuinely produces an image, but routing it to a vision
+        // provider mid-tool-loop detours the turn cross-provider and poisons
+        // the transcript, so it is denied promotion too (agent delivers via
+        // send_file_telegram.py using the durable `File:` path).
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("hit.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
         let input = format!("match: {}", image.display());
 
-        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
+        for tool in ["content_search", "glob_search", "GLOB_SEARCH", "image_gen", "IMAGE_GEN"] {
             let output = canonicalize_tool_result_media_markers_for(tool, &input);
             assert_eq!(output, input, "{tool} output must be left untouched");
             assert!(!output.contains("[IMAGE:"));
@@ -528,15 +541,17 @@ mod tests {
 
     #[test]
     fn canonicalize_for_wraps_image_producing_and_fetching_tools() {
-        // Default-allow: image_gen (produces) and file_download (fetches) keep
-        // canonicalization so a genuinely produced/fetched image still routes.
+        // Default-allow: file_download (fetches) and other non-denylisted tools
+        // keep canonicalization so a genuinely fetched image still routes to a
+        // configured vision provider. (`image_gen` is denylisted separately -
+        // see canonicalize_for_skips_path_listing_tools.)
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("generated.png");
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
         let input = format!("Saved to {}", image.display());
         let expected = format!("[IMAGE:{}]", image.display());
 
-        for tool in ["image_gen", "file_download", "some_future_tool"] {
+        for tool in ["file_download", "some_future_tool"] {
             let output = canonicalize_tool_result_media_markers_for(tool, &input);
             assert!(
                 output.contains(&expected),
