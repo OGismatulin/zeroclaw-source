@@ -532,7 +532,13 @@ mod tests {
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
         let input = format!("match: {}", image.display());
 
-        for tool in ["content_search", "glob_search", "GLOB_SEARCH", "image_gen", "IMAGE_GEN"] {
+        for tool in [
+            "content_search",
+            "glob_search",
+            "GLOB_SEARCH",
+            "image_gen",
+            "IMAGE_GEN",
+        ] {
             let output = canonicalize_tool_result_media_markers_for(tool, &input);
             assert_eq!(output, input, "{tool} output must be left untouched");
             assert!(!output.contains("[IMAGE:"));
