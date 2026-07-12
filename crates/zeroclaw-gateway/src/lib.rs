@@ -2856,12 +2856,7 @@ async fn run_gateway_webhook_agentic(
             "Load the full source for an available skill by name.",
         ));
     }
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
-    }
+    tool_descs.extend(config_gated_tool_descs(&config));
     if risk_profile.level != zeroclaw_config::autonomy::AutonomyLevel::Full {
         let excluded = &risk_profile.excluded_tools;
         if !excluded.is_empty() {
@@ -3317,6 +3312,28 @@ async fn run_gateway_webhook_agentic(
 /// through unvalidated to the provider, which fails fast on its own
 /// catalog. Adding a new PROVIDER itself still requires Rust changes
 /// (factory + registry) and is governed by zeroclaw-providers.
+/// Config-gated tool advertisements appended to the webhook system prompt's
+/// `tool_descs`. Kept as a pure helper so a regression test can assert that a
+/// tool the registry registers (config-gated) is ALSO advertised here —
+/// registration without advertising hides the tool from the agent's prompt
+/// (the session-tools incident; agent-context.md §2.1).
+fn config_gated_tool_descs(config: &Config) -> Vec<(&'static str, &'static str)> {
+    let mut descs: Vec<(&'static str, &'static str)> = Vec::new();
+    if config.browser.enabled {
+        descs.push(("browser_open", "Open approved URLs in browser."));
+    }
+    if config.composio.enabled {
+        descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+    }
+    if config.image_gen.enabled {
+        descs.push((
+            "image_gen",
+            "Generate an image from a text prompt (quality: fast|high). Saves PNG to workspace/images/ and returns its path.",
+        ));
+    }
+    descs
+}
+
 fn provider_exists_in_registry(config: &Config, name: &str) -> bool {
     // fork: accept legacy spellings the bot still sends (e.g. "opencode-go"
     // → family "opencode") — the factory applies the same canonicalization,
@@ -5451,6 +5468,49 @@ mod tests {
             Some(std::path::Path::new("/data/user/.zeroclaw"))
         );
         assert_eq!(options.secrets_encrypt, config.secrets.encrypt);
+    }
+
+    /// Regression: the webhook system prompt must ADVERTISE `image_gen`
+    /// whenever the tool is registered. Registration is gated on
+    /// `image_gen.enabled` (tools/mod.rs); advertising must use the same gate
+    /// and the same tool name. Registration without advertising hides the tool
+    /// from the agent's prompt (the session-tools incident, agent-context §2.1).
+    #[test]
+    fn image_gen_advertised_iff_enabled_and_name_matches_registration() {
+        use std::sync::Arc;
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_config::policy::SecurityPolicy;
+
+        // Disabled → not advertised.
+        let mut config = Config::default();
+        config.image_gen.enabled = false;
+        assert!(
+            !config_gated_tool_descs(&config)
+                .iter()
+                .any(|(n, _)| *n == "image_gen"),
+            "image_gen must NOT be advertised when disabled"
+        );
+
+        // Enabled → advertised.
+        config.image_gen.enabled = true;
+        let descs = config_gated_tool_descs(&config);
+        assert!(
+            descs.iter().any(|(n, _)| *n == "image_gen"),
+            "image_gen must be advertised when enabled"
+        );
+
+        // The advertised name must equal the actual registered tool name, so
+        // registration and advertising cannot drift apart.
+        let tool = zeroclaw_tools::image_gen::ImageGenTool::new(
+            Arc::new(SecurityPolicy::default()),
+            std::env::temp_dir(),
+            config.image_gen.fal_model.clone(),
+            config.image_gen.api_key_env.clone(),
+        );
+        assert!(
+            descs.iter().any(|(n, _)| *n == tool.name()),
+            "advertised name must equal the registered tool name"
+        );
     }
 
     #[test]
