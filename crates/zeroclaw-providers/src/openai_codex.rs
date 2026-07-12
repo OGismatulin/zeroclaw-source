@@ -1630,10 +1630,10 @@ pub(crate) fn extract_image_b64_from_sse(body: &str) -> Option<String> {
         // finished items under response.output[].
         if let Some(items) = v.pointer("/response/output").and_then(|x| x.as_array()) {
             for item in items {
-                if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call") {
-                    if let Some(r) = item.get("result").and_then(|r| r.as_str()) {
-                        found = Some(r.to_string());
-                    }
+                if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call")
+                    && let Some(r) = item.get("result").and_then(|r| r.as_str())
+                {
+                    found = Some(r.to_string());
                 }
             }
         }
@@ -1661,13 +1661,13 @@ pub async fn generate_image_png(
         .get_valid_openai_access_token(None)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+            anyhow::Error::msg(
+                "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
             )
         })?;
     // No `profile` in scope here (store not loaded separately) → account_id from JWT only.
     let account_id = extract_account_id_from_jwt(&token)
-        .ok_or_else(|| anyhow::anyhow!("OpenAI Codex account id not found in token"))?;
+        .ok_or_else(|| anyhow::Error::msg("OpenAI Codex account id not found in token"))?;
 
     // build_responses_url bails on empty input; pass the default endpoint const.
     let url = build_responses_url(DEFAULT_CODEX_RESPONSES_URL)?;
@@ -1717,7 +1717,7 @@ pub async fn generate_image_png(
     }
     let text = resp.text().await?;
     let b64 = extract_image_b64_from_sse(&text)
-        .ok_or_else(|| anyhow::anyhow!("codex response missing image_generation_call.result"))?;
+        .ok_or_else(|| anyhow::Error::msg("codex response missing image_generation_call.result"))?;
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
     if bytes.len() > CODEX_IMAGE_MAX_BYTES {
