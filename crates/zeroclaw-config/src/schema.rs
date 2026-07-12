@@ -8054,18 +8054,36 @@ pub struct ImageGenConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Default fal.ai model identifier.
-    #[serde(default = "default_image_gen_model")]
-    pub default_model: String,
+    /// Default backend when the tool call doesn't specify `quality`.
+    /// "fast" = fal.ai, "high" = codex. Default: "fast".
+    #[serde(default = "default_image_gen_backend")]
+    pub default_backend: String,
 
-    /// Environment variable name holding the fal.ai API key.
+    /// fal.ai model path for the fast backend (FLUX family).
+    /// Accepts the legacy key `default_model`.
+    #[serde(default = "default_image_gen_model", alias = "default_model")]
+    pub fal_model: String,
+
+    /// Codex routing model for the high-quality backend.
+    #[serde(default = "default_image_gen_codex_model")]
+    pub codex_model: String,
+
+    /// Environment variable name holding the fal.ai API key (fast backend only).
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
 }
 
+fn default_image_gen_backend() -> String {
+    "fast".into()
+}
+
 fn default_image_gen_model() -> String {
-    "fal-ai/flux/schnell".into()
+    "fal-ai/flux-2/turbo".into()
+}
+
+fn default_image_gen_codex_model() -> String {
+    "gpt-5.5".into()
 }
 
 fn default_image_gen_api_key_env() -> String {
@@ -8076,7 +8094,9 @@ impl Default for ImageGenConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            default_model: default_image_gen_model(),
+            default_backend: default_image_gen_backend(),
+            fal_model: default_image_gen_model(),
+            codex_model: default_image_gen_codex_model(),
             api_key_env: default_image_gen_api_key_env(),
         }
     }
@@ -20022,6 +20042,35 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn image_gen_config_parses_backend_fields_and_aliases_default_model() {
+        use super::ImageGenConfig;
+
+        // new fields
+        let toml = r#"
+enabled = true
+default_backend = "fast"
+fal_model = "fal-ai/flux-2/turbo"
+codex_model = "gpt-5.5"
+api_key_env = "FAL_API_KEY"
+"#;
+        let cfg: ImageGenConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.default_backend, "fast");
+        assert_eq!(cfg.fal_model, "fal-ai/flux-2/turbo");
+        assert_eq!(cfg.codex_model, "gpt-5.5");
+
+        // backwards compat: legacy key default_model reads as fal_model
+        let legacy: ImageGenConfig =
+            toml::from_str("default_model = \"fal-ai/flux/schnell\"").unwrap();
+        assert_eq!(legacy.fal_model, "fal-ai/flux/schnell");
+
+        // defaults for a config without the fields
+        let empty: ImageGenConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.default_backend, "fast");
+        assert_eq!(empty.fal_model, "fal-ai/flux-2/turbo");
+        assert_eq!(empty.codex_model, "gpt-5.5");
+    }
 
     #[::core::prelude::v1::test]
     fn skill_bundle_admits_skill_honors_include_and_exclude() {
