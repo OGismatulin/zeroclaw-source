@@ -47,15 +47,93 @@ fn format_image_tool_output(
     )
 }
 
-/// Standalone image generation tool using fal.ai (Flux / Nano Banana models).
+/// Maximum accepted image size in bytes for either backend (fal download /
+/// codex base64 decode). Guards against a hostile or runaway response.
+const IMAGE_GEN_MAX_BYTES: usize = 25 * 1024 * 1024;
+
+/// PNG file signature (first 8 bytes). Used to validate the codex-decoded
+/// bytes before writing so a partial / non-PNG payload never lands on disk.
+const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Which backend generates the image.
 ///
-/// Reads the API key from an environment variable (default: `FAL_API_KEY`),
-/// calls the fal.ai synchronous endpoint, downloads the resulting image,
-/// and saves it to `{workspace}/images/{filename}.png`.
+/// `Fal` = fal.ai fast backend (FLUX family, ~10s). `Codex` = ChatGPT Codex
+/// `image_generation` tool, higher quality (~90s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Fal,
+    Codex,
+}
+
+/// Resolve the backend from an optional `quality` argument, falling back to the
+/// configured `default_backend`. An unknown value resolves to the safe `Fal`
+/// backend with a warning rather than silently routing somewhere unexpected.
+pub(crate) fn resolve_backend(quality: Option<&str>, default_backend: &str) -> Backend {
+    let choice = quality
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_backend);
+    match choice {
+        "high" => Backend::Codex,
+        "fast" => Backend::Fal,
+        other => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_attrs(::serde_json::json!({ "quality_or_default": other })),
+                "image_gen: unknown quality/default_backend value; falling back to fast (fal)"
+            );
+            Backend::Fal
+        }
+    }
+}
+
+/// Accepted `size` presets and legacy fal FLUX size values. Kept as one set so
+/// both the new presets (`square|landscape|portrait|auto`) and the historical
+/// FLUX values still validate (the tool was disabled, so this is not a prod
+/// break, but explicit callers keep working).
+const ACCEPTED_SIZES: &[&str] = &[
+    "square",
+    "landscape",
+    "portrait",
+    "auto",
+    "square_hd",
+    "landscape_4_3",
+    "portrait_4_3",
+    "landscape_16_9",
+    "portrait_16_9",
+];
+
+/// Map a size preset to a fal.ai `image_size` value.
+pub(crate) fn map_size_fal(p: &str) -> &'static str {
+    match p {
+        "landscape" | "landscape_16_9" => "landscape_16_9",
+        "portrait" | "portrait_16_9" => "portrait_16_9",
+        _ => "square_hd", // square, auto, square_hd, 4_3, unknown → square_hd
+    }
+}
+
+/// Map a size preset to a codex `WxH` value (or "auto").
+pub(crate) fn map_size_codex(p: &str) -> &'static str {
+    match p {
+        "landscape" | "landscape_16_9" => "1536x1024",
+        "portrait" | "portrait_16_9" => "1024x1536",
+        "auto" => "auto",
+        _ => "1024x1024",
+    }
+}
+
+/// Standalone dual-backend image generation tool.
+///
+/// `quality: fast` (default) routes to fal.ai (FLUX family); `quality: high`
+/// routes to the ChatGPT Codex `image_generation` tool. Both save the PNG to
+/// `{workspace}/images/{filename}.png` and return its path via the shared
+/// `File:` + `[IMAGE:]` contract.
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
-    default_model: String,
+    /// fal.ai model path for the fast backend (overridable per-call via `model`).
+    fal_model: String,
     api_key_env: String,
     /// Whether the saved image persists on the host filesystem. `false` on an
     /// ephemeral runtime (Docker tmpfs / no volume mount), where the PNG is
@@ -64,40 +142,61 @@ pub struct ImageGenTool {
     /// ephemeral-workspace warning. Mirrors
     /// [`super::file_write::FileWriteTool`]. See issue #4627.
     persistent_writes: bool,
+    /// Backend used when a call omits `quality` ("fast" | "high").
+    default_backend: String,
+    /// Codex routing model for the high-quality backend.
+    codex_model: String,
+    /// Auth state dir for the in-process codex OAuth token (high backend).
+    codex_state_dir: PathBuf,
+    /// Whether the codex auth store encrypts secrets at rest.
+    codex_encrypt_secrets: bool,
 }
 
 impl ImageGenTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
-        default_model: String,
+        fal_model: String,
         api_key_env: String,
     ) -> Self {
         Self {
             security,
             workspace_dir,
-            default_model,
+            fal_model,
             api_key_env,
             persistent_writes: true,
+            default_backend: "fast".into(),
+            codex_model: "gpt-5.5".into(),
+            codex_state_dir: PathBuf::from("."),
+            codex_encrypt_secrets: false,
         }
     }
 
     /// Construct with an explicit persistence flag derived from the active
-    /// runtime adapter's `has_filesystem_access()`. Mirrors
-    /// [`super::file_write::FileWriteTool::new_with_persistence`].
+    /// runtime adapter's `has_filesystem_access()`, plus dual-backend config.
+    /// Mirrors [`super::file_write::FileWriteTool::new_with_persistence`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_persistence(
         security: Arc<SecurityPolicy>,
         workspace_dir: PathBuf,
-        default_model: String,
+        fal_model: String,
         api_key_env: String,
         persistent_writes: bool,
+        default_backend: String,
+        codex_model: String,
+        codex_state_dir: PathBuf,
+        codex_encrypt_secrets: bool,
     ) -> Self {
         Self {
             security,
             workspace_dir,
-            default_model,
+            fal_model,
             api_key_env,
             persistent_writes,
+            default_backend,
+            codex_model,
+            codex_state_dir,
+            codex_encrypt_secrets,
         }
     }
 
@@ -118,9 +217,10 @@ impl ImageGenTool {
             .ok_or_else(|| format!("Missing API key: set the {env_var} environment variable"))
     }
 
-    /// Core generation logic: call fal.ai, download image, save to disk.
+    /// Dispatcher: parse shared parameters, resolve the backend from `quality`
+    /// (falling back to `default_backend`), then route to fal or codex.
     async fn generate(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // ── Parse parameters ───────────────────────────────────────
+        // ── Parse shared parameters ────────────────────────────────
         let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p.trim().to_string(),
             _ => {
@@ -145,35 +245,102 @@ impl ImageGenTool {
         let size = args
             .get("size")
             .and_then(|v| v.as_str())
-            .unwrap_or("square_hd");
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("square")
+            .to_string();
 
-        // Validate size enum.
-        const VALID_SIZES: &[&str] = &[
-            "square_hd",
-            "landscape_4_3",
-            "portrait_4_3",
-            "landscape_16_9",
-            "portrait_16_9",
-        ];
-        if !VALID_SIZES.contains(&size) {
+        // Validate size against the accepted preset + legacy set.
+        if !ACCEPTED_SIZES.contains(&size.as_str()) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Invalid size '{size}'. Valid values: {}",
-                    VALID_SIZES.join(", ")
+                    ACCEPTED_SIZES.join(", ")
                 )),
             });
         }
 
+        let quality = args.get("quality").and_then(|v| v.as_str());
+        match resolve_backend(quality, &self.default_backend) {
+            Backend::Fal => self.generate_fal(&prompt, &size, &args, &safe_name).await,
+            Backend::Codex => self.generate_codex(&prompt, &size, &safe_name).await,
+        }
+    }
+
+    /// Write generated PNG bytes to `{workspace}/images/{safe_name}.png`,
+    /// enforcing the byte cap and (optionally) the PNG signature. On any
+    /// failure no partial file is left behind.
+    async fn save_image(
+        &self,
+        bytes: &[u8],
+        safe_name: &str,
+        model: &str,
+        prompt: &str,
+        require_png: bool,
+    ) -> anyhow::Result<ToolResult> {
+        if bytes.len() > IMAGE_GEN_MAX_BYTES {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Generated image exceeds size cap ({} > {IMAGE_GEN_MAX_BYTES} bytes)",
+                    bytes.len()
+                )),
+            });
+        }
+        if require_png && !bytes.starts_with(&PNG_MAGIC) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Generated image is not a valid PNG (bad signature)".into()),
+            });
+        }
+
+        let images_dir = self.workspace_dir.join("images");
+        tokio::fs::create_dir_all(&images_dir)
+            .await
+            .context("Failed to create images directory")?;
+
+        let output_path = images_dir.join(format!("{safe_name}.png"));
+        if let Err(e) = tokio::fs::write(&output_path, bytes).await {
+            // Do not leave a partial file behind on write failure.
+            let _ = tokio::fs::remove_file(&output_path).await;
+            return Err(anyhow::Error::new(e).context("Failed to write image file"));
+        }
+
+        let size_kb = bytes.len() / 1024;
+        // Emit a durable `File:` line (survives marker-stripping in older turns)
+        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
+        // Both carry the same path string so the promoter
+        // (`canonicalize_tool_result_media_markers`) dedups the bare path
+        // against the already-wrapped marker and does not double-count.
+        let path_display = output_path.display().to_string();
+        let output = format_image_tool_output(&path_display, size_kb, model, prompt);
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
+
+    /// Fast backend: fal.ai synchronous API. `model` (per-call override) applies
+    /// only here and is validated as a fal.ai path.
+    async fn generate_fal(
+        &self,
+        prompt: &str,
+        size: &str,
+        args: &serde_json::Value,
+        safe_name: &str,
+    ) -> anyhow::Result<ToolResult> {
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&self.default_model);
+            .unwrap_or(&self.fal_model);
 
         // Validate model identifier: must look like a fal.ai model path
-        // (e.g. "fal-ai/flux/schnell"). Reject values with "..", query
+        // (e.g. "fal-ai/flux-2/turbo"). Reject values with "..", query
         // strings, or fragments that could redirect the HTTP request.
         if model.contains("..")
             || model.contains('?')
@@ -186,7 +353,7 @@ impl ImageGenTool {
                 output: String::new(),
                 error: Some(format!(
                     "Invalid model identifier '{model}'. \
-                     Must be a fal.ai model path (e.g. 'fal-ai/flux/schnell')."
+                     Must be a fal.ai model path (e.g. 'fal-ai/flux-2/turbo')."
                 )),
             });
         }
@@ -209,7 +376,7 @@ impl ImageGenTool {
 
         let body = json!({
             "prompt": prompt,
-            "image_size": size,
+            "image_size": map_size_fal(size),
             "num_images": 1
         });
 
@@ -273,32 +440,43 @@ impl ImageGenTool {
             .await
             .context("Failed to read image bytes")?;
 
-        // ── Save to disk ───────────────────────────────────────────
-        let images_dir = self.workspace_dir.join("images");
-        tokio::fs::create_dir_all(&images_dir)
+        // fal may return PNG/JPEG/WEBP depending on the model; enforce the byte
+        // cap but not the PNG signature here.
+        self.save_image(&bytes, safe_name, model, prompt, false)
             .await
-            .context("Failed to create images directory")?;
+    }
 
-        let output_path = images_dir.join(format!("{safe_name}.png"));
-        tokio::fs::write(&output_path, &bytes)
+    /// High-quality backend: ChatGPT Codex `image_generation` tool. `model`
+    /// (fal override) does NOT apply here — codex uses `codex_model`.
+    async fn generate_codex(
+        &self,
+        prompt: &str,
+        size: &str,
+        safe_name: &str,
+    ) -> anyhow::Result<ToolResult> {
+        let bytes = match zeroclaw_providers::openai_codex::generate_image_png(
+            &self.codex_state_dir,
+            self.codex_encrypt_secrets,
+            prompt,
+            map_size_codex(size),
+            "png",
+            &self.codex_model,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("codex image generation failed: {e}")),
+                });
+            }
+        };
+
+        // codex returns PNG (output_format=png) → enforce the signature.
+        self.save_image(&bytes, safe_name, &self.codex_model, prompt, true)
             .await
-            .context("Failed to write image file")?;
-
-        let size_kb = bytes.len() / 1024;
-
-        // Emit a durable `File:` line (survives marker-stripping in older turns)
-        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
-        // Both carry the same path string so the promoter
-        // (`canonicalize_tool_result_media_markers`) dedups the bare path
-        // against the already-wrapped marker and does not double-count.
-        let path_display = output_path.display().to_string();
-        let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
     }
 }
 
@@ -309,8 +487,10 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt using fal.ai (Flux models). \
-         Saves the result to the workspace images directory and returns the file path."
+        "Generate an image from a text prompt. quality: fast (fal.ai FLUX, default) \
+         or high (Codex). Saves a PNG to the workspace images directory and returns \
+         the file path. size: square|landscape|portrait|auto. model overrides the \
+         fal model for the fast backend only."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -322,18 +502,23 @@ impl Tool for ImageGenTool {
                     "type": "string",
                     "description": "Text prompt describing the image to generate."
                 },
+                "quality": {
+                    "type": "string",
+                    "enum": ["fast", "high"],
+                    "description": "Backend: 'fast' (fal.ai FLUX) or 'high' (Codex). Defaults to the configured backend."
+                },
                 "filename": {
                     "type": "string",
                     "description": "Output filename without extension (default: 'generated_image'). Saved as PNG in workspace/images/."
                 },
                 "size": {
                     "type": "string",
-                    "enum": ["square_hd", "landscape_4_3", "portrait_4_3", "landscape_16_9", "portrait_16_9"],
-                    "description": "Image aspect ratio / size preset (default: 'square_hd')."
+                    "enum": ["square", "landscape", "portrait", "auto"],
+                    "description": "Image aspect ratio / size preset (default: 'square')."
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier (default: 'fal-ai/flux/schnell')."
+                    "description": "fal.ai model identifier for the fast backend only (default: 'fal-ai/flux-2/turbo'). Ignored when quality=high."
                 }
             }
         })
@@ -380,7 +565,7 @@ mod tests {
         ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
+            "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY".into(),
         )
     }
@@ -413,6 +598,35 @@ mod tests {
         assert!(schema["properties"]["filename"].is_object());
         assert!(schema["properties"]["size"].is_object());
         assert!(schema["properties"]["model"].is_object());
+        assert!(schema["properties"]["quality"].is_object());
+    }
+
+    #[test]
+    fn size_preset_maps_per_backend() {
+        assert_eq!(map_size_fal("landscape"), "landscape_16_9");
+        assert_eq!(map_size_codex("landscape"), "1536x1024");
+        assert_eq!(map_size_codex("auto"), "auto");
+        assert_eq!(map_size_fal("square"), "square_hd");
+    }
+
+    #[test]
+    fn resolve_backend_uses_quality_then_default() {
+        assert_eq!(resolve_backend(Some("high"), "fast"), Backend::Codex);
+        assert_eq!(resolve_backend(Some("fast"), "high"), Backend::Fal);
+        assert_eq!(resolve_backend(None, "fast"), Backend::Fal);
+        assert_eq!(resolve_backend(None, "high"), Backend::Codex);
+    }
+
+    #[test]
+    fn resolve_backend_unknown_defaults_to_fal_safely() {
+        assert_eq!(resolve_backend(None, "bogus"), Backend::Fal);
+        assert_eq!(resolve_backend(Some("weird"), "high"), Backend::Fal);
+    }
+
+    #[test]
+    fn schema_advertises_quality_param() {
+        let s = test_tool().parameters_schema();
+        assert!(s["properties"]["quality"].is_object());
     }
 
     #[test]
@@ -449,7 +663,7 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
+            "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_IMAGE_GEN".into(),
         );
         let result = tool
@@ -481,7 +695,7 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
+            "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_SIZE".into(),
         );
         let result = tool
@@ -505,7 +719,7 @@ mod tests {
         let tool = ImageGenTool::new(
             security,
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
+            "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY".into(),
         );
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
@@ -525,7 +739,7 @@ mod tests {
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
-            "fal-ai/flux/schnell".into(),
+            "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_MODEL".into(),
         );
         let result = tool
