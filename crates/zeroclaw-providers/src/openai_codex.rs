@@ -1606,9 +1606,168 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCodexModelProvider {
     }
 }
 
+/// Extract the base64 image from a codex Responses SSE stream body.
+///
+/// codex emits many events (`response.created`, `...in_progress`,
+/// `...partial_image`, `...completed`). The final image is carried on the
+/// terminal event as an `image_generation_call` item under
+/// `response.output[]`. We scan every `data:` line, tolerate `[DONE]`,
+/// malformed JSON and non-`data:` lines, and return the LAST matching
+/// `image_generation_call.result` — which is the terminal one.
+pub(crate) fn extract_image_b64_from_sse(body: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if payload == "[DONE]" || payload.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        // The terminal event (response.completed / response.done) carries the
+        // finished items under response.output[].
+        if let Some(items) = v.pointer("/response/output").and_then(|x| x.as_array()) {
+            for item in items {
+                if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call") {
+                    if let Some(r) = item.get("result").and_then(|r| r.as_str()) {
+                        found = Some(r.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Maximum decoded image size we will accept (bytes). Mirrors the fal-side cap.
+const CODEX_IMAGE_MAX_BYTES: usize = 25 * 1024 * 1024;
+
+/// Generate an image via the codex Responses `image_generation` tool using the
+/// in-process OAuth token. `size` is a codex `WxH` string ("1024x1024") or
+/// "auto"; `output_format` is e.g. "png". Returns the decoded image bytes.
+pub async fn generate_image_png(
+    state_dir: &std::path::Path,
+    encrypt_secrets: bool,
+    prompt: &str,
+    size: &str,
+    output_format: &str,
+    codex_model: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let auth = AuthService::new(state_dir, encrypt_secrets);
+    // get_valid_openai_access_token returns anyhow::Result<Option<String>>; unwrap the Option.
+    let token = auth
+        .get_valid_openai_access_token(None)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+            )
+        })?;
+    // No `profile` in scope here (store not loaded separately) → account_id from JWT only.
+    let account_id = extract_account_id_from_jwt(&token)
+        .ok_or_else(|| anyhow::anyhow!("OpenAI Codex account id not found in token"))?;
+
+    // build_responses_url bails on empty input; pass the default endpoint const.
+    let url = build_responses_url(DEFAULT_CODEX_RESPONSES_URL)?;
+    let mut image_tool =
+        serde_json::json!({ "type": "image_generation", "output_format": output_format });
+    if size != "auto" {
+        image_tool["size"] = serde_json::json!(size);
+    }
+    let body = serde_json::json!({
+        "model": codex_model,
+        "stream": true,
+        "instructions": "You are an image generation assistant.",
+        "input": [{"type":"message","role":"user","content":[{"type":"input_text","text": prompt}]}],
+        "tools": [image_tool],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "reasoning": {"effort":"low","summary":"auto"},
+        "include": ["reasoning.encrypted_content"],
+        "text": {"verbosity":"low"}
+    });
+
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(150))
+        .build()?;
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("OpenAI-Beta", "responses=experimental")
+        // Identity gate = originator + User-Agent (fork patch #22). Use the
+        // shared consts, not literals — a literal becomes a silent bug on the
+        // next identity change (exactly why patch #22 exists). Without the UA
+        // codex rejects image_generation (400/404).
+        .header("originator", CODEX_ORIGINATOR)
+        .header("User-Agent", CODEX_USER_AGENT)
+        .header("chatgpt-account-id", account_id)
+        .header("accept", "text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        anyhow::bail!("codex image API error ({s}): {t}");
+    }
+    let text = resp.text().await?;
+    let b64 = extract_image_b64_from_sse(&text)
+        .ok_or_else(|| anyhow::anyhow!("codex response missing image_generation_call.result"))?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
+    if bytes.len() > CODEX_IMAGE_MAX_BYTES {
+        anyhow::bail!(
+            "codex image exceeds size cap ({} > {} bytes)",
+            bytes.len(),
+            CODEX_IMAGE_MAX_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_image_generation_call_result_from_sse() {
+        // minimal SSE tail: final event carrying an image_generation_call item
+        let sse = "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"aGVsbG8=\"}]}}\n\n";
+        let b64 = extract_image_b64_from_sse(sse).expect("should find result");
+        assert_eq!(b64, "aGVsbG8=");
+    }
+
+    #[test]
+    fn image_sse_parser_takes_terminal_event_and_tolerates_noise() {
+        // multi-event stream: created -> in_progress -> completed; plus [DONE]
+        // and a malformed line. The completed event's result must be returned.
+        let sse = "event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{}}\n\n\
+event: response.in_progress\n\
+data: {\"type\":\"response.in_progress\"}\n\n\
+data: not-json-garbage\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\"},{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(
+            extract_image_b64_from_sse(sse).as_deref(),
+            Some("ZmluYWw=")
+        );
+    }
+
+    #[test]
+    fn image_sse_parser_returns_none_when_no_result() {
+        let sse = "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\"}]}}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(extract_image_b64_from_sse(sse), None);
+    }
 
     enum MockCodexReply {
         Sse(&'static str),
