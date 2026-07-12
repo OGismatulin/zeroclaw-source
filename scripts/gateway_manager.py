@@ -106,7 +106,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         1.05M / 400K published window (reserves ~128K output + ~5% headroom), so
 #         the old 0.70 trigger (280K) sat ABOVE the ~258K real limit → codex
 #         rejected input before compaction ran (DV-34269 overflow, 2026-07-11).
-CURRENT_CONFIG_MARKER = "v3-21"
+# v3-22 = [image_gen] enabled with dual backend (fast=fal flux-2-turbo,
+#         high=codex gpt-image-2). New block; existing per-user configs get it
+#         via template cutover. See spec 2026-07-12-image-generation-dual-backend.
+CURRENT_CONFIG_MARKER = "v3-22"
 
 
 def sanitize_filename(filename: str) -> str:

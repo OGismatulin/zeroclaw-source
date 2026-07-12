@@ -614,3 +614,10 @@ runtime_profile = "agent_default"
 mcp_bundles = ["all"]
 [agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[image_gen]
+enabled = true
+default_backend = "fast"
+fal_model = "fal-ai/flux-2/turbo"
+codex_model = "gpt-5.5"
+api_key_env = "FAL_API_KEY"
