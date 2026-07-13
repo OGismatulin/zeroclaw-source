@@ -4267,6 +4267,38 @@ mod tests {
         assert!(!safe_error.contains("model_provider boom"));
     }
 
+    #[tokio::test]
+    async fn execute_agentic_redacts_credential_bearing_custom_provider_identity() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "custom:https://user:pass@inference.host/v1?api_key=secret#debug",
+                "vision-model",
+                &FailingModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let safe_error = result.error.as_deref().unwrap_or("");
+        assert!(safe_error.contains("provider=custom"), "{safe_error}");
+        for secret in ["user", "pass", "api_key", "secret", "#debug", "https://"] {
+            assert!(
+                !safe_error.contains(secret),
+                "unsafe delegate error: {safe_error}"
+            );
+        }
+    }
+
     /// MCP tools pushed into the shared parent_tools handle after DelegateTool
     /// construction must be visible to the sub-agent tool list.
     #[derive(Default)]

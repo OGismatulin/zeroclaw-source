@@ -415,8 +415,8 @@ pub struct ProviderCandidateDescriptor {
 impl ProviderCandidateDescriptor {
     pub fn requested(provider_family: &str, configured_alias: Option<&str>) -> Self {
         Self {
-            provider_family: provider_family.to_string(),
-            configured_alias: configured_alias.map(ToString::to_string),
+            provider_family: super::safe_provider_identity(provider_family),
+            configured_alias: configured_alias.map(super::safe_provider_identity),
             pinned_model: None,
         }
     }
@@ -427,8 +427,8 @@ impl ProviderCandidateDescriptor {
         effective_model: &str,
     ) -> Self {
         Self {
-            provider_family: provider_family.to_string(),
-            configured_alias: configured_alias.map(ToString::to_string),
+            provider_family: super::safe_provider_identity(provider_family),
+            configured_alias: configured_alias.map(super::safe_provider_identity),
             pinned_model: Some(effective_model.to_string()),
         }
     }

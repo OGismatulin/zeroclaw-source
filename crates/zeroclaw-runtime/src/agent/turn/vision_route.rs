@@ -15,7 +15,7 @@ impl VisionRouteFailure {
     fn new(kind: &'static str, provider: &str, model: Option<&str>) -> Self {
         Self {
             kind,
-            provider: provider.to_string(),
+            provider: zeroclaw_providers::safe_provider_identity(provider),
             model: model.map(ToString::to_string),
         }
     }
@@ -83,31 +83,33 @@ pub(crate) fn resolve_vision_provider(
         && !model_provider.supports_vision()
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
-            let vp_instance = zeroclaw_providers::create_model_provider(vp, None).map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "vision_provider": vp,
-                            "error": format!("{}", e),
-                        })),
-                    "vision model_provider construction failed"
-                );
-                anyhow::Error::from(VisionRouteFailure::new(
-                    "vision_provider_misconfigured",
-                    vp,
-                    multimodal_config.vision_model.as_deref(),
-                ))
-            })?;
+            let safe_vp = zeroclaw_providers::safe_provider_identity(vp);
+            let vp_instance =
+                zeroclaw_providers::create_model_provider(vp, None).map_err(|_e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "vision_provider": &safe_vp,
+                                "error_kind": "provider_construction_failed",
+                            })),
+                        "vision model_provider construction failed"
+                    );
+                    anyhow::Error::from(VisionRouteFailure::new(
+                        "vision_provider_misconfigured",
+                        &safe_vp,
+                        multimodal_config.vision_model.as_deref(),
+                    ))
+                })?;
             if !vp_instance.supports_vision() {
                 // Operator misconfiguration (named a non-vision provider as
                 // the vision route) — surface it loudly rather than silently
                 // degrading.
                 return Err(VisionRouteFailure::new(
                     "vision_provider_misconfigured",
-                    vp,
+                    &safe_vp,
                     multimodal_config.vision_model.as_deref(),
                 )
                 .into());
@@ -259,6 +261,38 @@ mod tests {
         assert_eq!(typed.kind(), "vision_provider_misconfigured");
         assert_eq!(typed.provider(), "openai");
         assert_eq!(typed.model(), Some("text-only-model"));
+    }
+
+    #[test]
+    fn credential_bearing_custom_vision_misconfiguration_has_safe_identity_and_display() {
+        let history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+        let config = MultimodalConfig {
+            vision_model_provider: Some(
+                "custom:ftp://user:pass@inference.host/v1?api_key=secret#debug".to_string(),
+            ),
+            vision_model: Some("vision-model".to_string()),
+            ..MultimodalConfig::default()
+        };
+
+        let error = match resolve_vision_provider(&TextOnlyProvider, &history, &config, "main") {
+            Ok(_) => panic!("malformed custom vision provider must fail construction"),
+            Err(error) => error,
+        };
+        let typed = error
+            .downcast_ref::<VisionRouteFailure>()
+            .expect("custom construction failure must remain typed");
+
+        assert_eq!(typed.provider(), "custom");
+        assert_eq!(typed.model(), Some("vision-model"));
+        let public_error = typed.to_string();
+        for secret in ["user", "pass", "api_key", "secret", "#debug", "ftp://"] {
+            assert!(
+                !public_error.contains(secret),
+                "unsafe vision display: {public_error}"
+            );
+        }
     }
 
     /// Wiring check (#7415): the per-session `image_cache` threaded from the

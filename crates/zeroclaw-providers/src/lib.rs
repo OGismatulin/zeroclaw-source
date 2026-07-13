@@ -1100,6 +1100,29 @@ fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static
     }
 }
 
+/// Return the stable, public identity for a configured provider selector.
+///
+/// Legacy custom endpoints (`custom:<URL>`) and auth-profile selectors
+/// (`provider:profile`) carry routing details that must never enter public
+/// errors or envelopes. Keep only the provider family/alias token; endpoint
+/// details are reported separately through sanitized diagnostics.
+#[must_use]
+pub fn safe_provider_identity(configured: &str) -> String {
+    let identity = configured
+        .trim()
+        .split_once(':')
+        .map_or(configured.trim(), |(provider, _)| provider.trim());
+    let safe: String = identity
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .collect();
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
 // `parse_custom_provider_url` was deleted in #6273. The legacy colon-URL form
 // (`custom:https://...` and `anthropic-custom:https://...`) is collapsed
 // at TOML load time by `normalize_model_provider_type` in `schema/v2.rs` into
@@ -2285,6 +2308,18 @@ mod tests {
 
         assert_eq!(terminal.actual_provider(), "openai");
         assert!(!terminal.actual_provider().contains("work"));
+    }
+
+    #[test]
+    fn safe_provider_identity_drops_endpoint_credentials_and_auth_profiles() {
+        assert_eq!(
+            safe_provider_identity(
+                "custom:https://user:pass@inference.host/v1?api_key=secret#debug"
+            ),
+            "custom"
+        );
+        assert_eq!(safe_provider_identity("openai:work"), "openai");
+        assert_eq!(safe_provider_identity("openrouter"), "openrouter");
     }
 
     // Compile-time proof that both reqwest TLS-root features are enabled.

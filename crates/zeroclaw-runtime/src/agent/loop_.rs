@@ -5298,12 +5298,11 @@ mod tests {
 
     #[tokio::test]
     async fn dedicated_vision_provider_api_failure_propagates_through_full_turn() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(500)
                     .set_body_string(r#"{"error":{"message":"vision endpoint unavailable"}}"#),
@@ -5316,7 +5315,9 @@ mod tests {
         let main_provider = NonVisionModelProvider {
             calls: Arc::clone(&calls),
         };
-        let configured_vision_provider = format!("custom:{}/v1", server.uri());
+        let credential_endpoint = server.uri().replacen("http://", "http://user:pass@", 1);
+        let configured_vision_provider =
+            format!("custom:{credential_endpoint}/v1?api_key=secret#debug");
         let configured_vision_model = "configured-vision-model";
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
             vision_model_provider: Some(configured_vision_provider.clone()),
@@ -5334,10 +5335,17 @@ mod tests {
 
         let terminal = zeroclaw_providers::terminal_provider_failure(&error)
             .expect("full-turn result must retain dedicated vision terminal evidence");
-        assert_eq!(terminal.actual_provider(), configured_vision_provider);
+        assert_eq!(terminal.actual_provider(), "custom");
         assert_eq!(terminal.actual_model(), configured_vision_model);
         assert_eq!(terminal.route(), zeroclaw_providers::ProviderRoute::Vision);
         assert_eq!(terminal.attempts_for_call(), 1);
+        let public_error = terminal.to_string();
+        for secret in ["user", "pass", "api_key", "secret", "#debug", "http://"] {
+            assert!(
+                !public_error.contains(secret),
+                "unsafe terminal display: {public_error}"
+            );
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

@@ -487,14 +487,17 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let (vision_model_provider_box, degrade_strip_images) =
             resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+        let safe_vision_provider_name = multimodal_config
+            .vision_model_provider
+            .as_deref()
+            .map(zeroclaw_providers::safe_provider_identity);
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
             &str,
             &str,
         ) = if let Some(ref vp_box) = vision_model_provider_box {
-            let vp_name = multimodal_config
-                .vision_model_provider
+            let vp_name = safe_vision_provider_name
                 .as_deref()
                 .unwrap_or(provider_name);
             let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
