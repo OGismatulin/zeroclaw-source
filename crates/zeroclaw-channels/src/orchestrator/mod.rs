@@ -19673,8 +19673,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("does not support vision"),
-            "reply must mention vision capability error, got: {}",
+            sent[0].contains("kind=vision_not_supported"),
+            "reply must carry the safe typed vision error, got: {}",
             sent[0]
         );
         assert!(
@@ -19806,8 +19806,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("does not support vision"),
-            "first reply must mention vision capability error, got: {}",
+            sent[0].contains("kind=vision_not_supported"),
+            "first reply must carry the safe typed vision error, got: {}",
             sent[0]
         );
         assert!(
@@ -19961,8 +19961,13 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("Format Error"),
-            "first reply must mention the request format error, got: {}",
+            sent[0].contains("kind=client_error disposition=non_retryable"),
+            "first reply must carry the safe typed request rejection, got: {}",
+            sent[0]
+        );
+        assert!(
+            !sent[0].contains("test-request-id") && !sent[0].contains("Format Error"),
+            "provider response details must stay redacted, got: {}",
             sent[0]
         );
         assert!(
