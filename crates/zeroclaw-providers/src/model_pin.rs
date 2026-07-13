@@ -1,5 +1,6 @@
 use super::ModelProvider;
 use super::dispatch::ProviderDispatch;
+use super::reliable::ProviderCandidateDescriptor;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -7,18 +8,23 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 
 pub struct ModelPinnedProvider {
-    alias: String,
-    pinned_model: String,
+    descriptor: ProviderCandidateDescriptor,
     inner: Box<dyn ModelProvider>,
 }
 
 impl ModelPinnedProvider {
-    pub fn new(alias: &str, pinned_model: &str, inner: Box<dyn ModelProvider>) -> Self {
-        Self {
-            alias: alias.to_string(),
-            pinned_model: pinned_model.to_string(),
-            inner,
-        }
+    pub fn new(descriptor: ProviderCandidateDescriptor, inner: Box<dyn ModelProvider>) -> Self {
+        assert!(
+            descriptor.pinned_model().is_some(),
+            "ModelPinnedProvider requires a pinned candidate descriptor"
+        );
+        Self { descriptor, inner }
+    }
+
+    fn pinned_model(&self) -> &str {
+        self.descriptor
+            .pinned_model()
+            .expect("validated by ModelPinnedProvider::new")
     }
 }
 
@@ -84,7 +90,7 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
+            .chat_with_system(system_prompt, message, self.pinned_model(), temperature)
             .await
     }
 
@@ -95,7 +101,7 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_history(messages, &self.pinned_model, temperature)
+            .chat_with_history(messages, self.pinned_model(), temperature)
             .await
     }
 
@@ -106,7 +112,7 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, &self.pinned_model, temperature)
+            .chat(request, self.pinned_model(), temperature)
             .await
     }
 
@@ -118,7 +124,7 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         ProviderDispatch::from_ref(&*self.inner)
-            .chat_with_tools(messages, tools, &self.pinned_model, temperature)
+            .chat_with_tools(messages, tools, self.pinned_model(), temperature)
             .await
     }
 
@@ -135,7 +141,7 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.stream_chat_with_system(
             system_prompt,
             message,
-            &self.pinned_model,
+            self.pinned_model(),
             temperature,
             options,
         )
@@ -150,7 +156,7 @@ impl ModelProvider for ModelPinnedProvider {
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         // Same passthrough rationale as stream_chat_with_system.
         self.inner
-            .stream_chat_with_history(messages, &self.pinned_model, temperature, options)
+            .stream_chat_with_history(messages, self.pinned_model(), temperature, options)
     }
 
     fn stream_chat(
@@ -162,7 +168,7 @@ impl ModelProvider for ModelPinnedProvider {
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         ProviderDispatch::from_ref(&*self.inner).stream_chat(
             request,
-            &self.pinned_model,
+            self.pinned_model(),
             temperature,
             options,
         )
@@ -174,6 +180,6 @@ impl zeroclaw_api::attribution::Attributable for ModelPinnedProvider {
         self.inner.role()
     }
     fn alias(&self) -> &str {
-        &self.alias
+        self.descriptor.actual_provider()
     }
 }

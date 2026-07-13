@@ -51,6 +51,10 @@ pub use traits::{
 };
 
 use reliable::ReliableModelProvider;
+pub use reliable::{
+    ProviderCandidateDescriptor, ProviderErrorDiagnostic, ProviderErrorDisposition, ProviderRoute,
+    TerminalProviderFailure, terminal_provider_failure,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -1441,7 +1445,8 @@ pub fn create_resilient_model_provider_for_alias(
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
-    let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    let mut model_providers: Vec<(ProviderCandidateDescriptor, Box<dyn ModelProvider>)> =
+        Vec::new();
     push_pinned_entries(
         &mut model_providers,
         config,
@@ -1461,7 +1466,7 @@ pub fn create_resilient_model_provider_for_alias(
         )?;
     }
 
-    let reliable = ReliableModelProvider::new(
+    let reliable = ReliableModelProvider::new_with_candidates(
         alias,
         model_providers,
         reliability.provider_retries,
@@ -1478,7 +1483,7 @@ pub fn create_resilient_model_provider_for_alias(
 /// next alias. When the alias has no configured model, a single unpinned entry
 /// is pushed and the requested model flows through unchanged.
 fn push_pinned_entries(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<(ProviderCandidateDescriptor, Box<dyn ModelProvider>)>,
     config: &zeroclaw_config::schema::Config,
     family: &str,
     alias: &str,
@@ -1489,16 +1494,19 @@ fn push_pinned_entries(
     let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
 
     let Some(primary_model) = primary_model else {
-        out.push((family.to_string(), built));
+        out.push((
+            ProviderCandidateDescriptor::requested(family, Some(alias)),
+            built,
+        ));
         return;
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
+    let descriptor = ProviderCandidateDescriptor::pinned(family, Some(alias), primary_model);
     out.push((
-        family.to_string(),
+        descriptor.clone(),
         Box::new(crate::model_pin::ModelPinnedProvider::new(
-            alias,
-            primary_model,
+            descriptor,
             Box::new(std::sync::Arc::clone(&built)),
         )),
     ));
@@ -1506,11 +1514,11 @@ fn push_pinned_entries(
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
+        let descriptor = ProviderCandidateDescriptor::pinned(family, Some(alias), model);
         out.push((
-            family.to_string(),
+            descriptor.clone(),
             Box::new(crate::model_pin::ModelPinnedProvider::new(
-                alias,
-                model,
+                descriptor,
                 Box::new(std::sync::Arc::clone(&built)),
             )),
         ));
@@ -1525,7 +1533,7 @@ fn push_pinned_entries(
 /// constructed is a hard error because otherwise operators think the requested
 /// fallback is available when it is not.
 fn append_fallback_chain(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<(ProviderCandidateDescriptor, Box<dyn ModelProvider>)>,
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
