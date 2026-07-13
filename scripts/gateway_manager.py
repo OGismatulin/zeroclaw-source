@@ -30,7 +30,9 @@ from urllib.parse import urlsplit, urlunsplit
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
 INCIDENT_ID_PATTERN = re.compile(r"^zc-[0-9a-f]{16}$")
 ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+OPERATOR_TOKEN_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _ERROR_COMPONENTS = {"bot", "manager", "daemon", "provider", "request"}
+_OPERATOR_ROUTES = {"main", "vision"}
 
 _PUBLIC_ERROR_STRING_FIELDS = (
     "provider",
@@ -162,14 +164,29 @@ def _safe_operator_fields(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     safe: dict[str, object] = {}
-    for key in ("phase", "endpoint", "route"):
-        bounded = _bounded_string(value.get(key), limit=500 if key == "endpoint" else 80)
-        if bounded is not None:
-            safe[key] = bounded
-    for key in ("provider_status", "attempts_for_call"):
-        item = value.get(key)
-        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
-            safe[key] = item
+    phase = value.get("phase")
+    if isinstance(phase, str) and OPERATOR_TOKEN_PATTERN.fullmatch(phase):
+        safe["phase"] = phase
+    route = value.get("route")
+    if isinstance(route, str) and route in _OPERATOR_ROUTES:
+        safe["route"] = route
+    endpoint = _bounded_string(value.get("endpoint"), limit=500)
+    if endpoint is not None:
+        safe["endpoint"] = endpoint
+    provider_status = value.get("provider_status")
+    if (
+        isinstance(provider_status, int)
+        and not isinstance(provider_status, bool)
+        and 100 <= provider_status <= 599
+    ):
+        safe["provider_status"] = provider_status
+    attempts = value.get("attempts_for_call")
+    if (
+        isinstance(attempts, int)
+        and not isinstance(attempts, bool)
+        and 1 <= attempts <= 10_000
+    ):
+        safe["attempts_for_call"] = attempts
     return safe or None
 
 
@@ -509,7 +526,9 @@ class OperatorErrorNotifier:
         self._queue: queue.Queue[tuple[int, str] | None] = queue.Queue(
             maxsize=max(queue_capacity, 1)
         )
-        self._dedupe: dict[tuple[str, str, str, str], float] = {}
+        self._dedupe: dict[
+            tuple[str, str, str, str], tuple[float, object]
+        ] = {}
         self._dedupe_lock = threading.Lock()
         self._closed = threading.Event()
         self._worker = threading.Thread(
@@ -616,32 +635,57 @@ class OperatorErrorNotifier:
 
         code = payload["error_code"]
         key: tuple[str, str, str, str] | None = None
+        reservation: object | None = None
         now = self._clock()
         if code == "provider_rate_limited":
             key = self._dedupe_key(user_id=user_id, payload=payload)
+            reservation = object()
             with self._dedupe_lock:
                 last = self._dedupe.get(key)
-                if last is not None and now - last < self._DEDUPE_WINDOW_SECS:
+                if (
+                    last is not None
+                    and now - last[0] < self._DEDUPE_WINDOW_SECS
+                ):
                     return False
+                self._dedupe[key] = (now, reservation)
 
-        card = self.format_card(
-            user_id=user_id,
-            payload=payload,
-            operator=operator,
-        )
         try:
+            card = self.format_card(
+                user_id=user_id,
+                payload=payload,
+                operator=operator,
+            )
             self._queue.put_nowait((self._operator_user_id, card))
         except queue.Full:
+            self._rollback_reservation(key, reservation)
             print(
                 "[gateway-manager] operator notify dropped reason=queue_full "
                 f"incident_id={payload['incident_id']} error_code={code}",
                 flush=True,
             )
             return False
-        if key is not None:
-            with self._dedupe_lock:
-                self._dedupe[key] = now
+        except Exception as exc:
+            self._rollback_reservation(key, reservation)
+            print(
+                "[gateway-manager] operator notify formatting failed "
+                f"error_class={exc.__class__.__name__} "
+                f"incident_id={payload['incident_id']} error_code={code}",
+                flush=True,
+            )
+            return False
         return True
+
+    def _rollback_reservation(
+        self,
+        key: tuple[str, str, str, str] | None,
+        reservation: object | None,
+    ) -> None:
+        if key is None or reservation is None:
+            return
+        with self._dedupe_lock:
+            current = self._dedupe.get(key)
+            if current is not None and current[1] is reservation:
+                self._dedupe.pop(key, None)
 
     def _post_notify(self, user_id: int, card: str, timeout: float) -> None:
         payload = json.dumps({"user_id": user_id, "message": card}).encode()
@@ -1738,8 +1782,8 @@ class GatewayManagerServer:
                 code="gateway_auth_failed",
                 component="request",
                 retryable=False,
-                error_message="missing or invalid bearer token",
-                hint="Check the gateway credentials",
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
             )
 
         expected_secret = self.settings.webhook_secret
@@ -1749,8 +1793,8 @@ class GatewayManagerServer:
                 code="gateway_auth_failed",
                 component="request",
                 retryable=False,
-                error_message="missing or invalid webhook secret",
-                hint="Check the gateway credentials",
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
             )
 
         try:
@@ -1886,8 +1930,8 @@ class GatewayManagerServer:
                 code="gateway_auth_failed",
                 component="request",
                 retryable=False,
-                error_message="missing or invalid bearer token",
-                hint="Check the gateway credentials",
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
             )
 
         expected_secret = self.settings.webhook_secret
@@ -1897,8 +1941,8 @@ class GatewayManagerServer:
                 code="gateway_auth_failed",
                 component="request",
                 retryable=False,
-                error_message="missing or invalid webhook secret",
-                hint="Check the gateway credentials",
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
             )
 
         user_key = headers.get("x-telegram-user-id", "").strip()
