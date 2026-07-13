@@ -487,20 +487,28 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let (vision_model_provider_box, degrade_strip_images) =
             resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
+        let safe_vision_provider_name = multimodal_config
+            .vision_model_provider
+            .as_deref()
+            .map(zeroclaw_providers::safe_provider_identity);
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,
             &str,
             &str,
         ) = if let Some(ref vp_box) = vision_model_provider_box {
-            let vp_name = multimodal_config
-                .vision_model_provider
+            let vp_name = safe_vision_provider_name
                 .as_deref()
                 .unwrap_or(provider_name);
             let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
             (vp_box.as_ref(), vp_name, vm)
         } else {
             (model_provider, provider_name, model)
+        };
+        let provider_route = if vision_model_provider_box.is_some() {
+            zeroclaw_providers::ProviderRoute::Vision
+        } else {
+            zeroclaw_providers::ProviderRoute::Main
         };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
@@ -574,7 +582,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             active_model,
+            provider_route,
             &prepared_messages.messages,
             request_tools,
             should_consume_provider_stream,

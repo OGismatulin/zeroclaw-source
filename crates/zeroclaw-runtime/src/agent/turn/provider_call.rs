@@ -12,7 +12,10 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{
+    ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch, ProviderRoute,
+    ensure_terminal_provider_failure, runtime_step_timeout_failure,
+};
 
 /// Result of one provider call.
 ///
@@ -162,7 +165,9 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
+    provider_route: ProviderRoute,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
@@ -283,18 +288,24 @@ pub(crate) async fn call_provider(
                         result = tokio::time::timeout(step_timeout, chat_future) => {
                             match result {
                                 Ok(inner) => inner,
-                                Err(_) => anyhow::bail!(
-                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                ),
+                                Err(_) => return Err(runtime_step_timeout_failure(
+                                    active_model_provider_name,
+                                    active_model,
+                                    provider_route,
+                                )),
                             }
                         },
                     }
                 } else {
                     match tokio::time::timeout(step_timeout, chat_future).await {
                         Ok(inner) => inner,
-                        Err(_) => anyhow::bail!(
-                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                        ),
+                        Err(_) => {
+                            return Err(runtime_step_timeout_failure(
+                                active_model_provider_name,
+                                active_model,
+                                provider_route,
+                            ));
+                        }
                     }
                 }
             }
@@ -311,6 +322,21 @@ pub(crate) async fn call_provider(
         }
     };
 
+    let chat_result = chat_result.map_err(|err| {
+        if is_tool_loop_cancelled(&err)
+            || err.downcast_ref::<StreamInterruptedAfterOutput>().is_some()
+        {
+            err
+        } else {
+            ensure_terminal_provider_failure(
+                err,
+                active_model_provider_name,
+                active_model,
+                provider_route,
+            )
+        }
+    });
+
     Ok(ProviderCallOutcome {
         chat_result,
         streamed_live_deltas,
@@ -322,13 +348,18 @@ pub(crate) async fn call_provider(
 #[cfg(test)]
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
-    use super::announce_llm_request;
+    use super::{announce_llm_request, call_provider};
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
+    use futures_util::StreamExt;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{StreamError, StreamEvent, StreamOptions, StreamResult};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_log::LogConfig;
-    use zeroclaw_providers::{ChatMessage, ModelProvider};
+    use zeroclaw_providers::{
+        ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderRoute,
+        terminal_provider_failure,
+    };
 
     /// Minimal provider stub. Only `chat_with_system` is required by
     /// `ModelProvider`; `announce_llm_request` never calls it (it only opens
@@ -357,6 +388,128 @@ mod payload_capture_tests {
         }
     }
 
+    struct FailingChatProvider;
+
+    #[async_trait]
+    impl ModelProvider for FailingChatProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("503 vision backend unavailable")
+        }
+    }
+
+    impl Attributable for FailingChatProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "failing-vision"
+        }
+    }
+
+    struct SlowChatProvider;
+
+    #[async_trait]
+    impl ModelProvider for SlowChatProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            unreachable!("step timeout must fire first")
+        }
+    }
+
+    impl Attributable for SlowChatProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "slow-provider"
+        }
+    }
+
+    struct StreamingFallbackProvider;
+
+    #[async_trait]
+    impl ModelProvider for StreamingFallbackProvider {
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("not used")
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            futures_util::stream::once(async {
+                Err(StreamError::Http("stream transport failed".to_string()))
+            })
+            .boxed()
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("fallback succeeded".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for StreamingFallbackProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "streaming-fallback"
+        }
+    }
+
     fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
         TurnCtx {
             observer,
@@ -377,6 +530,103 @@ mod payload_capture_tests {
             agent_alias: None,
             turn_id: "trace-req-test",
         }
+    }
+
+    #[tokio::test]
+    async fn vision_provider_api_failure_is_typed_with_actual_route_identity() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing);
+        let provider = FailingChatProvider;
+        let messages = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "actual-vision",
+            "vision-model",
+            ProviderRoute::Vision,
+            &messages,
+            None,
+            false,
+            0,
+        )
+        .await
+        .expect("provider call boundary itself should complete");
+        let error = outcome
+            .chat_result
+            .expect_err("vision provider should fail");
+        let terminal = terminal_provider_failure(&error).expect("typed vision terminal failure");
+
+        assert_eq!(terminal.actual_provider(), "actual-vision");
+        assert_eq!(terminal.actual_model(), "vision-model");
+        assert_eq!(terminal.route(), ProviderRoute::Vision);
+        assert_eq!(terminal.attempts_for_call(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_runtime_step_timeout_has_timeout_phase() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig {
+            step_timeout_secs: Some(1),
+            ..PacingConfig::default()
+        };
+        let ctx = test_ctx(&observer, &pacing);
+        let provider = SlowChatProvider;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let error = match call_provider(
+            &ctx,
+            &provider,
+            "actual-main",
+            "main-model",
+            ProviderRoute::Main,
+            &messages,
+            None,
+            false,
+            0,
+        )
+        .await
+        {
+            Ok(_) => panic!("step timeout should end the provider boundary"),
+            Err(error) => error,
+        };
+        let terminal = terminal_provider_failure(&error).expect("typed timeout terminal failure");
+
+        assert_eq!(terminal.actual_provider(), "actual-main");
+        assert_eq!(terminal.actual_model(), "main-model");
+        assert_eq!(terminal.diagnostic().kind(), "timeout");
+        assert_eq!(terminal.diagnostic().phase(), "runtime_step_timeout");
+    }
+
+    #[tokio::test]
+    async fn streaming_error_is_not_wrapped_when_non_streaming_fallback_succeeds() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = test_ctx(&observer, &pacing);
+        let provider = StreamingFallbackProvider;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "actual-main",
+            "main-model",
+            ProviderRoute::Main,
+            &messages,
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("provider call boundary should complete");
+
+        assert_eq!(
+            outcome.chat_result.expect("fallback should succeed").text,
+            Some("fallback succeeded".to_string())
+        );
     }
 
     /// Read the next broadcast `llm_request` record within a 2s deadline,

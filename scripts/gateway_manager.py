@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 import email.parser
 import email.policy
+import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import signal
@@ -22,9 +24,378 @@ import threading
 import time
 from typing import Callable, TextIO, TypedDict
 from urllib import error, request
+from urllib.parse import urlsplit, urlunsplit
 
 
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
+INCIDENT_ID_PATTERN = re.compile(r"^zc-[0-9a-f]{16}$")
+ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
+OPERATOR_TOKEN_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
+_ERROR_COMPONENTS = {"bot", "manager", "daemon", "provider", "request"}
+_OPERATOR_ROUTES = {"main", "vision"}
+
+_PUBLIC_ERROR_STRING_FIELDS = (
+    "provider",
+    "model",
+    "requested_provider",
+    "requested_model",
+)
+_PUBLIC_ERROR_LIST_FIELDS = ("available_providers", "available_models")
+_ALERTABLE_ERROR_CODES = {
+    "provider_initialization_failed",
+    "provider_not_configured",
+    "provider_auth_failed",
+    "provider_rate_limited",
+    "provider_quota_exhausted",
+    "provider_timeout",
+    "provider_unavailable",
+    "provider_model_not_found",
+    "provider_request_rejected",
+    "provider_error",
+    "vision_provider_misconfigured",
+    "daemon_start_failed",
+    "daemon_capacity_exceeded",
+    "child_unreachable",
+    "gateway_timeout",
+    "daemon_internal_error",
+    "manager_internal_error",
+    "upload_failed",
+}
+_MANAGER_FORWARD_ERROR_CODES = {"child_unreachable", "gateway_timeout"}
+_CANONICAL_CHILD_ERRORS: dict[str, tuple[str, str, str, bool]] = {
+    "invalid_request": (
+        "Invalid request",
+        "Check the request and try again",
+        "request",
+        False,
+    ),
+    "gateway_auth_failed": (
+        "Gateway authorization failed",
+        "Check the service authorization configuration",
+        "request",
+        False,
+    ),
+    "webhook_rate_limited": (
+        "Webhook request rate limit exceeded",
+        "Retry after the indicated delay",
+        "request",
+        True,
+    ),
+    "gateway_auth_rate_limited": (
+        "Gateway authorization rate limit exceeded",
+        "Retry after the indicated delay",
+        "request",
+        True,
+    ),
+    "unknown_agent": (
+        "Requested agent is unavailable",
+        "Select an available agent",
+        "request",
+        False,
+    ),
+    "invalid_model": (
+        "Requested model is invalid",
+        "Select an available model",
+        "request",
+        False,
+    ),
+    "missing_model": (
+        "A model is required",
+        "Specify both provider and model",
+        "request",
+        False,
+    ),
+    "missing_provider": (
+        "A provider is required",
+        "Specify both provider and model",
+        "request",
+        False,
+    ),
+    "unknown_provider": (
+        "Requested provider is unavailable",
+        "Select an available provider",
+        "request",
+        False,
+    ),
+    "previous_turn_stuck": (
+        "Previous request is still running",
+        "Retry shortly",
+        "daemon",
+        True,
+    ),
+    "provider_not_configured": (
+        "Provider is not configured",
+        "Select a configured provider",
+        "daemon",
+        False,
+    ),
+    "daemon_internal_error": (
+        "Daemon request failed",
+        "Contact support with the incident ID",
+        "daemon",
+        False,
+    ),
+    "provider_initialization_failed": (
+        "Provider initialization failed",
+        "Select another provider or contact support",
+        "provider",
+        False,
+    ),
+    "vision_not_supported": (
+        "Vision is not supported",
+        "Select a vision-capable model",
+        "provider",
+        False,
+    ),
+    "vision_provider_misconfigured": (
+        "Vision provider is misconfigured",
+        "Select another model or contact support",
+        "provider",
+        False,
+    ),
+    "provider_auth_failed": (
+        "Provider authorization failed",
+        "Select another provider or contact support",
+        "provider",
+        False,
+    ),
+    "provider_rate_limited": (
+        "Provider rate limit exceeded",
+        "Retry after the indicated delay or select another model",
+        "provider",
+        True,
+    ),
+    "provider_quota_exhausted": (
+        "Provider quota exhausted",
+        "Select another provider",
+        "provider",
+        False,
+    ),
+    "provider_timeout": (
+        "Provider request timed out",
+        "Retry the request or select another model",
+        "provider",
+        True,
+    ),
+    "provider_unavailable": (
+        "Provider is unavailable",
+        "Retry the request or select another model",
+        "provider",
+        True,
+    ),
+    "provider_model_not_found": (
+        "Provider model was not found",
+        "Select another model",
+        "provider",
+        False,
+    ),
+    "context_window_exceeded": (
+        "Context window was exceeded",
+        "Start a new session or shorten the request",
+        "provider",
+        False,
+    ),
+    "provider_request_rejected": (
+        "Provider rejected the request",
+        "Check the request or select another model",
+        "provider",
+        False,
+    ),
+    "provider_error": (
+        "Provider request failed",
+        "Retry the request or select another model",
+        "provider",
+        True,
+    ),
+    "child_unreachable": (
+        "Child daemon is unreachable",
+        "Retry shortly",
+        "manager",
+        True,
+    ),
+    "gateway_timeout": (
+        "Gateway timeout forwarding to child daemon",
+        "Retry the request",
+        "manager",
+        True,
+    ),
+}
+
+
+def _new_incident_id() -> str:
+    return f"zc-{secrets.token_hex(8)}"
+
+
+def _bounded_string(value: object, *, limit: int = 200) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    return normalized[:limit]
+
+
+def _safe_log_identity(value: object, *, limit: int = 160) -> str | None:
+    bounded = _bounded_string(value, limit=limit)
+    if bounded is None:
+        return None
+    bounded = re.split(r"[?#]", bounded, maxsplit=1)[0]
+    if re.search(
+        r"(?i)(credential|secret|token|password|bearer|api[_-]?key)", bounded
+    ):
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._:/+\-]", "_", bounded)
+    return safe or None
+
+
+def _bounded_string_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    result: list[str] = []
+    for item in value[:50]:
+        bounded = _bounded_string(item)
+        if bounded is not None:
+            result.append(bounded)
+    return result
+
+
+def build_error_payload(
+    *,
+    code: str,
+    component: str,
+    retryable: bool,
+    error: str,
+    hint: str,
+    incident_id: str | None = None,
+    **optional: object,
+) -> dict[str, object]:
+    """Build the safe public error envelope used at every Manager boundary."""
+    safe_id = (
+        incident_id
+        if isinstance(incident_id, str) and INCIDENT_ID_PATTERN.fullmatch(incident_id)
+        else _new_incident_id()
+    )
+    payload: dict[str, object] = {
+        "error": _bounded_string(error, limit=240) or "ZeroClaw request failed",
+        "error_code": code,
+        "component": component,
+        "retryable": retryable,
+        "hint": _bounded_string(hint, limit=240)
+        or "Contact support with the incident ID",
+        "incident_id": safe_id,
+    }
+    for key in _PUBLIC_ERROR_STRING_FIELDS:
+        bounded = _bounded_string(optional.get(key))
+        if bounded is not None:
+            payload[key] = bounded
+    for key in _PUBLIC_ERROR_LIST_FIELDS:
+        bounded_list = _bounded_string_list(optional.get(key))
+        if bounded_list is not None:
+            payload[key] = bounded_list
+    retry_after = optional.get("retry_after")
+    if (
+        isinstance(retry_after, int)
+        and not isinstance(retry_after, bool)
+        and 0 <= retry_after <= 86_400
+    ):
+        payload["retry_after"] = retry_after
+    return payload
+
+
+def _is_structured_error(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        isinstance(payload.get("error"), str)
+        and isinstance(payload.get("error_code"), str)
+        and bool(ERROR_CODE_PATTERN.fullmatch(payload["error_code"]))
+        and isinstance(payload.get("component"), str)
+        and payload["component"] in _ERROR_COMPONENTS
+        and isinstance(payload.get("retryable"), bool)
+        and isinstance(payload.get("hint"), str)
+        and isinstance(payload.get("incident_id"), str)
+        and bool(INCIDENT_ID_PATTERN.fullmatch(payload["incident_id"]))
+    )
+
+
+def _safe_operator_fields(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    safe: dict[str, object] = {}
+    phase = value.get("phase")
+    if isinstance(phase, str) and OPERATOR_TOKEN_PATTERN.fullmatch(phase):
+        safe["phase"] = phase
+    route = value.get("route")
+    if isinstance(route, str) and route in _OPERATOR_ROUTES:
+        safe["route"] = route
+    endpoint = _bounded_string(value.get("endpoint"), limit=500)
+    if endpoint is not None:
+        safe["endpoint"] = endpoint
+    provider_status = value.get("provider_status")
+    if (
+        isinstance(provider_status, int)
+        and not isinstance(provider_status, bool)
+        and 100 <= provider_status <= 599
+    ):
+        safe["provider_status"] = provider_status
+    attempts = value.get("attempts_for_call")
+    if (
+        isinstance(attempts, int)
+        and not isinstance(attempts, bool)
+        and 1 <= attempts <= 10_000
+    ):
+        safe["attempts_for_call"] = attempts
+    return safe or None
+
+
+def normalize_child_error(
+    status: int, payload: object
+) -> tuple[int, dict[str, object], dict[str, object] | None]:
+    """Normalize an untrusted child error without forwarding raw diagnostics."""
+    if _is_structured_error(payload):
+        assert isinstance(payload, dict)
+        canonical = _CANONICAL_CHILD_ERRORS.get(payload["error_code"])
+        if canonical is None:
+            optional = {
+                key: payload.get(key)
+                for key in (*_PUBLIC_ERROR_STRING_FIELDS, *_PUBLIC_ERROR_LIST_FIELDS)
+            }
+            public = build_error_payload(
+                code="upstream_error",
+                component="daemon",
+                retryable=False,
+                error="Upstream daemon request failed",
+                hint="Contact support with the incident ID",
+                **optional,
+            )
+            return status, public, None
+        error_message, hint, component, retryable = canonical
+        public = build_error_payload(
+            code=payload["error_code"],
+            component=component,
+            retryable=retryable,
+            error=error_message,
+            hint=hint,
+            incident_id=payload["incident_id"],
+            **{key: payload.get(key) for key in _PUBLIC_ERROR_STRING_FIELDS},
+            **{key: payload.get(key) for key in _PUBLIC_ERROR_LIST_FIELDS},
+            retry_after=payload.get("retry_after"),
+        )
+        return status, public, _safe_operator_fields(payload.get("operator"))
+
+    optional: dict[str, object] = {}
+    if isinstance(payload, dict):
+        for key in (*_PUBLIC_ERROR_STRING_FIELDS, *_PUBLIC_ERROR_LIST_FIELDS):
+            optional[key] = payload.get(key)
+    public = build_error_payload(
+        code="upstream_error",
+        component="daemon",
+        retryable=False,
+        error="Upstream daemon request failed",
+        hint="Contact support with the incident ID",
+        **optional,
+    )
+    return status, public, None
 
 
 class DaemonSpawnError(RuntimeError):
@@ -298,6 +669,294 @@ class PairingState:
             return False
         token = authorization.removeprefix("Bearer ").strip()
         return token in self._tokens
+
+
+OperatorTransport = Callable[[int, str, float], None]
+
+
+class OperatorErrorNotifier:
+    """Non-blocking, bounded operator delivery independent of turn progress."""
+
+    _DEDUPE_WINDOW_SECS = 600.0
+    _DEDUPE_MAX_ENTRIES = 1_024
+
+    def __init__(
+        self,
+        *,
+        operator_user_id: str,
+        notify_url: str,
+        notify_secret: str,
+        queue_capacity: int = 128,
+        transport: OperatorTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        normalized_id = (operator_user_id or "").strip()
+        self._operator_user_id = (
+            int(normalized_id) if normalized_id.isdigit() else None
+        )
+        self._notify_url = notify_url.strip()
+        self._notify_secret = notify_secret
+        self._clock = clock
+        self._transport = transport or self._post_notify
+        self._queue: queue.Queue[tuple[int, str] | None] = queue.Queue(
+            maxsize=max(queue_capacity, 1)
+        )
+        self._dedupe: dict[
+            tuple[str, str, str, str], tuple[float, object]
+        ] = {}
+        self._dedupe_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._lifecycle = threading.Condition()
+        self._active_notifications = 0
+        self._worker = threading.Thread(
+            target=self._run,
+            name="operator-error-notifier",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @staticmethod
+    def _escape(value: object, *, limit: int) -> str | None:
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        bounded = _bounded_string(value, limit=limit)
+        return html.escape(bounded, quote=True) if bounded is not None else None
+
+    @staticmethod
+    def _safe_endpoint(value: object) -> str | None:
+        bounded = _bounded_string(value, limit=500)
+        if bounded is None:
+            return None
+        try:
+            parsed = urlsplit(bounded)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            host = parsed.hostname
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            safe = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+        except (ValueError, TypeError):
+            return None
+        return html.escape(safe[:500], quote=True)
+
+    @classmethod
+    def format_card(
+        cls,
+        *,
+        user_id: str | None,
+        payload: dict[str, object],
+        operator: dict[str, object] | None,
+    ) -> str:
+        incident_id = cls._escape(payload.get("incident_id"), limit=32) or "invalid"
+        code = cls._escape(payload.get("error_code"), limit=80) or "upstream_error"
+        component = cls._escape(payload.get("component"), limit=40) or "manager"
+        rows = [
+            "<b>ZeroClaw error</b>",
+            f"Incident: <code>{incident_id}</code>",
+            f"Code: <code>{code}</code>",
+            f"Component: <code>{component}</code>",
+        ]
+        optional_rows = (
+            ("User", user_id, 40),
+            ("Provider", payload.get("provider"), 160),
+            ("Model", payload.get("model"), 160),
+        )
+        for label, value, limit in optional_rows:
+            escaped = cls._escape(value, limit=limit)
+            if escaped is not None:
+                rows.append(f"{label}: <code>{escaped}</code>")
+
+        safe_operator = _safe_operator_fields(operator)
+        if safe_operator:
+            for label, key in (
+                ("Phase", "phase"),
+                ("Status", "provider_status"),
+                ("Attempts", "attempts_for_call"),
+                ("Route", "route"),
+            ):
+                escaped = cls._escape(safe_operator.get(key), limit=80)
+                if escaped is not None:
+                    rows.append(f"{label}: <code>{escaped}</code>")
+            endpoint = cls._safe_endpoint(safe_operator.get("endpoint"))
+            if endpoint is not None:
+                rows.append(f"Endpoint: <code>{endpoint}</code>")
+        return "\n".join(rows)[:2800]
+
+    def _dedupe_key(
+        self, *, user_id: str | None, payload: dict[str, object]
+    ) -> tuple[str, str, str, str]:
+        return (
+            _bounded_string(user_id, limit=40) or "",
+            _bounded_string(payload.get("provider"), limit=160) or "",
+            _bounded_string(payload.get("model"), limit=160) or "",
+            str(payload.get("error_code") or ""),
+        )
+
+    def notify(
+        self,
+        *,
+        user_id: str | None,
+        payload: dict[str, object],
+        operator: dict[str, object] | None,
+    ) -> bool:
+        with self._lifecycle:
+            if (
+                self._closed.is_set()
+                or self._operator_user_id is None
+                or not self._notify_url
+                or not self._notify_secret
+                or not _is_structured_error(payload)
+            ):
+                return False
+            self._active_notifications += 1
+        try:
+            return self._notify_open(
+                user_id=user_id,
+                payload=payload,
+                operator=operator,
+            )
+        finally:
+            with self._lifecycle:
+                self._active_notifications -= 1
+                if self._active_notifications == 0:
+                    self._lifecycle.notify_all()
+
+    def _notify_open(
+        self,
+        *,
+        user_id: str | None,
+        payload: dict[str, object],
+        operator: dict[str, object] | None,
+    ) -> bool:
+        code = payload["error_code"]
+        key: tuple[str, str, str, str] | None = None
+        reservation: object | None = None
+        now = self._clock()
+        if code == "provider_rate_limited":
+            key = self._dedupe_key(user_id=user_id, payload=payload)
+            reservation = object()
+            with self._dedupe_lock:
+                expired = [
+                    stored_key
+                    for stored_key, (stored_at, _marker) in self._dedupe.items()
+                    if now - stored_at >= self._DEDUPE_WINDOW_SECS
+                ]
+                for stored_key in expired:
+                    self._dedupe.pop(stored_key, None)
+                last = self._dedupe.get(key)
+                if (
+                    last is not None
+                    and now - last[0] < self._DEDUPE_WINDOW_SECS
+                ):
+                    return False
+                if (
+                    key not in self._dedupe
+                    and len(self._dedupe) >= self._DEDUPE_MAX_ENTRIES
+                ):
+                    oldest_key = min(
+                        self._dedupe,
+                        key=lambda stored_key: self._dedupe[stored_key][0],
+                    )
+                    self._dedupe.pop(oldest_key, None)
+                self._dedupe[key] = (now, reservation)
+
+        try:
+            card = self.format_card(
+                user_id=user_id,
+                payload=payload,
+                operator=operator,
+            )
+            self._queue.put_nowait((self._operator_user_id, card))
+        except queue.Full:
+            self._rollback_reservation(key, reservation)
+            print(
+                "[gateway-manager] operator notify dropped reason=queue_full "
+                f"incident_id={payload['incident_id']} error_code={code}",
+                flush=True,
+            )
+            return False
+        except Exception as exc:
+            self._rollback_reservation(key, reservation)
+            print(
+                "[gateway-manager] operator notify formatting failed "
+                f"error_class={exc.__class__.__name__} "
+                f"incident_id={payload['incident_id']} error_code={code}",
+                flush=True,
+            )
+            return False
+        return True
+
+    def _rollback_reservation(
+        self,
+        key: tuple[str, str, str, str] | None,
+        reservation: object | None,
+    ) -> None:
+        if key is None or reservation is None:
+            return
+        with self._dedupe_lock:
+            current = self._dedupe.get(key)
+            if current is not None and current[1] is reservation:
+                self._dedupe.pop(key, None)
+
+    def _post_notify(self, user_id: int, card: str, timeout: float) -> None:
+        payload = json.dumps({"user_id": user_id, "message": card}).encode()
+        req = request.Request(
+            url=self._notify_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Secret": self._notify_secret,
+            },
+        )
+        with request.urlopen(req, timeout=timeout):
+            pass
+
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._closed.is_set():
+                    return
+                continue
+            try:
+                if item is None:
+                    return
+                user_id, card = item
+                try:
+                    self._transport(user_id, card, 2.0)
+                except Exception as exc:
+                    print(
+                        "[gateway-manager] operator notify failed "
+                        f"error_class={exc.__class__.__name__}",
+                        flush=True,
+                    )
+            finally:
+                self._queue.task_done()
+
+    def wait_until_idle(self, *, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.005)
+        return self._queue.unfinished_tasks == 0
+
+    def close(self) -> None:
+        with self._lifecycle:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            while self._active_notifications:
+                self._lifecycle.wait()
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+        self._worker.join()
 
 
 class WorkspaceBootstrapper:
@@ -1164,11 +1823,158 @@ class GatewayManagerServer:
         pairing_state: PairingState,
         registry: GatewayRegistry | object | None,
         forward_webhook: Callable[..., tuple[int, dict[str, object]]],
+        operator_error_notifier: OperatorErrorNotifier | object | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
         self.registry = registry
         self.forward_webhook = forward_webhook
+        self.operator_error_notifier = operator_error_notifier
+
+    def finalize_error(
+        self,
+        *,
+        status_code: int,
+        payload: dict[str, object],
+        user_id: str | None,
+        manager_classified: bool,
+        operator: dict[str, object] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        """Log, alert, and return one already-safe public error response."""
+        public = payload.copy()
+        public.pop("operator", None)
+        role = "primary" if manager_classified else "echo"
+        log_fields: list[tuple[str, object]] = [
+            ("error_role", role),
+            ("incident_id", public.get("incident_id", "")),
+            ("error_code", public.get("error_code", "")),
+            ("component", public.get("component", "")),
+        ]
+        for key, value in (
+            ("user", user_id),
+            ("provider", public.get("provider")),
+            ("model", public.get("model")),
+        ):
+            bounded = (
+                _bounded_string(value, limit=160)
+                if key == "user"
+                else _safe_log_identity(value)
+            )
+            if bounded is not None:
+                log_fields.append((key, bounded))
+        safe_operator = _safe_operator_fields(operator)
+        if safe_operator:
+            for key in (
+                "phase",
+                "provider_status",
+                "attempts_for_call",
+                "endpoint",
+                "route",
+            ):
+                value = safe_operator.get(key)
+                if value is not None:
+                    if key == "endpoint":
+                        value = OperatorErrorNotifier._safe_endpoint(value)
+                    if value is None:
+                        continue
+                    log_fields.append((key, value))
+        print(
+            "[gateway-manager] error "
+            + " ".join(f"{key}={value}" for key, value in log_fields),
+            flush=True,
+        )
+
+        code = public.get("error_code")
+        notifier = self.operator_error_notifier
+        if (
+            code in _ALERTABLE_ERROR_CODES
+            and notifier is not None
+            and hasattr(notifier, "notify")
+        ):
+            try:
+                notifier.notify(
+                    user_id=user_id,
+                    payload=public,
+                    operator=safe_operator,
+                )
+            except Exception as exc:
+                print(
+                    "[gateway-manager] operator notify enqueue failed "
+                    f"error_class={exc.__class__.__name__} "
+                    f"incident_id={public.get('incident_id', '')} "
+                    f"error_code={code}",
+                    flush=True,
+                )
+        return status_code, public
+
+    def _manager_error(
+        self,
+        *,
+        status_code: int,
+        code: str,
+        component: str,
+        retryable: bool,
+        error_message: str,
+        hint: str,
+        user_id: str | None = None,
+        **optional: object,
+    ) -> tuple[int, dict[str, object]]:
+        return self.finalize_error(
+            status_code=status_code,
+            payload=build_error_payload(
+                code=code,
+                component=component,
+                retryable=retryable,
+                error=error_message,
+                hint=hint,
+                **optional,
+            ),
+            user_id=user_id,
+            manager_classified=True,
+        )
+
+    def handle_upload_rejection(
+        self, *, status_code: int
+    ) -> tuple[int, dict[str, object]]:
+        return self._manager_error(
+            status_code=status_code,
+            code="upload_rejected",
+            component="request",
+            retryable=False,
+            error_message="Upload was rejected",
+            hint="Check the file size and request format",
+        )
+
+    def handle_request_rejection(self) -> tuple[int, dict[str, object]]:
+        return self._manager_error(
+            status_code=400,
+            code="invalid_request",
+            component="request",
+            retryable=False,
+            error_message="Invalid request",
+            hint="Check the request and try again",
+        )
+
+    def handle_internal_error(
+        self, path: str, _exc: Exception
+    ) -> tuple[int, dict[str, object]]:
+        if path.startswith("/upload"):
+            return self._manager_error(
+                status_code=500,
+                code="upload_failed",
+                component="manager",
+                retryable=True,
+                error_message="Upload failed",
+                hint="Retry the upload or contact support with the incident ID",
+            )
+        return self._manager_error(
+            status_code=500,
+            code="manager_internal_error",
+            component="manager",
+            retryable=False,
+            error_message="Gateway Manager failed",
+            hint="Contact support with the incident ID",
+        )
 
     def handle_health(self) -> tuple[int, dict[str, object]]:
         known = 0
@@ -1197,34 +2003,103 @@ class GatewayManagerServer:
         body: bytes,
     ) -> tuple[int, dict[str, object]]:
         if not self.pairing_state.is_authorized(headers.get("authorization")):
-            return 401, {"error": "missing or invalid bearer token"}
+            return self._manager_error(
+                status_code=401,
+                code="gateway_auth_failed",
+                component="request",
+                retryable=False,
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
+            )
 
         expected_secret = self.settings.webhook_secret
         if expected_secret and headers.get("x-webhook-secret") != expected_secret:
-            return 403, {"error": "missing or invalid webhook secret"}
+            return self._manager_error(
+                status_code=403,
+                code="gateway_auth_failed",
+                component="request",
+                retryable=False,
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
+            )
 
         try:
             payload = json.loads(body.decode())
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return 400, {"error": "invalid webhook payload"}
+            return self._manager_error(
+                status_code=400,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="Invalid webhook request",
+                hint="Check the request body",
+            )
+
+        if not isinstance(payload, dict):
+            return self._manager_error(
+                status_code=400,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="Invalid webhook request",
+                hint="Send a JSON object",
+            )
 
         message = payload.get("message")
         if not isinstance(message, str) or not message.strip():
-            return 400, {"error": "webhook payload requires a non-empty message"}
+            return self._manager_error(
+                status_code=400,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="Invalid webhook request",
+                hint="Provide a non-empty message",
+            )
 
         user_key = self._extract_user_key(headers=headers, message=message)
         if user_key is None:
-            return 400, {"error": "telegram routing identity is required"}
+            return self._manager_error(
+                status_code=400,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="telegram routing identity is required",
+                hint="Provide the Telegram routing identity",
+            )
+        user_id = user_key.removeprefix("tg_")
         if self.registry is None or not hasattr(self.registry, "ensure_instance"):
-            raise RuntimeError("manager registry is not configured")
+            return self.handle_internal_error(
+                "/webhook", RuntimeError("manager registry is not configured")
+            )
 
         try:
             instance = self.registry.ensure_instance(user_key)
-        except (DaemonSpawnError, DaemonCapacityError) as exc:
-            return 503, {"error": str(exc)}
-        forwarded_headers = {
-            "X-Webhook-Secret": headers["x-webhook-secret"],
-        }
+        except DaemonSpawnError:
+            return self._manager_error(
+                status_code=503,
+                code="daemon_start_failed",
+                component="manager",
+                retryable=True,
+                error_message="Personal daemon failed to start",
+                hint="Retry shortly or contact support with the incident ID",
+                user_id=user_id,
+            )
+        except DaemonCapacityError:
+            return self._manager_error(
+                status_code=503,
+                code="daemon_capacity_exceeded",
+                component="manager",
+                retryable=True,
+                error_message="max instances reached",
+                hint="Retry shortly",
+                user_id=user_id,
+            )
+        except Exception as exc:
+            return self.handle_internal_error("/webhook", exc)
+        forwarded_headers: dict[str, str] = {}
+        webhook_secret = headers.get("x-webhook-secret")
+        if webhook_secret:
+            forwarded_headers["X-Webhook-Secret"] = webhook_secret
         idempotency_key = headers.get("x-idempotency-key")
         if idempotency_key:
             forwarded_headers["X-Idempotency-Key"] = idempotency_key
@@ -1232,7 +2107,34 @@ class GatewayManagerServer:
         if session_id:
             forwarded_headers["X-Session-Id"] = session_id
 
-        return self.forward_webhook(instance, headers=forwarded_headers, body=body)
+        try:
+            status_code, child_payload = self.forward_webhook(
+                instance, headers=forwarded_headers, body=body
+            )
+        except Exception as exc:
+            return self.handle_internal_error("/webhook", exc)
+        if status_code < 400:
+            return status_code, child_payload
+
+        child_was_known = (
+            _is_structured_error(child_payload)
+            and isinstance(child_payload, dict)
+            and child_payload.get("error_code") in _CANONICAL_CHILD_ERRORS
+        )
+        normalized_status, public, operator = normalize_child_error(
+            status_code, child_payload
+        )
+        code = public.get("error_code")
+        manager_classified = (
+            not child_was_known or code in _MANAGER_FORWARD_ERROR_CODES
+        )
+        return self.finalize_error(
+            status_code=normalized_status,
+            payload=public,
+            user_id=user_id,
+            manager_classified=manager_classified,
+            operator=operator,
+        )
 
     @staticmethod
     def _extract_user_key(*, headers: dict[str, str], message: str) -> str | None:
@@ -1253,20 +2155,38 @@ class GatewayManagerServer:
         content_type: str,
     ) -> tuple[int, dict[str, object]]:
         if not self.pairing_state.is_authorized(headers.get("authorization")):
-            return 401, {"error": "missing or invalid bearer token"}
+            return self._manager_error(
+                status_code=401,
+                code="gateway_auth_failed",
+                component="request",
+                retryable=False,
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
+            )
 
         expected_secret = self.settings.webhook_secret
         if expected_secret and headers.get("x-webhook-secret") != expected_secret:
-            return 403, {"error": "missing or invalid webhook secret"}
+            return self._manager_error(
+                status_code=403,
+                code="gateway_auth_failed",
+                component="request",
+                retryable=False,
+                error_message="Gateway authorization failed",
+                hint="Check the service authorization configuration",
+            )
 
         user_key = headers.get("x-telegram-user-id", "").strip()
         if not user_key.isdigit():
-            return 400, {"error": "X-Telegram-User-Id header is required"}
+            return self.handle_upload_rejection(status_code=400)
+        user_id = user_key
         user_key = f"tg_{user_key}"
 
-        parsed = parse_multipart(body, content_type)
+        try:
+            parsed = parse_multipart(body, content_type)
+        except Exception:
+            return self.handle_upload_rejection(status_code=400)
         if parsed is None:
-            return 400, {"error": "no file in upload request"}
+            return self.handle_upload_rejection(status_code=400)
 
         file_data: bytes = parsed["file_data"]  # type: ignore[assignment]
         original_name: str = parsed["filename"]  # type: ignore[assignment]
@@ -1278,14 +2198,25 @@ class GatewayManagerServer:
         uploads_dir = (
             self.settings.workspaces_root / user_key / "workspace" / "uploads"
         )
-        uploads_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            uploads_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_name = sanitize_filename(original_name)
-        stem = Path(safe_name).stem
-        suffix = Path(safe_name).suffix
-        unique_name = f"{stem}_{secrets.token_hex(3)}{suffix}"
-        dest = uploads_dir / unique_name
-        dest.write_bytes(file_data)
+            safe_name = sanitize_filename(original_name)
+            stem = Path(safe_name).stem
+            suffix = Path(safe_name).suffix
+            unique_name = f"{stem}_{secrets.token_hex(3)}{suffix}"
+            dest = uploads_dir / unique_name
+            dest.write_bytes(file_data)
+        except (OSError, ValueError):
+            return self._manager_error(
+                status_code=500,
+                code="upload_failed",
+                component="manager",
+                retryable=True,
+                error_message="Upload failed",
+                hint="Retry the upload or contact support with the incident ID",
+                user_id=user_id,
+            )
 
         print(f"[gateway-manager] upload: {unique_name} ({len(file_data)} bytes) for {user_key}", flush=True)
 
@@ -2142,14 +3073,35 @@ def forward_webhook_to_child(
             payload = json.loads(response.read().decode())
             return response.status, payload
     except error.HTTPError as exc:
-        payload = json.loads(exc.read().decode())
+        try:
+            payload = json.loads(exc.read().decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {"error": "malformed child error"}
         return exc.code, payload
     except error.URLError as exc:
         if isinstance(exc.reason, TimeoutError):
-            return 504, {"error": "gateway timeout forwarding to child daemon"}
-        return 502, {"error": f"child unreachable: {exc.reason}"}
+            return 504, build_error_payload(
+                code="gateway_timeout",
+                component="manager",
+                retryable=True,
+                error="gateway timeout forwarding to child daemon",
+                hint="Retry the request",
+            )
+        return 502, build_error_payload(
+            code="child_unreachable",
+            component="manager",
+            retryable=True,
+            error="Child daemon is unreachable",
+            hint="Retry shortly",
+        )
     except TimeoutError:
-        return 504, {"error": "gateway timeout forwarding to child daemon"}
+        return 504, build_error_payload(
+            code="gateway_timeout",
+            component="manager",
+            retryable=True,
+            error="gateway timeout forwarding to child daemon",
+            hint="Retry the request",
+        )
 
 
 def _raise_keyboard_interrupt(_signum: int, _frame: object | None) -> None:
@@ -2187,6 +3139,11 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     )
     fallback_state: dict[str, float] = {}
     fallback_lock = threading.Lock()
+    operator_error_notifier = OperatorErrorNotifier(
+        operator_user_id=operator_user_id,
+        notify_url=notify_url,
+        notify_secret=notify_secret,
+    )
 
     def _forward(
         instance: DaemonInstance,
@@ -2226,6 +3183,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         pairing_state=pairing_state,
         registry=registry,
         forward_webhook=_forward,
+        operator_error_notifier=operator_error_notifier,
     )
 
 
@@ -2244,63 +3202,80 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            if self.path != "/health":
-                self._write_json(404, {"error": "not found"})
-                return
-            status_code, payload = self.server.app.handle_health()
-            self._write_json(status_code, payload)
+            status_code, payload = self._dispatch_get()
         except Exception as exc:
-            print(f"[gateway-manager] unhandled error in GET: {exc}", flush=True)
-            self._write_json(500, {"error": "internal server error"})
+            status_code, payload = self.server.app.handle_internal_error(
+                self.path, exc
+            )
+        self._write_json_safely(status_code, payload)
+
+    def _dispatch_get(self) -> tuple[int, dict[str, object]]:
+        if self.path != "/health":
+            return self.server.app._manager_error(
+                status_code=404,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="Route not found",
+                hint="Check the request path",
+            )
+        return self.server.app.handle_health()
 
     def do_POST(self) -> None:
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-
-            # Early reject for /upload exceeding size limit
-            if self.path == "/upload" and content_length > MAX_UPLOAD_SIZE:
-                self._write_json(413, {"error": "file exceeds 20 MB limit"})
-                return
-
-            body = self.rfile.read(content_length) if content_length else b""
-            headers = {key.lower(): value for key, value in self.headers.items()}
-
-            if self.path == "/pair":
-                status_code, payload = self.server.app.handle_pair(headers)
-                self._write_json(status_code, payload)
-                return
-
-            if self.path == "/webhook":
-                status_code, payload = self.server.app.handle_webhook(
-                    headers=headers,
-                    body=body,
-                )
-                self._write_json(status_code, payload)
-                return
-
-            if self.path == "/upload":
-                content_type = headers.get("content-type", "")
-                status_code, payload = self.server.app.handle_upload(
-                    headers=headers,
-                    body=body,
-                    content_type=content_type,
-                )
-                self._write_json(status_code, payload)
-                return
-
-            if self.path == "/warmup":
-                status_code, payload = self.server.app.handle_warmup(
-                    headers=headers,
-                    body=body,
-                )
-                self._write_json(status_code, payload)
-                return
+            status_code, payload = self._dispatch_post()
         except Exception as exc:
-            print(f"[gateway-manager] unhandled error in POST: {exc}", flush=True)
-            self._write_json(500, {"error": "internal server error"})
-            return
+            status_code, payload = self.server.app.handle_internal_error(
+                self.path, exc
+            )
+        self._write_json_safely(status_code, payload)
 
-        self._write_json(404, {"error": "not found"})
+    def _dispatch_post(self) -> tuple[int, dict[str, object]]:
+        raw_content_length = self.headers.get("Content-Length", "0")
+        try:
+            content_length = int(raw_content_length)
+        except (TypeError, ValueError):
+            return self._reject_content_length(status_code=400)
+        if content_length < 0:
+            return self._reject_content_length(status_code=400)
+        if content_length > MAX_UPLOAD_SIZE:
+            status_code = 413 if self.path == "/upload" else 400
+            return self._reject_content_length(status_code=status_code)
+
+        body = self.rfile.read(content_length) if content_length else b""
+        headers = {key.lower(): value for key, value in self.headers.items()}
+
+        if self.path == "/pair":
+            return self.server.app.handle_pair(headers)
+
+        if self.path == "/webhook":
+            return self.server.app.handle_webhook(headers=headers, body=body)
+
+        if self.path == "/upload":
+            return self.server.app.handle_upload(
+                headers=headers,
+                body=body,
+                content_type=headers.get("content-type", ""),
+            )
+
+        if self.path == "/warmup":
+            return self.server.app.handle_warmup(headers=headers, body=body)
+
+        return self.server.app._manager_error(
+            status_code=404,
+            code="invalid_request",
+            component="request",
+            retryable=False,
+            error_message="Route not found",
+            hint="Check the request path",
+        )
+
+    def _reject_content_length(
+        self, *, status_code: int
+    ) -> tuple[int, dict[str, object]]:
+        if self.path == "/upload":
+            return self.server.app.handle_upload_rejection(status_code=status_code)
+        return self.server.app.handle_request_rejection()
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -2312,6 +3287,19 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _write_json_safely(
+        self, status_code: int, payload: dict[str, object]
+    ) -> None:
+        try:
+            self._write_json(status_code, payload)
+        except Exception as exc:
+            path = _safe_log_identity(self.path, limit=160) or "unknown"
+            print(
+                "[gateway-manager] response write failed "
+                f"path={path} error_class={exc.__class__.__name__}",
+                flush=True,
+            )
 
 
 def main() -> int:
@@ -2334,6 +3322,9 @@ def main() -> int:
         registry = app.registry
         if registry is not None and hasattr(registry, "stop_all"):
             registry.stop_all()
+        notifier = app.operator_error_notifier
+        if notifier is not None and hasattr(notifier, "close"):
+            notifier.close()
     return 0
 
 

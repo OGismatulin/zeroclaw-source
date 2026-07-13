@@ -1316,10 +1316,9 @@ async fn safety_net_agent_turn_error_path_keeps_executed_rounds() {
         .turn("do work then fail")
         .await
         .expect_err("second provider call is scripted to fail");
-    assert!(
-        err.to_string().contains("provider 500"),
-        "unexpected error: {err}"
-    );
+    let terminal = zeroclaw_providers::terminal_provider_failure(&err)
+        .expect("actual provider-call failure remains typed");
+    assert_eq!(terminal.diagnostic().kind(), "provider_server");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
