@@ -2479,6 +2479,37 @@ struct GatewayChatOutcome {
     cost_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NeedsQuickstart {
+    message: &'static str,
+}
+
+impl NeedsQuickstart {
+    const fn no_model() -> Self {
+        Self {
+            message: "needs_quickstart: gateway has no model configured. Complete \
+                      browser quickstart at /quickstart, or set \
+                      [providers.models.<type>.<alias>] model = \"...\" before sending messages.",
+        }
+    }
+
+    const fn unconfigured_provider() -> Self {
+        Self {
+            message: "needs_quickstart: gateway booted without a working model_provider. \
+                      Complete browser quickstart at /quickstart, or fix \
+                      [providers.models.<type>.<alias>] and POST /admin/reload.",
+        }
+    }
+}
+
+impl std::fmt::Display for NeedsQuickstart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for NeedsQuickstart {}
+
 struct UnconfiguredModelProvider;
 
 #[async_trait::async_trait]
@@ -2490,11 +2521,7 @@ impl ModelProvider for UnconfiguredModelProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        anyhow::bail!(
-            "needs_quickstart: gateway booted without a working model_provider. \
-             Complete browser quickstart at /quickstart, or fix \
-             [providers.models.<type>.<alias>] and POST /admin/reload."
-        )
+        Err(anyhow::Error::new(NeedsQuickstart::unconfigured_provider()))
     }
 }
 
@@ -2525,11 +2552,7 @@ fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure),
             "gateway dispatch refused: no model configured (browser quickstart incomplete)"
         );
-        Some(anyhow::Error::msg(
-            "needs_quickstart: gateway has no model configured. Complete \
-             browser quickstart at /quickstart, or set [providers.models.<type>.<alias>] \
-             model = \"...\" before sending messages.",
-        ))
+        Some(anyhow::Error::new(NeedsQuickstart::no_model()))
     } else {
         None
     }
@@ -2540,7 +2563,7 @@ fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
 /// `needs_quickstart` HTTP response or a more accurate channel-side
 /// reply, instead of the generic 500 / "sorry" catch-all.
 fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
-    e.to_string().contains("needs_quickstart")
+    e.downcast_ref::<NeedsQuickstart>().is_some()
 }
 
 /// Reply text sent over a channel SDK when chat dispatch refuses
@@ -2686,6 +2709,9 @@ async fn run_gateway_webhook_agentic(
     session_id: Option<&str>,
     cancel_handle: Option<(u64, tokio_util::sync::CancellationToken)>,
 ) -> anyhow::Result<TurnOutcome> {
+    if let Some(error) = needs_quickstart_for(model_name) {
+        return Err(error);
+    }
     let config = state.config.read().clone();
     // fork (V3 multi-agent): the webhook always runs the default runtime
     // agent — its risk/runtime profiles supply what used to live in the
@@ -7402,8 +7428,11 @@ mod tests {
     /// `gateway start requires at least one configured [agents.<alias>]
     /// entry`, which crashed the daemon supervisor before the reload
     /// channel could be exercised.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
         // Isolate data_dir so parallel nextest runs don't race on the
         // real ~/.zeroclaw/data (see #7054).
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7467,8 +7496,11 @@ mod tests {
     /// and `/quickstart` — the exact endpoints they need to fix the broken
     /// risk_profile reference. The fix degrades gracefully: warn,
     /// fall through to an empty tools registry, keep serving.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
@@ -7517,8 +7549,11 @@ mod tests {
         handle.abort();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
         let mut config = Config::default();
         config.providers.models.anthropic.insert(
             "default".to_string(),
@@ -7559,8 +7594,11 @@ mod tests {
         handle.abort();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_gateway_uses_external_shutdown_sender() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -8519,6 +8557,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_structured_error_shape(
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            &parsed,
+            "unknown_agent",
+            false,
+        );
         assert_eq!(parsed["error"], "Unknown agent");
         assert_eq!(parsed["error_code"], "unknown_agent");
         assert_eq!(parsed["component"], "request");
@@ -10090,34 +10135,67 @@ mod tests {
         assert!(!t_b.is_cancelled(), "B is freshly registered");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn webhook_lock_timeout_returns_503() {
+    async fn webhook_lock_timeout_returns_structured_503_with_one_primary_event() {
         // If the per-daemon webhook_session mutex is held past the configured
-        // timeout, run_gateway_webhook_agentic must surface "previous_turn_stuck"
-        // (handle_webhook then maps that to HTTP 503).
+        // timeout, the real handler must map the typed marker to a correlated
+        // structured 503 and exactly one canonical primary event.
         let provider_impl = Arc::new(MockModelProvider::default());
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-        let state = make_test_state(provider.clone(), memory);
-        // make_test_state hard-codes webhook_lock_timeout_secs = 1 (see Task 6).
+        let mut state = make_test_state(provider, memory);
+        state.webhook_lock_timeout_secs = 0;
 
         // Manually hold the webhook_session lock to simulate a stuck M1.
         let _guard = state.webhook_session.lock().await;
 
-        let outcome = run_gateway_webhook_agentic(
-            &state,
-            provider.as_ref(),
-            "mock",
-            "test-model",
-            None,
-            "hello",
-            Some("tg_user_99999"),
-            None,
-        )
-        .await;
+        // Install capture only after the lock is held. The shared hook guard
+        // serializes temporary gateway servers, while a zero timeout removes
+        // any unrelated scheduling delay from this handler regression.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
 
-        assert!(outcome.is_err());
-        assert_eq!(outcome.unwrap_err().to_string(), "previous_turn_stuck");
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                model: None,
+                provider: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_structured_error_shape(
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            "previous_turn_stuck",
+            true,
+        );
+        let incident_id = body["incident_id"].as_str().unwrap();
+        let primary: Vec<serde_json::Value> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| event["attributes"]["error_role"] == "primary")
+            .collect();
+        assert_eq!(primary.len(), 1, "primary events: {primary:?}");
+        assert_eq!(primary[0]["event"]["action"], "fail");
+        assert_eq!(primary[0]["event"]["category"], "agent");
+        assert_eq!(primary[0]["attributes"]["incident_id"], incident_id);
+        assert_eq!(
+            primary[0]["attributes"]["error_code"],
+            "previous_turn_stuck"
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]
@@ -10425,9 +10503,16 @@ mod tests {
     #[test]
     fn is_needs_quickstart_err_detects_marker_from_helper() {
         let err = needs_quickstart_for("").expect("empty model produces marker");
+        assert!(err.downcast_ref::<NeedsQuickstart>().is_some());
         assert!(
             is_needs_quickstart_err(&err),
             "the marker emitted by needs_quickstart_for must be detected"
+        );
+
+        let wrapped = err.context("outer dispatch context");
+        assert!(
+            is_needs_quickstart_err(&wrapped),
+            "typed marker must survive anyhow context"
         );
     }
 
@@ -10443,13 +10528,44 @@ mod tests {
     }
 
     #[test]
-    fn is_needs_quickstart_err_detects_via_substring() {
-        // Defends the contract that the substring marker is the
-        // detection key — not the exact string. Wrappers (e.g.
-        // anyhow::Error::context) must not break the check.
-        let err =
-            anyhow::Error::msg("provider call failed").context("needs_quickstart: empty model");
-        assert!(is_needs_quickstart_err(&err));
+    fn is_needs_quickstart_err_rejects_literal_marker_text_without_type() {
+        let err = anyhow::Error::msg("needs_quickstart: arbitrary provider text");
+        assert!(!is_needs_quickstart_err(&err));
+        let wrapped = anyhow::Error::msg("provider call failed")
+            .context("needs_quickstart: arbitrary outer context");
+        assert!(!is_needs_quickstart_err(&wrapped));
+    }
+
+    #[tokio::test]
+    async fn webhook_quickstart_returns_structured_provider_not_configured() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(UnconfiguredModelProvider);
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = fresh_model_test_state(provider, memory, "unconfigured", "");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                model: None,
+                provider: None,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_structured_error_shape(
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+            "provider_not_configured",
+            false,
+        );
     }
 
     #[test]
