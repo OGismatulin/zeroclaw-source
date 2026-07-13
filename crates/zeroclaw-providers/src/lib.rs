@@ -925,6 +925,10 @@ impl ProviderHttpError {
     pub(crate) const fn retry_after_secs(&self) -> Option<u64> {
         self.retry_after_secs
     }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 impl std::fmt::Display for ProviderHttpError {

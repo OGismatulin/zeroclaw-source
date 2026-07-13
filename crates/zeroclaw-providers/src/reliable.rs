@@ -92,15 +92,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        let code = status.as_u16();
-        return status.is_client_error() && code != 429 && code != 408;
+    if let Some(code) = typed_http_status(err) {
+        return (400..500).contains(&code) && code != 429 && code != 408;
     }
     // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
-    let msg = err.to_string();
+    let msg = error_chain_text(err);
     for word in msg.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = word.parse::<u16>()
             && (400..500).contains(&code)
@@ -145,14 +142,11 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 /// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution.
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        let code = status.as_u16();
+    if let Some(code) = typed_http_status(err) {
         return code == 401 || code == 403;
     }
 
-    let msg_lower = err.to_string().to_lowercase();
+    let msg_lower = error_chain_text(err).to_lowercase();
     let hints = [
         "401 unauthorized",
         "403 forbidden",
@@ -175,13 +169,20 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
 /// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
 /// can recover by switching to prompt-guided tool instructions.
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
     let hints = [
         "tool call validation failed",
         "was not in request",
         "not found in tool list",
         "invalid_tool_call",
     ];
+    if typed_provider_http_error(err).is_some_and(|provider_err| {
+        let lower = provider_err.detail().to_lowercase();
+        hints.iter().any(|hint| lower.contains(hint))
+    }) {
+        return true;
+    }
+
+    let lower = error_chain_text(err).to_lowercase();
     hints.iter().any(|hint| lower.contains(hint))
 }
 
@@ -192,7 +193,6 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
         "exceeds the available context size",
@@ -205,18 +205,23 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "input is too long",
         "prompt exceeds max length",
     ];
+    if typed_provider_http_error(err).is_some_and(|provider_err| {
+        let lower = provider_err.detail().to_lowercase();
+        hints.iter().any(|hint| lower.contains(hint))
+    }) {
+        return true;
+    }
 
+    let lower = error_chain_text(err).to_lowercase();
     hints.iter().any(|hint| lower.contains(hint))
 }
 
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
-        && let Some(status) = reqwest_err.status()
-    {
-        return status.as_u16() == 429;
+    if let Some(code) = typed_http_status(err) {
+        return code == 429;
     }
-    let msg = err.to_string();
+    let msg = error_chain_text(err);
     msg.contains("429")
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
@@ -231,9 +236,6 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     if !is_rate_limited(err) {
         return false;
     }
-
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
 
     let business_hints = [
         "plan does not include",
@@ -251,20 +253,25 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         "model not available for your plan",
     ];
 
-    if business_hints.iter().any(|hint| lower.contains(hint)) {
+    fn matches_business_failure(lower: &str, business_hints: &[&str]) -> bool {
+        if business_hints.iter().any(|hint| lower.contains(hint)) {
+            return true;
+        }
+
+        lower.split(|c: char| !c.is_ascii_digit()).any(|token| {
+            token
+                .parse::<u16>()
+                .is_ok_and(|code| matches!(code, 1113 | 1311))
+        })
+    }
+
+    if typed_provider_http_error(err).is_some_and(|provider_err| {
+        matches_business_failure(&provider_err.detail().to_lowercase(), &business_hints)
+    }) {
         return true;
     }
 
-    // Known model_provider business codes observed for 429 where retry is futile.
-    for token in lower.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = token.parse::<u16>()
-            && matches!(code, 1113 | 1311)
-        {
-            return true;
-        }
-    }
-
-    false
+    matches_business_failure(&error_chain_text(err).to_lowercase(), &business_hints)
 }
 
 const MAX_RETRY_AFTER_SECS: f64 = 86_400.0;
@@ -591,12 +598,26 @@ fn terminal_provider_error(
 }
 
 fn typed_http_status(err: &anyhow::Error) -> Option<u16> {
-    err.downcast_ref::<super::ProviderHttpError>()
+    typed_provider_http_error(err)
         .map(|provider_err| provider_err.status().as_u16())
         .or_else(|| {
-            err.downcast_ref::<reqwest::Error>()
+            typed_reqwest_error(err)
                 .and_then(|reqwest_err| reqwest_err.status().map(|status| status.as_u16()))
         })
+}
+
+fn typed_provider_http_error(err: &anyhow::Error) -> Option<&super::ProviderHttpError> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<super::ProviderHttpError>())
+}
+
+fn typed_reqwest_error(err: &anyhow::Error) -> Option<&reqwest::Error> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<reqwest::Error>())
+}
+
+fn error_chain_text(err: &anyhow::Error) -> String {
+    format!("{err:#}")
 }
 
 /// Legacy text-only providers still need status-shaped classification for
@@ -609,8 +630,7 @@ fn legacy_http_status_for_classification(error_detail: &str) -> Option<u16> {
 }
 
 fn typed_retry_after_secs(err: &anyhow::Error) -> Option<u64> {
-    err.downcast_ref::<super::ProviderHttpError>()
-        .and_then(super::ProviderHttpError::retry_after_secs)
+    typed_provider_http_error(err).and_then(super::ProviderHttpError::retry_after_secs)
 }
 
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
@@ -636,8 +656,7 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
-    let endpoint = err
-        .downcast_ref::<reqwest::Error>()
+    let endpoint = typed_reqwest_error(err)
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
     let status = typed_http_status(err);
@@ -720,7 +739,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+    if let Some(reqwest_err) = typed_reqwest_error(err) {
         if let Some(status) = reqwest_err.status() {
             let code = status.as_u16();
             let (kind, hint) = if status.is_server_error() {
@@ -2839,53 +2858,174 @@ mod tests {
     }
 
     #[test]
-    fn public_http_metadata_comes_from_typed_boundary_and_retry_after_is_rate_limit_only() {
+    fn wrapped_typed_http_errors_keep_classification_and_retry_after_gating() {
         let cases = [
             (
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 "retry later",
+                "rate_limited",
                 ProviderErrorDisposition::RateLimited,
                 Some(12),
             ),
             (
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 "insufficient quota",
+                "rate_limited",
+                ProviderErrorDisposition::RateLimitedNonRetryable,
+                None,
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"code":1311,"message":"package unavailable"}"#,
+                "rate_limited",
                 ProviderErrorDisposition::RateLimitedNonRetryable,
                 None,
             ),
             (
                 reqwest::StatusCode::UNAUTHORIZED,
                 "invalid api key",
+                "auth",
+                ProviderErrorDisposition::NonRetryable,
+                None,
+            ),
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                "access denied",
+                "auth",
                 ProviderErrorDisposition::NonRetryable,
                 None,
             ),
             (
                 reqwest::StatusCode::BAD_REQUEST,
                 "maximum context length exceeded",
+                "context_window",
                 ProviderErrorDisposition::Retryable,
                 None,
             ),
             (
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
                 "temporarily unavailable",
+                "provider_server",
                 ProviderErrorDisposition::Retryable,
                 None,
             ),
         ];
 
-        for (status, detail, disposition, retry_after_secs) in cases {
+        for (status, detail, kind, disposition, retry_after_secs) in cases {
             let error = anyhow::Error::new(crate::ProviderHttpError::new(
                 "test",
                 status,
                 Some(12),
                 detail.to_string(),
-            ));
+            ))
+            .context("outer provider request context");
             let diagnostic = provider_error_diagnostic(&error);
 
+            assert_eq!(diagnostic.kind(), kind, "{detail}");
             assert_eq!(diagnostic.status(), Some(status.as_u16()), "{detail}");
             assert_eq!(diagnostic.disposition(), disposition, "{detail}");
             assert_eq!(diagnostic.retry_after_secs(), retry_after_secs, "{detail}");
         }
+    }
+
+    #[tokio::test]
+    async fn wrapped_api_error_keeps_bounded_retry_after_for_retryable_429() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "999999")
+                .body("retry later")
+                .expect("test response"),
+        );
+        let error = crate::api_error("test", response)
+            .await
+            .context("outer provider request context");
+
+        let diagnostic = provider_error_diagnostic(&error);
+
+        assert_eq!(diagnostic.kind(), "rate_limited");
+        assert_eq!(
+            diagnostic.disposition(),
+            ProviderErrorDisposition::RateLimited
+        );
+        assert_eq!(diagnostic.status(), Some(429));
+        assert_eq!(diagnostic.retry_after_secs(), Some(86_400));
+    }
+
+    #[tokio::test]
+    async fn wrapped_typed_context_window_aborts_retries_and_provider_fallback() {
+        struct WrappedContextFailure {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for WrappedContextFailure {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "WrappedContextFailure"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for WrappedContextFailure {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(crate::ProviderHttpError::new(
+                    "test",
+                    reqwest::StatusCode::BAD_REQUEST,
+                    Some(12),
+                    "maximum context length exceeded".to_string(),
+                ))
+                .context("outer provider request context"))
+            }
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "configured-alias",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(WrappedContextFailure {
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(TerminalFailureMock {
+                        calls: Arc::clone(&fallback_calls),
+                        error: "fallback must not run",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let error = provider
+            .chat_with_system(None, "hello", "requested-model", None)
+            .await
+            .expect_err("context overflow belongs to the outer owner");
+        let terminal = terminal_provider_failure(&error).expect("typed terminal failure");
+
+        assert_eq!(terminal.diagnostic().kind(), "context_window");
+        assert_eq!(terminal.diagnostic().retry_after_secs(), None);
+        assert_eq!(terminal.attempts_for_call(), 1);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
