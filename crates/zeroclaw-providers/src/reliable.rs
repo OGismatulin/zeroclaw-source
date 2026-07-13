@@ -275,9 +275,10 @@ struct ParsedRetryAfter {
     millis: u64,
 }
 
-/// Parse Retry-After without constructing a `Duration` from untrusted floating
-/// point input. Values are validated, clamped to one day, then converted.
-fn parse_retry_after(err: &anyhow::Error) -> Option<ParsedRetryAfter> {
+/// Legacy compatibility parser used only for retry scheduling when an older
+/// provider still collapses response headers into its error text. Public
+/// diagnostics never consume this reconstructed metadata.
+fn parse_legacy_retry_after(err: &anyhow::Error) -> Option<ParsedRetryAfter> {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
 
@@ -309,8 +310,8 @@ fn parse_retry_after(err: &anyhow::Error) -> Option<ParsedRetryAfter> {
     None
 }
 
-fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    parse_retry_after(err).map(|value| value.millis)
+fn parse_legacy_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
+    parse_legacy_retry_after(err).map(|value| value.millis)
 }
 
 fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
@@ -589,15 +590,27 @@ fn terminal_provider_error(
     .into()
 }
 
-fn http_status(err: &anyhow::Error) -> Option<u16> {
-    err.downcast_ref::<reqwest::Error>()
-        .and_then(|reqwest_err| reqwest_err.status().map(|status| status.as_u16()))
+fn typed_http_status(err: &anyhow::Error) -> Option<u16> {
+    err.downcast_ref::<super::ProviderHttpError>()
+        .map(|provider_err| provider_err.status().as_u16())
         .or_else(|| {
-            err.to_string()
-                .split(|c: char| !c.is_ascii_digit())
-                .filter_map(|token| token.parse::<u16>().ok())
-                .find(|code| (400..=599).contains(code))
+            err.downcast_ref::<reqwest::Error>()
+                .and_then(|reqwest_err| reqwest_err.status().map(|status| status.as_u16()))
         })
+}
+
+/// Legacy text-only providers still need status-shaped classification for
+/// retry policy. This value must never be copied into public diagnostics.
+fn legacy_http_status_for_classification(error_detail: &str) -> Option<u16> {
+    error_detail
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|token| token.parse::<u16>().ok())
+        .find(|code| (400..=599).contains(code))
+}
+
+fn typed_retry_after_secs(err: &anyhow::Error) -> Option<u64> {
+    err.downcast_ref::<super::ProviderHttpError>()
+        .and_then(super::ProviderHttpError::retry_after_secs)
 }
 
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
@@ -627,8 +640,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
-    let status = http_status(err);
-    let retry_after_secs = parse_retry_after(err).map(|value| value.public_secs);
+    let status = typed_http_status(err);
     let rate_limited = is_rate_limited(err);
     let non_retryable_rate_limit = is_non_retryable_rate_limit(err);
     let non_retryable = is_non_retryable(err) || non_retryable_rate_limit;
@@ -638,6 +650,9 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         (false, true) => ProviderErrorDisposition::NonRetryable,
         (false, false) => ProviderErrorDisposition::Retryable,
     };
+    let retry_after_secs = (disposition == ProviderErrorDisposition::RateLimited)
+        .then(|| typed_retry_after_secs(err))
+        .flatten();
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
@@ -675,7 +690,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if let Some(code) = status {
+    if let Some(code) = status.or_else(|| legacy_http_status_for_classification(&error_detail)) {
         let (kind, hint) = if (500..=599).contains(&code) {
             (
                 "provider_server",
@@ -700,7 +715,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint,
             endpoint,
-            status: Some(code),
+            status,
             retry_after_secs,
         };
     }
@@ -1055,7 +1070,11 @@ impl ReliableModelProvider {
 
     /// Compute backoff duration, respecting Retry-After if present.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
-        if let Some(retry_after) = parse_retry_after_ms(err) {
+        let typed_retry_after_ms = typed_retry_after_secs(err)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .map(|millis| millis.min(MAX_RETRY_AFTER_SECS as u64 * 1_000));
+        if let Some(retry_after) = typed_retry_after_ms.or_else(|| parse_legacy_retry_after_ms(err))
+        {
             // Use Retry-After but cap at 30s to avoid indefinite waits
             retry_after.min(30_000).max(base)
         } else {
@@ -2697,7 +2716,7 @@ mod tests {
             assert_eq!(terminal.route(), ProviderRoute::Vision);
             assert_eq!(terminal.attempts_for_call(), 2);
             assert_eq!(terminal.diagnostic().kind(), "provider_server");
-            assert_eq!(terminal.diagnostic().status(), Some(503));
+            assert_eq!(terminal.diagnostic().status(), None);
             assert_eq!(
                 terminal.diagnostic().disposition(),
                 ProviderErrorDisposition::Retryable
@@ -2752,7 +2771,7 @@ mod tests {
             .expect_err("context overflow must be delegated to the outer owner");
         let terminal = terminal_provider_failure(&err).expect("typed context evidence");
         assert_eq!(terminal.diagnostic().kind(), "context_window");
-        assert_eq!(terminal.diagnostic().status(), Some(400));
+        assert_eq!(terminal.diagnostic().status(), None);
         assert_eq!(terminal.attempts_for_call(), 1);
         assert!(is_context_window_exceeded(&err));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2765,25 +2784,25 @@ mod tests {
             (
                 "429 Too Many Requests: retry later",
                 "rate_limited",
-                Some(429),
+                None,
                 ProviderErrorDisposition::RateLimited,
             ),
             (
                 "429 Too Many Requests: insufficient quota",
                 "rate_limited",
-                Some(429),
+                None,
                 ProviderErrorDisposition::RateLimitedNonRetryable,
             ),
             (
                 "401 Unauthorized",
                 "auth",
-                Some(401),
+                None,
                 ProviderErrorDisposition::NonRetryable,
             ),
             (
                 "503 Service Unavailable",
                 "provider_server",
-                Some(503),
+                None,
                 ProviderErrorDisposition::Retryable,
             ),
         ];
@@ -2797,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_is_bounded_before_conversion_and_public_seconds_are_ceil() {
+    fn legacy_retry_after_is_bounded_but_never_becomes_public_metadata() {
         let cases = [
             ("429 Retry-After: 2.0001", Some((3, 2_001))),
             ("429 Retry-After: 1e308", Some((86_400, 86_400_000))),
@@ -2809,17 +2828,63 @@ mod tests {
 
         for (message, expected) in cases {
             let error = anyhow::Error::msg(message);
-            let parsed = parse_retry_after(&error);
+            let parsed = parse_legacy_retry_after(&error);
             assert_eq!(
                 parsed.map(|value| (value.public_secs, value.millis)),
                 expected,
                 "{message}"
             );
-            assert_eq!(
-                provider_error_diagnostic(&error).retry_after_secs(),
-                expected.map(|(public_secs, _)| public_secs),
-                "public diagnostic seconds: {message}"
-            );
+            assert_eq!(provider_error_diagnostic(&error).retry_after_secs(), None);
+        }
+    }
+
+    #[test]
+    fn public_http_metadata_comes_from_typed_boundary_and_retry_after_is_rate_limit_only() {
+        let cases = [
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "retry later",
+                ProviderErrorDisposition::RateLimited,
+                Some(12),
+            ),
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "insufficient quota",
+                ProviderErrorDisposition::RateLimitedNonRetryable,
+                None,
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                "invalid api key",
+                ProviderErrorDisposition::NonRetryable,
+                None,
+            ),
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                "maximum context length exceeded",
+                ProviderErrorDisposition::Retryable,
+                None,
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable",
+                ProviderErrorDisposition::Retryable,
+                None,
+            ),
+        ];
+
+        for (status, detail, disposition, retry_after_secs) in cases {
+            let error = anyhow::Error::new(crate::ProviderHttpError::new(
+                "test",
+                status,
+                Some(12),
+                detail.to_string(),
+            ));
+            let diagnostic = provider_error_diagnostic(&error);
+
+            assert_eq!(diagnostic.status(), Some(status.as_u16()), "{detail}");
+            assert_eq!(diagnostic.disposition(), disposition, "{detail}");
+            assert_eq!(diagnostic.retry_after_secs(), retry_after_secs, "{detail}");
         }
     }
 
@@ -3474,19 +3539,19 @@ mod tests {
     #[test]
     fn parse_retry_after_integer() {
         let err = anyhow::Error::msg("429 Too Many Requests, Retry-After: 5");
-        assert_eq!(parse_retry_after_ms(&err), Some(5000));
+        assert_eq!(parse_legacy_retry_after_ms(&err), Some(5000));
     }
 
     #[test]
     fn parse_retry_after_float() {
         let err = anyhow::Error::msg("Rate limited. retry_after: 2.5 seconds");
-        assert_eq!(parse_retry_after_ms(&err), Some(2500));
+        assert_eq!(parse_legacy_retry_after_ms(&err), Some(2500));
     }
 
     #[test]
     fn parse_retry_after_missing() {
         let err = anyhow::Error::msg("500 Internal Server Error");
-        assert_eq!(parse_retry_after_ms(&err), None);
+        assert_eq!(parse_legacy_retry_after_ms(&err), None);
     }
 
     #[test]
@@ -3626,7 +3691,7 @@ mod tests {
     fn parse_retry_after_zero() {
         let err = anyhow::Error::msg("429 Too Many Requests, Retry-After: 0");
         assert_eq!(
-            parse_retry_after_ms(&err),
+            parse_legacy_retry_after_ms(&err),
             Some(0),
             "Retry-After: 0 should parse as 0ms"
         );
@@ -3636,7 +3701,7 @@ mod tests {
     fn parse_retry_after_with_underscore_separator() {
         let err = anyhow::Error::msg("rate limited, retry_after: 10");
         assert_eq!(
-            parse_retry_after_ms(&err),
+            parse_legacy_retry_after_ms(&err),
             Some(10_000),
             "retry_after with underscore must be parsed"
         );
@@ -3646,7 +3711,7 @@ mod tests {
     fn parse_retry_after_space_separator() {
         let err = anyhow::Error::msg("Retry-After 7");
         assert_eq!(
-            parse_retry_after_ms(&err),
+            parse_legacy_retry_after_ms(&err),
             Some(7000),
             "Retry-After with space separator must be parsed"
         );

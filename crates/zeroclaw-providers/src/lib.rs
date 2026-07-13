@@ -894,14 +894,88 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     sanitize_api_error(&formatted)
 }
 
-/// Build a sanitized model_provider error from a failed HTTP response.
-pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    let sanitized = sanitize_api_error(&body);
+/// Safe, typed response metadata retained across the provider/reliability boundary.
+#[derive(Debug)]
+pub(crate) struct ProviderHttpError {
+    model_provider: String,
+    status: reqwest::StatusCode,
+    retry_after_secs: Option<u64>,
+    detail: String,
+}
+
+impl ProviderHttpError {
+    pub(crate) fn new(
+        model_provider: &str,
+        status: reqwest::StatusCode,
+        retry_after_secs: Option<u64>,
+        detail: String,
+    ) -> Self {
+        Self {
+            model_provider: model_provider.to_string(),
+            status,
+            retry_after_secs,
+            detail: sanitize_api_error(&detail),
+        }
+    }
+
+    pub(crate) const fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    pub(crate) const fn retry_after_secs(&self) -> Option<u64> {
+        self.retry_after_secs
+    }
+}
+
+impl std::fmt::Display for ProviderHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} API error ({}): {}",
+            self.model_provider, self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpError {}
+
+const MAX_PROVIDER_RETRY_AFTER_SECS: u64 = 86_400;
+
+fn parse_retry_after_header(value: &reqwest::header::HeaderValue) -> Option<u64> {
+    let value = value.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.min(MAX_PROVIDER_RETRY_AFTER_SECS));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let remaining_ms = (retry_at - chrono::Utc::now()).num_milliseconds();
+    Some(
+        remaining_ms
+            .max(0)
+            .saturating_add(999)
+            .div_euclid(1_000)
+            .try_into()
+            .unwrap_or(MAX_PROVIDER_RETRY_AFTER_SECS)
+            .min(MAX_PROVIDER_RETRY_AFTER_SECS),
+    )
+}
+
+pub(crate) fn response_retry_after_secs(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(parse_retry_after_header)
+}
+
+fn provider_http_error(
+    model_provider: &str,
+    status: reqwest::StatusCode,
+    retry_after_secs: Option<u64>,
+    detail: String,
+) -> anyhow::Error {
+    let error = ProviderHttpError::new(model_provider, status, retry_after_secs, detail);
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -909,13 +983,22 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
             .with_attrs(::serde_json::json!({
                 "model_provider": model_provider,
                 "status": status.as_u16(),
-                "body": sanitized,
+                "body": error.detail,
             })),
         "providers: API error"
     );
-    anyhow::Error::msg(format!(
-        "{model_provider} API error ({status}): {sanitized}"
-    ))
+    anyhow::Error::new(error)
+}
+
+/// Build a sanitized model-provider error from a failed HTTP response.
+pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let retry_after_secs = response_retry_after_secs(&response);
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
+    provider_http_error(model_provider, status, retry_after_secs, body)
 }
 
 /// Resolve API key for a model_provider from config and environment variables.
@@ -1375,14 +1458,7 @@ pub fn create_resilient_model_provider_with_options(
 
         // Optional "provider:profile" form propagates an auth profile
         // override (codex multi-profile setups). Plain names pass through.
-        let (provider_name, profile_override) = match fallback.split_once(':') {
-            Some((name, profile))
-                if !profile.starts_with("http://") && !profile.starts_with("https://") =>
-            {
-                (name, Some(profile))
-            }
-            _ => (fallback.as_str(), None),
-        };
+        let (provider_name, profile_override) = fallback_provider_target(fallback);
 
         // Each fallback provider resolves its own credential via provider-
         // specific env vars (fork env-candidates table) instead of
@@ -1404,7 +1480,7 @@ pub fn create_resilient_model_provider_with_options(
             None,
             &fallback_options,
         ) {
-            Ok(provider) => model_providers.push((fallback.clone(), provider)),
+            Ok(provider) => model_providers.push((provider_name.to_string(), provider)),
             Err(_error) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1427,6 +1503,17 @@ pub fn create_resilient_model_provider_with_options(
     .with_model_fallbacks(reliability.model_fallbacks.clone());
 
     Ok(Box::new(reliable))
+}
+
+fn fallback_provider_target(fallback: &str) -> (&str, Option<&str>) {
+    match fallback.split_once(':') {
+        Some((name, profile))
+            if !profile.starts_with("http://") && !profile.starts_with("https://") =>
+        {
+            (name, Some(profile))
+        }
+        _ => (fallback, None),
+    }
 }
 
 /// Wrap the primary model_provider in a retry/backoff harness with full
@@ -2125,6 +2212,75 @@ pub mod test_util {
 mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
+
+    #[tokio::test]
+    async fn api_error_preserves_typed_response_metadata() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "17")
+                .body("upstream detail")
+                .expect("test response"),
+        );
+
+        let error = api_error("Test Provider", response).await;
+        let typed = error
+            .downcast_ref::<ProviderHttpError>()
+            .expect("provider HTTP boundary must remain typed");
+
+        assert_eq!(typed.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(typed.retry_after_secs(), Some(17));
+    }
+
+    #[tokio::test]
+    async fn fallback_profile_selector_is_not_terminal_provider_identity() {
+        struct FailureProvider;
+
+        impl ::zeroclaw_api::attribution::Attributable for FailureProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "FailureProvider"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for FailureProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("503 unavailable")
+            }
+        }
+
+        let (provider_name, profile_override) = fallback_provider_target("openai:work");
+        assert_eq!(profile_override, Some("work"));
+        let provider = ReliableModelProvider::new(
+            "configured-alias",
+            vec![(provider_name.to_string(), Box::new(FailureProvider))],
+            0,
+            1,
+        );
+
+        let error = provider
+            .chat_with_system(None, "hello", "gpt-test", None)
+            .await
+            .expect_err("provider should fail");
+        let terminal = terminal_provider_failure(&error).expect("typed terminal failure");
+
+        assert_eq!(terminal.actual_provider(), "openai");
+        assert!(!terminal.actual_provider().contains("work"));
+    }
 
     // Compile-time proof that both reqwest TLS-root features are enabled.
     // `tls_built_in_webpki_certs` is gated on `rustls-tls-webpki-roots-no-provider`;

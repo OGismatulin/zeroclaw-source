@@ -2610,10 +2610,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(super::api_error(&self.name, response).await);
         }
 
         let body = response.text().await?;
@@ -2897,6 +2894,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after_secs = super::response_retry_after_secs(&response);
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
@@ -2914,7 +2912,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 });
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(super::provider_http_error(
+                &self.name,
+                status,
+                retry_after_secs,
+                sanitized,
+            ));
         }
 
         let native_response: ApiChatResponse = response.json().await?;
