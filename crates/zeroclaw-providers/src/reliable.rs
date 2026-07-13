@@ -83,6 +83,16 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Terminal failures intentionally hide the raw provider cause. Their
+    // diagnostic disposition is the authoritative downstream retry contract.
+    if let Some(failure) = terminal_provider_failure(err) {
+        return matches!(
+            failure.diagnostic().disposition(),
+            ProviderErrorDisposition::NonRetryable
+                | ProviderErrorDisposition::RateLimitedNonRetryable
+        );
+    }
+
     // Tool schema validation errors are NOT non-retryable — the model_provider's
     // built-in fallback in compatible.rs can recover by switching to
     // prompt-guided tool instructions.
@@ -142,6 +152,14 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 /// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution.
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    // Terminal failures intentionally have no raw provider source. Preserve
+    // auth eviction semantics from their safe diagnostic instead.
+    if let Some(failure) = terminal_provider_failure(err) {
+        let diagnostic = failure.diagnostic();
+        return matches!(diagnostic.kind(), "auth" | "provider_auth")
+            || matches!(diagnostic.status(), Some(401 | 403));
+    }
+
     if let Some(code) = typed_http_status(err) {
         return code == 401 || code == 403;
     }
@@ -2652,6 +2670,75 @@ mod tests {
 
         fn alias(&self) -> &str {
             "TerminalFailureMock"
+        }
+    }
+
+    async fn final_terminal_error(error: &'static str) -> anyhow::Error {
+        let provider = ReliableModelProvider::new(
+            "configured-alias",
+            vec![(
+                "custom".to_string(),
+                Box::new(TerminalFailureMock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    error,
+                }),
+            )],
+            0,
+            1,
+        );
+
+        provider
+            .chat_with_system(None, "hello", "requested-model", None)
+            .await
+            .expect_err("provider should return a terminal failure")
+    }
+
+    #[tokio::test]
+    async fn public_auth_classifier_recognizes_sanitized_terminal_failures() {
+        for message in [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "OpenAI Codex OAuth token expired",
+        ] {
+            let error = final_terminal_error(message).await;
+            let terminal = terminal_provider_failure(&error).expect("typed terminal failure");
+
+            assert_eq!(terminal.diagnostic().kind(), "auth", "{message}");
+            assert!(is_auth_error(&error), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_non_retryable_classifier_uses_terminal_disposition() {
+        for message in [
+            "404 model not found",
+            "400 malformed provider request",
+            r#"429 Too Many Requests: {"code":1311,"message":"package unavailable"}"#,
+        ] {
+            let error = final_terminal_error(message).await;
+            let terminal = terminal_provider_failure(&error).expect("typed terminal failure");
+
+            assert!(
+                matches!(
+                    terminal.diagnostic().disposition(),
+                    ProviderErrorDisposition::NonRetryable
+                        | ProviderErrorDisposition::RateLimitedNonRetryable
+                ),
+                "{message}"
+            );
+            assert!(is_non_retryable(&error), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_non_retryable_classifier_keeps_terminal_retryable_exceptions() {
+        for message in [
+            "429 Too Many Requests: retry later",
+            "maximum context length exceeded",
+        ] {
+            let error = final_terminal_error(message).await;
+
+            assert!(!is_non_retryable(&error), "{message}");
         }
     }
 
