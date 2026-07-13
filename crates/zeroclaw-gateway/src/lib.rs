@@ -2945,9 +2945,9 @@ async fn run_gateway_webhook_agentic(
                 if let (Some((my_id, _)), Some(key)) = (cancel_handle.as_ref(), session_id) {
                     cas_remove_cancel_token(state, key, *my_id);
                 }
-                // NOTE: message text "previous_turn_stuck" is matched verbatim by
-                // `e.to_string()` in handle_webhook's error branch — do not change.
-                return Err(anyhow::Error::msg("previous_turn_stuck"));
+                return Err(anyhow::Error::new(
+                    zeroclaw_runtime::agent::loop_::PreviousTurnStuck,
+                ));
             }
         };
 
@@ -3578,6 +3578,479 @@ pub struct WebhookQuery {
     pub agent: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct StructuredErrorEnvelope {
+    error: &'static str,
+    error_code: &'static str,
+    component: &'static str,
+    retryable: bool,
+    hint: String,
+    incident_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_providers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_models: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator: Option<StructuredErrorOperator>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct StructuredErrorOperator {
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    attempts_for_call: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_status: Option<u16>,
+    route: &'static str,
+}
+
+#[derive(Debug)]
+struct StructuredErrorResponse {
+    status: StatusCode,
+    envelope: StructuredErrorEnvelope,
+}
+
+#[derive(Debug)]
+enum GatewayEarlyFailure {
+    WebhookRateLimited {
+        retry_after: u64,
+    },
+    GatewayAuthRateLimited {
+        retry_after: u64,
+    },
+    GatewayAuthFailed {
+        status: StatusCode,
+    },
+    InvalidRequest,
+    UnknownAgent,
+    InvalidModel,
+    MissingModel,
+    MissingProvider,
+    UnknownProvider {
+        requested_provider: String,
+        available_providers: Vec<String>,
+    },
+    ProviderInitializationFailed {
+        requested_provider: String,
+        requested_model: String,
+    },
+    PreviousTurnStuck,
+    ProviderNotConfigured,
+    VisionNotSupported,
+    VisionProviderMisconfigured,
+}
+
+#[derive(Debug)]
+struct SafeTerminalProviderFailure {
+    provider: String,
+    model: String,
+    kind: &'static str,
+    disposition: zeroclaw_providers::ProviderErrorDisposition,
+    phase: &'static str,
+    hint: &'static str,
+    endpoint: Option<String>,
+    provider_status: Option<u16>,
+    retry_after: Option<u64>,
+    attempts_for_call: u32,
+    route: zeroclaw_providers::ProviderRoute,
+}
+
+impl From<&zeroclaw_providers::TerminalProviderFailure> for SafeTerminalProviderFailure {
+    fn from(failure: &zeroclaw_providers::TerminalProviderFailure) -> Self {
+        let diagnostic = failure.diagnostic();
+        Self {
+            provider: bounded_error_identity(failure.actual_provider()),
+            model: bounded_error_identity(failure.actual_model()),
+            kind: diagnostic.kind(),
+            disposition: diagnostic.disposition(),
+            phase: diagnostic.phase(),
+            hint: diagnostic.hint(),
+            endpoint: diagnostic.endpoint().map(ToString::to_string),
+            provider_status: diagnostic.status(),
+            retry_after: diagnostic.retry_after_secs(),
+            attempts_for_call: failure.attempts_for_call(),
+            route: failure.route(),
+        }
+    }
+}
+
+fn bounded_error_identity(value: &str) -> String {
+    value.chars().take(128).collect()
+}
+
+fn structured_error_incident_id() -> String {
+    format!("zc-{}", hex::encode(&Uuid::new_v4().as_bytes()[..8]))
+}
+
+fn base_structured_error(
+    status: StatusCode,
+    error: &'static str,
+    error_code: &'static str,
+    component: &'static str,
+    retryable: bool,
+    hint: impl Into<String>,
+) -> StructuredErrorResponse {
+    StructuredErrorResponse {
+        status,
+        envelope: StructuredErrorEnvelope {
+            error,
+            error_code,
+            component,
+            retryable,
+            hint: hint.into(),
+            incident_id: structured_error_incident_id(),
+            provider: None,
+            model: None,
+            requested_provider: None,
+            requested_model: None,
+            available_providers: None,
+            available_models: None,
+            retry_after: None,
+            operator: None,
+        },
+    }
+}
+
+fn build_structured_early_error(failure: GatewayEarlyFailure) -> StructuredErrorResponse {
+    let mut response = match failure {
+        GatewayEarlyFailure::WebhookRateLimited { retry_after } => {
+            let mut response = base_structured_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Gateway webhook rate limit exceeded",
+                "webhook_rate_limited",
+                "request",
+                true,
+                "Retry after the indicated delay",
+            );
+            response.envelope.retry_after = Some(retry_after);
+            response
+        }
+        GatewayEarlyFailure::GatewayAuthRateLimited { retry_after } => {
+            let mut response = base_structured_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Gateway authentication rate limit exceeded",
+                "gateway_auth_rate_limited",
+                "request",
+                true,
+                "Retry authentication after the indicated delay",
+            );
+            response.envelope.retry_after = Some(retry_after);
+            response
+        }
+        GatewayEarlyFailure::GatewayAuthFailed { status } => base_structured_error(
+            status,
+            "Gateway authentication failed",
+            "gateway_auth_failed",
+            "request",
+            false,
+            "Check the gateway credentials",
+        ),
+        GatewayEarlyFailure::InvalidRequest => base_structured_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid gateway request",
+            "invalid_request",
+            "request",
+            false,
+            "Check the request format and required fields",
+        ),
+        GatewayEarlyFailure::UnknownAgent => base_structured_error(
+            StatusCode::BAD_REQUEST,
+            "Unknown agent",
+            "unknown_agent",
+            "request",
+            false,
+            "Select a configured agent",
+        ),
+        GatewayEarlyFailure::InvalidModel => base_structured_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid model selection",
+            "invalid_model",
+            "request",
+            false,
+            "Provide a non-empty provider and model pair",
+        ),
+        GatewayEarlyFailure::MissingModel => base_structured_error(
+            StatusCode::BAD_REQUEST,
+            "Model is required with provider",
+            "missing_model",
+            "request",
+            false,
+            "Provide provider and model together",
+        ),
+        GatewayEarlyFailure::MissingProvider => base_structured_error(
+            StatusCode::BAD_REQUEST,
+            "Provider is required with model",
+            "missing_provider",
+            "request",
+            false,
+            "Provide provider and model together",
+        ),
+        GatewayEarlyFailure::UnknownProvider {
+            requested_provider,
+            available_providers,
+        } => {
+            let mut response = base_structured_error(
+                StatusCode::BAD_REQUEST,
+                "Unknown provider",
+                "unknown_provider",
+                "request",
+                false,
+                "Select an available provider",
+            );
+            response.envelope.requested_provider =
+                Some(bounded_error_identity(&requested_provider));
+            response.envelope.available_providers = Some(
+                available_providers
+                    .into_iter()
+                    .take(128)
+                    .map(|provider| bounded_error_identity(&provider))
+                    .collect(),
+            );
+            response
+        }
+        GatewayEarlyFailure::ProviderInitializationFailed {
+            requested_provider,
+            requested_model,
+        } => {
+            let mut response = base_structured_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Provider initialization failed",
+                "provider_initialization_failed",
+                "provider",
+                false,
+                "Check the requested provider configuration",
+            );
+            response.envelope.requested_provider =
+                Some(bounded_error_identity(&requested_provider));
+            response.envelope.requested_model = Some(bounded_error_identity(&requested_model));
+            response
+        }
+        GatewayEarlyFailure::PreviousTurnStuck => base_structured_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Previous turn is still in progress",
+            "previous_turn_stuck",
+            "daemon",
+            true,
+            "Retry after the previous turn releases the session",
+        ),
+        GatewayEarlyFailure::ProviderNotConfigured => base_structured_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Provider is not configured",
+            "provider_not_configured",
+            "daemon",
+            false,
+            "Complete quickstart or configure a model provider",
+        ),
+        GatewayEarlyFailure::VisionNotSupported => base_structured_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Vision is not supported",
+            "vision_not_supported",
+            "provider",
+            false,
+            "Select a vision-capable model or remove the image",
+        ),
+        GatewayEarlyFailure::VisionProviderMisconfigured => base_structured_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Vision provider is misconfigured",
+            "vision_provider_misconfigured",
+            "provider",
+            false,
+            "Check the configured vision provider",
+        ),
+    };
+    response.envelope.available_models = None;
+    response
+}
+
+fn classify_vision_route_failure_kind(kind: &str) -> Option<GatewayEarlyFailure> {
+    match kind {
+        "vision_not_supported" => Some(GatewayEarlyFailure::VisionNotSupported),
+        "vision_provider_misconfigured" => Some(GatewayEarlyFailure::VisionProviderMisconfigured),
+        _ => None,
+    }
+}
+
+fn terminal_error_contract(
+    failure: &SafeTerminalProviderFailure,
+) -> (StatusCode, &'static str, &'static str, bool) {
+    use zeroclaw_providers::ProviderErrorDisposition::{
+        NonRetryable, RateLimited, RateLimitedNonRetryable, Retryable,
+    };
+
+    match (failure.kind, failure.disposition) {
+        ("auth", _) => (
+            StatusCode::BAD_GATEWAY,
+            "Provider authentication failed",
+            "provider_auth_failed",
+            false,
+        ),
+        ("rate_limited", RateLimited) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Provider rate limit exceeded",
+            "provider_rate_limited",
+            true,
+        ),
+        ("rate_limited", RateLimitedNonRetryable) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Provider quota is exhausted",
+            "provider_quota_exhausted",
+            false,
+        ),
+        ("timeout" | "connect_timeout", _) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "Provider request timed out",
+            "provider_timeout",
+            true,
+        ),
+        ("connect" | "dns" | "provider_server" | "http_error", Retryable) => (
+            StatusCode::BAD_GATEWAY,
+            "Provider is unavailable",
+            "provider_unavailable",
+            true,
+        ),
+        ("model_not_found", _) => (
+            StatusCode::BAD_GATEWAY,
+            "Provider model was not found",
+            "provider_model_not_found",
+            false,
+        ),
+        ("context_window", _) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Context window exceeded",
+            "context_window_exceeded",
+            false,
+        ),
+        ("client_error", _) | (_, NonRetryable | RateLimitedNonRetryable) => (
+            StatusCode::BAD_GATEWAY,
+            "Provider rejected the request",
+            "provider_request_rejected",
+            false,
+        ),
+        (_, Retryable | RateLimited) => (
+            StatusCode::BAD_GATEWAY,
+            "Provider request failed",
+            "provider_error",
+            true,
+        ),
+    }
+}
+
+fn build_structured_terminal_error(
+    failure: &SafeTerminalProviderFailure,
+) -> StructuredErrorResponse {
+    let (status, error, error_code, retryable) = terminal_error_contract(failure);
+    let mut response = base_structured_error(
+        status,
+        error,
+        error_code,
+        "provider",
+        retryable,
+        failure.hint,
+    );
+    response.envelope.provider = Some(failure.provider.clone());
+    response.envelope.model = Some(failure.model.clone());
+    response.envelope.retry_after = failure.retry_after;
+    response.envelope.operator = Some(StructuredErrorOperator {
+        phase: failure.phase,
+        endpoint: failure.endpoint.clone(),
+        attempts_for_call: failure.attempts_for_call,
+        provider_status: failure.provider_status,
+        route: failure.route.as_str(),
+    });
+    response
+}
+
+fn build_structured_runtime_error(error: &anyhow::Error) -> StructuredErrorResponse {
+    if zeroclaw_runtime::agent::loop_::is_previous_turn_stuck(error) {
+        return build_structured_early_error(GatewayEarlyFailure::PreviousTurnStuck);
+    }
+    if let Some(vision) = error.downcast_ref::<zeroclaw_runtime::agent::loop_::VisionRouteFailure>()
+        && let Some(failure) = classify_vision_route_failure_kind(vision.kind())
+    {
+        return build_structured_early_error(failure);
+    }
+    if is_needs_quickstart_err(error) {
+        return build_structured_early_error(GatewayEarlyFailure::ProviderNotConfigured);
+    }
+    if let Some(terminal) = zeroclaw_providers::terminal_provider_failure(error) {
+        return build_structured_terminal_error(&SafeTerminalProviderFailure::from(terminal));
+    }
+    base_structured_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Daemon request failed",
+        "daemon_internal_error",
+        "daemon",
+        false,
+        "Retry later or contact the operator with the incident ID",
+    )
+}
+
+fn emit_primary_structured_error(response: &StructuredErrorResponse) {
+    let envelope = &response.envelope;
+    let mut attrs = serde_json::json!({
+        "error_role": "primary",
+        "incident_id": envelope.incident_id,
+        "error_code": envelope.error_code,
+        "component": envelope.component,
+    });
+    if let Some(object) = attrs.as_object_mut() {
+        if let Some(provider) = envelope.provider.as_ref() {
+            object.insert("provider".to_string(), serde_json::json!(provider));
+        }
+        if let Some(model) = envelope.model.as_ref() {
+            object.insert("model".to_string(), serde_json::json!(model));
+        }
+    }
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(attrs),
+        "gateway request failed"
+    );
+}
+
+fn structured_error_response(
+    response: StructuredErrorResponse,
+) -> (StatusCode, Json<serde_json::Value>) {
+    emit_primary_structured_error(&response);
+    let body = serde_json::to_value(&response.envelope).unwrap_or_else(|_| {
+        serde_json::json!({
+            "error": "Daemon request failed",
+            "error_code": "daemon_internal_error",
+            "component": "daemon",
+            "retryable": false,
+            "hint": "Contact the operator",
+            "incident_id": response.envelope.incident_id,
+        })
+    });
+    (response.status, Json(body))
+}
+
+fn structured_early_error_response(
+    failure: GatewayEarlyFailure,
+) -> (StatusCode, Json<serde_json::Value>) {
+    structured_error_response(build_structured_early_error(failure))
+}
+
+fn structured_runtime_error_response(
+    error: &anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    structured_error_response(build_structured_runtime_error(error))
+}
+
 /// POST /webhook — main webhook endpoint
 async fn handle_webhook(
     State(state): State<AppState>,
@@ -3595,11 +4068,9 @@ async fn handle_webhook(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "/webhook rate limit exceeded"
         );
-        let err = serde_json::json!({
-            "error": "Too many webhook requests. Please retry later.",
-            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        return structured_early_error_response(GatewayEarlyFailure::WebhookRateLimited {
+            retry_after: RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
     // ── Bearer token auth (pairing) with auth rate limiting ──
@@ -3612,11 +4083,9 @@ async fn handle_webhook(
                     .with_attrs(::serde_json::json!({"rate_key": rate_key})),
                 "webhook: auth rate limit exceeded for"
             );
-            let err = serde_json::json!({
-                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
-                "retry_after": e.retry_after_secs,
+            return structured_early_error_response(GatewayEarlyFailure::GatewayAuthRateLimited {
+                retry_after: e.retry_after_secs,
             });
-            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
         }
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -3631,10 +4100,9 @@ async fn handle_webhook(
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "webhook: rejected — not paired / invalid bearer token"
             );
-            let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            return structured_early_error_response(GatewayEarlyFailure::GatewayAuthFailed {
+                status: StatusCode::UNAUTHORIZED,
             });
-            return (StatusCode::UNAUTHORIZED, Json(err));
         }
     }
 
@@ -3655,8 +4123,9 @@ async fn handle_webhook(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "webhook: rejected request — invalid or missing X-Webhook-Secret"
                 );
-                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return structured_early_error_response(GatewayEarlyFailure::GatewayAuthFailed {
+                    status: StatusCode::UNAUTHORIZED,
+                });
             }
         }
     }
@@ -3672,10 +4141,7 @@ async fn handle_webhook(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                 "webhook JSON parse error"
             );
-            let err = serde_json::json!({
-                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
-            });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return structured_early_error_response(GatewayEarlyFailure::InvalidRequest);
         }
     };
 
@@ -3698,12 +4164,7 @@ async fn handle_webhook(
                     .with_attrs(::serde_json::json!({"agent": alias})),
                 "webhook: rejected — unknown agent alias"
             );
-            let err = serde_json::json!({
-                "error": format!(
-                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
-                )
-            });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return structured_early_error_response(GatewayEarlyFailure::UnknownAgent);
         }
     }
 
@@ -3786,50 +4247,35 @@ async fn handle_webhook(
                             })),
                             "Webhook: failed to init override provider"
                         );
-                        let err = serde_json::json!({
-                            "error": format!(
-                                "failed to initialize provider '{provider}'"
-                            ),
-                            "error_code": "provider_initialization_failed",
-                            "provider": provider,
-                            "model": model,
-                        });
-                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+                        return structured_early_error_response(
+                            GatewayEarlyFailure::ProviderInitializationFailed {
+                                requested_provider: provider,
+                                requested_model: model,
+                            },
+                        );
                     }
                 }
             }
             ModelSelection::InvalidEmpty => {
-                let err = serde_json::json!({
-                    "error": "model and provider must not be empty",
-                    "error_code": "invalid_model",
-                });
-                return (StatusCode::BAD_REQUEST, Json(err));
+                return structured_early_error_response(GatewayEarlyFailure::InvalidModel);
             }
             ModelSelection::MissingModel => {
-                let err = serde_json::json!({
-                    "error": "provider was set but model is missing — both must come together",
-                    "error_code": "missing_model",
-                });
-                return (StatusCode::BAD_REQUEST, Json(err));
+                return structured_early_error_response(GatewayEarlyFailure::MissingModel);
             }
             ModelSelection::MissingProvider => {
-                let err = serde_json::json!({
-                    "error": "model was set but provider is missing — both must come together",
-                    "error_code": "missing_provider",
-                });
-                return (StatusCode::BAD_REQUEST, Json(err));
+                return structured_early_error_response(GatewayEarlyFailure::MissingProvider);
             }
             ModelSelection::UnknownProvider {
                 requested,
                 available_providers,
             } => {
-                let err = serde_json::json!({
-                    "error": format!("unknown provider '{requested}'"),
-                    "error_code": "unknown_provider",
-                    "requested_provider": requested,
-                    "available_providers": available_providers,
+                return structured_early_error_response(GatewayEarlyFailure::UnknownProvider {
+                    requested_provider: requested,
+                    available_providers: available_providers
+                        .into_iter()
+                        .map(ToString::to_string)
+                        .collect(),
                 });
-                return (StatusCode::BAD_REQUEST, Json(err));
             }
         };
     let started_at = Instant::now();
@@ -4009,7 +4455,7 @@ async fn handle_webhook(
             });
             (StatusCode::OK, Json(body))
         }
-        Err(e) if e.to_string() == "previous_turn_stuck" => {
+        Err(e) if zeroclaw_runtime::agent::loop_::is_previous_turn_stuck(&e) => {
             // M1 held the per-daemon webhook_session lock past the configured
             // timeout (`ZEROCLAW_WEBHOOK_LOCK_TIMEOUT_SECS`, default 5s).
             // Surface a machine-readable 503 so the bot can either retry or
@@ -4020,11 +4466,7 @@ async fn handle_webhook(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                 "Webhook lock timeout: previous_turn_stuck"
             );
-            let body = serde_json::json!({
-                "error": "previous turn is still in flight, please retry",
-                "error_code": "previous_turn_stuck",
-            });
-            (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+            structured_runtime_error_response(&e)
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -4074,21 +4516,16 @@ async fn handle_webhook(
                     "Webhook chat refused: gateway has no model configured; \
                      visit /quickstart"
                 );
-                let body = serde_json::json!({
-                    "error": "needs_quickstart",
-                    "url": "/quickstart"
-                });
-                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+                structured_runtime_error_response(&e)
             } else {
                 ::zeroclaw_log::record!(
                     ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": sanitized})),
                     "webhook model_provider error"
                 );
-                let err = serde_json::json!({"error": "LLM request failed"});
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                structured_runtime_error_response(&e)
             }
         }
     }
@@ -5450,6 +5887,487 @@ mod tests {
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+
+    fn assert_structured_error_shape(
+        status: StatusCode,
+        expected_status: StatusCode,
+        body: &serde_json::Value,
+        expected_code: &str,
+        expected_retryable: bool,
+    ) {
+        assert_eq!(status, expected_status, "{expected_code}: {body}");
+        assert_eq!(body["error_code"], expected_code);
+        assert_eq!(body["retryable"], expected_retryable);
+        for required in ["error", "component", "hint", "incident_id"] {
+            assert!(
+                body.get(required).is_some_and(|value| !value.is_null()),
+                "{expected_code} missing {required}: {body}"
+            );
+        }
+        let incident_id = body["incident_id"].as_str().expect("string incident id");
+        assert_eq!(incident_id.len(), 19, "{incident_id}");
+        assert!(incident_id.starts_with("zc-"), "{incident_id}");
+        assert!(
+            incident_id[3..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "incident id must match ^zc-[0-9a-f]{{16}}$: {incident_id}"
+        );
+    }
+
+    #[test]
+    fn structured_error_terminal_mapping_covers_kind_and_disposition() {
+        use zeroclaw_providers::ProviderErrorDisposition::{
+            NonRetryable, RateLimited, RateLimitedNonRetryable, Retryable,
+        };
+
+        let cases = [
+            (
+                "auth",
+                NonRetryable,
+                "provider_auth_failed",
+                StatusCode::BAD_GATEWAY,
+                false,
+            ),
+            (
+                "rate_limited",
+                RateLimited,
+                "provider_rate_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                true,
+            ),
+            (
+                "rate_limited",
+                RateLimitedNonRetryable,
+                "provider_quota_exhausted",
+                StatusCode::TOO_MANY_REQUESTS,
+                false,
+            ),
+            (
+                "timeout",
+                Retryable,
+                "provider_timeout",
+                StatusCode::GATEWAY_TIMEOUT,
+                true,
+            ),
+            (
+                "connect_timeout",
+                Retryable,
+                "provider_timeout",
+                StatusCode::GATEWAY_TIMEOUT,
+                true,
+            ),
+            (
+                "connect",
+                Retryable,
+                "provider_unavailable",
+                StatusCode::BAD_GATEWAY,
+                true,
+            ),
+            (
+                "dns",
+                Retryable,
+                "provider_unavailable",
+                StatusCode::BAD_GATEWAY,
+                true,
+            ),
+            (
+                "provider_server",
+                Retryable,
+                "provider_unavailable",
+                StatusCode::BAD_GATEWAY,
+                true,
+            ),
+            (
+                "http_error",
+                Retryable,
+                "provider_unavailable",
+                StatusCode::BAD_GATEWAY,
+                true,
+            ),
+            (
+                "model_not_found",
+                NonRetryable,
+                "provider_model_not_found",
+                StatusCode::BAD_GATEWAY,
+                false,
+            ),
+            (
+                "context_window",
+                Retryable,
+                "context_window_exceeded",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+            (
+                "client_error",
+                NonRetryable,
+                "provider_request_rejected",
+                StatusCode::BAD_GATEWAY,
+                false,
+            ),
+            (
+                "opaque_unknown",
+                NonRetryable,
+                "provider_request_rejected",
+                StatusCode::BAD_GATEWAY,
+                false,
+            ),
+            (
+                "opaque_unknown",
+                Retryable,
+                "provider_error",
+                StatusCode::BAD_GATEWAY,
+                true,
+            ),
+        ];
+
+        for (kind, disposition, code, expected_status, retryable) in cases {
+            let failure = SafeTerminalProviderFailure {
+                provider: "actual-provider".into(),
+                model: "actual-model".into(),
+                kind,
+                disposition,
+                phase: "test_phase",
+                hint: "safe hint",
+                endpoint: None,
+                provider_status: None,
+                retry_after: None,
+                attempts_for_call: 1,
+                route: zeroclaw_providers::ProviderRoute::Main,
+            };
+            let response = build_structured_terminal_error(&failure);
+            let body = serde_json::to_value(&response.envelope).unwrap();
+            assert_structured_error_shape(response.status, expected_status, &body, code, retryable);
+            assert_eq!(body["provider"], "actual-provider", "{kind}");
+            assert_eq!(body["model"], "actual-model", "{kind}");
+        }
+    }
+
+    #[test]
+    fn structured_error_terminal_metadata_is_safe_and_typed() {
+        let failure = SafeTerminalProviderFailure {
+            provider: "backup-alias".into(),
+            model: "effective-private-model".into(),
+            kind: "rate_limited",
+            disposition: zeroclaw_providers::ProviderErrorDisposition::RateLimited,
+            phase: "http_response",
+            hint: "wait, change key/quota, or switch provider",
+            endpoint: Some("https://safe.example/v1/chat".into()),
+            provider_status: Some(429),
+            retry_after: Some(17),
+            attempts_for_call: 3,
+            route: zeroclaw_providers::ProviderRoute::Vision,
+        };
+
+        let response = build_structured_terminal_error(&failure);
+        let body = serde_json::to_value(&response.envelope).unwrap();
+        assert_structured_error_shape(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            &body,
+            "provider_rate_limited",
+            true,
+        );
+        assert_eq!(body["provider"], "backup-alias");
+        assert_eq!(body["model"], "effective-private-model");
+        assert_eq!(body["retry_after"], 17);
+        assert_eq!(body["operator"]["phase"], "http_response");
+        assert_eq!(body["operator"]["endpoint"], "https://safe.example/v1/chat");
+        assert_eq!(body["operator"]["attempts_for_call"], 3);
+        assert_eq!(body["operator"]["provider_status"], 429);
+        assert_eq!(body["operator"]["route"], "vision");
+        assert!(body.get("cause").is_none());
+        assert!(body["operator"].get("body").is_none());
+
+        let raw = "error sending request for url \
+            (https://user:hunter2@inference.host/v1/chat?token=hunter2#debug): timed out";
+        let error = zeroclaw_providers::ensure_terminal_provider_failure(
+            anyhow::Error::msg(raw),
+            "safe-provider",
+            "safe-model",
+            zeroclaw_providers::ProviderRoute::Main,
+        );
+        let response = build_structured_runtime_error(&error);
+        let json = serde_json::to_string(&response.envelope).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            body["operator"]["endpoint"],
+            "https://inference.host/v1/chat"
+        );
+        assert!(!json.contains("hunter2"));
+        assert!(!json.contains("token="));
+        assert!(!json.contains("#debug"));
+    }
+
+    #[test]
+    fn structured_error_early_inventory_is_complete() {
+        let cases = [
+            (
+                GatewayEarlyFailure::WebhookRateLimited { retry_after: 60 },
+                "webhook_rate_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                true,
+            ),
+            (
+                GatewayEarlyFailure::GatewayAuthRateLimited { retry_after: 9 },
+                "gateway_auth_rate_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                true,
+            ),
+            (
+                GatewayEarlyFailure::GatewayAuthFailed {
+                    status: StatusCode::UNAUTHORIZED,
+                },
+                "gateway_auth_failed",
+                StatusCode::UNAUTHORIZED,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::GatewayAuthFailed {
+                    status: StatusCode::FORBIDDEN,
+                },
+                "gateway_auth_failed",
+                StatusCode::FORBIDDEN,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::InvalidRequest,
+                "invalid_request",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::UnknownAgent,
+                "unknown_agent",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::InvalidModel,
+                "invalid_model",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::MissingModel,
+                "missing_model",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::MissingProvider,
+                "missing_provider",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::UnknownProvider {
+                    requested_provider: "missing".into(),
+                    available_providers: vec!["openai".into()],
+                },
+                "unknown_provider",
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::ProviderInitializationFailed {
+                    requested_provider: "custom.alias".into(),
+                    requested_model: "requested-model".into(),
+                },
+                "provider_initialization_failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::PreviousTurnStuck,
+                "previous_turn_stuck",
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+            ),
+            (
+                GatewayEarlyFailure::ProviderNotConfigured,
+                "provider_not_configured",
+                StatusCode::SERVICE_UNAVAILABLE,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::VisionNotSupported,
+                "vision_not_supported",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+            (
+                GatewayEarlyFailure::VisionProviderMisconfigured,
+                "vision_provider_misconfigured",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+            ),
+        ];
+
+        for (failure, code, status, retryable) in cases {
+            let response = build_structured_early_error(failure);
+            let body = serde_json::to_value(&response.envelope).unwrap();
+            assert_structured_error_shape(response.status, status, &body, code, retryable);
+            assert_ne!(body["error_code"], "unknown_model");
+        }
+    }
+
+    #[test]
+    fn structured_error_provider_init_uses_requested_not_actual_fields() {
+        let response =
+            build_structured_early_error(GatewayEarlyFailure::ProviderInitializationFailed {
+                requested_provider: "requested-provider".into(),
+                requested_model: "requested-model".into(),
+            });
+        let body = serde_json::to_value(&response.envelope).unwrap();
+        assert_eq!(body["requested_provider"], "requested-provider");
+        assert_eq!(body["requested_model"], "requested-model");
+        assert!(body.get("provider").is_none());
+        assert!(body.get("model").is_none());
+    }
+
+    #[test]
+    fn structured_error_typed_pre_call_markers_beat_runtime_catch_all() {
+        let previous = anyhow::Error::new(zeroclaw_runtime::agent::loop_::PreviousTurnStuck)
+            .context("outer runtime context");
+        let previous_response = build_structured_runtime_error(&previous);
+        assert_eq!(previous_response.envelope.error_code, "previous_turn_stuck");
+
+        assert!(matches!(
+            classify_vision_route_failure_kind("vision_not_supported"),
+            Some(GatewayEarlyFailure::VisionNotSupported)
+        ));
+        assert!(matches!(
+            classify_vision_route_failure_kind("vision_provider_misconfigured"),
+            Some(GatewayEarlyFailure::VisionProviderMisconfigured)
+        ));
+        assert!(classify_vision_route_failure_kind("raw_unknown_kind").is_none());
+    }
+
+    #[test]
+    fn structured_error_arbitrary_runtime_error_is_daemon_internal_without_identity() {
+        let raw = "RAW_SENTINEL bearer sk-super-secret /private/user/path prompt text";
+        let response = build_structured_runtime_error(&anyhow::Error::msg(raw));
+        let json = serde_json::to_string(&response.envelope).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_structured_error_shape(
+            response.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &body,
+            "daemon_internal_error",
+            false,
+        );
+        assert!(body.get("provider").is_none());
+        assert!(body.get("model").is_none());
+        assert!(!json.contains("RAW_SENTINEL"));
+        assert!(!json.contains("super-secret"));
+        assert!(!json.contains("/private/user/path"));
+        assert!(!json.contains("prompt text"));
+    }
+
+    struct StructuredFailureProvider;
+
+    #[async_trait]
+    impl ModelProvider for StructuredFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 Service Unavailable: RAW_TERMINAL_SENTINEL")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredFailureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StructuredFailureProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_error_extracts_actual_alias_family_effective_model_and_vision_route() {
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+        use zeroclaw_providers::{ProviderCandidateDescriptor, ProviderRoute};
+
+        let descriptor = ProviderCandidateDescriptor::pinned(
+            "openai",
+            Some("backup-alias"),
+            "effective-private-model",
+        );
+        let provider = ReliableModelProvider::new_with_candidates(
+            "requested",
+            vec![(descriptor, Box::new(StructuredFailureProvider))],
+            0,
+            1,
+        )
+        .with_route(ProviderRoute::Vision);
+        let error = provider
+            .chat_with_system(None, "secret prompt", "requested-public-model", None)
+            .await
+            .expect_err("provider must fail");
+
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error)
+            .expect("typed terminal provider failure");
+        assert_eq!(terminal.actual_provider(), "backup-alias");
+        assert_eq!(terminal.provider_family(), "openai");
+        assert_eq!(terminal.configured_alias(), Some("backup-alias"));
+        assert_eq!(terminal.actual_model(), "effective-private-model");
+        let safe = SafeTerminalProviderFailure::from(terminal);
+        assert_eq!(safe.provider, "backup-alias");
+        assert_eq!(safe.model, "effective-private-model");
+
+        let response = build_structured_runtime_error(&error);
+        let json = serde_json::to_string(&response.envelope).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(body["provider"], "backup-alias");
+        assert_eq!(body["model"], "effective-private-model");
+        assert_eq!(body["operator"]["attempts_for_call"], 1);
+        assert_eq!(body["operator"]["route"], "vision");
+        assert!(body.get("requested_provider").is_none());
+        assert!(body.get("requested_model").is_none());
+        assert!(!json.contains("RAW_TERMINAL_SENTINEL"));
+        assert!(!json.contains("secret prompt"));
+    }
+
+    #[test]
+    fn structured_error_emits_one_primary_agent_event_with_response_incident_id() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let response = build_structured_runtime_error(&anyhow::Error::msg("private raw cause"));
+        let incident_id = response.envelope.incident_id.clone();
+        let (status, Json(body)) = structured_error_response(response);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["incident_id"], incident_id);
+
+        let events: Vec<serde_json::Value> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| event["attributes"]["error_role"] == "primary")
+            .collect();
+        assert_eq!(events.len(), 1, "primary events: {events:?}");
+        let event = &events[0];
+        assert_eq!(event["event"]["action"], "fail");
+        assert_eq!(event["event"]["category"], "agent");
+        assert_eq!(event["attributes"]["incident_id"], incident_id);
+        assert_eq!(event["attributes"]["error_code"], "daemon_internal_error");
+        assert!(event["attributes"].get("provider").is_none());
+        assert!(event["attributes"].get("model").is_none());
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
 
     /// fork regression (patch #13): the per-request override path must
     /// inherit process-wide settings from the global config. With a bare
@@ -7601,12 +8519,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Unknown agent `ghost`")
-        );
+        assert_eq!(parsed["error"], "Unknown agent");
+        assert_eq!(parsed["error_code"], "unknown_agent");
+        assert_eq!(parsed["component"], "request");
+        assert_eq!(parsed["retryable"], false);
+        assert!(parsed["incident_id"].as_str().is_some());
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
         // Key still fresh — a corrected retry with the same key proceeds.
         assert!(state.idempotency_store.record_if_new("ghost-key"));
