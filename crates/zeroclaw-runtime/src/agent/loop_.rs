@@ -5112,9 +5112,18 @@ mod tests {
         history: &mut Vec<ChatMessage>,
         event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     ) -> anyhow::Result<String> {
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        run_terminal_test_turn_with_multimodal(model_provider, history, event_tx, &multimodal).await
+    }
+
+    async fn run_terminal_test_turn_with_multimodal(
+        model_provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+        multimodal: &zeroclaw_config::schema::MultimodalConfig,
+    ) -> anyhow::Result<String> {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
-        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let knobs = LoopKnobs::default();
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5132,7 +5141,7 @@ mod tests {
                     observer: &observer,
                     silent: true,
                     approval: None,
-                    multimodal_config: &multimodal,
+                    multimodal_config: multimodal,
                     hooks: None,
                     activated_tools: None,
                     model_switch_callback: None,
@@ -5285,6 +5294,51 @@ mod tests {
         assert_eq!(terminal.route(), zeroclaw_providers::ProviderRoute::Main);
         assert_eq!(terminal.attempts_for_call(), 1);
         assert_eq!(terminal.diagnostic().kind(), "provider_server");
+    }
+
+    #[tokio::test]
+    async fn dedicated_vision_provider_api_failure_propagates_through_full_turn() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"vision endpoint unavailable"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let main_provider = NonVisionModelProvider {
+            calls: Arc::clone(&calls),
+        };
+        let configured_vision_provider = format!("custom:{}/v1", server.uri());
+        let configured_vision_model = "configured-vision-model";
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            vision_model_provider: Some(configured_vision_provider.clone()),
+            vision_model: Some(configured_vision_model.to_string()),
+            ..Default::default()
+        };
+        let mut history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+
+        let error =
+            run_terminal_test_turn_with_multimodal(&main_provider, &mut history, None, &multimodal)
+                .await
+                .expect_err("dedicated vision API failure should end the full turn");
+
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error)
+            .expect("full-turn result must retain dedicated vision terminal evidence");
+        assert_eq!(terminal.actual_provider(), configured_vision_provider);
+        assert_eq!(terminal.actual_model(), configured_vision_model);
+        assert_eq!(terminal.route(), zeroclaw_providers::ProviderRoute::Vision);
+        assert_eq!(terminal.attempts_for_call(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
