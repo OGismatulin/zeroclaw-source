@@ -881,20 +881,57 @@ class GatewayRegistry:
 
     @staticmethod
     def _is_alive(instance: DaemonInstance) -> bool:
-        """Check that daemon process exists and its HTTP port responds."""
+        """Check that daemon process exists and its HTTP port responds.
+
+        A live-process daemon that misses a single /health probe is re-probed
+        over a short confirmation window before being declared dead: a burst of
+        concurrent subagent work (e.g. the 5-analyst Jira ensemble in a cron
+        turn) can briefly starve the daemon's tokio runtime, and a false-dead
+        respawn drops the in-flight webhook and wipes in-memory session history
+        (2026-07-13 incident; see
+        docs/analysis/2026-07-11-respawn-race-deadlock-fix.md §follow-ups).
+        A truly-exited process (pid gone) or a missing workspace is declared
+        dead immediately — no confirmation delay.
+        """
         try:
             os.kill(instance.pid, 0)
         except OSError:
             return False
         if not instance.workspace_root.exists():
             return False
-        try:
-            with request.urlopen(
-                f"http://127.0.0.1:{instance.port}/health", timeout=2.0
-            ) as resp:
-                return resp.status == 200
-        except (error.URLError, TimeoutError, OSError):
-            return False
+
+        attempts, interval = GatewayRegistry._liveness_confirm_params()
+        for i in range(attempts):
+            if GatewayRegistry._probe_port_health(instance.port):
+                if i > 0:
+                    print(
+                        f"[gateway-manager] daemon for {instance.user_key}"
+                        f" recovered on /health probe {i + 1}/{attempts}",
+                        flush=True,
+                    )
+                return True
+            if i == 0:
+                print(
+                    f"[gateway-manager] daemon for {instance.user_key} missed"
+                    f" first /health probe; confirming liveness"
+                    f" (up to {attempts} probes)",
+                    flush=True,
+                )
+            if i < attempts - 1:
+                time.sleep(interval)
+                # Re-check process liveness after the wait: if it exited
+                # mid-window, stop and declare dead instead of probing a dead
+                # port for the rest of the window.
+                try:
+                    os.kill(instance.pid, 0)
+                except OSError:
+                    return False
+        print(
+            f"[gateway-manager] daemon for {instance.user_key} unresponsive"
+            f" after {attempts} /health probes",
+            flush=True,
+        )
+        return False
 
     def _allocate_port(self) -> int:
         with self._global_lock:
@@ -925,6 +962,41 @@ class GatewayRegistry:
                 except (ValueError, IndexError):
                     return None
         return None
+
+    @staticmethod
+    def _liveness_confirm_params() -> tuple[int, float]:
+        """Retry count + inter-probe sleep for the _is_alive confirmation window.
+
+        A live-process daemon that misses a single /health probe (tokio starved
+        by a burst of concurrent subagent work — e.g. the 5-analyst Jira ensemble
+        running in a cron turn inside the same daemon process) is re-probed this
+        many times before being declared dead, preventing a false-dead respawn
+        that drops the in-flight webhook and wipes in-memory session history
+        (2026-07-13 incident;
+        docs/superpowers/specs/2026-07-13-manager-liveness-confirmation-window-design.md).
+
+        inf/nan/<=0/oversized values fall back to defaults so a bad env value
+        cannot turn the window into an unbounded time.sleep — mirrors the
+        finite-validation wait_until_healthy uses for its health budget.
+        """
+        default_attempts, default_interval = 3, 2.0
+        try:
+            attempts = int(
+                os.getenv("ZEROCLAW_MANAGER_LIVENESS_CONFIRM_ATTEMPTS", "3")
+            )
+        except ValueError:
+            attempts = default_attempts
+        if attempts < 1 or attempts > 10:
+            attempts = default_attempts
+        try:
+            interval = float(
+                os.getenv("ZEROCLAW_MANAGER_LIVENESS_CONFIRM_INTERVAL_SECS", "2")
+            )
+        except ValueError:
+            interval = default_interval
+        if not math.isfinite(interval) or interval < 0 or interval > 30:
+            interval = default_interval
+        return attempts, interval
 
     @staticmethod
     def _probe_port_health(port: int) -> bool:
