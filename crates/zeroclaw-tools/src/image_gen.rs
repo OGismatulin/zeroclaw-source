@@ -124,6 +124,27 @@ pub(crate) fn map_size_codex(p: &str) -> &'static str {
     }
 }
 
+/// Deterministic 8-hex correlation id from a seed (safe_name + prompt). Lets the
+/// operator grep the raw error in the log by the same id shown to the user,
+/// without pulling in any external crate.
+fn short_correlation_id(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
+/// Stable, user-facing message for a codex image failure. Deliberately omits
+/// the raw internal error (which goes only to the operator log) and states no
+/// fallback: the user is told the quality model failed, never silently served
+/// a fast/fal or vector-diagram substitute.
+fn codex_image_error_message(correlation_id: &str) -> String {
+    format!(
+        "Качественная генерация (GPT-image-2) не удалась (код: {correlation_id}). \
+Попробуйте ещё раз или явно запросите быстрый режим генерации."
+    )
+}
+
 /// Standalone dual-backend image generation tool.
 ///
 /// `quality: fast` (default) routes to fal.ai (FLUX family); `quality: high`
@@ -468,10 +489,23 @@ impl ImageGenTool {
         {
             Ok(b) => b,
             Err(e) => {
+                // Raw internal error → operator log only (never the user-facing text).
+                let cid = short_correlation_id(&format!("{safe_name}|{prompt}"));
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "codex_image_generation",
+                            "correlation_id": cid,
+                            "error": e.to_string(),
+                        })),
+                    "image_gen: codex quality:high failed"
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("codex image generation failed: {e}")),
+                    error: Some(codex_image_error_message(&cid)),
                 });
             }
         };
@@ -576,6 +610,17 @@ mod tests {
     fn tool_name() {
         let tool = test_tool();
         assert_eq!(tool.name(), "image_gen");
+    }
+
+    #[test]
+    fn codex_error_message_is_user_facing_no_internals() {
+        let msg = super::codex_image_error_message("abc12345");
+        assert!(msg.contains("Качественная генерация"));
+        assert!(msg.contains("abc12345"));
+        // no internal string / no fallback wording
+        for bad in ["missing", "image_generation_call", "fal", "diagram"] {
+            assert!(!msg.to_lowercase().contains(bad), "leaked: {bad}");
+        }
     }
 
     #[test]
