@@ -23,6 +23,10 @@ swap_size_mb = 512
   # ZEROCLAW_MODEL = 'GLM-5.1'
   ZEROCLAW_PROVIDER = 'opencode-go'
   ZEROCLAW_MODEL = 'deepseek-v4-flash'
+  # Phase 0 diagnostic: privacy-safe codex image SSE shape logging (record! WARN).
+  # Remove once quality:high extractor is verified (see
+  # docs/superpowers/plans/2026-07-13-codex-image-generation-reliability.md).
+  ZEROCLAW_CODEX_IMAGE_DEBUG = '1'
   ZEROCLAW_MANAGER_HOST = '0.0.0.0'
   ZEROCLAW_MANAGER_PORT = '3000'
   ZEROCLAW_MANAGER_BASE_PORT = '3001'
