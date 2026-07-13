@@ -502,6 +502,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
+        let provider_route = if vision_model_provider_box.is_some() {
+            zeroclaw_providers::ProviderRoute::Vision
+        } else {
+            zeroclaw_providers::ProviderRoute::Main
+        };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
         let IterationToolSpecs {
             ref tool_specs,
@@ -574,7 +579,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             active_model,
+            provider_route,
             &prepared_messages.messages,
             request_tools,
             should_consume_provider_stream,

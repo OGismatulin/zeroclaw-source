@@ -4262,13 +4262,9 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("model_provider boom")
-        );
+        let safe_error = result.error.as_deref().unwrap_or("");
+        assert!(safe_error.contains("kind=provider_error"));
+        assert!(!safe_error.contains("model_provider boom"));
     }
 
     /// MCP tools pushed into the shared parent_tools handle after DelegateTool

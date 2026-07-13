@@ -598,6 +598,53 @@ pub fn terminal_provider_failure(err: &anyhow::Error) -> Option<&TerminalProvide
     err.downcast_ref::<TerminalProviderFailure>()
 }
 
+/// Preserve an existing terminal provider record, or classify one bare error
+/// returned by an actual provider call at the runtime boundary.
+pub fn ensure_terminal_provider_failure(
+    err: anyhow::Error,
+    actual_provider: &str,
+    actual_model: &str,
+    route: ProviderRoute,
+) -> anyhow::Error {
+    if terminal_provider_failure(&err).is_some() {
+        return err;
+    }
+    TerminalProviderFailure::new(
+        &ProviderCandidateDescriptor::requested(actual_provider, None),
+        actual_model,
+        route,
+        1,
+        provider_error_diagnostic(&err),
+    )
+    .into()
+}
+
+/// Build the typed terminal record for the runtime's outer inference-step
+/// timeout. The provider future was polled exactly once and no raw cause is
+/// retained in the public error chain.
+pub fn runtime_step_timeout_failure(
+    actual_provider: &str,
+    actual_model: &str,
+    route: ProviderRoute,
+) -> anyhow::Error {
+    TerminalProviderFailure::new(
+        &ProviderCandidateDescriptor::requested(actual_provider, None),
+        actual_model,
+        route,
+        1,
+        ProviderErrorDiagnostic {
+            kind: "timeout",
+            disposition: ProviderErrorDisposition::Retryable,
+            phase: "runtime_step_timeout",
+            hint: "retry_later",
+            endpoint: None,
+            status: None,
+            retry_after_secs: None,
+        },
+    )
+    .into()
+}
+
 fn terminal_provider_error(
     candidate: &ProviderCandidateDescriptor,
     requested_model: &str,

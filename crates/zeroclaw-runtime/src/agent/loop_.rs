@@ -131,6 +131,8 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 #[cfg(test)]
 use zeroclaw_providers::{ChatRequest, ToolCall};
 
+pub use super::turn::vision_route::VisionRouteFailure;
+
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
@@ -747,6 +749,24 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_parallel};
+
+/// Typed turn-lock timeout marker. Its display text preserves the historical
+/// gateway log/error code while callers use downcasting instead of equality on
+/// the outer anyhow context string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviousTurnStuck;
+
+impl std::fmt::Display for PreviousTurnStuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("previous_turn_stuck")
+    }
+}
+
+impl std::error::Error for PreviousTurnStuck {}
+
+pub fn is_previous_turn_stuck(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<PreviousTurnStuck>().is_some()
+}
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
@@ -4339,6 +4359,106 @@ mod tests {
         }
     }
 
+    struct ContextOverflowModelProvider {
+        calls: Arc<AtomicUsize>,
+        request_lengths: Arc<Mutex<Vec<usize>>>,
+        always_fail: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ContextOverflowModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system is not used by the turn loop")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.request_lengths
+                .lock()
+                .expect("request lengths lock")
+                .push(request.messages.len());
+            if call == 0 || self.always_fail {
+                anyhow::bail!("maximum context length exceeded")
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl_test_model_provider_attribution!(ContextOverflowModelProvider);
+
+    struct CountingFallbackModelProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingFallbackModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system is not used by the turn loop")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("fallback must not run".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl_test_model_provider_attribution!(CountingFallbackModelProvider);
+
+    struct BareFailureModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for BareFailureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system is not used by the turn loop")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("503 upstream temporarily unavailable")
+        }
+    }
+    impl_test_model_provider_attribution!(BareFailureModelProvider);
+
     struct StreamingScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<String>>>,
         stream_calls: Arc<AtomicUsize>,
@@ -4987,12 +5107,204 @@ mod tests {
         }
     }
 
+    async fn run_terminal_test_turn(
+        model_provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    ) -> anyhow::Result<String> {
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider,
+                    provider_name: "configured-main",
+                    model: "requested-model",
+                    temperature: Some(0.0),
+                },
+                ResolvedIo {
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal,
+                    hooks: None,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: 4,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    knobs: &knobs,
+                },
+            ),
+            history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+    }
+
+    fn trimmable_context_history() -> Vec<ChatMessage> {
+        let large = "x".repeat(4_000);
+        let mut history = vec![ChatMessage::system("system")];
+        for turn in 0..6 {
+            history.push(ChatMessage::user(format!("turn {turn} {large}")));
+            history.push(ChatMessage::assistant(format!("reply {turn} {large}")));
+        }
+        history
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_context_overflow_trims_and_retries_in_outer_turn() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let request_lengths = Arc::new(Mutex::new(Vec::new()));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "configured-main",
+            vec![
+                (
+                    "actual-main".to_string(),
+                    Box::new(ContextOverflowModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        request_lengths: Arc::clone(&request_lengths),
+                        always_fail: false,
+                    }),
+                ),
+                (
+                    "forbidden-fallback".to_string(),
+                    Box::new(CountingFallbackModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let mut history = trimmable_context_history();
+        let original_len = history.len();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let result = run_terminal_test_turn(&provider, &mut history, Some(event_tx))
+            .await
+            .expect("outer turn should trim canonical history and recover");
+
+        assert_eq!(result, "recovered");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        let lengths = request_lengths.lock().expect("request lengths lock");
+        assert_eq!(lengths.len(), 2);
+        assert_eq!(lengths[0], original_len);
+        assert!(
+            lengths[1] < lengths[0],
+            "outer owner must trim canonical history"
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_context_overflow_unrecoverable_stays_downcastable() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "configured-main",
+            vec![
+                (
+                    "actual-main".to_string(),
+                    Box::new(ContextOverflowModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        request_lengths: Arc::new(Mutex::new(Vec::new())),
+                        always_fail: true,
+                    }),
+                ),
+                (
+                    "forbidden-fallback".to_string(),
+                    Box::new(CountingFallbackModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("latest")];
+
+        let error = run_terminal_test_turn(&provider, &mut history, None)
+            .await
+            .expect_err("one canonical turn cannot be trimmed");
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error)
+            .expect("gateway-facing result must retain terminal evidence");
+
+        assert_eq!(terminal.diagnostic().kind(), "context_window");
+        assert_eq!(terminal.actual_provider(), "actual-main");
+        assert_eq!(terminal.actual_model(), "requested-model");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_propagates_from_dispatch_outcome_through_turn_err_arm() {
+        let provider = BareFailureModelProvider;
+        let mut history = vec![ChatMessage::user("hello")];
+
+        let error = run_terminal_test_turn(&provider, &mut history, None)
+            .await
+            .expect_err("bare provider failure should end the turn");
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error)
+            .expect("turn boundary must type a real provider call failure");
+
+        assert_eq!(terminal.actual_provider(), "configured-main");
+        assert_eq!(terminal.actual_model(), "requested-model");
+        assert_eq!(terminal.route(), zeroclaw_providers::ProviderRoute::Main);
+        assert_eq!(terminal.attempts_for_call(), 1);
+        assert_eq!(terminal.diagnostic().kind(), "provider_server");
+    }
+
+    #[test]
+    fn previous_turn_stuck_typed_marker_survives_anyhow_context() {
+        use anyhow::Context as _;
+
+        let error = Err::<(), _>(anyhow::Error::new(PreviousTurnStuck))
+            .context("gateway turn-lock acquisition")
+            .expect_err("marker should remain an error");
+
+        assert!(is_previous_turn_stuck(&error));
+        assert_eq!(error.root_cause().to_string(), "previous_turn_stuck");
+    }
+
     /// A **user-supplied** image on a non-vision provider with no configured
     /// `vision_model_provider` must surface a structured capability error
     /// (channels render it back to the user) — we never silently ignore an
     /// image the user actually sent.
     #[tokio::test]
-    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+    async fn vision_provider_missing_route_is_typed_vision_not_supported() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
@@ -5053,8 +5365,11 @@ mod tests {
         .await
         .expect_err("user image on a non-vision provider should error");
 
-        assert!(err.to_string().contains("provider_capability_error"));
-        assert!(err.to_string().contains("capability=vision"));
+        let typed = err
+            .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+            .expect("latest-user image without a route must be typed");
+        assert_eq!(typed.kind(), "vision_not_supported");
+        assert_eq!(typed.provider(), "mock-provider");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -5386,7 +5701,7 @@ mod tests {
     /// the name, a descriptive error should be returned (not the generic
     /// capability error).
     #[tokio::test]
-    async fn run_tool_call_loop_vision_provider_creation_failure() {
+    async fn vision_provider_construction_failure_is_typed_misconfiguration() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = NonVisionModelProvider {
@@ -5453,12 +5768,12 @@ mod tests {
         .await
         .expect_err("should fail when vision model_provider cannot be created");
 
-        assert!(
-            err.to_string()
-                .contains("failed to create vision model_provider"),
-            "expected creation failure error, got: {}",
-            err
-        );
+        let typed = err
+            .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+            .expect("vision construction failure must be typed pre-call");
+        assert_eq!(typed.kind(), "vision_provider_misconfigured");
+        assert_eq!(typed.provider(), "nonexistent-provider-xyz");
+        assert_eq!(typed.model(), Some("some-model"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -5688,13 +6003,14 @@ mod tests {
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
 
-        // Verify the routing was attempted (not the generic capability error).
-        assert!(
-            err.to_string()
-                .contains("failed to create vision model_provider"),
-            "expected creation failure, got: {}",
-            err
-        );
+        // Verify the routing was attempted and classified as operator config,
+        // rather than the latest-user no-route capability failure.
+        let typed = err
+            .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+            .expect("creation failure should remain typed");
+        assert_eq!(typed.kind(), "vision_provider_misconfigured");
+        assert_eq!(typed.provider(), "nonexistent-provider-xyz");
+        assert_eq!(typed.model(), None);
     }
 
     /// Empty `[IMAGE:]` markers (which are preserved as literal text by the
@@ -5837,12 +6153,11 @@ mod tests {
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
 
-        assert!(
-            err.to_string()
-                .contains("failed to create vision model_provider"),
-            "expected creation failure for multiple images, got: {}",
-            err
-        );
+        let typed = err
+            .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+            .expect("multiple-image construction failure should remain typed");
+        assert_eq!(typed.kind(), "vision_provider_misconfigured");
+        assert_eq!(typed.provider(), "nonexistent-provider-xyz");
     }
 
     #[test]

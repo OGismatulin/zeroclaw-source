@@ -2,7 +2,50 @@
 
 use anyhow::Result;
 use zeroclaw_config::schema::MultimodalConfig;
-use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderCapabilityError, multimodal};
+use zeroclaw_providers::{ChatMessage, ModelProvider, multimodal};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionRouteFailure {
+    kind: &'static str,
+    provider: String,
+    model: Option<String>,
+}
+
+impl VisionRouteFailure {
+    fn new(kind: &'static str, provider: &str, model: Option<&str>) -> Self {
+        Self {
+            kind,
+            provider: provider.to_string(),
+            model: model.map(ToString::to_string),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+}
+
+impl std::fmt::Display for VisionRouteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vision route failed: kind={} provider={} model={}",
+            self.kind,
+            self.provider,
+            self.model.as_deref().unwrap_or("unknown")
+        )
+    }
+}
+
+impl std::error::Error for VisionRouteFailure {}
 
 /// Resolve the vision route for this iteration.
 ///
@@ -52,21 +95,21 @@ pub(crate) fn resolve_vision_provider(
                         })),
                     "vision model_provider construction failed"
                 );
-                anyhow::Error::msg(format!(
-                    "failed to create vision model_provider '{vp}': {e}"
+                anyhow::Error::from(VisionRouteFailure::new(
+                    "vision_provider_misconfigured",
+                    vp,
+                    multimodal_config.vision_model.as_deref(),
                 ))
             })?;
             if !vp_instance.supports_vision() {
                 // Operator misconfiguration (named a non-vision provider as
                 // the vision route) — surface it loudly rather than silently
                 // degrading.
-                return Err(ProviderCapabilityError {
-                    model_provider: vp.clone(),
-                    capability: "vision".to_string(),
-                    message: format!(
-                        "configured vision_model_provider '{vp}' does not support vision input"
-                    ),
-                }
+                return Err(VisionRouteFailure::new(
+                    "vision_provider_misconfigured",
+                    vp,
+                    multimodal_config.vision_model.as_deref(),
+                )
                 .into());
             }
             Some(vp_instance)
@@ -76,14 +119,9 @@ pub(crate) fn resolve_vision_provider(
             // render this back to the user (e.g. "⚠️ Error … does not
             // support vision"). Configuring a `vision_model_provider`
             // routes around it.
-            return Err(ProviderCapabilityError {
-                        model_provider: provider_name.to_string(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
-                        ),
-                    }
-                    .into());
+            return Err(
+                VisionRouteFailure::new("vision_not_supported", provider_name, None).into(),
+            );
         } else {
             // The only image markers left are carried over from earlier
             // history (e.g. a prior failed image turn whose user message
@@ -168,6 +206,60 @@ pub(crate) async fn prepare_messages_for_iteration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+
+    struct TextOnlyProvider;
+
+    #[async_trait]
+    impl ModelProvider for TextOnlyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl Attributable for TextOnlyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "text-only"
+        }
+    }
+
+    #[test]
+    fn vision_provider_non_vision_capability_is_typed_misconfiguration() {
+        let history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+        let config = MultimodalConfig {
+            // The OpenAI provider currently advertises vision=false. Its
+            // construction succeeds, exercising the distinct post-build
+            // capability validation path without making an API call.
+            vision_model_provider: Some("openai".to_string()),
+            vision_model: Some("text-only-model".to_string()),
+            ..MultimodalConfig::default()
+        };
+
+        let error = match resolve_vision_provider(&TextOnlyProvider, &history, &config, "main") {
+            Ok(_) => panic!("configured non-vision provider must be rejected before a call"),
+            Err(error) => error,
+        };
+        let typed = error
+            .downcast_ref::<VisionRouteFailure>()
+            .expect("capability failure must be typed");
+
+        assert_eq!(typed.kind(), "vision_provider_misconfigured");
+        assert_eq!(typed.provider(), "openai");
+        assert_eq!(typed.model(), Some("text-only-model"));
+    }
 
     /// Wiring check (#7415): the per-session `image_cache` threaded from the
     /// embedded `Agent` wrappers is populated on the first prep and reused on
