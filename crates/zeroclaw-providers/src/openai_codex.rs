@@ -1681,9 +1681,7 @@ fn build_image_request_body(
 /// image data or prompt/reasoning text, only the *shape* of the response.
 fn redact_json_values(v: &serde_json::Value) -> serde_json::Value {
     match v {
-        serde_json::Value::String(s) => {
-            serde_json::Value::String(format!("<str len={}>", s.len()))
-        }
+        serde_json::Value::String(s) => serde_json::Value::String(format!("<str len={}>", s.len())),
         serde_json::Value::Array(a) => {
             serde_json::Value::Array(a.iter().map(redact_json_values).collect())
         }
