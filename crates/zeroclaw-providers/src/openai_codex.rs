@@ -1615,7 +1615,10 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCodexModelProvider {
 /// malformed JSON and non-`data:` lines, and return the LAST matching
 /// `image_generation_call.result` — which is the terminal one.
 pub(crate) fn extract_image_b64_from_sse(body: &str) -> Option<String> {
-    let mut found: Option<String> = None;
+    let mut terminal_result: Option<String> = None;
+    let mut item_done_result: Option<String> = None;
+    let mut best_partial: Option<(i64, String)> = None;
+    let nonempty = |s: &str| (!s.is_empty()).then(|| s.to_string());
     for line in body.lines() {
         let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
             continue;
@@ -1626,19 +1629,45 @@ pub(crate) fn extract_image_b64_from_sse(body: &str) -> Option<String> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
-        // The terminal event (response.completed / response.done) carries the
-        // finished items under response.output[].
+        // (1) Terminal event (response.completed / response.done): finished items
+        // under response.output[]. Observed live: this array is often EMPTY on the
+        // chatgpt.com/backend-api/codex endpoint (see spec §11) — hence the fallbacks.
         if let Some(items) = v.pointer("/response/output").and_then(|x| x.as_array()) {
             for item in items {
                 if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call")
                     && let Some(r) = item.get("result").and_then(|r| r.as_str())
+                    && let Some(r) = nonempty(r)
                 {
-                    found = Some(r.to_string());
+                    terminal_result = Some(r);
                 }
             }
         }
+        // (2) response.output_item.done carries a single finished item under /item.
+        if let Some(item) = v.pointer("/item")
+            && item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call")
+            && let Some(r) = item.get("result").and_then(|r| r.as_str())
+            && let Some(r) = nonempty(r)
+        {
+            item_done_result = Some(r);
+        }
+        // (3) response.image_generation_call.partial_image: streamed frames; keep
+        // the highest index (most complete). Only a legitimate final when the
+        // endpoint delivers no full result (spec §5.3).
+        if let Some(b64) = v.get("partial_image_b64").and_then(|r| r.as_str())
+            && let Some(b64) = nonempty(b64)
+        {
+            let idx = v
+                .get("partial_image_index")
+                .and_then(|i| i.as_i64())
+                .unwrap_or(0);
+            if best_partial.as_ref().is_none_or(|(prev, _)| idx >= *prev) {
+                best_partial = Some((idx, b64));
+            }
+        }
     }
-    found
+    terminal_result
+        .or(item_done_result)
+        .or_else(|| best_partial.map(|(_, b64)| b64))
 }
 
 /// Maximum decoded image size we will accept (bytes). Mirrors the fal-side cap.
@@ -1868,6 +1897,46 @@ data: [DONE]\n\n";
 data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\"}]}}\n\n\
 data: [DONE]\n\n";
         assert_eq!(extract_image_b64_from_sse(sse), None);
+    }
+
+    #[test]
+    fn image_sse_reads_output_item_done_shape() {
+        let sse = "event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"status\":\"completed\",\"result\":\"aXRlbWRvbmU=\"}}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(
+            extract_image_b64_from_sse(sse).as_deref(),
+            Some("aXRlbWRvbmU=")
+        );
+    }
+
+    #[test]
+    fn image_sse_falls_back_to_highest_index_partial() {
+        let sse = "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":0,\"partial_image_b64\":\"cGFydDA=\"}\n\n\
+data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":1,\"partial_image_b64\":\"cGFydDE=\"}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(extract_image_b64_from_sse(sse).as_deref(), Some("cGFydDE="));
+    }
+
+    #[test]
+    fn image_sse_prefers_terminal_over_partial() {
+        let sse = "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":0,\"partial_image_b64\":\"cGFydA==\"}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n";
+        assert_eq!(extract_image_b64_from_sse(sse).as_deref(), Some("ZmluYWw="));
+    }
+
+    #[test]
+    fn image_sse_reasoning_only_returns_none() {
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\"}]}}\n\n";
+        assert_eq!(extract_image_b64_from_sse(sse), None);
+    }
+
+    #[test]
+    fn image_sse_empty_terminal_result_does_not_shadow_partial() {
+        let sse = "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":0,\"partial_image_b64\":\"cGFydA==\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"\"}]}}\n\n";
+        assert_eq!(extract_image_b64_from_sse(sse).as_deref(), Some("cGFydA=="));
     }
 
     #[test]
