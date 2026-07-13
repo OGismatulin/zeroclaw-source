@@ -1676,6 +1676,63 @@ fn build_image_request_body(
     })
 }
 
+/// Recursively replace every JSON string with `<str len=N>`, preserving keys,
+/// numbers, booleans, and structure. Safe for logging: never leaks base64
+/// image data or prompt/reasoning text, only the *shape* of the response.
+fn redact_json_values(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(format!("<str len={}>", s.len()))
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(redact_json_values).collect())
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .map(|(k, val)| (k.clone(), redact_json_values(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Build a privacy-safe diagnostic report of a codex image SSE body: line
+/// count, event-type histogram, presence flags, and a value-redacted skeleton
+/// of the last parsed event (to reveal the terminal shape). No raw bytes.
+fn codex_sse_shape_report(body: &str) -> String {
+    let mut data_lines = 0usize;
+    let mut types: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut saw_image_call = false;
+    let mut saw_partial = false;
+    let mut last_skeleton = serde_json::Value::Null;
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if payload == "[DONE]" || payload.is_empty() {
+            continue;
+        }
+        data_lines += 1;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
+                *types.entry(t.to_string()).or_default() += 1;
+            }
+            if payload.contains("\"image_generation_call\"") {
+                saw_image_call = true;
+            }
+            if v.get("partial_image_b64").is_some() {
+                saw_partial = true;
+            }
+            last_skeleton = redact_json_values(&v);
+        }
+    }
+    format!(
+        "codex_image_shape: body_len={} data_lines={data_lines} image_generation_call={saw_image_call} \
+partial_image={saw_partial} event_types={types:?} last_event_skeleton={last_skeleton}",
+        body.len()
+    )
+}
+
 /// Generate an image via the codex Responses `image_generation` tool using the
 /// in-process OAuth token. `size` is a codex `WxH` string ("1024x1024") or
 /// "auto"; `output_format` is e.g. "png". Returns the decoded image bytes.
@@ -1730,9 +1787,43 @@ pub async fn generate_image_png(
         let t = resp.text().await.unwrap_or_default();
         anyhow::bail!("codex image API error ({s}): {t}");
     }
-    let text = resp.text().await?;
-    let b64 = extract_image_b64_from_sse(&text)
-        .ok_or_else(|| anyhow::Error::msg("codex response missing image_generation_call.result"))?;
+    let debug = std::env::var("ZEROCLAW_CODEX_IMAGE_DEBUG").as_deref() == Ok("1");
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            if debug {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "codex_image_stream_read",
+                            "error": e.to_string(),
+                        })),
+                    "openai_codex: image stream read failed"
+                );
+            }
+            return Err(e.into());
+        }
+    };
+    let b64 = match extract_image_b64_from_sse(&text) {
+        Some(b) => b,
+        None => {
+            if debug {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "codex_image_extract",
+                            "report": codex_sse_shape_report(&text),
+                        })),
+                    "openai_codex: image extract found no result"
+                );
+            }
+            anyhow::bail!("codex response missing image_generation_call.result");
+        }
+    };
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
     if bytes.len() > CODEX_IMAGE_MAX_BYTES {
@@ -1801,6 +1892,36 @@ data: [DONE]\n\n";
         assert!(body["tools"][0].get("size").is_none());
         assert_eq!(body["tools"][0]["partial_images"], 2);
         assert_eq!(body["tool_choice"]["type"], "image_generation");
+    }
+
+    #[test]
+    fn redact_hides_string_values_keeps_structure() {
+        let v = serde_json::json!({"type":"x","result":"AAAABBBB","n":5,"arr":["ss"]});
+        let r = redact_json_values(&v);
+        assert_eq!(r["type"], "<str len=1>");
+        assert_eq!(r["result"], "<str len=8>");
+        assert_eq!(r["n"], 5);
+        assert_eq!(r["arr"][0], "<str len=2>");
+    }
+
+    #[test]
+    fn shape_report_summarizes_without_leaking_base64() {
+        let sse = "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"QUJDREVGR0hJSktMTU5P\"}]}}\n\n\
+data: [DONE]\n\n";
+        let s = codex_sse_shape_report(sse);
+        assert!(!s.contains("QUJDREVGR0hJSktMTU5P")); // no raw base64
+        assert!(s.contains("data_lines=1"));
+        assert!(s.contains("image_generation_call=true"));
+        assert!(s.contains("response.completed")); // event type histogram
+    }
+
+    #[test]
+    fn shape_report_tolerates_malformed_and_unclosed() {
+        let sse = "data: not-json\n\
+data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
+        let s = codex_sse_shape_report(sse); // must not panic
+        assert!(s.contains("data_lines="));
     }
 
     enum MockCodexReply {
