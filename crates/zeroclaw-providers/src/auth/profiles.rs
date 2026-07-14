@@ -2,11 +2,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 use tokio::time::sleep;
 use zeroclaw_config::secrets::SecretStore;
 
@@ -152,7 +150,6 @@ impl Default for AuthProfilesData {
 #[derive(Debug, Clone)]
 pub struct AuthProfilesStore {
     path: PathBuf,
-    lock_path: PathBuf,
     secret_store: SecretStore,
 }
 
@@ -160,7 +157,6 @@ impl AuthProfilesStore {
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
         Self {
             path: state_dir.join(PROFILES_FILENAME),
-            lock_path: state_dir.join(LOCK_FILENAME),
             secret_store: SecretStore::new(state_dir, encrypt_secrets),
         }
     }
@@ -191,6 +187,14 @@ impl AuthProfilesStore {
     /// file so all daemons sharing it via symlink flock the same inode.
     fn refresh_lock_path(&self) -> PathBuf {
         self.real_path().with_file_name(REFRESH_LOCK_FILENAME)
+    }
+
+    /// Path of the cross-process store lock, anchored next to the REAL store
+    /// file so every daemon sharing it via symlink flocks the same inode
+    /// (matches `refresh_lock_path`; the pre-2026-07-14 per-user O_EXCL lock was
+    /// neither shared nor death-safe — see `acquire_lock`).
+    fn store_lock_path(&self) -> PathBuf {
+        self.real_path().with_file_name(LOCK_FILENAME)
     }
 
     pub async fn load(&self) -> Result<AuthProfilesData> {
@@ -516,80 +520,82 @@ impl AuthProfilesStore {
         }
     }
 
-    async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
-        if let Some(parent) = self.lock_path.parent() {
+    /// Cross-process exclusive lock around the profile-store read/modify/write
+    /// critical section. Uses flock(2) on the SHARED (symlink-resolved) lock
+    /// file, so every daemon sharing the store flocks the same inode and the
+    /// kernel releases it on fd close / process death. A daemon killed while
+    /// holding it (SIGKILL/OOM/deploy) therefore cannot brick auth with a stale
+    /// lock file — the previous per-user O_EXCL implementation could, and did:
+    /// an orphaned `auth-profiles.lock` bricked codex auth for ~6h (DV-34312,
+    /// 2026-07-14). The store lock is held only for brief file reads/writes,
+    /// never across the HTTP refresh (that is `acquire_refresh_lock`).
+    #[cfg(unix)]
+    async fn acquire_lock(&self) -> Result<StoreLockGuard> {
+        let path = self.store_lock_path();
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "Failed to create lock directory at {}",
-                    parent.display().to_string()
-                )
+                format!("Failed to create lock directory at {}", parent.display())
             })?;
         }
 
         let mut waited = 0_u64;
         loop {
-            match OpenOptions::new()
-                .create_new(true)
+            let file = std::fs::OpenOptions::new()
+                .create(true)
                 .write(true)
-                .open(&self.lock_path)
-                .await
-            {
-                Ok(mut file) => {
-                    let mut buffer = Vec::new();
-                    writeln!(&mut buffer, "pid={}", std::process::id())?;
-                    if let Err(e) = file.write_all(&buffer).await {
-                        fs::remove_file(&self.lock_path)
-                            .await
-                            .inspect(|e| {
-                                ::zeroclaw_log::record!(
-                                    ERROR,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Fail
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"e": format!("{:?}", e)})),
-                                    "Failed to remove auth profile lock file: "
-                                );
-                            })
-                            .ok();
-                        return Err(e).with_context(|| {
-                            format!(
-                                "Failed to write auth profile lock at {}",
-                                self.lock_path.display()
-                            )
-                        });
-                    }
-                    return Ok(AuthProfileLockGuard {
-                        lock_path: self.lock_path.clone(),
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                .truncate(false)
+                .open(&path)
+                .with_context(|| {
+                    format!("Failed to open auth profile lock at {}", path.display())
+                })?;
+
+            match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+                Ok(flock) => return Ok(StoreLockGuard(flock)),
+                // On Linux/macOS EWOULDBLOCK aliases EAGAIN; flock(LOCK_NB)
+                // contention surfaces as EAGAIN here.
+                Err((_, nix::errno::Errno::EAGAIN)) => {
                     if waited >= LOCK_TIMEOUT_MS {
                         anyhow::bail!(
                             "Timed out waiting for auth profile lock at {}",
-                            self.lock_path.display()
+                            path.display()
                         );
                     }
                     sleep(Duration::from_millis(LOCK_WAIT_MS)).await;
                     waited = waited.saturating_add(LOCK_WAIT_MS);
                 }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Failed to create auth profile lock at {}",
-                            self.lock_path.display()
-                        )
-                    });
+                Err((_, e)) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "Failed to acquire auth profile lock at {}",
+                        path.display()
+                    )));
                 }
             }
         }
     }
 
+    /// Non-Unix fallback: `nix` flock(2) is Unix-only and the daemon only runs
+    /// on Linux (Fly) / macOS (local). Windows is a CI compile target only.
+    #[cfg(not(unix))]
+    async fn acquire_lock(&self) -> Result<StoreLockGuard> {
+        let path = self.store_lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create lock directory at {}", parent.display())
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open auth profile lock at {}", path.display()))?;
+        Ok(StoreLockGuard(file))
+    }
+
     /// Cross-process exclusive lock around the token-refresh critical section.
     /// Uses flock(2): the kernel releases it on fd close / process death, so a
     /// daemon killed mid-refresh (SIGKILL/OOM/deploy) cannot brick auth with a
-    /// stale lock file (unlike the O_EXCL `acquire_lock` above).
+    /// stale lock file.
     #[cfg(unix)]
     pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard> {
         let path = self.refresh_lock_path();
@@ -682,15 +688,16 @@ pub(crate) struct RefreshLockGuard(#[allow(dead_code)] nix::fcntl::Flock<std::fs
 #[cfg(not(unix))]
 pub(crate) struct RefreshLockGuard(#[allow(dead_code)] std::fs::File);
 
-struct AuthProfileLockGuard {
-    lock_path: PathBuf,
-}
+/// RAII guard for the cross-process profile-store flock. Dropping it (or
+/// process death) closes the fd and releases the kernel advisory lock — no
+/// stale lock file is left behind (unlike the old O_EXCL guard).
+#[cfg(unix)]
+struct StoreLockGuard(#[allow(dead_code)] nix::fcntl::Flock<std::fs::File>);
 
-impl Drop for AuthProfileLockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
-    }
-}
+/// Non-Unix fallback guard: holds the open lock file (no kernel lock; Windows
+/// is a compile-only target, the daemon never runs there).
+#[cfg(not(unix))]
+struct StoreLockGuard(#[allow(dead_code)] std::fs::File);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedAuthProfiles {
@@ -886,6 +893,58 @@ mod tests {
             .expect("must not time out")
             .expect("must acquire after release");
         drop(g2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_lock_shared_contended_and_released() {
+        let shared = tempfile::tempdir().unwrap();
+        let u1 = tempfile::tempdir().unwrap();
+        let u2 = tempfile::tempdir().unwrap();
+        let shared_file = shared.path().join("auth-profiles.json");
+        std::fs::write(&shared_file, b"{}").unwrap();
+        std::os::unix::fs::symlink(&shared_file, u1.path().join("auth-profiles.json")).unwrap();
+        std::os::unix::fs::symlink(&shared_file, u2.path().join("auth-profiles.json")).unwrap();
+
+        let s1 = AuthProfilesStore::new(u1.path(), false);
+        let s2 = AuthProfilesStore::new(u2.path(), false);
+        // both daemons resolve to the SAME store-lock inode
+        assert_eq!(s1.store_lock_path(), s2.store_lock_path());
+
+        let g = s1.acquire_lock().await.unwrap();
+        // While s1 holds it, s2 blocks. Bound the wait with an EXTERNAL timeout;
+        // Err here proves s2 is blocked (acquire_lock's own timeout is 10s).
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), s2.acquire_lock()).await;
+        assert!(blocked.is_err(), "s2 must block while s1 holds the store flock");
+
+        // After s1 releases (Drop closes fd → kernel releases flock), s2 acquires fast.
+        drop(g);
+        let g2 = tokio::time::timeout(std::time::Duration::from_secs(2), s2.acquire_lock())
+            .await
+            .expect("must not time out")
+            .expect("must acquire after release");
+        drop(g2);
+    }
+
+    // Regression for DV-34312 (2026-07-14): the old O_EXCL lock left an orphaned
+    // `auth-profiles.lock` FILE behind on process death, bricking every
+    // subsequent acquire for ~6h. flock keys on kernel advisory state, not file
+    // existence, so a leftover lock file must NOT block acquisition.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_lock_not_bricked_by_leftover_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth-profiles.json"), b"{}").unwrap();
+        let store = AuthProfilesStore::new(dir.path(), false);
+        // Simulate the orphan: a 0-byte lock file left by a dead holder.
+        std::fs::write(store.store_lock_path(), b"").unwrap();
+
+        let g = tokio::time::timeout(std::time::Duration::from_secs(1), store.acquire_lock())
+            .await
+            .expect("must not brick on a leftover lock file")
+            .expect("must acquire despite leftover file");
+        drop(g);
     }
 
     #[cfg(unix)]
