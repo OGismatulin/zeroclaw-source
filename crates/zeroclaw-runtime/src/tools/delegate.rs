@@ -1702,57 +1702,86 @@ impl DelegateTool {
             });
         }
 
-        let content = tokio::fs::read_to_string(&result_path).await?;
-        let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
+        // DV-34312 poll-throttle: when the task is still `Running`, long-poll up
+        // to `check_result_long_poll_secs` (0 = off → immediate return) instead
+        // of returning at once. Each poll is one full LLM iteration of the
+        // caller; without this, an orchestrator polling a slow sub-agent every
+        // ~5s drains its `max_iterations` before launching downstream work (the
+        // coordinator died mid-poll, one minute before the analyst finished, in
+        // DV-34312). We re-read the flat result each tick and return EARLY on a
+        // terminal state or reconciled-loss; `Running` is returned only once the
+        // window elapses. Bounds iterations to ~`wall_time / interval`.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(self.delegate_config.check_result_long_poll_secs);
+        const POLL_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+        loop {
+            let content = tokio::fs::read_to_string(&result_path).await?;
+            let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
-        // Overlay the control-plane's reconciled view (upstream #8217): a
-        // crashed/timed-out task whose flat file still says `Running` is
-        // surfaced as lost/timed_out, so the agent stops polling a task that
-        // will never complete. Checked FIRST so a dead task never renders alive.
-        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
-            return Ok(ToolResult {
-                success: false,
-                output: serde_json::to_string_pretty(&json!({
-                    "task_id": task_id,
-                    "agent": result.agent,
-                    "status": label,
-                    "started_at": result.started_at,
-                    "note": "the owning daemon exited or the task exceeded its max runtime; \
-                             reconciled by the supervision reaper",
-                }))?,
-                error: Some(format!("background task is {label} and will not complete")),
-            });
-        }
-
-        // fork(#20): while still running, surface the heartbeat from the sidecar
-        // so the orchestrator can tell "alive" from "stuck" (two polls, growing
-        // updated_at = alive). Sidecar absent for short tasks (<heartbeat
-        // interval) — that's fine. Upstream's registry has heartbeat_at but no
-        // producer stamps it, so this sidecar remains our liveness source.
-        if result.status == BackgroundTaskStatus::Running {
-            let progress_path = self.results_dir().join(format!("{task_id}.progress.json"));
-            if let Ok(p) = tokio::fs::read_to_string(&progress_path).await
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&p)
-                && let Some(ts) = v.get("updated_at").and_then(|x| x.as_str())
-            {
-                result.updated_at = Some(ts.to_string());
+            // Fresh flat-result FIRST: a task that has just written an
+            // authoritative terminal state must win over a stale control-plane
+            // view (so we never return `lost` for a task that actually
+            // completed during the wait). Only Completed is success; other
+            // terminals (Failed/Cancelled) are tool errors.
+            if !matches!(result.status, BackgroundTaskStatus::Running) {
+                let output = serde_json::to_string_pretty(&result)?;
+                let (success, error) = match result.status {
+                    BackgroundTaskStatus::Completed => (true, None),
+                    _ => (false, result.error),
+                };
+                return Ok(ToolResult {
+                    success,
+                    output,
+                    error,
+                });
             }
-        }
 
-        // fork(#20): a still-running poll is a SUCCESSFUL query ("in progress"),
-        // NOT a tool error — only Failed/Cancelled are errors. (Pre-fix this
-        // returned success=false for Running, so a healthy poll rendered as
-        // `Error:` and pushed weak orchestrators to cancel live sub-agents.)
-        let output = serde_json::to_string_pretty(&result)?;
-        let (success, error) = match result.status {
-            BackgroundTaskStatus::Completed | BackgroundTaskStatus::Running => (true, None),
-            _ => (false, result.error),
-        };
-        Ok(ToolResult {
-            success,
-            output,
-            error,
-        })
+            // Reconciled-loss overlay (upstream #8217): a crashed/timed-out task
+            // whose flat file still says `Running` is surfaced as lost/timed_out
+            // so the agent stops polling a task that will never complete.
+            // Re-checked each tick, so a task dying mid-wait returns immediately
+            // rather than sitting out the remaining window.
+            if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+                return Ok(ToolResult {
+                    success: false,
+                    output: serde_json::to_string_pretty(&json!({
+                        "task_id": task_id,
+                        "agent": result.agent,
+                        "status": label,
+                        "started_at": result.started_at,
+                        "note": "the owning daemon exited or the task exceeded its max runtime; \
+                                 reconciled by the supervision reaper",
+                    }))?,
+                    error: Some(format!("background task is {label} and will not complete")),
+                });
+            }
+
+            // Still `Running`. Once the long-poll window is exhausted (or it is
+            // disabled, deadline == now), return Running surfacing the FRESHEST
+            // sidecar heartbeat (fork #20: growing updated_at = alive vs stuck).
+            if tokio::time::Instant::now() >= deadline {
+                let progress_path = self.results_dir().join(format!("{task_id}.progress.json"));
+                if let Ok(p) = tokio::fs::read_to_string(&progress_path).await
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&p)
+                    && let Some(ts) = v.get("updated_at").and_then(|x| x.as_str())
+                {
+                    result.updated_at = Some(ts.to_string());
+                }
+                // fork(#20): a still-running poll is a SUCCESSFUL query ("in
+                // progress"), NOT a tool error — pushing weak orchestrators to
+                // cancel a healthy sub-agent is exactly the failure we avoid.
+                let output = serde_json::to_string_pretty(&result)?;
+                return Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                });
+            }
+
+            // Wait one tick, never overshooting the deadline.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(POLL_TICK.min(remaining)).await;
+        }
     }
 
     /// List all background delegate task results.
@@ -5178,6 +5207,134 @@ mod tests {
             result.output
         );
 
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    fn completed_result(task_id: &str, output: &str) -> BackgroundDelegateResult {
+        BackgroundDelegateResult {
+            task_id: task_id.to_string(),
+            agent: "researcher".into(),
+            status: BackgroundTaskStatus::Completed,
+            output: Some(output.to_string()),
+            error: None,
+            started_at: "2026-06-20T00:00:00Z".into(),
+            finished_at: Some("2026-06-20T00:10:00Z".into()),
+            updated_at: None,
+        }
+    }
+
+    fn long_poll_tool(workspace: std::path::PathBuf, secs: u64) -> DelegateTool {
+        DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace)
+            .with_delegate_config(DelegateToolConfig {
+                check_result_long_poll_secs: secs,
+                ..Default::default()
+            })
+    }
+
+    // DV-34312 gate (g): long_poll = 0 keeps the pre-fix immediate return for a
+    // still-running task (zero blast radius for callers that don't opt in).
+    #[tokio::test]
+    async fn check_result_zero_long_poll_returns_running_immediately() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_delegate_lp0_{}", uuid::Uuid::new_v4()));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(
+            &workspace.join("delegate_results"),
+            &running_result(&task_id),
+        );
+
+        let tool = long_poll_tool(workspace.clone(), 0);
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("running"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "long_poll=0 must return immediately"
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // DV-34312 gate (b): a task already terminal on entry returns at once even
+    // with a large long-poll window — the loop must not wait on a done task.
+    #[tokio::test]
+    async fn check_result_terminal_returns_immediately_despite_long_poll() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_delegate_term_{}", uuid::Uuid::new_v4()));
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(
+            &workspace.join("delegate_results"),
+            &completed_result(&task_id, "final analysis"),
+        );
+
+        let tool = long_poll_tool(workspace.clone(), 60);
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("final analysis"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "terminal-on-entry must not wait out the long-poll window"
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // DV-34312 gate (c) — THE race that killed the run: a task that reaches a
+    // terminal state DURING the long-poll wait must be returned in the same
+    // tool-call, not missed because the coordinator already returned a stale
+    // `Running`. Real clock (tokio `test-util`/`start_paused` not enabled here):
+    // long window = 60s, writer flips to Completed early, the poll's re-read
+    // tick catches it and returns FAR below the 60s window.
+    #[tokio::test]
+    async fn check_result_long_poll_exits_early_on_terminal_during_wait() {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_delegate_lprace_{}", uuid::Uuid::new_v4()));
+        let results_dir = workspace.join("delegate_results");
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(&results_dir, &running_result(&task_id));
+
+        // Background writer: flip Running -> Completed shortly after the poll
+        // starts, so the task is Running on the first read and terminal on a
+        // later tick.
+        let path = results_dir.join(format!("{task_id}.json"));
+        let done = completed_result(&task_id, "done mid-wait");
+        // std thread (fork bans `tokio::spawn`) flips the flat file to Completed
+        // shortly after the poll begins — Running on the first read, terminal on
+        // a later re-read tick.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::fs::write(&path, serde_json::to_string(&done).unwrap()).unwrap();
+        });
+
+        let tool = long_poll_tool(workspace.clone(), 60);
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(result.success, "completed-during-wait must be success");
+        assert!(
+            result.output.contains("done mid-wait"),
+            "must return the terminal payload written during the wait: {}",
+            result.output
+        );
+        // Caught on a re-read tick (~POLL_TICK), NOT after waiting out the 60s
+        // window — proves early-exit closes the DV-34312 race.
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "must exit early on terminal, not wait out the full window (elapsed {elapsed:?})"
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 

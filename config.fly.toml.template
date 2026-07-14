@@ -252,6 +252,12 @@ timeout_secs = 30
 [delegate]
 timeout_secs = 90
 agentic_timeout_secs = 3600
+# Server-side long-poll (seconds) for check_result on a still-Running task:
+# waits up to this long, re-reading status every ~5s, returns early on
+# terminal/reconciled-loss. Bounds orchestrator poll frequency so a slow
+# sub-agent can't drain max_iterations before the coordinator launches
+# downstream work (DV-34312). 0 = off (immediate return). Range 0..=300.
+check_result_long_poll_secs = 60
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────
 # Periodic HEARTBEAT.md tasks (e.g. Jira watchdog). V3 made `enabled` default

@@ -3249,6 +3249,16 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Server-side long-poll window (seconds) for `check_result` on a still
+    /// `Running` task: the tool waits up to this long, re-reading status every
+    /// few seconds and returning early the moment the task reaches a terminal
+    /// state or is reconciled lost. Bounds how fast an orchestrator can poll a
+    /// slow sub-agent so a single slow analyst cannot drain `max_iterations`
+    /// before the coordinator launches downstream work (DV-34312). `0` (default)
+    /// keeps the pre-2026-07-14 behavior: `Running` returns immediately.
+    /// Valid range `0..=300`; values above 300 are rejected on validation.
+    #[serde(default)]
+    pub check_result_long_poll_secs: u64,
 }
 
 impl Default for DelegateToolConfig {
@@ -3256,6 +3266,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            check_result_long_poll_secs: 0,
         }
     }
 }
@@ -18216,6 +18227,15 @@ impl Config {
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
+        // Delegate long-poll window (DV-34312 poll-throttle): 0 = off, cap 300s
+        // (a check_result long-poll never needs to outlast the client timeout).
+        if self.delegate.check_result_long_poll_secs > 300 {
+            anyhow::bail!(
+                "delegate.check_result_long_poll_secs must be 0..=300 (got {})",
+                self.delegate.check_result_long_poll_secs
+            );
+        }
+
         // Skills — extra registries
         {
             let mut seen = std::collections::HashSet::new();
@@ -20909,6 +20929,29 @@ enabled = true
         tg.reply_queue_depth_max = REPLY_QUEUE_DEPTH_CEILING;
         config.channels.telegram.insert("default".to_string(), tg);
         config.validate().expect("documented ceiling must pass");
+    }
+
+    // DV-34312 poll-throttle gate (h): the long-poll window is bounded 0..=300.
+    #[test]
+    async fn validate_rejects_delegate_long_poll_above_max() {
+        let mut config = Config::default();
+        config.delegate.check_result_long_poll_secs = 301;
+        let err = config
+            .validate()
+            .expect_err("delegate.check_result_long_poll_secs > 300 must be rejected");
+        assert!(
+            err.to_string().contains("check_result_long_poll_secs"),
+            "error must name the offending field; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_delegate_long_poll_at_bounds() {
+        let mut config = Config::default();
+        config.delegate.check_result_long_poll_secs = 300;
+        config.validate().expect("documented ceiling 300 must pass");
+        config.delegate.check_result_long_poll_secs = 0;
+        config.validate().expect("0 (off) must pass");
     }
 
     #[test]

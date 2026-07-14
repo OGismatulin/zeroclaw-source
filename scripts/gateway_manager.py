@@ -480,7 +480,12 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-22 = [image_gen] enabled with dual backend (fast=fal flux-2-turbo,
 #         high=codex gpt-image-2). New block; existing per-user configs get it
 #         via template cutover. See spec 2026-07-12-image-generation-dual-backend.
-CURRENT_CONFIG_MARKER = "v3-22"
+# v3-23 = [delegate] check_result_long_poll_secs = 60. Server-side long-poll on
+#         check_result of a still-Running task so a slow sub-agent can't drain
+#         the coordinator's max_iterations before it launches the judge
+#         (DV-34312). New field; existing per-user configs get it via template
+#         cutover. See spec 2026-07-14-jira-coordinator-poll-throttle-design.
+CURRENT_CONFIG_MARKER = "v3-23"
 
 
 def sanitize_filename(filename: str) -> str:
