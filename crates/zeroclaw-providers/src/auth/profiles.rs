@@ -916,7 +916,10 @@ mod tests {
         // Err here proves s2 is blocked (acquire_lock's own timeout is 10s).
         let blocked =
             tokio::time::timeout(std::time::Duration::from_millis(300), s2.acquire_lock()).await;
-        assert!(blocked.is_err(), "s2 must block while s1 holds the store flock");
+        assert!(
+            blocked.is_err(),
+            "s2 must block while s1 holds the store flock"
+        );
 
         // After s1 releases (Drop closes fd → kernel releases flock), s2 acquires fast.
         drop(g);
