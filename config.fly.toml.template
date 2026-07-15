@@ -624,6 +624,11 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [image_gen]
 enabled = true
 default_backend = "fast"
-fal_model = "fal-ai/flux-2/turbo"
+fal_model = "xai/grok-imagine-image"
 codex_model = "gpt-5.5"
 api_key_env = "FAL_API_KEY"
+fal_size_param = "aspect_ratio"
+
+[image_gen.fal_extra_body]
+resolution = "1k"
+output_format = "png"

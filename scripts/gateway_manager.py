@@ -485,7 +485,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         the coordinator's max_iterations before it launches the judge
 #         (DV-34312). New field; existing per-user configs get it via template
 #         cutover. See spec 2026-07-14-jira-coordinator-poll-throttle-design.
-CURRENT_CONFIG_MARKER = "v3-23"
+# v3-24 = [image_gen] fast model -> xai/grok-imagine-image (better Cyrillic text);
+#         data-driven fal body via fal_size_param/fal_size_map/[image_gen.fal_extra_body].
+#         See spec 2026-07-15-fal-image-model-data-driven-body.
+CURRENT_CONFIG_MARKER = "v3-24"
 
 
 def sanitize_filename(filename: str) -> str:
