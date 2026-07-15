@@ -307,6 +307,21 @@ tool_timeout_secs = 120
 [mcp.servers.headers]
 Authorization = "Bearer __CODEMAP_SEMANTIC_API_KEY__"
 
+# codemap-fs: third remote MCP on the SAME box — read-only file access to the
+# indexed monorepa (services/packages/prototypes) so the agent reads a file or a
+# project's CLAUDE.md/README.md directly instead of hunting via glab api. Its
+# [mcp.servers.headers] MUST sit immediately below THIS block (headers attach to
+# the last [[mcp.servers]]). REUSES CODEMAP_API_KEY (Oleg #2 — one key, three
+# routes). Design: docs/superpowers/specs/2026-07-15-*.
+[[mcp.servers]]
+name = "codemap-fs"
+transport = "http"
+url = "https://178-104-197-112.sslip.io/fs/mcp"
+tool_timeout_secs = 120
+
+[mcp.servers.headers]
+Authorization = "Bearer __CODEMAP_API_KEY__"
+
 # codemap: remote code-index MCP over the internet (Fly iad -> Hetzner EU).
 # graph of the Lalafo monorepa (graphify). Bearer secret is seeded from
 # CODEMAP_API_KEY via the __CODEMAP_API_KEY__ placeholder (no env-subst in
@@ -328,7 +343,7 @@ Authorization = "Bearer __CODEMAP_API_KEY__"
 # every agent got every [[mcp.servers]] globally; this bundle + per-agent
 # `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
 [mcp_bundles.all]
-servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic"]
+servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic", "codemap-fs"]
 
 # ── Risk profile (default) ──────────────────────────────────────────────────
 # Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full

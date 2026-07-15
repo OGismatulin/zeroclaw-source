@@ -488,7 +488,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-24 = [image_gen] fast model -> xai/grok-imagine-image (better Cyrillic text);
 #         data-driven fal body via fal_size_param/fal_size_map/[image_gen.fal_extra_body].
 #         See spec 2026-07-15-fal-image-model-data-driven-body.
-CURRENT_CONFIG_MARKER = "v3-25"
+CURRENT_CONFIG_MARKER = "v3-26"
 
 
 def sanitize_filename(filename: str) -> str:
