@@ -149,6 +149,17 @@ impl ShellTool {
         self
     }
 
+    /// Resolve the effective per-call timeout: a caller-supplied positive
+    /// `requested` value wins but is clamped down to the profile `ceiling_secs`;
+    /// zero or missing falls back to the ceiling. Callers cannot extend beyond
+    /// the profile ceiling, only shorten.
+    pub(crate) fn resolve_timeout(ceiling_secs: u64, requested: Option<u64>) -> u64 {
+        match requested {
+            Some(s) if s > 0 => s.min(ceiling_secs),
+            _ => ceiling_secs,
+        }
+    }
+
     /// Overlay the TUI client's environment on top of the safe-env snapshot.
     ///
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
@@ -280,6 +291,11 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
                     "default": false
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional per-call timeout in seconds, clamped to the profile ceiling. Use ~60-90 for network CLIs (glab api, curl) so a hung call fails fast instead of blocking the whole turn."
                 }
             },
             "required": ["command"]
@@ -384,7 +400,8 @@ impl Tool for ShellTool {
             cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
-        let timeout_secs = self.timeout_secs;
+        let requested_timeout = args.get("timeout_secs").and_then(|v| v.as_u64());
+        let timeout_secs = Self::resolve_timeout(self.timeout_secs, requested_timeout);
         // Run in own process group so `ChildGroupGuard` can reap the
         // whole subtree (backgrounded jobs, subshells) on any exit path.
         #[cfg(unix)]
@@ -662,6 +679,61 @@ mod tests {
                 .contains(&json!("command"))
         );
         assert!(schema["properties"]["approved"].is_object());
+    }
+
+    #[test]
+    fn schema_exposes_optional_timeout_secs() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["timeout_secs"].is_object());
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("schema required field should be an array")
+                .iter()
+                .any(|v| v == "timeout_secs")
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_clamps_to_ceiling() {
+        assert_eq!(ShellTool::resolve_timeout(600, Some(9999)), 600);
+        assert_eq!(ShellTool::resolve_timeout(600, Some(5)), 5);
+        assert_eq!(ShellTool::resolve_timeout(600, Some(0)), 600);
+        assert_eq!(ShellTool::resolve_timeout(600, None), 600);
+    }
+
+    /// A per-call `timeout_secs` far below the profile ceiling must kill a
+    /// hung child promptly (process-group reap), not wait out the ceiling.
+    #[tokio::test]
+    async fn per_call_timeout_kills_hung_child() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["sleep".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(600);
+        let start = std::time::Instant::now();
+        let res = tool
+            .execute(json!({"command": "sleep 30", "timeout_secs": 1}))
+            .await
+            .expect("execute should return a result");
+        assert!(
+            !res.success,
+            "expected failure, got output: {:?}",
+            res.output
+        );
+        let err = res.error.expect("timeout must surface an error");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err:?}"
+        );
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "process group not killed promptly (elapsed {:?})",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
