@@ -134,8 +134,9 @@ const FAL_RESERVED_KEYS: [&str; 2] = ["prompt", "num_images"];
 
 /// Build the fal.ai request body from config: static `extra` fields first, then
 /// the size key (unless empty or a reserved name), then the always-winning
-/// reserved `prompt`/`num_images`. Size value = `size_map[preset]` else the
-/// built-in map for `size_param` else the raw preset.
+/// reserved `prompt`/`num_images`. Size value = `size_map[preset]` if present,
+/// else the built-in map for `size_param` (an unknown `size_param` falls back
+/// to the FLUX/`image_size` presets).
 fn build_fal_body(
     prompt: &str,
     size: &str,
@@ -228,6 +229,10 @@ pub struct ImageGenTool {
     fal_size_map: std::collections::HashMap<String, String>,
     /// Static params merged verbatim into the fal request body.
     fal_extra_body: std::collections::HashMap<String, serde_json::Value>,
+    /// Base URL for the fal.ai fast backend. Always `"https://fal.run"` in
+    /// production; overridable in-crate by tests to point at a mock server
+    /// (no trailing slash — callers append `/{model}`).
+    fal_base_url: String,
 }
 
 impl ImageGenTool {
@@ -250,6 +255,7 @@ impl ImageGenTool {
             fal_size_param: "image_size".into(),
             fal_size_map: Default::default(),
             fal_extra_body: Default::default(),
+            fal_base_url: "https://fal.run".into(),
         }
     }
 
@@ -284,6 +290,7 @@ impl ImageGenTool {
             fal_size_param,
             fal_size_map,
             fal_extra_body,
+            fal_base_url: "https://fal.run".into(),
         }
     }
 
@@ -460,7 +467,7 @@ impl ImageGenTool {
 
         // ── Call fal.ai ────────────────────────────────────────────
         let client = Self::http_client();
-        let url = format!("https://fal.run/{model}");
+        let url = format!("{}/{model}", self.fal_base_url);
 
         let body = build_fal_body(
             prompt,
@@ -1068,5 +1075,110 @@ mod tests {
         assert_eq!(result.unwrap(), "test_value_123");
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY") };
+    }
+
+    /// Wire-level proof that `generate_fal` actually POSTs the body
+    /// `build_fal_body` assembles — not just that the pure function returns the
+    /// right `serde_json::Value` in isolation. Configures the tool like the
+    /// grok backend (`aspect_ratio` + extras) and captures the real HTTP
+    /// request against a `wiremock` server (via the `fal_base_url` seam) to
+    /// assert `aspect_ratio` (not `image_size`), the extras, and the
+    /// `Authorization: Key <token>` header all land on the wire.
+    #[tokio::test]
+    async fn generate_fal_wire_body_carries_aspect_ratio_not_image_size() {
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        // Unique per-test env var — never touch the shared FAL_API_KEY.
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FAL_API_KEY_TEST_WIRE", "dummy_key_wire") };
+
+        let tmp = TempDir::new().unwrap();
+        let mock_server = MockServer::start().await;
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("resolution".to_string(), serde_json::json!("1k"));
+        extra.insert("output_format".to_string(), serde_json::json!("png"));
+
+        let mut tool = ImageGenTool::new_with_persistence(
+            test_security(),
+            tmp.path().to_path_buf(),
+            "xai/grok-imagine-image".into(),
+            "FAL_API_KEY_TEST_WIRE".into(),
+            true,
+            "fast".into(),
+            "gpt-5.5".into(),
+            PathBuf::from("."),
+            false,
+            "aspect_ratio".into(),
+            Default::default(),
+            extra,
+        );
+        tool.fal_base_url = mock_server.uri();
+
+        let image_url = format!("{}/img.png", mock_server.uri());
+        Mock::given(method("POST"))
+            .and(path("/xai/grok-imagine-image"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "images": [{ "url": image_url }]
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Minimal PNG-looking bytes; fal downloads use require_png=false so any
+        // bytes pass, but keep the signature for realism.
+        let mut png_bytes = PNG_MAGIC.to_vec();
+        png_bytes.extend_from_slice(&[0x00, 0x01, 0x02]);
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png_bytes))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let result = tool
+            .execute(json!({
+                "prompt": "вывеска ОТКРЫТО",
+                "quality": "fast",
+                "size": "landscape"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("File:"),
+            "output missing File: line: {}",
+            result.output
+        );
+
+        let received = mock_server.received_requests().await.unwrap();
+        let post_req: &Request = received
+            .iter()
+            .find(|r| r.url.path() == "/xai/grok-imagine-image")
+            .expect("expected a POST to the fal model path");
+
+        let body: serde_json::Value = post_req.body_json().unwrap();
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert!(body.get("image_size").is_none());
+        assert_eq!(body["resolution"], "1k");
+        assert_eq!(body["output_format"], "png");
+        assert_eq!(body["prompt"], "вывеска ОТКРЫТО");
+
+        let auth = post_req
+            .headers
+            .get("Authorization")
+            .expect("Authorization header missing")
+            .to_str()
+            .unwrap();
+        assert!(
+            auth.starts_with("Key "),
+            "unexpected Authorization header: {auth}"
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FAL_API_KEY_TEST_WIRE") };
     }
 }
