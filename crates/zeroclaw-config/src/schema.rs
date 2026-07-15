@@ -8083,6 +8083,22 @@ pub struct ImageGenConfig {
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
+
+    /// JSON key that carries the size/aspect value in the fal request body.
+    /// "image_size" (FLUX, default), "aspect_ratio" (grok), or "" to omit size.
+    #[serde(default = "default_image_gen_fal_size_param")]
+    pub fal_size_param: String,
+
+    /// Preset (square|landscape|portrait|auto|…) → model-specific value. When a
+    /// preset is absent, a built-in map is chosen by `fal_size_param`, else the
+    /// raw preset is passed through.
+    #[serde(default)]
+    pub fal_size_map: std::collections::HashMap<String, String>,
+
+    /// Static params merged verbatim into the fal request body (e.g. resolution,
+    /// output_format). Reserved keys (prompt, num_images, the size param) win.
+    #[serde(default)]
+    pub fal_extra_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn default_image_gen_backend() -> String {
@@ -8101,6 +8117,10 @@ fn default_image_gen_api_key_env() -> String {
     "FAL_API_KEY".into()
 }
 
+fn default_image_gen_fal_size_param() -> String {
+    "image_size".into()
+}
+
 impl Default for ImageGenConfig {
     fn default() -> Self {
         Self {
@@ -8109,6 +8129,9 @@ impl Default for ImageGenConfig {
             fal_model: default_image_gen_model(),
             codex_model: default_image_gen_codex_model(),
             api_key_env: default_image_gen_api_key_env(),
+            fal_size_param: default_image_gen_fal_size_param(),
+            fal_size_map: Default::default(),
+            fal_extra_body: Default::default(),
         }
     }
 }
@@ -20090,6 +20113,41 @@ api_key_env = "FAL_API_KEY"
         assert_eq!(empty.default_backend, "fast");
         assert_eq!(empty.fal_model, "fal-ai/flux-2/turbo");
         assert_eq!(empty.codex_model, "gpt-5.5");
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_gen_config_parses_data_driven_fal_body_fields() {
+        use super::ImageGenConfig;
+
+        let toml = r#"
+enabled = true
+fal_model = "xai/grok-imagine-image"
+fal_size_param = "aspect_ratio"
+
+[fal_size_map]
+landscape = "16:9"
+
+[fal_extra_body]
+resolution = "1k"
+output_format = "png"
+"#;
+        let cfg: ImageGenConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.fal_size_param, "aspect_ratio");
+        assert_eq!(
+            cfg.fal_size_map.get("landscape").map(String::as_str),
+            Some("16:9")
+        );
+        assert_eq!(
+            cfg.fal_extra_body
+                .get("resolution")
+                .and_then(|v| v.as_str()),
+            Some("1k")
+        );
+
+        let empty: ImageGenConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.fal_size_param, "image_size"); // Rust default stays FLUX
+        assert!(empty.fal_size_map.is_empty());
+        assert!(empty.fal_extra_body.is_empty());
     }
 
     #[::core::prelude::v1::test]
