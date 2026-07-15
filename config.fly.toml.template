@@ -369,6 +369,7 @@ allowed_commands = [
     "agent-browser",
     "gh",
     "glab",
+    "code_repos_sync.py",
 ]
 forbidden_paths = [
     "/etc",

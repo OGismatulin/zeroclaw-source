@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Clone, update, and discover Lalafo microservice and frontend repositories for agent code browsing.
 
