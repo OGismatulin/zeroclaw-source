@@ -105,13 +105,61 @@ const ACCEPTED_SIZES: &[&str] = &[
     "portrait_16_9",
 ];
 
-/// Map a size preset to a fal.ai `image_size` value.
-pub(crate) fn map_size_fal(p: &str) -> &'static str {
-    match p {
-        "landscape" | "landscape_16_9" => "landscape_16_9",
-        "portrait" | "portrait_16_9" => "portrait_16_9",
-        _ => "square_hd", // square, auto, square_hd, 4_3, unknown → square_hd
+/// Map a size preset to a built-in value for the given fal `size_param`.
+/// `"aspect_ratio"` (grok-style models) yields `W:H` ratios; anything else
+/// (including the default `"image_size"`) yields FLUX preset names.
+pub(crate) fn builtin_size_map(size_param: &str, preset: &str) -> &'static str {
+    match size_param {
+        "aspect_ratio" => match preset {
+            "landscape" | "landscape_16_9" => "16:9",
+            "portrait" | "portrait_16_9" => "9:16",
+            "landscape_4_3" => "4:3",
+            "portrait_4_3" => "3:4",
+            _ => "1:1", // square, auto, unknown
+        },
+        _ => match preset {
+            // "image_size" and unknown params → FLUX presets
+            "landscape" | "landscape_16_9" => "landscape_16_9",
+            "portrait" | "portrait_16_9" => "portrait_16_9",
+            "landscape_4_3" => "landscape_4_3",
+            "portrait_4_3" => "portrait_4_3",
+            _ => "square_hd",
+        },
     }
+}
+
+/// Reserved fal.ai request body keys that are always set from live call
+/// parameters and can never be overridden by config-supplied static fields.
+const FAL_RESERVED_KEYS: [&str; 2] = ["prompt", "num_images"];
+
+/// Build the fal.ai request body from config: static `extra` fields first, then
+/// the size key (unless empty or a reserved name), then the always-winning
+/// reserved `prompt`/`num_images`. Size value = `size_map[preset]` else the
+/// built-in map for `size_param` else the raw preset.
+fn build_fal_body(
+    prompt: &str,
+    size: &str,
+    size_param: &str,
+    size_map: &std::collections::HashMap<String, String>,
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in extra {
+        map.insert(k.clone(), v.clone());
+    }
+    if !size_param.is_empty() && !FAL_RESERVED_KEYS.contains(&size_param) {
+        let val: String = size_map
+            .get(size)
+            .cloned()
+            .unwrap_or_else(|| builtin_size_map(size_param, size).to_string());
+        map.insert(size_param.to_string(), serde_json::Value::String(val));
+    }
+    map.insert(
+        "prompt".into(),
+        serde_json::Value::String(prompt.to_string()),
+    );
+    map.insert("num_images".into(), serde_json::json!(1));
+    serde_json::Value::Object(map)
 }
 
 /// Map a size preset to a codex `WxH` value (or "auto").
@@ -173,6 +221,13 @@ pub struct ImageGenTool {
     codex_state_dir: PathBuf,
     /// Whether the codex auth store encrypts secrets at rest.
     codex_encrypt_secrets: bool,
+    /// JSON key that carries the size/aspect value in the fal request body
+    /// (e.g. "image_size" for FLUX, "aspect_ratio" for grok; "" to omit size).
+    fal_size_param: String,
+    /// Preset → model-specific size value, overriding the built-in map.
+    fal_size_map: std::collections::HashMap<String, String>,
+    /// Static params merged verbatim into the fal request body.
+    fal_extra_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl ImageGenTool {
@@ -192,6 +247,9 @@ impl ImageGenTool {
             codex_model: "gpt-5.5".into(),
             codex_state_dir: PathBuf::from("."),
             codex_encrypt_secrets: false,
+            fal_size_param: "image_size".into(),
+            fal_size_map: Default::default(),
+            fal_extra_body: Default::default(),
         }
     }
 
@@ -209,6 +267,9 @@ impl ImageGenTool {
         codex_model: String,
         codex_state_dir: PathBuf,
         codex_encrypt_secrets: bool,
+        fal_size_param: String,
+        fal_size_map: std::collections::HashMap<String, String>,
+        fal_extra_body: std::collections::HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
             security,
@@ -220,6 +281,9 @@ impl ImageGenTool {
             codex_model,
             codex_state_dir,
             codex_encrypt_secrets,
+            fal_size_param,
+            fal_size_map,
+            fal_extra_body,
         }
     }
 
@@ -361,6 +425,7 @@ impl ImageGenTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&self.fal_model);
+        let model = model.trim();
 
         // Validate model identifier: must look like a fal.ai model path
         // (e.g. "fal-ai/flux-2/turbo"). Reject values with "..", query
@@ -397,11 +462,13 @@ impl ImageGenTool {
         let client = Self::http_client();
         let url = format!("https://fal.run/{model}");
 
-        let body = json!({
-            "prompt": prompt,
-            "image_size": map_size_fal(size),
-            "num_images": 1
-        });
+        let body = build_fal_body(
+            prompt,
+            size,
+            &self.fal_size_param,
+            &self.fal_size_map,
+            &self.fal_extra_body,
+        );
 
         let resp = client
             .post(&url)
@@ -523,7 +590,7 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an image from a text prompt. quality: fast (fal.ai FLUX, default) \
+        "Generate an image from a text prompt. quality: fast (fal.ai fast model, default) \
          or high (Codex). Saves a PNG to the workspace images directory and returns \
          the file path. size: square|landscape|portrait|auto. model overrides the \
          fal model for the fast backend only."
@@ -541,7 +608,7 @@ impl Tool for ImageGenTool {
                 "quality": {
                     "type": "string",
                     "enum": ["fast", "high"],
-                    "description": "Backend: 'fast' (fal.ai FLUX) or 'high' (Codex). Defaults to the configured backend."
+                    "description": "Backend: 'fast' (fal.ai) or 'high' (Codex). Defaults to the configured backend."
                 },
                 "filename": {
                     "type": "string",
@@ -554,7 +621,7 @@ impl Tool for ImageGenTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "fal.ai model identifier for the fast backend only (default: 'fal-ai/flux-2/turbo'). Ignored when quality=high."
+                    "description": "fal.ai model path for the fast backend only (overrides the configured model). Ignored when quality=high."
                 }
             }
         })
@@ -650,10 +717,121 @@ mod tests {
 
     #[test]
     fn size_preset_maps_per_backend() {
-        assert_eq!(map_size_fal("landscape"), "landscape_16_9");
+        assert_eq!(
+            builtin_size_map("image_size", "landscape"),
+            "landscape_16_9"
+        );
         assert_eq!(map_size_codex("landscape"), "1536x1024");
         assert_eq!(map_size_codex("auto"), "auto");
-        assert_eq!(map_size_fal("square"), "square_hd");
+        assert_eq!(builtin_size_map("image_size", "square"), "square_hd");
+    }
+
+    #[test]
+    fn builtin_size_map_covers_families_and_4_3() {
+        assert_eq!(
+            builtin_size_map("image_size", "landscape"),
+            "landscape_16_9"
+        );
+        assert_eq!(builtin_size_map("image_size", "square"), "square_hd");
+        assert_eq!(
+            builtin_size_map("image_size", "landscape_4_3"),
+            "landscape_4_3"
+        );
+        assert_eq!(builtin_size_map("aspect_ratio", "landscape"), "16:9");
+        assert_eq!(builtin_size_map("aspect_ratio", "portrait"), "9:16");
+        assert_eq!(builtin_size_map("aspect_ratio", "square"), "1:1");
+        assert_eq!(builtin_size_map("aspect_ratio", "auto"), "1:1");
+        assert_eq!(builtin_size_map("aspect_ratio", "landscape_4_3"), "4:3");
+        assert_eq!(builtin_size_map("aspect_ratio", "portrait_4_3"), "3:4");
+    }
+
+    #[test]
+    fn build_fal_body_default_is_flux_compatible() {
+        let body = build_fal_body(
+            "a cat",
+            "square",
+            "image_size",
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(body["prompt"], "a cat");
+        assert_eq!(body["num_images"], 1);
+        assert_eq!(body["image_size"], "square_hd");
+        assert!(body.get("aspect_ratio").is_none());
+    }
+
+    #[test]
+    fn build_fal_body_grok_uses_aspect_ratio_and_extra() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("resolution".to_string(), serde_json::json!("1k"));
+        extra.insert("output_format".to_string(), serde_json::json!("png"));
+        let body = build_fal_body(
+            "вывеска ОТКРЫТО",
+            "landscape",
+            "aspect_ratio",
+            &Default::default(),
+            &extra,
+        );
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert_eq!(body["resolution"], "1k");
+        assert_eq!(body["output_format"], "png");
+        assert!(body.get("image_size").is_none());
+    }
+
+    #[test]
+    fn build_fal_body_empty_size_param_omits_size() {
+        let body = build_fal_body("x", "square", "", &Default::default(), &Default::default());
+        assert!(body.get("image_size").is_none());
+        assert!(body.get("aspect_ratio").is_none());
+    }
+
+    #[test]
+    fn build_fal_body_reserved_keys_win() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("prompt".to_string(), serde_json::json!("HIJACK"));
+        extra.insert("num_images".to_string(), serde_json::json!(9));
+        extra.insert("aspect_ratio".to_string(), serde_json::json!("2:1"));
+        let body = build_fal_body(
+            "real",
+            "landscape",
+            "aspect_ratio",
+            &Default::default(),
+            &extra,
+        );
+        assert_eq!(body["prompt"], "real");
+        assert_eq!(body["num_images"], 1);
+        assert_eq!(body["aspect_ratio"], "16:9");
+    }
+
+    #[test]
+    fn build_fal_body_size_param_as_reserved_is_ignored() {
+        let body = build_fal_body(
+            "real",
+            "landscape",
+            "prompt",
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(body["prompt"], "real");
+    }
+
+    #[test]
+    fn build_fal_body_partial_map_falls_back_to_builtin() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("portrait".to_string(), "9:20".to_string());
+        let body = build_fal_body("x", "landscape", "aspect_ratio", &map, &Default::default());
+        assert_eq!(body["aspect_ratio"], "16:9");
+    }
+
+    #[test]
+    fn description_has_no_hardcoded_default_model() {
+        let t = test_tool();
+        assert!(!t.description().to_lowercase().contains("flux-2/turbo"));
+        let schema = t.parameters_schema();
+        let model_desc = schema["properties"]["model"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!model_desc.contains("fal-ai/flux-2/turbo"));
     }
 
     #[test]

@@ -1112,6 +1112,9 @@ pub fn all_tools_with_runtime(
             root_config.image_gen.codex_model.clone(),
             codex_state_dir,
             root_config.secrets.encrypt,
+            root_config.image_gen.fal_size_param.clone(),
+            root_config.image_gen.fal_size_map.clone(),
+            root_config.image_gen.fal_extra_body.clone(),
         )));
     }
 
