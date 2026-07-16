@@ -54,12 +54,12 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
-use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 pub use reliable::{
     ProviderCandidateDescriptor, ProviderErrorDiagnostic, ProviderErrorDisposition, ProviderRoute,
     TerminalProviderFailure, ensure_terminal_provider_failure, runtime_step_timeout_failure,
     terminal_provider_failure,
 };
+use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
 
