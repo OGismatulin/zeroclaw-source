@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -320,7 +320,7 @@ impl ImageGenTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: 'prompt'".into()),
                 });
             }
@@ -347,7 +347,7 @@ impl ImageGenTool {
         if !ACCEPTED_SIZES.contains(&size.as_str()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid size '{size}'. Valid values: {}",
                     ACCEPTED_SIZES.join(", ")
@@ -376,7 +376,7 @@ impl ImageGenTool {
         if bytes.len() > IMAGE_GEN_MAX_BYTES {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Generated image exceeds size cap ({} > {IMAGE_GEN_MAX_BYTES} bytes)",
                     bytes.len()
@@ -386,7 +386,7 @@ impl ImageGenTool {
         if require_png && !bytes.starts_with(&PNG_MAGIC) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Generated image is not a valid PNG (bad signature)".into()),
             });
         }
@@ -413,7 +413,7 @@ impl ImageGenTool {
         let output = format_image_tool_output(&path_display, size_kb, model, prompt);
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -445,7 +445,7 @@ impl ImageGenTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid model identifier '{model}'. \
                      Must be a fal.ai model path (e.g. 'fal-ai/flux-2/turbo')."
@@ -459,7 +459,7 @@ impl ImageGenTool {
             Err(msg) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 });
             }
@@ -491,7 +491,7 @@ impl ImageGenTool {
             let body_text = resp.text().await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("fal.ai API error ({status}): {body_text}")),
             });
         }
@@ -524,7 +524,7 @@ impl ImageGenTool {
         if !img_resp.status().is_success() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to download image from {image_url} ({})",
                     img_resp.status()
@@ -578,7 +578,7 @@ impl ImageGenTool {
                 );
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(codex_image_error_message(&cid)),
                 });
             }
@@ -642,7 +642,7 @@ impl Tool for ImageGenTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -651,7 +651,7 @@ impl Tool for ImageGenTool {
         // A generated image saved to an ephemeral workspace never reaches the
         // host and is lost at session end; warn loudly on success (issue #4627).
         if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output);
+            result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
         Ok(result)
     }

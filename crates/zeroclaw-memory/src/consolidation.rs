@@ -9,9 +9,14 @@
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
 use crate::conflict;
+use crate::dedup::{self, DedupAction};
 use crate::importance;
-use crate::traits::{Memory, MemoryCategory};
+use crate::merge;
+use crate::policy::PolicyEnforcer;
+use crate::policy_gate;
+use crate::traits::{Memory, MemoryCategory, StoreOptions};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 
 /// Output of consolidation extraction.
@@ -53,7 +58,8 @@ const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"Ты — движок консол�
 fn strip_media_markers(text: &str) -> String {
     // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
+            .expect("media-tag regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -63,6 +69,7 @@ pub async fn consolidate_turn(
     model: &str,
     temperature: Option<f64>,
     memory: &dyn Memory,
+    memory_config: &MemoryConfig,
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
@@ -118,19 +125,79 @@ pub async fn consolidate_turn(
         // Compute importance score heuristically.
         let imp = importance::compute_importance(update, &MemoryCategory::Core);
 
-        // Detect conflicting Core memories BEFORE storing the new entry, so the
-        // new entry itself is never a candidate for being superseded.
-        //
-        // Fork patch #18: a hardcoded similarity threshold cannot cleanly
-        // separate "contradiction" from "mere relatedness" (cos between
-        // "language is Python" and "language is Rust" was only 0.78). Instead,
-        // recall the nearest Core candidates and let an LLM judge decide which
-        // the new fact makes outdated. `judge_conflicts` is best-effort and
-        // returns empty on any provider/parse error (supersede nothing).
-        let candidates: Vec<_> = memory
+        // Merge resolution: adopt the upstream v0.8.3 durable-seam write path
+        // (policy write-gate + near-duplicate dedup) and carry fork patch #18
+        // (LLM judge in place of the similarity-threshold conflict check).
+
+        // A (upstream v0.8.3 durable seam): fail-closed policy write-gate on the
+        // autonomous consolidation path.
+        let policy = PolicyEnforcer::new(&memory_config.policy);
+        if let Err(e) =
+            policy_gate::validate_store(memory, &policy, "default", &MemoryCategory::Core).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory consolidation write denied by policy"
+            );
+            anyhow::bail!("memory consolidation write denied by policy: {e}");
+        }
+
+        // Recall the nearest Core candidates ONCE; shared by the upstream dedup
+        // gate and the fork #18 judge. Tolerant of recall failure (fork
+        // resilience): an empty set means "dedup inserts, judge supersedes
+        // nothing", so a Core update is never dropped on a recall hiccup.
+        let recalled = memory
             .recall(update, 10, None, None, None)
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // A (upstream v0.8.3 durable seam): write-time near-duplicate detection.
+        // No-op unless `[memory].dedup_on_write` is enabled (default false).
+        let dedup_candidates = dedup::core_candidates(recalled.clone());
+        match dedup::dedup_gate(&dedup_candidates, update, memory_config) {
+            DedupAction::Insert => {}
+            DedupAction::Reject { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory consolidation skipped duplicate core update"
+                );
+                return Ok(());
+            }
+            DedupAction::Merge { into } => {
+                if let Some(survivor) = dedup_candidates.iter().find(|entry| entry.id == into) {
+                    let merged = merge::merge_into_survivor(survivor, update);
+                    let options = StoreOptions {
+                        namespace: Some(survivor.namespace.clone()),
+                        importance: merged.importance,
+                        ..StoreOptions::default()
+                    };
+                    memory
+                        .store_with_options(
+                            &survivor.key,
+                            &merged.content,
+                            MemoryCategory::Core,
+                            survivor.session_id.as_deref(),
+                            options,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fork patch #18: replace the similarity-threshold conflict check
+        // (`check_and_resolve_conflicts`) with an LLM judge. A hardcoded
+        // threshold cannot cleanly separate "contradiction" from "mere
+        // relatedness" (cos between "language is Python" and "language is Rust"
+        // was only 0.78). Let the judge decide which pre-existing Core facts the
+        // new fact makes outdated. `judge_conflicts` is best-effort and returns
+        // empty on any provider/parse error (supersede nothing).
+        let candidates: Vec<_> = recalled
             .into_iter()
             .filter(|c| {
                 matches!(c.category, MemoryCategory::Core)
@@ -144,23 +211,23 @@ pub async fn consolidate_turn(
                 .unwrap_or_default();
 
         // Store with importance metadata.
+        let options = StoreOptions {
+            importance: Some(imp),
+            ..StoreOptions::default()
+        };
         memory
-            .store_with_metadata(
-                &mem_key,
-                update,
-                MemoryCategory::Core,
-                None,
-                None,
-                Some(imp),
-            )
+            .store_with_options(&mem_key, update, MemoryCategory::Core, None, options)
             .await?;
 
-        // Retire the older conflicting facts: recall filters
-        // `superseded_by IS NULL`, so this is what actually de-duplicates Core.
-        // The marker value is the new entry's key — only NULL-ness gates recall
-        // (no FK/JOIN reads the value), and the new row's internal id is not
-        // available here without an extra round-trip.
-        if !superseded_ids.is_empty() {
+        // Retire the older conflicting facts (fork #18): recall filters
+        // `superseded_by IS NULL`, so marking supersede is what actually
+        // de-duplicates Core. The marker value is the new entry's key — only
+        // NULL-ness gates recall (no FK/JOIN reads the value), and the new row's
+        // internal id is not available here without an extra round-trip.
+        // Gated by the upstream v0.8.3 `conflict_supersede_enabled` kill-switch
+        // (default on): the judge is the detector, this flag is the operator
+        // switch for whether its verdict is applied.
+        if !superseded_ids.is_empty() && memory_config.conflict_supersede_enabled {
             // Observability (#18): record what the judge retired and why.
             let update_preview: String = update.chars().take(120).collect();
             let superseded_contents: Vec<String> = superseded_ids
@@ -371,6 +438,7 @@ mod integration_tests {
             "test-model",
             None,
             &mem,
+            &zeroclaw_config::schema::MemoryConfig::default(),
             "Как деплоить?",
             "Через CI.",
         )
@@ -396,9 +464,17 @@ mod integration_tests {
             judge_reply: "[]".into(),
         };
 
-        consolidate_turn(&provider, "test-model", None, &mem, "Привет", "Привет!")
-            .await
-            .unwrap();
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &mem,
+            &zeroclaw_config::schema::MemoryConfig::default(),
+            "Привет",
+            "Привет!",
+        )
+        .await
+        .unwrap();
 
         let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
         assert_eq!(daily.len(), 1);
@@ -446,6 +522,7 @@ mod integration_tests {
             "test-model",
             None,
             &mem,
+            &zeroclaw_config::schema::MemoryConfig::default(),
             "Теперь пишу на Rust",
             "Понял, основной язык — Rust.",
         )
@@ -518,6 +595,7 @@ mod integration_tests {
             "test-model",
             None,
             &mem,
+            &zeroclaw_config::schema::MemoryConfig::default(),
             "Теперь пишу на Rust",
             "Понял.",
         )
@@ -574,6 +652,7 @@ mod integration_tests {
             "test-model",
             None,
             &mem,
+            &zeroclaw_config::schema::MemoryConfig::default(),
             "Теперь пишу на Rust",
             "Понял.",
         )

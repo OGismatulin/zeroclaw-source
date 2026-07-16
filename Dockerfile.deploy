@@ -9,7 +9,7 @@
 
 FROM busybox:1.37.0-musl AS busybox
 
-FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
+FROM rust:1.96-slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS builder
 
 WORKDIR /app
 
@@ -26,10 +26,12 @@ COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
 COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
 COPY crates/zeroclaw-infra/Cargo.toml crates/zeroclaw-infra/Cargo.toml
 COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
+COPY crates/zeroclaw-commands/Cargo.toml crates/zeroclaw-commands/Cargo.toml
 COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
 COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
 COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
 COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
+COPY crates/zeroclaw-sop-graph/Cargo.toml crates/zeroclaw-sop-graph/Cargo.toml
 COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
 COPY crates/zeroclaw-eval/Cargo.toml crates/zeroclaw-eval/Cargo.toml
 COPY crates/zeroclaw-log/Cargo.toml crates/zeroclaw-log/Cargo.toml
@@ -57,8 +59,9 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && for crate_dir in \
          robot-kit aardvark-sys zeroclaw-api zeroclaw-infra zeroclaw-config \
-         zeroclaw-log zeroclaw-spawn \
+         zeroclaw-log zeroclaw-spawn zeroclaw-commands \
          zeroclaw-providers zeroclaw-memory zeroclaw-channels zeroclaw-tools \
+         zeroclaw-sop-graph \
          zeroclaw-runtime zeroclaw-eval zeroclaw-plugins zeroclaw-gateway \
          zeroclaw-hardware zeroclaw-tool-call-parser; do \
        mkdir -p "crates/$crate_dir/src" && \

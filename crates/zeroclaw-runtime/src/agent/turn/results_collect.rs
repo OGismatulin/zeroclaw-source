@@ -92,21 +92,44 @@ pub(crate) fn collect_tool_results(
         .enumerate()
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
-        // Bind args before the guard: needed for both the wait/poll exemption
-        // and the loop detector.
+        // fork: bind args before the guard — needed for the wait/poll (#25)
+        // exemption as well as the loop detector.
         let args = tool_calls
             .get(result_index)
             .map(|c| &c.arguments)
             .unwrap_or(&serde_json::Value::Null);
         // Skip loop detection for (a) explicitly ignored tools and (b) wait/poll
-        // calls that legitimately repeat while polling a background delegate.
-        // Putting the skip on this guard also skips detection_relevant_output,
-        // which is correct (a wait produced no progress signal).
+        // calls that legitimately repeat while polling a background delegate
+        // (fork #25). Putting the skip on this guard also skips
+        // detection_relevant_output, which is correct (a wait produced no
+        // progress signal).
         if !loop_ignore_tools.contains(tool_name.as_str()) && !is_wait_poll_call(&tool_name, args) {
-            detection_relevant_output.push_str(&outcome.output);
+            // Keep failed outputs out of the hash-based identical-output abort
+            // (check_identical_output_abort) too, for the same reason the
+            // pattern detector below is gated: a burst of identical,
+            // argument-independent error strings (rate-limit / action-budget)
+            // would otherwise hash identically and hard-abort the turn — the
+            // exact misfire upstream 78067a86e8 removes. Successful output still
+            // feeds the hash so the #7143 productive-loop guard (identical
+            // *successful* output) still aborts.
+            if outcome.success {
+                detection_relevant_output.push_str(&outcome.output);
+            }
 
-            // Feed the pattern-based loop detector with name + args + result.
-            let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+            // Feed the pattern-based loop detector with name + args + result —
+            // but only for *successful* calls. Failed calls (e.g. rate-limit /
+            // action-budget errors, not-found, permission denials) return
+            // identical, path-independent error strings; counting them as
+            // "no progress" (different args, identical result) escalates a
+            // transient, recoverable failure into a hard turn abort and hides
+            // the real cause. The detector exists to catch productive-but-stuck
+            // loops — identical *successful* output (see #7143) — not walls of
+            // identical errors the model can still react to.
+            let det_result = if outcome.success {
+                loop_detector.record(&tool_name, args, &outcome.output)
+            } else {
+                crate::agent::loop_detector::LoopDetectionResult::Ok
+            };
             match det_result {
                 crate::agent::loop_detector::LoopDetectionResult::Ok => {}
                 crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
@@ -264,7 +287,11 @@ pub(crate) fn check_identical_output_abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::loop_detector::LoopDetectorConfig;
 
+    const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
+
+    // ── fork #25: wait-protocol loop-detector exemption ───────────────────
     #[test]
     fn pure_sleep_command_matches_only_bare_waits() {
         // reachable form (python one-liner)
@@ -346,6 +373,7 @@ mod tests {
         };
         let outcome = ToolExecutionOutcome {
             output: out.to_string(),
+            output_data: None,
             success: true,
             error_reason: None,
             duration: std::time::Duration::from_secs(0),
@@ -412,5 +440,143 @@ mod tests {
             bailed,
             "real no-progress loop must still trip the circuit breaker"
         );
+    }
+
+    // ── upstream 78067a86e8: failed tool results are not no-progress ──────
+    fn outcome(output: &str, success: bool) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            output: output.to_string(),
+            success,
+            error_reason: if success {
+                None
+            } else {
+                Some(output.to_string())
+            },
+            duration: Duration::from_millis(1),
+            receipt: None,
+            output_data: None,
+        }
+    }
+
+    /// Run one results-collection pass over `n` `file_read` calls that each use
+    /// different args but return an identical `output` string, with the given
+    /// `success` flag.
+    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
+        for i in 0..n {
+            tool_calls.push(ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": format!("file_{i}.rs") }),
+                tool_call_id: None,
+            });
+            ordered.push(Some((
+                "file_read".to_string(),
+                None,
+                outcome(output, success),
+            )));
+        }
+        collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        )
+    }
+
+    #[test]
+    fn failed_tool_results_do_not_trip_no_progress_breaker() {
+        // Many failed reads (different paths, identical rate-limit error) must
+        // NOT abort the turn: a recoverable rate-limit/budget error is not a
+        // "no progress" exploration loop. Regression for the circuit breaker
+        // firing on `file_read` "called N times ... identical results".
+        assert!(run(8, RATE_LIMIT_ERR, false).is_ok());
+    }
+
+    #[test]
+    fn successful_identical_results_still_trip_no_progress_breaker() {
+        // Identical *successful* output across different args is the genuine
+        // stuck-loop signal (#7143) and must still hard-abort the turn.
+        let err = match run(8, "byte-identical successful output", true) {
+            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("loop detector"), "got: {err}");
+    }
+
+    /// Drive the *hash-based* identical-output abort
+    /// (`check_identical_output_abort`) directly, with loop detection ACTIVE
+    /// (pacing configured + elapsed), over `n` iterations whose `file_read`
+    /// calls each use different args but return an identical `output` with the
+    /// given `success` flag. Mirrors `run`, but exercises the *second*
+    /// loop-detection mechanism (the hash path) rather than the pattern
+    /// detector.
+    fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
+        // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
+        let pacing = PacingConfig {
+            loop_detection_min_elapsed_secs: Some(0),
+            ..PacingConfig::default()
+        };
+        let loop_started_at = Instant::now();
+        let mut consecutive_identical_outputs = 0usize;
+        let mut last_tool_output_hash: Option<u64> = None;
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        for iteration in 0..n {
+            let mut history: Vec<ChatMessage> = Vec::new();
+            let tool_calls = vec![ParsedToolCall {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({ "path": format!("file_{iteration}.rs") }),
+                tool_call_id: None,
+            }];
+            let ordered = vec![Some((
+                "file_read".to_string(),
+                None,
+                outcome(output, success),
+            ))];
+            let collected = collect_tool_results(
+                ordered,
+                &tool_calls,
+                &mut history,
+                &mut detector,
+                &ignore,
+                10_000,
+                None,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+            check_identical_output_abort(
+                &collected.detection_relevant_output,
+                loop_started_at,
+                &pacing,
+                &mut consecutive_identical_outputs,
+                &mut last_tool_output_hash,
+                "test-model",
+                iteration,
+                "turn-test",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_identical_outputs_do_not_trip_hash_based_abort() {
+        // The *other* loop-detection mechanism: with loop detection active
+        // (pacing configured + elapsed), a wall of identical *failed* outputs
+        // must not trip the hash-based `check_identical_output_abort`. Gating
+        // `detection_relevant_output` on `outcome.success` keeps failures out
+        // of the hash entirely, so the breaker never fires. Without the gate
+        // this aborts at the third identical failure.
+        assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
     }
 }
