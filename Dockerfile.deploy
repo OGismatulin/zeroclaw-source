@@ -74,7 +74,7 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    cargo build --release --locked --features rag-pdf
+    cargo build --release --locked
 RUN rm -rf src benches apps crates/*/src crates/*/examples tools xtask
 
 COPY src/ src/
@@ -91,7 +91,7 @@ COPY locales.toml locales.toml
 # .dockerignore intentionally excludes apps/tauri/src/ (desktop-only sources
 # we don't need for the gateway image), but cargo's workspace resolution
 # still requires SOMETHING for apps/tauri (Cargo.toml has no [[bin]]).
-# Drop a stub main.rs/lib.rs back so `cargo build --release --features rag-pdf`
+# Drop a stub main.rs/lib.rs back so `cargo build --release`
 # can resolve the workspace. The real binary built by this stage is
 # zeroclaw (gateway) — we never invoke the tauri target.
 RUN mkdir -p apps/tauri/src && \
@@ -126,7 +126,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            /app/target/release/deps/zeroclaw-* \
            /app/target/release/deps/libzeroclaw-* && \
     touch src/main.rs src/lib.rs && \
-    cargo build --release --locked --features rag-pdf && \
+    cargo build --release --locked && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 
