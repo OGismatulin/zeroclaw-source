@@ -465,7 +465,7 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 }
 
 /// Per-session webhook conversation history. In-memory only, lost on restart.
-pub(crate) struct WebhookSessionState {
+pub struct WebhookSessionState {
     session_id: String,
     history: Vec<ChatMessage>,
     last_provider: String,
@@ -642,7 +642,7 @@ pub struct AppState {
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
     /// In-memory webhook conversation history per session.
     /// Protected by async mutex to serialize concurrent webhook requests.
-    pub(crate) webhook_session: Arc<TokioMutex<Option<WebhookSessionState>>>,
+    pub webhook_session: Arc<TokioMutex<Option<WebhookSessionState>>>,
     /// Per-session cancellation tokens for aborting in-flight agent responses.
     /// Key namespace is **disjoint by handler** to keep paths from clobbering
     /// each other:

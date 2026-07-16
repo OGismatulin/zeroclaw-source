@@ -48,6 +48,7 @@ fn test_state(config: Config) -> AppState {
     AppState {
         config: Arc::new(RwLock::new(config)),
         model_provider: Arc::new(MockModelProvider),
+        provider_name: "mock".into(),
         model: "test-model".into(),
         temperature: None,
         mem: memory.clone(),
@@ -102,7 +103,11 @@ fn test_state(config: Config) -> AppState {
         canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
         #[cfg(feature = "webauthn")]
         webauthn: None,
+        webhook_session: Arc::new(tokio::sync::Mutex::new(None)),
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_token_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        webhook_lock_timeout_secs: 5,
+        hooks: None,
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry: None,
         sop_engine: None,
@@ -115,6 +120,14 @@ fn run_cli_patch_output(config_dir: &std::path::Path, patch_doc: &[u8]) -> Outpu
     Command::new(bin)
         .env("ZEROCLAW_CONFIG_DIR", config_dir)
         .env("RUST_LOG", "off")
+        // Fork: the stderr fmt layer floors at WARN regardless of RUST_LOG
+        // when `--verbose` is absent (see zeroclaw-log/src/subscriber.rs).
+        // This CLI child validates a default `Config` (memory.search_mode
+        // = "hybrid" on sqlite with no embedder), which always emits a
+        // benign `memory_semantic_search_without_embedder` WARN. Silence
+        // the terminal floor for this short-lived subprocess only so the
+        // stderr-emptiness assertions below hold; daemon runs are unaffected.
+        .env("ZEROCLAW_STDERR_FLOOR", "off")
         .args(["config", "patch", "--json", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
