@@ -769,4 +769,87 @@ mod tests {
         drop(guard);
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
     }
+
+    /// Task 14: `ObserverEvent::LlmResponse` grew an OTel-only `messages:
+    /// Option<LlmMessageSnapshot>` field. `LegacyTraceObserver` has no match
+    /// arm for `LlmResponse` — that legacy `llm_response` JSONL row is
+    /// written independently via a direct `zeroclaw_log::record!` call in
+    /// `agent/turn/parse_response.rs`, so bridging it here again would
+    /// double-emit. This locks in that a populated `messages` snapshot (a)
+    /// does not panic, (b) does not leak a new legacy row or a `messages`
+    /// key into `runtime-trace.jsonl`, and (c) still reaches the wrapped
+    /// inner observer untouched, alongside a sanity check that a *handled*
+    /// variant (`LlmRequest`) keeps producing its legacy `event_type` +
+    /// `payload` row exactly as before.
+    #[test]
+    fn legacy_trace_observer_ignores_llm_response_messages_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ObservabilityConfig {
+            log_persistence: zeroclaw_config::schema::LogPersistence::Rolling,
+            log_persistence_path: tmp
+                .path()
+                .join("trace.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            log_persistence_max_entries: 50,
+            ..ObservabilityConfig::default()
+        };
+        runtime_trace::init_from_config(&cfg, tmp.path());
+
+        let inner = Arc::new(CountingObserver::default());
+        let observer = LegacyTraceObserver::new(inner.clone());
+
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "opencode-go".into(),
+            model: "deepseek-v4-flash".into(),
+            messages_count: 3,
+            channel: Some("webhook".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let snapshot = traits::LlmMessageSnapshot {
+            input: vec![traits::MessageSnapshot {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            output_text: Some("hello".into()),
+            output_tool_calls: vec![],
+            system_instructions: None,
+        };
+        observer.record_event(&ObserverEvent::LlmResponse {
+            model_provider: "opencode-go".into(),
+            model: "deepseek-v4-flash".into(),
+            duration: std::time::Duration::from_millis(120),
+            success: true,
+            error_message: None,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            messages: Some(snapshot),
+            channel: Some("webhook".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        // Both events still reach the wrapped inner observer unchanged.
+        assert_eq!(inner.events.load(Ordering::SeqCst), 2);
+
+        let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "LlmResponse (even with `messages` populated) must not add a legacy row"
+        );
+
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            row["event_type"], "llm_request",
+            "the one row is from LlmRequest"
+        );
+        assert!(
+            row.get("messages").is_none(),
+            "no `messages` key must leak into the legacy row shape"
+        );
+    }
 }

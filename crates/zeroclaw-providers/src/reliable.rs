@@ -4430,6 +4430,88 @@ mod tests {
         );
     }
 
+    /// Task 14 gap: `retryable_rate_limit_cools_down_provider_and_uses_fallback`
+    /// (above) only exercises *provider*-level fallback — both provider entries
+    /// serve the same requested model, and no `model_fallbacks` map is involved.
+    /// This test exercises the `model_fallbacks` per-model chain specifically:
+    /// the primary provider is rate-limited (cooldown armed) for the requested
+    /// model, the still-healthy fallback provider also cannot serve that exact
+    /// model, so the model chain advances to the `model_fallbacks` candidate —
+    /// and asserts the executed-candidate identity (`ProviderFallbackInfo`)
+    /// reflects the fallback model that was actually used, not the originally
+    /// requested (provider, model) pair.
+    #[tokio::test]
+    async fn model_fallback_used_after_provider_cooldown_reports_executed_identity() {
+        scope_provider_fallback(async {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let fallback_mock = Arc::new(ModelAwareMock {
+                calls: Arc::new(AtomicUsize::new(0)),
+                models_seen: parking_lot::Mutex::new(Vec::new()),
+                fail_models: vec!["model-a"],
+                response: "ok from fallback model",
+            });
+
+            let mut fallbacks = HashMap::new();
+            fallbacks.insert("model-a".to_string(), vec!["model-b".to_string()]);
+
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "primary".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&primary_calls),
+                            fail_until_attempt: usize::MAX,
+                            response: "never",
+                            error: "HTTP 429 Too Many Requests, Retry-After: 30",
+                        }),
+                    ),
+                    (
+                        "fallback".into(),
+                        Box::new(fallback_mock.clone()) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                0,
+                1,
+            )
+            .with_model_fallbacks(fallbacks);
+
+            let result = model_provider
+                .simple_chat("hello", "model-a", Some(0.0))
+                .await
+                .unwrap();
+
+            assert_eq!(result, "ok from fallback model");
+            assert_eq!(
+                primary_calls.load(Ordering::SeqCst),
+                1,
+                "cooled-down primary should only be tried once, for the originally requested model"
+            );
+            assert!(
+                model_provider.provider_cooldown_active("primary"),
+                "primary should remain cooled down while the model_fallbacks candidate is tried"
+            );
+
+            let seen = fallback_mock.models_seen.lock().clone();
+            assert_eq!(
+                seen.as_slice(),
+                ["model-a", "model-b"],
+                "fallback provider should be tried with the requested model first, \
+                 then the model_fallbacks candidate, while primary stays skipped"
+            );
+
+            let fb = take_last_provider_fallback().expect("fallback identity should be recorded");
+            assert_eq!(fb.requested_provider, "primary");
+            assert_eq!(fb.requested_model, "model-a");
+            assert_eq!(fb.actual_provider, "fallback");
+            assert_eq!(
+                fb.actual_model, "model-b",
+                "executed identity must carry the model_fallbacks candidate, not the requested model"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn retryable_rate_limit_cools_down_shared_provider_identity() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
