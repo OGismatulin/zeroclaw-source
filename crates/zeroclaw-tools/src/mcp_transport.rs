@@ -395,6 +395,13 @@ impl McpTransportConn for HttpTransport {
     }
 
     async fn reset(&mut self) -> Result<()> {
+        // fork: release the server-side session before dropping it locally.
+        // Stateful streamable-HTTP servers (supergateway --stateful, python MCP
+        // SDK) hold one session per `initialize` until their own idle timeout;
+        // the client historically never released them, so every reconnect leaked
+        // one. Detached fire-and-forget so a hung/saturated server never stalls
+        // the reconnect hot path.
+        self.spawn_session_teardown();
         // Drop the stale session so the next request re-initializes and the
         // server issues a fresh `Mcp-Session-Id`.
         self.session_id = None;
@@ -402,7 +409,51 @@ impl McpTransportConn for HttpTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
+        // fork: same best-effort teardown on explicit close.
+        self.spawn_session_teardown();
+        self.session_id = None;
         Ok(())
+    }
+}
+
+impl HttpTransport {
+    /// fork: Best-effort MCP session teardown per MCP spec 2025-06-18
+    /// §Session Management — HTTP DELETE carrying `Mcp-Session-Id`. Detached
+    /// (fire-and-forget) so it never blocks a caller, and a no-op when there is
+    /// no live session or no tokio runtime. Servers that ignore DELETE are
+    /// unaffected (behavior-preserving); stateful servers reclaim the session
+    /// slot instead of leaking it until timeout. This leak — multiplied across
+    /// daemon boots and per-agent scoped registries on a deploy — is what
+    /// saturated the small-session-cap remote box and hung `initialize`.
+    fn spawn_session_teardown(&self) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        handle.spawn(async move {
+            let mut req = client
+                .delete(&url)
+                .timeout(Duration::from_secs(5))
+                .header(MCP_SESSION_ID_HEADER, session_id);
+            for (key, value) in &headers {
+                req = req.header(key, value);
+            }
+            let _ = req.send().await;
+        });
+    }
+}
+
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        // fork: the registry is usually dropped WITHOUT `close()` being called
+        // (daemon shutdown, per-turn scoped registries), which is the dominant
+        // session leak. Reclaim the slot on drop too.
+        self.spawn_session_teardown();
     }
 }
 
@@ -1557,6 +1608,70 @@ mod tests {
         transport.session_id = Some("stale-session".into());
         transport.reset().await.expect("reset");
         assert!(transport.session_id.is_none());
+    }
+
+    // fork: regression for the stateful-session leak that saturated the remote
+    // codemap box and hung `initialize` (task-hotfix-mcp). `reset()` must send a
+    // best-effort HTTP DELETE carrying `Mcp-Session-Id` so the server reclaims
+    // the session slot instead of leaking it until its own idle timeout.
+    #[tokio::test]
+    async fn http_transport_reset_sends_delete_session_teardown() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(header(MCP_SESSION_ID_HEADER, "sess-42"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        transport.session_id = Some("sess-42".into());
+        transport.reset().await.expect("reset");
+        assert!(transport.session_id.is_none());
+        // Teardown is detached (fire-and-forget); give the spawned task a moment.
+        for _ in 0..50 {
+            if server.received_requests().await.unwrap_or_default().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // `expect(1)` on the mock is verified on drop: exactly one DELETE with
+        // the session header must have been sent.
+    }
+
+    // fork: with no live session, teardown must be a silent no-op (no DELETE).
+    #[tokio::test]
+    async fn http_transport_reset_without_session_sends_no_delete() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        assert!(transport.session_id.is_none());
+        transport.reset().await.expect("reset");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `expect(0)` verified on drop.
     }
 
     #[tokio::test]

@@ -25,6 +25,23 @@ use zeroclaw_config::schema::McpServerConfig;
 /// Prevents a hung server from blocking the daemon indefinitely.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
+// fork: Bounded handshake timeout for the *initial* connect (daemon boot),
+// distinct from the 30s reconnect/tool-call budget. Boot connects every
+// configured MCP server sequentially and non-fatally; three of ours (codemap,
+// codemap-semantic, codemap-fs) share one remote box, so a saturated/slow box
+// could burn 3×30s = 90s and push daemon boot past the gateway manager's 90s
+// health window → spawn fails → respawn storm → outage. A short connect budget
+// makes an unreachable/slow server fail fast so the daemon still becomes healthy
+// with the servers that DO answer (connect_all is non-fatal per server). Healthy
+// connects observed at ~1.5s, so 10s is generous headroom. See
+// .superpowers/sdd/task-hotfix-mcp-report.md.
+const MCP_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+// fork: compile-time guard — the initial-connect budget must stay strictly
+// under the reconnect/tool budget, so three slow servers sharing one box cannot
+// burn 3×30s and blow the gateway manager's 90s daemon-health window.
+const _: () = assert!(MCP_CONNECT_TIMEOUT_SECS < RECV_TIMEOUT_SECS);
+
 /// Default timeout for tool calls (seconds) when not configured per-server.
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 
@@ -44,6 +61,9 @@ const RECONNECT_BACKOFF_MS: u64 = 500;
 async fn handshake(
     transport: &mut dyn McpTransportConn,
     server_name: &str,
+    // fork: caller-supplied budget. Initial connect passes the short
+    // MCP_CONNECT_TIMEOUT_SECS; the reconnect path keeps RECV_TIMEOUT_SECS.
+    recv_timeout_secs: u64,
 ) -> Result<McpServerCapabilities> {
     let init_req = JsonRpcRequest::new(
         1,
@@ -59,13 +79,13 @@ async fn handshake(
     );
 
     let init_resp = timeout(
-        Duration::from_secs(RECV_TIMEOUT_SECS),
+        Duration::from_secs(recv_timeout_secs),
         transport.send_and_recv(&init_req),
     )
     .await
     .with_context(|| {
         format!(
-            "MCP server `{server_name}` timed out after {RECV_TIMEOUT_SECS}s waiting for initialize response"
+            "MCP server `{server_name}` timed out after {recv_timeout_secs}s waiting for initialize response"
         )
     })??;
 
@@ -191,22 +211,25 @@ impl McpServer {
             )
         })?;
 
-        // Initialize handshake (initialize + initialized notification)
-        let capabilities = handshake(transport.as_mut(), &config.name).await?;
+        // Initialize handshake (initialize + initialized notification).
+        // fork: initial connect uses the short boot budget so a slow/saturated
+        // server fails fast and does not blow the daemon's 90s health window.
+        let capabilities =
+            handshake(transport.as_mut(), &config.name, MCP_CONNECT_TIMEOUT_SECS).await?;
 
         // Fetch available tools
         let id = 2u64;
         let list_req = JsonRpcRequest::new(id, "tools/list", json!({}));
 
         let list_resp = timeout(
-            Duration::from_secs(RECV_TIMEOUT_SECS),
+            Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
             transport.send_and_recv(&list_req),
         )
         .await
         .with_context(|| {
             format!(
                 "MCP server `{}` timed out after {}s waiting for tools/list response",
-                config.name, RECV_TIMEOUT_SECS
+                config.name, MCP_CONNECT_TIMEOUT_SECS
             )
         })??;
 
@@ -355,13 +378,17 @@ impl McpServer {
                                 "MCP server `{server_name}` failed to reset transport during reconnect"
                             )
                         })?;
-                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
-                                )
-                            })?;
+                        let refreshed = handshake(
+                            inner.transport.as_mut(),
+                            &server_name,
+                            RECV_TIMEOUT_SECS,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "MCP server `{server_name}` failed to re-handshake during reconnect"
+                            )
+                        })?;
                         inner.capabilities = refreshed;
                         continue;
                     }
@@ -440,13 +467,17 @@ impl McpServer {
                                 "MCP server `{server_name}` failed to reset transport during reconnect"
                             )
                         })?;
-                        let refreshed = handshake(inner.transport.as_mut(), &server_name)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "MCP server `{server_name}` failed to re-handshake during reconnect"
-                                )
-                            })?;
+                        let refreshed = handshake(
+                            inner.transport.as_mut(),
+                            &server_name,
+                            RECV_TIMEOUT_SECS,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "MCP server `{server_name}` failed to re-handshake during reconnect"
+                            )
+                        })?;
                         inner.capabilities = refreshed;
                         continue;
                     }
@@ -1661,5 +1692,47 @@ done
             .await
             .expect_err("jsonrpc error should surface");
         assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    // ── fork: bounded initial-connect handshake timeout ────────────────────
+    // (The `MCP_CONNECT_TIMEOUT_SECS < RECV_TIMEOUT_SECS` invariant is a
+    // compile-time `const _` guard next to the constants.)
+
+    // Functional proof that `handshake` honours the caller-supplied budget: a
+    // server that delays its `initialize` response past the budget makes the
+    // handshake error at the budget, not 30s later.
+    #[tokio::test]
+    async fn handshake_times_out_at_caller_budget() {
+        use std::time::Instant;
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(4))
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut transport =
+            create_transport(&http_server_config(server.uri())).expect("build transport");
+        let started = Instant::now();
+        let err = handshake(transport.as_mut(), "remote", 1)
+            .await
+            .expect_err("handshake must time out at the 1s budget");
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        // Fired at the 1s budget, well before the server's 4s delay would land.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "handshake honoured the budget but took {elapsed:?}"
+        );
     }
 }
