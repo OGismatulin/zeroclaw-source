@@ -154,21 +154,24 @@ impl ContextCompressor {
         self.context_window = window;
     }
 
-    /// Fast-path: trim oversized tool results in non-protected messages.
-    /// Returns total characters saved. No LLM call needed.
-    fn fast_trim_tool_results(&self, history: &mut [ChatMessage]) -> usize {
+    /// Truncate oversized `tool` results within [protect_first_n .. len-protect_last_n).
+    /// Shared core for the normal fast-trim pass and the emergency tail-trim pass.
+    fn trim_tool_results_in_range(
+        &self,
+        history: &mut [ChatMessage],
+        protect_first_n: usize,
+        protect_last_n: usize,
+    ) -> usize {
         let max = self.config.tool_result_retrim_chars;
         if max == 0 {
             return 0;
         }
         let mut saved = 0;
-        let protect_start = self.config.protect_first_n.min(history.len());
-        let protect_end = history.len().saturating_sub(self.config.protect_last_n);
-
+        let protect_start = protect_first_n.min(history.len());
+        let protect_end = history.len().saturating_sub(protect_last_n);
         if protect_start >= protect_end {
             return 0;
         }
-
         for msg in &mut history[protect_start..protect_end] {
             if msg.role != "tool" {
                 continue;
@@ -194,6 +197,16 @@ impl ContextCompressor {
             saved += original_len - msg.content.len();
         }
         saved
+    }
+
+    /// Fast-path: trim oversized tool results in non-protected messages.
+    /// Returns total characters saved. No LLM call needed.
+    fn fast_trim_tool_results(&self, history: &mut [ChatMessage]) -> usize {
+        self.trim_tool_results_in_range(
+            history,
+            self.config.protect_first_n,
+            self.config.protect_last_n,
+        )
     }
 
     /// Main entry point. Compresses history in-place if over threshold.
@@ -264,9 +277,46 @@ impl ContextCompressor {
             }
         }
 
-        let tokens_after = estimate_tokens(history);
+        let mut tokens_after = estimate_tokens(history);
+        let mut emergency_saved = 0usize;
+        if tokens_after > threshold {
+            let tokens_before_emergency = tokens_after;
+            // Escalate protected tail toward 0, trimming oversized tool results until
+            // under threshold (headroom for system prompt + tool defs + next user msg
+            // that estimate_tokens does not count) or nothing left to trim.
+            // Last resort: when escalation reaches protect == 0, even the most-recent
+            // tool result becomes trimmable — a degraded turn is preferred over a hard
+            // context_window_exceeded failure.
+            // Clamp the starting protection to history length so a misconfigured large
+            // value doesn't spin many no-op iterations (each recomputes estimate_tokens).
+            let mut protect = self.config.emergency_protect_last_n.min(history.len());
+            loop {
+                emergency_saved +=
+                    self.trim_tool_results_in_range(history, self.config.protect_first_n, protect);
+                tokens_after = estimate_tokens(history);
+                if tokens_after <= threshold || protect == 0 {
+                    break;
+                }
+                protect -= 1;
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "emergency_saved": emergency_saved,
+                        "tokens_before": tokens_before_emergency,
+                        "tokens_after": tokens_after,
+                        "threshold": threshold,
+                        "context_window": self.context_window,
+                        "still_over_threshold": tokens_after > threshold,
+                    })),
+                "context_compressor: emergency tail-trim (over threshold after passes)"
+            );
+        }
+
         Ok(CompressionResult {
-            compressed: passes_used > 0,
+            compressed: passes_used > 0 || emergency_saved > 0 || tokens_after < tokens_before,
             tokens_before,
             tokens_after,
             passes_used,
@@ -986,6 +1036,12 @@ mod tests {
     }
 
     #[test]
+    fn context_compression_config_default_emergency_protect_last_n() {
+        let config = ContextCompressionConfig::default();
+        assert_eq!(config.emergency_protect_last_n, 2);
+    }
+
+    #[test]
     fn test_config_serde_defaults() {
         let json = "{}";
         let config: ContextCompressionConfig = serde_json::from_str(json).unwrap();
@@ -1186,6 +1242,170 @@ mod tests {
         let mut history = vec![msg("tool", &big)];
         let saved = compressor.fast_trim_tool_results(&mut history);
         assert_eq!(saved, 0);
+    }
+
+    // ── emergency tail-trim tests ───────────────────────────────────
+
+    // Тест 1: tool-dominated хвост, passes=0 (guard), аварийный проход уводит под threshold,
+    // последний (вне зоны трима) элемент цел.
+    #[tokio::test]
+    async fn emergency_trim_reduces_tool_dominated_tail() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 10, // блокирует и compress_once, и обычный fast-trim
+            emergency_protect_last_n: 1,
+            tool_result_retrim_chars: 100,
+            threshold_ratio: 0.5, // threshold = 500 при window=1000
+            max_passes: 1,
+            ..Default::default() // OK: ContextCompressionConfig ДЕРИВИТ Default
+        };
+        let compressor = ContextCompressor::new(config, 1_000); // threshold = 500 токенов
+        let big = "X".repeat(50_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool(big.clone()),
+            ChatMessage::tool(big.clone()),
+            ChatMessage::tool("small tail"), // last — под max И защищён emergency N=1, останется цел
+        ];
+        let provider = CaptureSummarizerModelProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model", None)
+            .await
+            .unwrap();
+        assert!(
+            result.compressed,
+            "emergency pass должен пометить compressed"
+        );
+        assert!(
+            result.tokens_after <= 500,
+            "должен увести под threshold (500)"
+        );
+        assert_eq!(
+            history.last().unwrap().content,
+            "small tail",
+            "хвост под max и вне зоны трима (emergency N=1) — цел"
+        );
+        assert!(
+            history[1].content.len() < 1_000,
+            "big tool-результат обрезан"
+        );
+    }
+
+    // Тест 2 (replay сигнатуры инцидента): compress_once ОТРАБАТЫВАЕТ (passes>=1), но
+    // защищённый protect_last_n хвост всё ещё держит массу → аварийный проход дорезает.
+    #[tokio::test]
+    async fn emergency_trim_after_summarization_pass() {
+        // protect_last_n=3 keeps the big tool tail out of the fast-trim / compress_once
+        // ranges; a non-tool (assistant) middle gives compress_once real work to do
+        // (fast-trim only touches `tool` messages), so passes_used>=1. The summarized
+        // pass still leaves the protected tool tail over threshold → emergency trims it.
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 3, // n>protected_total → compress_once сработает
+            emergency_protect_last_n: 1,
+            tool_result_retrim_chars: 100,
+            threshold_ratio: 0.5, // threshold = 3000 при window=6000 (summary ~1K влезает)
+            max_passes: 1,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 6_000); // threshold = 3000
+        let big = "X".repeat(50_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant(big.clone()), // middle — summarized by compress_once
+            ChatMessage::user("q2"),
+            ChatMessage::tool(big.clone()), // protected tail (tool) — emergency-trimmable
+            ChatMessage::tool(big.clone()), // protected tail (tool) — emergency-trimmable
+            ChatMessage::tool("tail small"), // last — protected by emergency N=1
+        ];
+        let provider = CaptureSummarizerModelProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model", None)
+            .await
+            .unwrap();
+        assert!(
+            result.passes_used >= 1,
+            "compress_once должен отработать (passes>=1)"
+        );
+        assert!(result.compressed);
+        assert!(
+            result.tokens_after <= 3_000,
+            "аварийный проход дорезал под threshold"
+        );
+    }
+
+    // Тест 3 (residual / degenerate): вся масса в role!="tool" (assistant) → аварийный
+    // проход no-op (тримит только tool), НЕ паника, compressed=false, история не изменена.
+    // (Эмиссию WARN с still_over_threshold проверяем в local gate по трейсу — Task 5.)
+    #[tokio::test]
+    async fn emergency_trim_noop_on_assistant_bloat() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 10,
+            emergency_protect_last_n: 1,
+            tool_result_retrim_chars: 100,
+            threshold_ratio: 0.5,
+            max_passes: 1,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 1_000);
+        let big = "X".repeat(50_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant(big.clone()),
+            ChatMessage::assistant(big.clone()),
+        ];
+        let provider = CaptureSummarizerModelProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model", None)
+            .await
+            .unwrap();
+        assert!(!result.compressed, "нечего тримить (не tool) → no-op");
+        assert_eq!(
+            history[1].content.len(),
+            50_000,
+            "assistant-контент не тронут"
+        );
+    }
+
+    // Тест 4: под порогом — ранний возврат, ветка вообще не входит.
+    #[tokio::test]
+    async fn emergency_trim_skipped_when_under_threshold() {
+        let config = ContextCompressionConfig {
+            protect_first_n: 1,
+            protect_last_n: 1,
+            emergency_protect_last_n: 1,
+            tool_result_retrim_chars: 100,
+            threshold_ratio: 0.99,
+            max_passes: 1,
+            ..Default::default()
+        };
+        let compressor = ContextCompressor::new(config, 1_000_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool("small"),
+            ChatMessage::system("tail"),
+        ];
+        let provider = CaptureSummarizerModelProvider {
+            supports_vision: false,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        let result = compressor
+            .compress_if_needed(&mut history, &provider, "model", None)
+            .await
+            .unwrap();
+        assert!(!result.compressed);
+        assert_eq!(history[1].content, "small");
     }
 
     /// When the compressed range has no thinking-mode reasoning_content,

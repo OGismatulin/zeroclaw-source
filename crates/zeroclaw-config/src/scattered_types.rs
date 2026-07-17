@@ -280,6 +280,9 @@ fn default_identifier_policy() -> String {
 fn default_tool_result_retrim_chars() -> usize {
     2_000
 }
+fn default_emergency_protect_last_n() -> usize {
+    2
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -325,6 +328,16 @@ pub struct ContextCompressionConfig {
     pub tool_result_trim_exempt: Vec<String>,
     #[serde(default)]
     pub model_windows: HashMap<String, usize>,
+    /// When post-turn compaction still leaves the transcript above threshold,
+    /// an emergency no-LLM tail-trim truncates oversized `tool` results even in
+    /// the normally protected tail. This is the STARTING tail-protection for the
+    /// emergency pass: the pass escalates the protected tail toward 0 as a last
+    /// resort until the transcript is under threshold, so the last N is a
+    /// best-effort starting point, NOT a hard floor. A value larger than
+    /// `protect_last_n` is not a no-op — it just wastes early iterations before
+    /// escalation begins to bite. Default: 2.
+    #[serde(default = "default_emergency_protect_last_n")]
+    pub emergency_protect_last_n: usize,
 }
 
 impl Default for ContextCompressionConfig {
@@ -344,6 +357,7 @@ impl Default for ContextCompressionConfig {
             tool_result_retrim_chars: default_tool_result_retrim_chars(),
             tool_result_trim_exempt: Vec::new(),
             model_windows: HashMap::new(),
+            emergency_protect_last_n: default_emergency_protect_last_n(),
         }
     }
 }
