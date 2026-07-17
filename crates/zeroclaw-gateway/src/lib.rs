@@ -2882,6 +2882,37 @@ fn emit_provider_fallback_event(
     );
 }
 
+/// fork(Phase C): emit a structured `mcp_connect_failure` trace event when a
+/// configured MCP server fails its boot connect (transport spawn, handshake
+/// timeout, or protocol error). `connect_all` skips the server non-fatally;
+/// this only records the failure so the `gateway_manager.py` consumer can spot
+/// shared-box saturation (#30) early. Mirrors `emit_provider_fallback_event`.
+///
+/// On-disk contract (C2 depends on this exact shape): a legacy JSONL row with
+/// `event_type: "mcp_connect_failure"` and `payload` = `{server, stage,
+/// timeout_secs, session_id}`. `stage` is one of `transport_setup`,
+/// `boot_connect_timeout`, `boot_connect_error`.
+fn emit_mcp_connect_failure_event(
+    failure: &zeroclaw_tools::mcp_client::McpConnectFailure,
+    session_id: Option<&str>,
+) {
+    zeroclaw_runtime::observability::runtime_trace::record_event(
+        "mcp_connect_failure",
+        Some("webhook"),
+        None,        // provider — not applicable
+        None,        // model — not applicable
+        None,        // turn_id — best-effort, none at this site
+        Some(false), // success — the connect failed
+        None,
+        serde_json::json!({
+            "server": failure.server,
+            "stage": failure.stage.as_str(),
+            "timeout_secs": failure.timeout_secs,
+            "session_id": session_id.unwrap_or_default(),
+        }),
+    );
+}
+
 /// Agentic webhook chat that preserves gateway auth/idempotency flow while
 /// executing the full tool loop with persistent per-session history.
 async fn run_gateway_webhook_agentic(
@@ -2987,8 +3018,14 @@ async fn run_gateway_webhook_agentic(
     // `all_tools_with_runtime`, so collect the names off the MCP registry here.
     let mut mcp_tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
+        match tools::McpRegistry::connect_all_with_failures(&config.mcp.servers).await {
+            Ok((registry, connect_failures)) => {
+                // fork(Phase C): surface boot-connect failures (saturation #30)
+                // as trace events. connect_all stays non-fatal — the registry
+                // already excludes the failed servers.
+                for failure in &connect_failures {
+                    emit_mcp_connect_failure_event(failure, session_id);
+                }
                 let registry = std::sync::Arc::new(registry);
                 mcp_tool_names.extend(registry.tool_names());
                 if config.mcp.deferred_loading {
@@ -6775,6 +6812,40 @@ mod tests {
             !raw.contains("provider_fallback"),
             "same-pair retry must not emit a provider_fallback event"
         );
+    }
+
+    #[test]
+    fn mcp_connect_failure_event_has_server_stage_and_timeout() {
+        use zeroclaw_config::schema::ObservabilityConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ObservabilityConfig {
+            log_persistence: zeroclaw_config::schema::LogPersistence::Rolling,
+            log_persistence_path: tmp
+                .path()
+                .join("trace.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+            log_persistence_max_entries: 10,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&cfg, tmp.path());
+
+        let failure = zeroclaw_tools::mcp_client::McpConnectFailure {
+            server: "codemap".into(),
+            stage: zeroclaw_tools::mcp_client::McpConnectStage::Timeout,
+            timeout_secs: 10,
+            error: "MCP server `codemap` timed out".into(),
+        };
+        emit_mcp_connect_failure_event(&failure, Some("tg_user_99999_s_test"));
+
+        let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
+        let line = raw.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(ev["event_type"], "mcp_connect_failure");
+        assert_eq!(ev["payload"]["server"], "codemap");
+        assert_eq!(ev["payload"]["stage"], "boot_connect_timeout");
+        assert_eq!(ev["payload"]["timeout_secs"], 10);
+        assert_eq!(ev["payload"]["session_id"], "tg_user_99999_s_test");
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.

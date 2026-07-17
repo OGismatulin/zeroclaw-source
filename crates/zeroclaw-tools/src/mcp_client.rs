@@ -55,6 +55,93 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Fixed backoff between reconnect attempts (milliseconds).
 const RECONNECT_BACKOFF_MS: u64 = 500;
 
+// ── fork(Phase C): structured boot-connect failure observability ───────────
+//
+// `McpRegistry::connect_all` is non-fatal per server (a failed server is
+// skipped, the daemon still boots). To make the #30 saturation scenario
+// observable — a slow/unreachable shared MCP box burning the connect budget —
+// the connect path classifies each per-server failure and surfaces it through
+// `connect_all_with_failures`. A caller that has the runtime-trace writer in
+// scope (the gateway webhook path) emits an `mcp_connect_failure` event from
+// the returned failures. This crate (`zeroclaw-tools`) is a *dependency* of
+// `zeroclaw-runtime`, so it cannot call `runtime_trace::record_event` itself;
+// it only produces the typed data. Emission (and the on-disk JSON contract)
+// lives at the call site.
+
+/// Stage at which a boot connect failed. The variant is the saturation-vs-
+/// protocol signal the trace consumer (gateway_manager watchdog) reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpConnectStage {
+    /// Transport creation (spawn / URL) failed before any handshake.
+    TransportSetup,
+    /// initialize or tools/list exceeded the boot-connect budget — the
+    /// saturation signal (#30).
+    Timeout,
+    /// initialize / tools/list returned a protocol or transport error within
+    /// the budget (server answered, but unhappily).
+    Handshake,
+}
+
+impl McpConnectStage {
+    /// Stable wire string used in the `mcp_connect_failure` trace payload.
+    /// External consumers match on these exact values — do not rename.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportSetup => "transport_setup",
+            Self::Timeout => "boot_connect_timeout",
+            Self::Handshake => "boot_connect_error",
+        }
+    }
+}
+
+/// One per-server boot-connect failure, surfaced by
+/// [`McpRegistry::connect_all_with_failures`] for observability. `server`,
+/// `stage`, and `timeout_secs` are the trace-event contract; `error` is the
+/// human-readable detail used for the local ERROR log line only.
+#[derive(Debug, Clone)]
+pub struct McpConnectFailure {
+    pub server: String,
+    pub stage: McpConnectStage,
+    pub timeout_secs: u64,
+    pub error: String,
+}
+
+/// Classified failure of the shared [`handshake`] helper, so the initial
+/// connect can distinguish a boot-connect *timeout* (saturation) from a
+/// protocol error while the reconnect path keeps treating it as `anyhow`.
+#[derive(Debug)]
+enum HandshakeError {
+    /// The recv budget elapsed before the server answered.
+    Timeout(anyhow::Error),
+    /// The server answered within budget but with an error / rejection.
+    Protocol(anyhow::Error),
+}
+
+impl HandshakeError {
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+
+    fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::Timeout(e) | Self::Protocol(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` renders the full anyhow context chain (keeps the legacy
+        // "timed out ..." text the reconnect callers and tests rely on).
+        write!(f, "{:#}", self.inner())
+    }
+}
+
+// StdError so the reconnect callers' `handshake(...).await.with_context(...)?`
+// keeps compiling (anyhow's blanket `Context for Result<T, E: StdError>`).
+impl std::error::Error for HandshakeError {}
+
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
 /// reconnect-after-stale-session path in [`McpServer::call_tool`].
@@ -64,7 +151,7 @@ async fn handshake(
     // fork: caller-supplied budget. Initial connect passes the short
     // MCP_CONNECT_TIMEOUT_SECS; the reconnect path keeps RECV_TIMEOUT_SECS.
     recv_timeout_secs: u64,
-) -> Result<McpServerCapabilities> {
+) -> std::result::Result<McpServerCapabilities, HandshakeError> {
     let init_req = JsonRpcRequest::new(
         1,
         "initialize",
@@ -78,22 +165,30 @@ async fn handshake(
         }),
     );
 
-    let init_resp = timeout(
+    let init_resp = match timeout(
         Duration::from_secs(recv_timeout_secs),
         transport.send_and_recv(&init_req),
     )
     .await
-    .with_context(|| {
-        format!(
-            "MCP server `{server_name}` timed out after {recv_timeout_secs}s waiting for initialize response"
-        )
-    })??;
+    {
+        Err(_elapsed) => {
+            return Err(HandshakeError::Timeout(anyhow::Error::msg(format!(
+                "MCP server `{server_name}` timed out after {recv_timeout_secs}s waiting for initialize response"
+            ))));
+        }
+        Ok(Err(e)) => {
+            return Err(HandshakeError::Protocol(e.context(format!(
+                "MCP server `{server_name}` transport error during initialize"
+            ))));
+        }
+        Ok(Ok(resp)) => resp,
+    };
 
     if init_resp.error.is_some() {
-        bail!(
+        return Err(HandshakeError::Protocol(anyhow::Error::msg(format!(
             "MCP server `{server_name}` rejected initialize: {:?}",
             init_resp.error
-        );
+        ))));
     }
 
     // Parse server-advertised capabilities from the initialize result.
@@ -201,53 +296,102 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// Connect to the server, perform the initialize handshake, and fetch the tool list.
+    /// Connect to the server, perform the initialize handshake, and fetch the
+    /// tool list. Thin `anyhow` wrapper over [`Self::connect_classified`] with
+    /// the boot budget, kept for the callers that only need pass/fail.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
-        // Create transport based on config
-        let mut transport = create_transport(&config).with_context(|| {
-            format!(
-                "failed to create transport for MCP server `{}`",
-                config.name
+        Self::connect_classified(config, MCP_CONNECT_TIMEOUT_SECS)
+            .await
+            .map_err(|f| anyhow::Error::msg(f.error))
+    }
+
+    /// Connect + handshake + tools/list, classifying any failure into an
+    /// [`McpConnectFailure`] so the boot path can emit an observability event.
+    /// `connect_timeout_secs` is the per-step budget (the reconnect budget is
+    /// separate); production passes `MCP_CONNECT_TIMEOUT_SECS`.
+    ///
+    /// fork: initial connect uses the short boot budget so a slow/saturated
+    /// server fails fast and does not blow the daemon's 90s health window.
+    async fn connect_classified(
+        config: McpServerConfig,
+        connect_timeout_secs: u64,
+    ) -> std::result::Result<Self, McpConnectFailure> {
+        let fail = |stage: McpConnectStage, error: String| McpConnectFailure {
+            server: config.name.clone(),
+            stage,
+            timeout_secs: connect_timeout_secs,
+            error,
+        };
+
+        // Create transport based on config.
+        let mut transport = create_transport(&config).map_err(|e| {
+            fail(
+                McpConnectStage::TransportSetup,
+                format!(
+                    "failed to create transport for MCP server `{}`: {e:#}",
+                    config.name
+                ),
             )
         })?;
 
         // Initialize handshake (initialize + initialized notification).
-        // fork: initial connect uses the short boot budget so a slow/saturated
-        // server fails fast and does not blow the daemon's 90s health window.
-        let capabilities =
-            handshake(transport.as_mut(), &config.name, MCP_CONNECT_TIMEOUT_SECS).await?;
+        let capabilities = handshake(transport.as_mut(), &config.name, connect_timeout_secs)
+            .await
+            .map_err(|he| {
+                let stage = if he.is_timeout() {
+                    McpConnectStage::Timeout
+                } else {
+                    McpConnectStage::Handshake
+                };
+                fail(
+                    stage,
+                    format!("MCP server `{}` handshake failed: {he}", config.name),
+                )
+            })?;
 
-        // Fetch available tools
+        // Fetch available tools.
         let id = 2u64;
         let list_req = JsonRpcRequest::new(id, "tools/list", json!({}));
 
-        let list_resp = timeout(
-            Duration::from_secs(MCP_CONNECT_TIMEOUT_SECS),
+        let list_resp = match timeout(
+            Duration::from_secs(connect_timeout_secs),
             transport.send_and_recv(&list_req),
         )
         .await
-        .with_context(|| {
-            format!(
-                "MCP server `{}` timed out after {}s waiting for tools/list response",
-                config.name, MCP_CONNECT_TIMEOUT_SECS
-            )
-        })??;
+        {
+            Err(_elapsed) => {
+                return Err(fail(
+                    McpConnectStage::Timeout,
+                    format!(
+                        "MCP server `{}` timed out after {connect_timeout_secs}s waiting for tools/list response",
+                        config.name
+                    ),
+                ));
+            }
+            Ok(Err(e)) => {
+                return Err(fail(
+                    McpConnectStage::Handshake,
+                    format!(
+                        "MCP server `{}` transport error during tools/list: {e:#}",
+                        config.name
+                    ),
+                ));
+            }
+            Ok(Ok(resp)) => resp,
+        };
 
         let result = list_resp.result.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"mcp_server": &config.name})),
-                "mcp_client: tools/list returned no result"
-            );
-            anyhow::Error::msg(format!(
-                "tools/list returned no result from `{}`",
-                config.name
-            ))
+            fail(
+                McpConnectStage::Handshake,
+                format!("tools/list returned no result from `{}`", config.name),
+            )
         })?;
-        let tool_list: McpToolsListResult = serde_json::from_value(result)
-            .with_context(|| format!("failed to parse tools/list from `{}`", config.name))?;
+        let tool_list: McpToolsListResult = serde_json::from_value(result).map_err(|e| {
+            fail(
+                McpConnectStage::Handshake,
+                format!("failed to parse tools/list from `{}`: {e}", config.name),
+            )
+        })?;
 
         let tool_count = tool_list.tools.len();
 
@@ -596,14 +740,29 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
+    /// Connect to all configured servers. Non-fatal: failures are logged and
+    /// skipped. Thin wrapper over [`Self::connect_all_with_failures`] that
+    /// discards the failure list, for the many callers that don't observe it.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+        Ok(Self::connect_all_with_failures(configs).await?.0)
+    }
+
+    /// Connect to all configured servers, also returning the per-server
+    /// boot-connect failures. Non-fatal semantics are unchanged: a failed
+    /// server is skipped and the registry contains the servers that answered.
+    /// The failures are surfaced (not swallowed) so a call site with the
+    /// runtime-trace writer in scope can emit an `mcp_connect_failure` event —
+    /// early observability of the #30 shared-box saturation scenario.
+    pub async fn connect_all_with_failures(
+        configs: &[McpServerConfig],
+    ) -> Result<(Self, Vec<McpConnectFailure>)> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
+        let mut failures = Vec::new();
 
         for config in configs {
-            match McpServer::connect(config.clone()).await {
+            match McpServer::connect_classified(config.clone(), MCP_CONNECT_TIMEOUT_SECS).await {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
@@ -616,23 +775,35 @@ impl McpRegistry {
                     }
                     servers.push(server);
                 }
-                // Non-fatal — log and continue with remaining servers
-                Err(e) => {
+                // Non-fatal — log, record the failure for the caller, and
+                // continue with the remaining servers.
+                Err(failure) => {
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_server": &failure.server,
+                                "stage": failure.stage.as_str(),
+                            })),
+                        &format!(
+                            "Failed to connect to MCP server `{}`: {}",
+                            failure.server, failure.error
+                        )
                     );
+                    failures.push(failure);
                 }
             }
         }
 
-        Ok(Self {
-            servers,
-            tool_index,
-            server_index,
-        })
+        Ok((
+            Self {
+                servers,
+                tool_index,
+                server_index,
+            },
+            failures,
+        ))
     }
 
     /// All prefixed tool names across all connected servers.
@@ -1734,5 +1905,140 @@ done
             elapsed < Duration::from_secs(3),
             "handshake honoured the budget but took {elapsed:?}"
         );
+    }
+
+    // ── fork(Phase C): structured boot-connect failures ────────────────────
+    // `connect_all_with_failures` surfaces per-server boot-connect failures so
+    // an observer at the call site (gateway webhook) can emit an
+    // `mcp_connect_failure` trace event. `connect_all` stays non-fatal: a failed
+    // server is skipped and the daemon still boots with the servers that answer.
+
+    /// A wiremock server that completes the full boot handshake (initialize +
+    /// initialized + empty tools/list). Reused by the success-path tests.
+    async fn mount_healthy_mcp(server: &wiremock::MockServer) {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "s")
+                    .set_body_json(json!({
+                        "jsonrpc":"2.0","id":1,"result":{"capabilities":{}}
+                    })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[]}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn connect_all_with_failures_surfaces_exactly_one_failure() {
+        // A server that cannot even build a transport (nonexistent spawn) yields
+        // exactly one structured failure carrying the three contract fields.
+        let configs = vec![McpServerConfig {
+            name: "bad".to_string(),
+            command: "/usr/bin/does_not_exist_zc_test".to_string(),
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        }];
+        let (registry, failures) = McpRegistry::connect_all_with_failures(&configs)
+            .await
+            .expect("connect_all_with_failures never returns Err");
+        // Non-fatal semantics preserved: the bad server is simply skipped.
+        assert!(registry.is_empty());
+        assert_eq!(failures.len(), 1, "exactly one failure surfaced");
+        let f = &failures[0];
+        assert_eq!(f.server, "bad");
+        assert_eq!(f.stage.as_str(), "transport_setup");
+        assert_eq!(f.timeout_secs, MCP_CONNECT_TIMEOUT_SECS);
+    }
+
+    #[tokio::test]
+    async fn connect_all_with_failures_none_on_success() {
+        // A healthy server produces zero failures and a live registry.
+        let server = wiremock::MockServer::start().await;
+        mount_healthy_mcp(&server).await;
+        let (registry, failures) =
+            McpRegistry::connect_all_with_failures(&[http_server_config(server.uri())])
+                .await
+                .expect("connect_all_with_failures");
+        assert_eq!(registry.server_count(), 1);
+        assert!(
+            failures.is_empty(),
+            "a successful connect emits no failure, got: {failures:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_classified_timeout_is_boot_connect_timeout_stage() {
+        use std::time::Instant;
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // initialize is delayed well past the (test) budget → boot-connect timeout.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(4))
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}})),
+            )
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let failure = match McpServer::connect_classified(http_server_config(server.uri()), 1).await
+        {
+            Ok(_) => panic!("delayed initialize must fail the boot connect"),
+            Err(f) => f,
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(failure.stage.as_str(), "boot_connect_timeout");
+        assert_eq!(failure.timeout_secs, 1);
+        assert_eq!(failure.server, "remote");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "classified connect honoured the budget but took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_classified_rejected_initialize_is_boot_connect_error_stage() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // initialize returns a JSON-RPC error within budget → handshake error,
+        // NOT a timeout (distinct saturation-vs-protocol stage).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nope"}
+            })))
+            .mount(&server)
+            .await;
+
+        let failure = match McpServer::connect_classified(http_server_config(server.uri()), 5).await
+        {
+            Ok(_) => panic!("rejected initialize must fail the boot connect"),
+            Err(f) => f,
+        };
+        assert_eq!(failure.stage.as_str(), "boot_connect_error");
+        assert_eq!(failure.server, "remote");
     }
 }
