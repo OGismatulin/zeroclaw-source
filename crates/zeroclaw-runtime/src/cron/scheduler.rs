@@ -10,10 +10,10 @@ use crate::cron::{
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -22,6 +22,8 @@ use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const CRON_AGENT_TIMEOUT_PREFIX: &str = "agent job timed out after";
+const CRON_AGENT_CANCELLATION_GRACE_SECS: u64 = 5;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -34,6 +36,34 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
+
+type SchedulerJobResult = (String, bool, String);
+
+/// Owns a successfully claimed cron lock for the lifetime of a spawned worker.
+///
+/// The guard releases the lock after ordinary completion and also covers the
+/// paths where a Tokio task is cancelled or panics before persistence returns,
+/// so a dead worker cannot wedge its job until a daemon restart.
+struct ClaimedJobLock {
+    config: Config,
+    job_id: String,
+}
+
+impl Drop for ClaimedJobLock {
+    fn drop(&mut self) {
+        if let Err(e) = release_job(&self.config, &self.job_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": self.job_id, "error": format!("{e}")})
+                    ),
+                "Cron job: failed to release in-flight lock from worker cleanup"
+            );
+        }
+    }
+}
 
 /// True when an LLM-produced output is a *quiet* `NO_REPLY` sentinel — one that
 /// means "nothing to report" — rather than content meant to be delivered.
@@ -365,14 +395,13 @@ pub async fn run(
         ),
     }
 
-    // ── Startup catch-up: run ALL overdue jobs before entering the
-    //    normal polling loop. The regular loop is capped by `max_tasks`,
-    //    which could leave some overdue jobs waiting across many cycles
-    //    if the machine was off for a while. The catch-up phase fetches
-    //    without the `max_tasks` limit so every missed job fires once.
+    // ── Startup catch-up selects overdue jobs without the normal `max_tasks`
+    //    limit. Only free global worker slots are claimed; the rest stay due
+    //    for later polls instead of blocking scheduler liveness behind one job.
     //    Controlled by `[scheduler] catch_up_on_startup` (default: true).
+    let mut workers = JoinSet::new();
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx).await;
+        start_catch_up_overdue_jobs(&config, SCHEDULER_COMPONENT, &mut workers);
     } else {
         ::zeroclaw_log::record!(
             INFO,
@@ -408,10 +437,16 @@ pub async fn run(
                     }
                 };
 
-                let jobs = claim_due_jobs(&config, jobs);
-                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                start_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &mut workers);
+            }
+            completed = workers.join_next(), if !workers.is_empty() => {
+                if let Some(completed) = completed {
+                    handle_scheduler_worker_completion(completed, &event_tx);
+                }
             }
             _ = cancel.cancelled() => {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
                 ::zeroclaw_log::record!(
                     INFO,
@@ -426,31 +461,45 @@ pub async fn run(
 
 /// Resolve which agent owns a given cron job. Lookup order:
 ///
-/// 1. The row's persisted `agent_alias` field, when it names a
-///    configured agent.
+/// 1. The row's persisted `agent_alias` field, when it names an enabled
+///    configured agent. A disabled persisted owner is not allowed to fall
+///    through to declarative ownership.
 /// 2. Reverse-resolve via `[agents.<x>].cron_jobs` (declarative path:
 ///    every alias that lists the cron alias claims ownership).
 ///
-/// Returns `None` when neither resolves. Callers (process_due_jobs,
-/// execute_job_now) log and skip the job rather than crashing the
-/// scheduler loop.
+/// Returns `None` when neither resolves. Callers log and skip the job rather
+/// than crashing the scheduler loop.
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
-    if !job.agent_alias.is_empty()
-        && let Some((alias, _)) = config
-            .agents
-            .iter()
-            .find(|(alias, _)| alias.as_str() == job.agent_alias)
-    {
-        return Some(alias.as_str());
+    if !job.agent_alias.is_empty() {
+        match config.agents.get_key_value(job.agent_alias.as_str()) {
+            Some((alias, agent)) if agent.enabled => return Some(alias.as_str()),
+            Some(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"job_id": job.id, "agent": job.agent_alias})
+                        ),
+                    "Cron job's persisted owning agent is disabled; skipping launch"
+                );
+                return None;
+            }
+            None => {}
+        }
     }
     config.agent_for_cron_job(&job.id)
 }
 
-/// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
+/// Fetch **all** overdue jobs (ignoring `max_tasks`) and dispatch free slots.
 ///
-/// Called once at scheduler startup so that jobs missed during downtime
-/// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
+/// Called once at scheduler startup so missed jobs are picked up immediately
+/// without awaiting the entire backlog before the normal loop can run.
+fn start_catch_up_overdue_jobs(
+    config: &Config,
+    component: &str,
+    workers: &mut JoinSet<SchedulerJobResult>,
+) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
@@ -482,13 +531,12 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
         "Scheduler startup: catching up overdue jobs"
     );
 
-    let jobs = claim_due_jobs(config, jobs);
-    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    start_due_jobs(config, jobs, component, workers);
 
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-        "Scheduler startup: catch-up complete"
+        "Scheduler startup: dispatched overdue cron jobs"
     );
 }
 
@@ -610,6 +658,42 @@ fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std:
     }
 }
 
+fn cron_agent_timeout(config: &Config, agent_alias: &str) -> Duration {
+    let seconds = config
+        .runtime_profile_for_agent(agent_alias)
+        .and_then(|profile| profile.agentic_timeout_secs)
+        .unwrap_or(config.delegate.agentic_timeout_secs);
+    Duration::from_secs(seconds)
+}
+
+async fn await_cron_agent_run<F>(
+    mut run: std::pin::Pin<&mut F>,
+    cancellation: CancellationToken,
+    timeout: Duration,
+) -> Result<String>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    match time::timeout(timeout, run.as_mut()).await {
+        Ok(result) => result,
+        Err(_) => {
+            cancellation.cancel();
+            // The agent loop receives this token through AgentRunOverrides and
+            // stops scheduling new tool calls. Give a cooperative in-flight
+            // operation a short window to unwind before dropping it.
+            let _ = time::timeout(
+                Duration::from_secs(CRON_AGENT_CANCELLATION_GRACE_SECS),
+                run.as_mut(),
+            )
+            .await;
+            Err(anyhow::Error::msg(format!(
+                "{CRON_AGENT_TIMEOUT_PREFIX} {}s",
+                timeout.as_secs()
+            )))
+        }
+    }
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -636,6 +720,13 @@ async fn execute_job_with_retry(
             return (false, last_output);
         }
 
+        if last_output.starts_with(CRON_AGENT_TIMEOUT_PREFIX) {
+            // The timeout is the job-level liveness boundary. Retrying it here
+            // would multiply that boundary by `scheduler_retries` and keep a
+            // global scheduler slot occupied long after its configured limit.
+            return (false, last_output);
+        }
+
         if attempt < retries {
             let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
             time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
@@ -646,77 +737,70 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
-/// Atomically claim each due job, returning only the jobs this scheduler won.
+/// Start due jobs without waiting for them to finish.
 ///
-/// Claiming is part of selection: a job already in flight (claimed by an earlier
-/// poll, the startup catch-up, or a concurrent trigger) is dropped here so it is
-/// never launched again while a prior run is still running (issue #6037). Each
-/// claimed job's lock is released in `execute_and_persist_job` once its run
-/// completes. Callers pass jobs sourced from `due_jobs` / `all_overdue_jobs`,
-/// which are always DB-backed, so a failed claim means the row is locked (or the
-/// claim query errored) rather than absent.
-fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
-    jobs.into_iter()
-        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
-            Ok(true) => true,
-            Ok(false) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"job_id": job.id})),
-                    "Cron job already in flight; skipping duplicate launch"
-                );
-                false
+/// The `JoinSet` lives for the whole scheduler lifetime, so its length is the
+/// global (not per-poll) concurrency count. Only jobs for a free slot are
+/// claimed; jobs that do not fit remain eligible for a later poll instead of
+/// being left with a leaked in-flight lock.
+fn start_due_jobs(
+    config: &Config,
+    jobs: Vec<CronJob>,
+    component: &str,
+    workers: &mut JoinSet<SchedulerJobResult>,
+) {
+    crate::health::mark_component_ok(component);
+    let max_concurrent = config.scheduler.max_concurrent.max(1);
+
+    for job in jobs {
+        if workers.len() >= max_concurrent {
+            break;
+        }
+
+        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id})),
+                "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list"
+            );
+            continue;
+        };
+        let agent_alias = agent_alias.to_owned();
+        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{e}")})), "Cron job: failed to build SecurityPolicy for owning agent");
+                continue;
             }
+        };
+
+        match claim_job(config, &job.id, Utc::now()) {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                            ::serde_json::json!({"job_id": job.id, "error": format!("{e}")})
                         ),
                     "Cron job: failed to claim in-flight lock; skipping launch"
                 );
-                false
+                continue;
             }
-        })
-        .collect()
-}
+        }
 
-async fn process_due_jobs(
-    config: &Config,
-    jobs: Vec<CronJob>,
-    component: &str,
-    event_tx: &EventBroadcast,
-) {
-    // Refresh scheduler health on every successful poll cycle, including idle cycles.
-    crate::health::mark_component_ok(component);
-
-    let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        // Resolve owning agent per-job. Skip orphans with a warning so a
-        // mis-configured job can't take down the scheduler loop. The job was
-        // claimed in `claim_due_jobs`, so release the lock on every skip path
-        // here — otherwise a skipped job would stay filtered out of `due_jobs`
-        // until restart instead of being retried next poll (issue #6037).
-        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
-            let _ = release_job(config, &job.id);
-            return None;
-        };
-        let agent_alias = agent_alias.to_owned();
-        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
-                let _ = release_job(config, &job.id);
-                return None;
-            }
-        };
         let config = config.clone();
         let component = component.to_owned();
-        Some(async move {
+        let lock = ClaimedJobLock {
+            config: config.clone(),
+            job_id: job.id.clone(),
+        };
+        workers.spawn(async move {
+            let _lock = lock;
             Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
@@ -725,30 +809,45 @@ async fn process_due_jobs(
                 &component,
             ))
             .await
-        })
-    }))
-    .buffer_unordered(max_concurrent);
+        });
+    }
+}
 
-    while let Some((job_id, success, output)) = in_flight.next().await {
-        if !success {
+fn handle_scheduler_worker_completion(
+    completed: Result<SchedulerJobResult, tokio::task::JoinError>,
+    event_tx: &EventBroadcast,
+) {
+    let (job_id, success, output) = match completed {
+        Ok(result) => result,
+        Err(e) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
-                "Scheduler job '' failed: "
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "Scheduler worker ended before publishing a cron result"
             );
+            return;
         }
-        // Broadcast cron result to dashboard/SSE clients.
-        if let Some(tx) = event_tx {
-            let _ = tx.send(serde_json::json!({
-                "type": "cron_result",
-                "job_id": job_id,
-                "success": success,
-                "output": output,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }));
-        }
+    };
+
+    if !success {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
+            "Scheduler job '' failed: "
+        );
+    }
+    if let Some(tx) = event_tx {
+        let _ = tx.send(serde_json::json!({
+            "type": "cron_result",
+            "job_id": job_id,
+            "success": success,
+            "output": output,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
     }
 }
 
@@ -777,20 +876,6 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
-
-    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
-    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
-    // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup (issue #6037).
-    if let Err(e) = release_job(config, &job.id) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "Cron job: failed to release in-flight lock after run"
-        );
-    }
 
     (job.id.clone(), success, output)
 }
@@ -877,6 +962,7 @@ async fn run_agent_job(
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
+        cancellation_token: None,
         is_subagent: false,
         // `uses_memory = false` fully opts the job out of the engine's
         // memory-context injection (stateless digest jobs)...
@@ -887,9 +973,14 @@ async fn run_agent_job(
         // backend nor reach one via advertised memory tools (issue #8695).
         memory_free: !job.uses_memory,
     };
+    let cancellation = CancellationToken::new();
+    let run_overrides = crate::agent::loop_::AgentRunOverrides {
+        cancellation_token: Some(cancellation.clone()),
+        ..run_overrides
+    };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
+            let mut run = Box::pin(
                 crate::agent::run(
                     cron_config,
                     agent_alias,
@@ -907,6 +998,11 @@ async fn run_agent_job(
                     run_overrides,
                 )
                 .instrument(subagent_span),
+            );
+            await_cron_agent_run(
+                run.as_mut(),
+                cancellation,
+                cron_agent_timeout(config, agent_alias),
             )
             .await
         }
@@ -1451,6 +1547,19 @@ mod tests {
         }
     }
 
+    async fn start_and_finish_due_jobs(
+        config: &Config,
+        jobs: Vec<CronJob>,
+        component: &str,
+        event_tx: &EventBroadcast,
+    ) {
+        let mut workers = JoinSet::new();
+        start_due_jobs(config, jobs, component, &mut workers);
+        while let Some(completed) = workers.join_next().await {
+            handle_scheduler_worker_completion(completed, event_tx);
+        }
+    }
+
     #[test]
     fn high_frequency_daily_cron_is_not_flagged() {
         // `0 6 * * *` fires once per day — must never warn regardless of when the check runs
@@ -1953,13 +2062,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_due_jobs_marks_component_ok_even_when_idle() {
+    async fn start_due_jobs_marks_component_ok_even_when_idle() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, Vec::new(), &component, &None).await;
+        start_and_finish_due_jobs(&config, Vec::new(), &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -1969,14 +2078,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_due_jobs_failure_does_not_mark_component_unhealthy() {
+    async fn start_due_jobs_failure_does_not_mark_component_unhealthy() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_scheduler_component_health_test");
+        let job = cron::add_job(
+            &config,
+            TEST_AGENT,
+            "* * * * *",
+            "ls definitely_missing_file_for_scheduler_component_health_test",
+        )
+        .unwrap();
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        start_and_finish_due_jobs(&config, vec![job], &component, &None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -2628,26 +2743,18 @@ mod tests {
     #[tokio::test]
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        let job = test_job("echo broadcast-ok");
-        // Bind the synthetic test job to test-agent so process_due_jobs's
-        // owning-agent lookup succeeds (jobs without an owner are skipped).
-        config
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .cron_jobs
-            .push(job.id.clone());
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo broadcast-ok").unwrap();
         let component = unique_component("broadcast-ok");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        start_and_finish_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
@@ -2656,30 +2763,30 @@ mod tests {
     #[tokio::test]
     async fn broadcast_sends_cron_result_on_failure() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_broadcast_fail_test");
-        config
-            .agents
-            .get_mut("test-agent")
-            .unwrap()
-            .cron_jobs
-            .push(job.id.clone());
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(
+            &config,
+            TEST_AGENT,
+            "* * * * *",
+            "ls definitely_missing_file_for_broadcast_fail_test",
+        )
+        .unwrap();
         let component = unique_component("broadcast-fail");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        start_and_finish_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], false);
         assert!(event["timestamp"].as_str().is_some());
     }
 
     #[tokio::test]
-    async fn claim_due_jobs_skips_in_flight_job() {
+    async fn start_due_jobs_skips_in_flight_job() {
         // Regression for #6037: once a due job is claimed for execution, a
         // subsequent selection pass must not pick it up again until the prior
         // run releases it — otherwise a job that runs longer than the poll
@@ -2688,75 +2795,169 @@ mod tests {
         let config = test_config(&tmp).await;
         let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
 
-        let claimed = claim_due_jobs(&config, vec![job.clone()]);
-        assert_eq!(claimed.len(), 1, "first selection claims the job");
-
-        let claimed_again = claim_due_jobs(&config, vec![job.clone()]);
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let mut workers = JoinSet::new();
+        start_due_jobs(
+            &config,
+            vec![job.clone()],
+            &unique_component("in-flight"),
+            &mut workers,
+        );
         assert!(
-            claimed_again.is_empty(),
-            "an in-flight job must be skipped by the next selection pass"
+            workers.is_empty(),
+            "an in-flight job must be skipped by a later scheduler tick"
         );
 
         cron::release_job(&config, &job.id).unwrap();
-        let after_release = claim_due_jobs(&config, vec![job]);
+    }
+
+    #[tokio::test]
+    async fn start_due_jobs_skips_disabled_persisted_owner_without_claiming() {
+        // A persisted alias must not revive an agent that an operator has
+        // disabled after the job was scheduled. As on every skipped path, the
+        // prior claim is released so it does not remain wedged in flight.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo disabled").unwrap();
+        config.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
+        assert!(resolve_owning_agent(&config, &job).is_none());
+        let mut workers = JoinSet::new();
+        start_due_jobs(
+            &config,
+            vec![job.clone()],
+            &unique_component("disabled"),
+            &mut workers,
+        );
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "a disabled persisted owner must be skipped before its cron lock is claimed"
+        );
+        assert!(workers.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn start_due_jobs_keeps_global_capacity_and_leaves_unstarted_job_unlocked() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.max_concurrent = 1;
+        config
+            .risk_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .allowed_commands = vec!["sleep".into()];
+        let first = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "sleep 30").unwrap();
+        let second = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "sleep 30").unwrap();
+        let mut workers = tokio::task::JoinSet::new();
+
+        start_due_jobs(&config, vec![first.clone()], "scheduler-test", &mut workers);
         assert_eq!(
-            after_release.len(),
+            workers.len(),
             1,
-            "after release the job is selectable again"
+            "first job must consume the only global slot"
+        );
+
+        start_due_jobs(
+            &config,
+            vec![second.clone()],
+            "scheduler-test",
+            &mut workers,
+        );
+        assert_eq!(
+            workers.len(),
+            1,
+            "second tick must not exceed global capacity"
+        );
+        assert!(
+            cron::claim_job(&config, &second.id, Utc::now()).unwrap(),
+            "a job with no slot must remain unlocked for a later scheduler tick"
+        );
+        cron::release_job(&config, &second.id).unwrap();
+
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        assert!(
+            cron::claim_job(&config, &first.id, Utc::now()).unwrap(),
+            "aborting a spawned worker must release its claimed cron lock"
+        );
+    }
+
+    #[test]
+    fn cron_agent_timeout_uses_target_runtime_profile() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert(TEST_AGENT.into(), Default::default());
+        config.runtime_profiles.insert(
+            TEST_AGENT.into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                agentic_timeout_secs: Some(42),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            TEST_AGENT.into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            cron_agent_timeout(&config, TEST_AGENT),
+            Duration::from_secs(42)
         );
     }
 
     #[tokio::test]
-    async fn process_due_jobs_releases_lock_for_skipped_orphan_job() {
-        // A job claimed for execution but then skipped by process_due_jobs (here
-        // an orphan with no owning agent) must have its in-flight lock released,
-        // so it is retried on the next poll instead of being wedged out of
-        // due_jobs until restart (issue #6037).
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        // Insert a real, claimable DB row under a configured agent, then drive
-        // process_due_jobs with an in-memory view whose agent_alias is cleared.
-        // With an empty alias and an id bound to no [agents.<x>].cron_jobs list,
-        // resolve_owning_agent returns None, so the job is skipped as an orphan.
-        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo orphan").unwrap();
-        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
-        let orphan = CronJob {
-            agent_alias: String::new(),
-            ..job.clone()
-        };
+    async fn cron_agent_timeout_cancels_inflight_run_before_returning_failure() {
+        let cancellation = CancellationToken::new();
+        let observed = cancellation.clone();
+        let mut run = Box::pin(async move {
+            observed.cancelled().await;
+            anyhow::bail!("cancelled by scheduler")
+        });
 
-        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+        let error =
+            await_cron_agent_run(run.as_mut(), cancellation.clone(), Duration::from_millis(1))
+                .await
+                .expect_err("pending cron run must time out");
 
-        assert!(
-            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
-            "a skipped orphan job's in-flight lock must be released, not leaked"
-        );
+        assert!(cancellation.is_cancelled());
+        assert!(error.to_string().starts_with(CRON_AGENT_TIMEOUT_PREFIX));
     }
 
     #[tokio::test]
     async fn broadcast_none_skips_without_error() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = test_job("echo no-broadcast");
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo no-broadcast").unwrap();
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        start_and_finish_due_jobs(&config, vec![job], &component, &None).await;
     }
 
     #[tokio::test]
     async fn broadcast_handles_no_subscribers() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = test_job("echo no-subscribers");
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo no-subscribers").unwrap();
         let component = unique_component("broadcast-no-sub");
 
         let (tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         // Drop the only receiver immediately — `let _ = tx.send(...)` in
-        // process_due_jobs must not panic when there are no subscribers.
+        // Scheduler result publication must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        start_and_finish_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
     }
 }

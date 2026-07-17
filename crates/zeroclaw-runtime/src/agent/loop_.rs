@@ -1261,6 +1261,9 @@ pub fn apply_text_tool_prompt_policy(
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
     pub memory: Option<Arc<dyn Memory>>,
+    /// Optional cancellation propagated by a non-webhook caller such as a
+    /// bounded cron worker. `None` preserves the historical single-shot path.
+    pub cancellation_token: Option<CancellationToken>,
     /// `true` when the run is a SubAgent invocation. SubAgents must not
     /// spawn further subagents (depth-1 cap). The agent loop reads this
     /// when constructing the `spawn_subagent` tool so the depth-cap
@@ -1448,6 +1451,7 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let cancellation_token = overrides.cancellation_token;
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -2124,7 +2128,7 @@ pub async fn run(
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
-                                cancellation_token: None,
+                                cancellation_token: cancellation_token.clone(),
                                 on_delta: None,
                                 shared_budget: None,
                                 channel: None,

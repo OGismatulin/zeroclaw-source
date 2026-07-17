@@ -488,7 +488,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-24 = [image_gen] fast model -> xai/grok-imagine-image (better Cyrillic text);
 #         data-driven fal body via fal_size_param/fal_size_map/[image_gen.fal_extra_body].
 #         See spec 2026-07-15-fal-image-model-data-driven-body.
-CURRENT_CONFIG_MARKER = "v3-26"
+# v3-27 = Jira package agents use the isolated jira_analysis profile (256k
+#         context budget and 1800s agent cap); jira_coordinator owns cron runs
+#         and jira_worker handles source translation and visual artifacts.
+CURRENT_CONFIG_MARKER = "v3-27"
 
 
 def sanitize_filename(filename: str) -> str:

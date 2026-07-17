@@ -213,6 +213,7 @@ impl Tool for SpawnSubagentTool {
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
+            cancellation_token: None,
             is_subagent: true,
             // Sub-turn origin already skips memory injection; explicit for
             // the same future-proofing reason as `is_subagent` above.

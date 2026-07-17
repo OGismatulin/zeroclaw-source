@@ -553,6 +553,48 @@ protect_last_n = 10
 "GLM-5.1"                 = 202_752
 "Qwen3.5-397B-A17B"       = 262_144
 
+# Jira package runs load a large immutable source manifest and invoke the full
+# tool surface.  The measured system floor is already above 205k tokens, so
+# these roles must not inherit the 128k generic subagent budget.
+[runtime_profiles.jira_analysis]
+agentic = true
+compact_context = false
+max_tool_iterations = 200
+max_actions_per_hour = 1_000_000
+max_history_messages = 200
+max_context_tokens = 256_000
+agentic_timeout_secs = 1800
+parallel_tools = true
+tool_dispatcher = "native"
+shell_timeout_secs = 600
+
+[runtime_profiles.jira_analysis.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+
+[runtime_profiles.jira_analysis.context_compression.model_windows]
+"mimo-v2.5-pro"           = 800_000
+"mimo-v2.5"               = 800_000
+"deepseek-v4-flash"       = 800_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.2"                 = 1_000_000
+"glm-5.2-fast"            = 1_048_576
+"kimi-k2.7-code"          = 256_000
+"minimax-m2.7"            = 196_608
+"gpt-5.5"                 = 256_000
+"gpt-5.4"                 = 256_000
+"gpt-5.4-mini"            = 256_000
+"gpt-5.6-sol"             = 353_000
+"gpt-5.6-terra"           = 353_000
+"gpt-5.6-luna"            = 353_000
+"glm-5-turbo"             = 128_000
+"glm-5.1"                 = 202_752
+"GLM-5.1"                 = 202_752
+"Qwen3.5-397B-A17B"       = 262_144
+
 # ── Agents ──────────────────────────────────────────────────────────────────
 # Each agent carries ONLY model_provider / risk_profile / runtime_profile. Dead
 # per-agent allowed_tools + system_prompt dropped (behavior-neutral: the main
@@ -564,6 +606,18 @@ protect_last_n = 10
 model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "default"
+mcp_bundles = ["all"]
+
+[agents.jira_coordinator]
+model_provider = "openai.codex_worker"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+
+[agents.jira_worker]
+model_provider = "openai.codex_worker"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.worker]
@@ -581,7 +635,7 @@ mcp_bundles = ["all"]
 [agents.analyst_mimo]
 model_provider = "opencode.mimo"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 # Neutral analyst persona instead of the main-user identity: an explicit
 # workspace.path survives fork patch #2 (schema.rs is_none() guard), so
@@ -592,7 +646,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_deepseek_pro]
 model_provider = "deepseek.pro"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -600,7 +654,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_deepseek_flash]
 model_provider = "deepseek.flash"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_deepseek_flash.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -608,7 +662,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_glm]
 model_provider = "zai.default"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_glm.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -616,7 +670,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_glm_nwt]
 model_provider = "custom.neuralwatt_glm"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_glm_nwt.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -624,7 +678,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_sol]
 model_provider = "openai.codex_sol"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_sol.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -632,7 +686,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.analyst_terra]
 model_provider = "openai.codex_terra"
 risk_profile = "default"
-runtime_profile = "agent_default"
+runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"

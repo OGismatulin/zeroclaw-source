@@ -15,7 +15,7 @@ pub struct CronAddTool {
     security: Arc<SecurityPolicy>,
     /// Owning agent — the alias of the agent whose tool loop registered
     /// this tool instance. Cron jobs created here are validated against
-    /// this agent's risk profile and run as this agent.
+    /// this agent's effective security policy and run as this agent.
     agent_alias: String,
 }
 
@@ -86,6 +86,82 @@ impl CronAddTool {
         }
 
         None
+    }
+
+    /// Resolve the optional owner of an agent cron job.
+    ///
+    /// A cron job is a deferred agent execution, so accepting an arbitrary
+    /// target here would let its creator escape the policy under which the
+    /// `cron_add` mutation was authorized.  Cross-profile dispatch belongs to
+    /// the explicit delegation surface; this convenience path is deliberately
+    /// limited to configured, enabled peers sharing the caller's risk profile
+    /// without a wider effective security policy.
+    fn resolve_agent_job_owner(&self, args: &Value) -> Result<String, ToolResult> {
+        let Some(raw_target) = args.get("agent") else {
+            return Ok(self.agent_alias.clone());
+        };
+        let Some(raw_target) = raw_target.as_str() else {
+            return Err(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some("Invalid agent: expected a configured agent alias".to_string()),
+            });
+        };
+        let target_alias = raw_target.trim();
+        if target_alias.is_empty() {
+            return Err(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "Invalid agent: expected a non-empty configured agent alias".to_string(),
+                ),
+            });
+        }
+
+        let Some(target) = self.config.agents.get(target_alias) else {
+            return Err(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Unknown target agent: {target_alias}")),
+            });
+        };
+        if !target.enabled {
+            return Err(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Target agent is disabled: {target_alias}")),
+            });
+        }
+
+        let target_policy =
+            SecurityPolicy::for_agent(&self.config, target_alias).map_err(|e| ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Could not resolve risk profile for target agent {target_alias}: {e}"
+                )),
+            })?;
+        if target_policy.risk_profile_name != self.security.risk_profile_name {
+            return Err(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Target agent {target_alias} uses risk profile {:?}; cron_add may target only the caller's risk profile {:?}",
+                    target_policy.risk_profile_name, self.security.risk_profile_name
+                )),
+            });
+        }
+        target_policy
+            .ensure_no_escalation_beyond(&self.security)
+            .map_err(|violation| ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Target agent {target_alias} escalates beyond the caller's security policy: {violation}"
+                )),
+            })?;
+
+        Ok(target_alias.to_string())
     }
 }
 
@@ -239,6 +315,10 @@ impl Tool for CronAddTool {
                 "prompt": {
                     "type": "string",
                     "description": "Agent prompt to run on schedule (required when job_type is 'agent')"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional configured owner for an agent job. It must be enabled, use the same risk profile, and have no wider effective security policy than the caller; defaults to the caller."
                 },
                 "session_target": {
                     "type": "string",
@@ -438,6 +518,10 @@ impl Tool for CronAddTool {
                 )
             }
             JobType::Agent => {
+                let agent_alias = match self.resolve_agent_job_owner(&args) {
+                    Ok(agent_alias) => agent_alias,
+                    Err(result) => return Ok(result),
+                };
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
                     Some(prompt) if !prompt.trim().is_empty() => prompt,
                     _ => {
@@ -502,7 +586,7 @@ impl Tool for CronAddTool {
 
                 cron::add_agent_job(
                     &self.config,
-                    &self.agent_alias,
+                    &agent_alias,
                     name,
                     schedule,
                     prompt,
@@ -1113,6 +1197,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_job_can_target_same_risk_profile_peer_and_persists_owner() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = (*test_config(&tmp).await).clone();
+        config.agents.insert(
+            "jira_coordinator".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "after", "after_seconds": 60 },
+                "job_type": "agent",
+                "agent": "jira_coordinator",
+                "prompt": "continue the Jira analysis"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].agent_alias, "jira_coordinator");
+    }
+
+    #[tokio::test]
+    async fn agent_job_rejects_same_risk_profile_peer_with_wider_runtime_budgets() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = (*test_config(&tmp).await).clone();
+        config.runtime_profiles.insert(
+            "wider-runtime".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_actions_per_hour: 21,
+                max_cost_per_day_cents: 501,
+                shell_timeout_secs: 61,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "jira_coordinator".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: "wider-runtime".into(),
+                ..Default::default()
+            },
+        );
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "after", "after_seconds": 60 },
+                "job_type": "agent",
+                "agent": "jira_coordinator",
+                "prompt": "continue the Jira analysis"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("escalates"));
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_job_rejects_target_with_different_risk_profile() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = (*test_config(&tmp).await).clone();
+        config.risk_profiles.insert(
+            "other-risk".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "other-runtime".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "other_agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: "other-risk".into(),
+                runtime_profile: "other-runtime".into(),
+                ..Default::default()
+            },
+        );
+        let cfg = Arc::new(config);
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "after", "after_seconds": 60 },
+                "job_type": "agent",
+                "agent": "other_agent",
+                "prompt": "continue the Jira analysis"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("risk profile"));
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn empty_allowed_tools_stored_as_none() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -1152,6 +1347,21 @@ mod tests {
         assert!(description.contains("exclude scheduler mutation tools"));
         assert!(description.contains("cron_add"));
         assert!(description.contains("opt back in"));
+    }
+
+    #[tokio::test]
+    async fn agent_schema_documents_same_risk_profile_targeting() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let schema = tool.parameters_schema();
+        let description = schema["properties"]["agent"]["description"]
+            .as_str()
+            .expect("agent field must be exposed in cron_add schema");
+
+        assert!(description.contains("same risk profile"));
+        assert!(description.contains("no wider effective security policy"));
     }
 
     #[tokio::test]
