@@ -284,7 +284,12 @@ impl ContextCompressor {
             // Escalate protected tail toward 0, trimming oversized tool results until
             // under threshold (headroom for system prompt + tool defs + next user msg
             // that estimate_tokens does not count) or nothing left to trim.
-            let mut protect = self.config.emergency_protect_last_n;
+            // Last resort: when escalation reaches protect == 0, even the most-recent
+            // tool result becomes trimmable — a degraded turn is preferred over a hard
+            // context_window_exceeded failure.
+            // Clamp the starting protection to history length so a misconfigured large
+            // value doesn't spin many no-op iterations (each recomputes estimate_tokens).
+            let mut protect = self.config.emergency_protect_last_n.min(history.len());
             loop {
                 emergency_saved +=
                     self.trim_tool_results_in_range(history, self.config.protect_first_n, protect);
@@ -1260,7 +1265,7 @@ mod tests {
             ChatMessage::system("sys"),
             ChatMessage::tool(big.clone()),
             ChatMessage::tool(big.clone()),
-            ChatMessage::tool("small tail"), // last — защищён emergency N=1, останется цел
+            ChatMessage::tool("small tail"), // last — под max И защищён emergency N=1, останется цел
         ];
         let provider = CaptureSummarizerModelProvider {
             supports_vision: false,
@@ -1281,7 +1286,7 @@ mod tests {
         assert_eq!(
             history.last().unwrap().content,
             "small tail",
-            "хвост N=1 цел"
+            "хвост под max и вне зоны трима (emergency N=1) — цел"
         );
         assert!(
             history[1].content.len() < 1_000,

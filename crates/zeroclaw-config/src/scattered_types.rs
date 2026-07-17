@@ -330,8 +330,12 @@ pub struct ContextCompressionConfig {
     pub model_windows: HashMap<String, usize>,
     /// When post-turn compaction still leaves the transcript above threshold,
     /// an emergency no-LLM tail-trim truncates oversized `tool` results even in
-    /// the normally protected tail, preserving only the last N messages.
-    /// Smaller than `protect_last_n` (else the pass is a no-op). Default: 2.
+    /// the normally protected tail. This is the STARTING tail-protection for the
+    /// emergency pass: the pass escalates the protected tail toward 0 as a last
+    /// resort until the transcript is under threshold, so the last N is a
+    /// best-effort starting point, NOT a hard floor. A value larger than
+    /// `protect_last_n` is not a no-op — it just wastes early iterations before
+    /// escalation begins to bite. Default: 2.
     #[serde(default = "default_emergency_protect_last_n")]
     pub emergency_protect_last_n: usize,
 }
