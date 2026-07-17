@@ -8,7 +8,7 @@ import email.policy
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
@@ -1243,12 +1243,19 @@ class GatewayRegistry:
         spawn_process: SpawnProcess | None = None,
         wait_until_healthy: WaitUntilHealthy | None = None,
         clock: Callable[[], float] = _now,
+        on_daemon_spawn: Callable[[Path], None] | None = None,
     ) -> None:
         self.settings = settings
         self.bootstrapper = bootstrapper
         self.spawn_process = spawn_process or self._spawn_process
         self.wait_until_healthy = wait_until_healthy or self._wait_until_healthy
         self.clock = clock
+        # fork(mcp-resilience C2): boot-path hook. Called with the freshly
+        # spawned daemon's runtime-trace path after every spawn attempt (both
+        # success and health-timeout failure) so boot-time mcp_connect_failure
+        # events — invisible to the per-turn ProgressNotifier — reach the shared
+        # tracker/alert pipeline. None (default) disables the scan.
+        self.on_daemon_spawn = on_daemon_spawn
         self._instances: dict[str, DaemonInstance] = {}
         self._next_port = settings.manager_base_port
         self._global_lock = threading.Lock()
@@ -1383,11 +1390,18 @@ class GatewayRegistry:
                         pass
                 except Exception:
                     pass
+            # A health-timeout is the primary saturation signature: scan the
+            # boot trace for mcp_connect_failure events before surfacing the
+            # error (deploy-burst failures cluster on exactly this path).
+            self._scan_boot_mcp_failures(workspace_root)
             # Surface the real startup cause (health timeout / early exit /
             # rc) up to warmup/webhook; cleanup must not mask it.
             reason = str(exc) or exc.__class__.__name__
             raise DaemonSpawnError(reason) from exc
 
+        # Successful spawn can still have logged connect timeouts for slow MCP
+        # servers during warmup — scan so those count toward a burst too.
+        self._scan_boot_mcp_failures(workspace_root)
         self._ensure_default_cron_jobs(user_key)
 
         # The previous daemon was already reaped before this spawn (see above);
@@ -1406,6 +1420,26 @@ class GatewayRegistry:
         )
         self._instances[user_key] = instance
         return instance
+
+    def _scan_boot_mcp_failures(self, workspace_root: Path) -> None:
+        """Best-effort boot-path scan (fork mcp-resilience C2). The per-turn
+        ProgressNotifier only observes events during a webhook turn, so boot-time
+        mcp_connect_failure events (with deferred_loading=false these are most
+        real failures) written during warmup are never seen by it. Hand the
+        daemon's trace path to the injected hook, which reads the recent tail
+        and feeds it into the shared tracker/alert pipeline. Never breaks spawn."""
+        if self.on_daemon_spawn is None:
+            return
+        trace_path = (
+            workspace_root / "workspace" / "logs" / "runtime-trace.jsonl"
+        )
+        try:
+            self.on_daemon_spawn(trace_path)
+        except Exception as exc:
+            print(
+                f"[gateway-manager] boot mcp-failure scan failed: {exc}",
+                flush=True,
+            )
 
     def _ensure_default_cron_jobs(self, user_key: str) -> None:
         """Best-effort: bootstrap default cron jobs (e.g. nightly retro)
@@ -2335,6 +2369,7 @@ _EVENT_TURN_FINAL_RESPONSE = "turn_final_response"
 _EVENT_TURN_CANCELLED = "turn_cancelled"
 _EVENT_CONTEXT_STATE = "context_state"
 _EVENT_PROVIDER_FALLBACK = "provider_fallback"
+_EVENT_MCP_CONNECT_FAILURE = "mcp_connect_failure"
 
 
 class _ToolEvent(TypedDict):
@@ -2347,6 +2382,124 @@ class _ContextFullnessState(TypedDict):
     warned_at_percent: int
     last_compression_event_id: str | None
     last_percent: int
+
+
+class _McpFailureTracker:
+    """Manager-level dedup + threshold tracker for mcp_connect_failure bursts.
+
+    fork(mcp-resilience C2): the Rust runtime emits an ``mcp_connect_failure``
+    trace event whenever an MCP server does not finish its initial connect
+    inside the (10 s) timeout. A single such failure is routine noise — one
+    server briefly slow to boot. The signature worth paging the operator about
+    is a *burst*: one webhook turn can emit one event per failed server, and a
+    deploy / saturation event (e.g. the 2026-07-16 "warmup 0/4" outage when the
+    codemap box saturated) knocks over several servers and/or daemons at once.
+
+    A single instance is shared across every per-turn ``ProgressNotifier`` (like
+    the provider-fallback dedup dict), so failures from different daemons and
+    different turns accumulate into one global burst counter.
+
+    Dedup / idempotence: the manager re-reads the rolling trace from offset 0
+    after every trim, so the same line can be handed to us repeatedly. We count
+    each event exactly once, keyed by a caller-supplied content key (the trace
+    ``id`` when present, else a digest of timestamp + server/stage/timeout —
+    ``mcp_connect_failure`` boot-path events may carry no id). Entries outside
+    the window are pruned, so the counter reflects only recent failures. After
+    an alert we stay silent for one window; a sustained outage re-alerts at most
+    once per window rather than once per event.
+    """
+
+    def __init__(
+        self,
+        *,
+        threshold: int,
+        window_secs: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.threshold = max(int(threshold), 1)
+        self.window_secs = float(window_secs)
+        self._clock = clock
+        self._lock = threading.Lock()
+        # event-key -> monotonic first-seen time (window membership + dedup)
+        self._seen: dict[str, float] = {}
+        self._last_alert_at: float | None = None
+
+    def record(self, event_key: str) -> int | None:
+        """Register one failure.
+
+        Returns the burst size (>= threshold) when this event pushes a fresh
+        burst over the threshold and no alert has fired within the current
+        window; otherwise ``None`` (below threshold, duplicate, or suppressed).
+        """
+        now = self._clock()
+        with self._lock:
+            if event_key in self._seen:
+                return None  # duplicate trace line (re-read after a trim)
+            # Edge: an id-less event re-read AFTER it has aged out of the window
+            # (pruned below) is treated as fresh and re-counted. Bounded by the
+            # window and, for id-less events, only reachable if the same stale
+            # trace line is still tailed >window later — negligible and, at
+            # worst, an over-count that the per-window alert suppression absorbs.
+            cutoff = now - self.window_secs
+            self._seen = {
+                key: seen_at
+                for key, seen_at in self._seen.items()
+                if seen_at >= cutoff
+            }
+            self._seen[event_key] = now
+            if len(self._seen) < self.threshold:
+                return None
+            if (
+                self._last_alert_at is not None
+                and now - self._last_alert_at < self.window_secs
+            ):
+                return None  # already paged the operator this window
+            self._last_alert_at = now
+            return len(self._seen)
+
+
+def _consume_mcp_connect_failure(
+    event: dict,
+    *,
+    tracker: _McpFailureTracker | None,
+    operator_user_id: str,
+    post_notify: Callable[[int, str], None],
+) -> None:
+    """Feed one mcp_connect_failure event into the shared tracker and, if it
+    pushes a fresh burst over the threshold, page the operator exactly once.
+
+    Shared by BOTH the webhook-path consumer (ProgressNotifier, during a turn)
+    and the boot-path scanner (daemon spawn), so every route flows through ONE
+    tracker + alert pipeline — no parallel alerting. No-op when the operator id
+    is empty/non-numeric or no tracker is plumbed. The dedup content key (trace
+    id, else timestamp+server+stage+timeout) makes repeated reads of the same
+    line idempotent — rolling-trim re-reads on the webhook path, overlapping
+    tail re-scans across respawns on the boot path. Keyed only on
+    server/stage/timeout; tolerates missing/different channel & session_id.
+    """
+    if not operator_user_id or not operator_user_id.isdigit():
+        return  # alerts disabled / misconfigured operator id
+    if tracker is None:
+        return
+    payload = event.get("payload") or {}
+    server = str(payload.get("server") or "")
+    stage = str(payload.get("stage") or "")
+    timeout_secs = payload.get("timeout_secs")
+    eid = str(event.get("id") or "")
+    ts = str(event.get("timestamp") or "")
+    event_key = eid or f"{ts}|{server}|{stage}|{timeout_secs}"
+    burst = tracker.record(event_key)
+    if burst is None:
+        return
+    window_min = max(int(tracker.window_secs // 60), 1)
+    timeout_txt = timeout_secs if timeout_secs is not None else "?"
+    message = (
+        f"⚠ MCP connect-таймауты: {burst} отказ(ов) за ~{window_min} мин "
+        f"(последний: сервер {server or '?'}, стадия {stage or '?'}, "
+        f"timeout {timeout_txt}с). Похоже на сатурацию MCP-бокса — "
+        "проверь codemap/Hetzner."
+    )
+    post_notify(int(operator_user_id), message)
 
 
 class ProgressNotifier:
@@ -2482,6 +2635,7 @@ class ProgressNotifier:
         fallback_state: dict[str, float] | None = None,
         fallback_lock: threading.Lock | None = None,
         fallback_window_secs: int = 1800,
+        mcp_failure_tracker: _McpFailureTracker | None = None,
     ) -> None:
         self.trace_path = trace_path
         self.user_id = user_id
@@ -2493,6 +2647,8 @@ class ProgressNotifier:
         # outer closure exactly like _ctx_state / _ctx_state_lock.
         self._fallback_state = fallback_state  # dict[str, float] | None
         self._fallback_lock = fallback_lock  # threading.Lock | None
+        # Shared manager-level burst tracker for mcp_connect_failure events.
+        self._mcp_failure_tracker = mcp_failure_tracker
         # Capture the webhook start time before forwarding the request.
         # The monitor thread may open the rolling trace a bit later, after the
         # daemon has already appended the first events for the current turn.
@@ -2696,6 +2852,10 @@ class ProgressNotifier:
 
                 if et == _EVENT_PROVIDER_FALLBACK:
                     self._handle_provider_fallback(event)
+                    continue
+
+                if et == _EVENT_MCP_CONNECT_FAILURE:
+                    self._handle_mcp_connect_failure(event)
                     continue
 
                 if et == _EVENT_TOOL_CALL_START:
@@ -2982,6 +3142,18 @@ class ProgressNotifier:
         )
         self._post_notify(int(self.operator_user_id), message)
 
+    def _handle_mcp_connect_failure(self, event: dict) -> None:
+        # fork(mcp-resilience C2): webhook-path consumer. Delegate to the shared
+        # tracker/alert pipeline (also driven by the boot-path spawn scanner) so
+        # a burst of connect timeouts pages the OPERATOR once — end user gets
+        # nothing. Silent if no operator is set or no shared tracker is plumbed.
+        _consume_mcp_connect_failure(
+            event,
+            tracker=self._mcp_failure_tracker,
+            operator_user_id=self.operator_user_id,
+            post_notify=self._post_notify,
+        )
+
     def _handle_context_state(self, event: dict) -> None:
         payload = event.get("payload") or {}
         sid = str(payload.get("session_id") or "")
@@ -3060,6 +3232,91 @@ class ProgressNotifier:
             self._send_notify(message)
 
 
+# Bounded tail read for the boot-path scan. Boot-time mcp_connect_failure events
+# are written in a tight burst during daemon warmup — one per MCP server that
+# missed its connect timeout, at most a handful. 64 KiB of trailing trace
+# comfortably covers that burst without loading a large rolling file.
+_BOOT_TRACE_TAIL_BYTES = 64 * 1024
+# Only count failures written recently relative to the scan, so a normal spawn
+# does not re-page on stale boot events from an earlier cold start. The health
+# budget is ~90s; 180s leaves headroom for clock skew between writer and reader.
+_BOOT_MCP_FAILURE_MAX_AGE_SECS = 180.0
+
+
+def _read_recent_mcp_failures(
+    trace_path: Path,
+    *,
+    now: datetime,
+    max_age_secs: float = _BOOT_MCP_FAILURE_MAX_AGE_SECS,
+    tail_bytes: int = _BOOT_TRACE_TAIL_BYTES,
+) -> list[dict]:
+    """Read recent mcp_connect_failure events from the tail of a runtime trace.
+
+    Bounded read (last ``tail_bytes``), tolerant of a missing/unreadable file
+    (returns ``[]``) and of partial/garbled lines. Filters to
+    mcp_connect_failure events whose timestamp is within ``max_age_secs`` of
+    ``now``; events with no parseable timestamp are kept (fail-open, matching
+    ProgressNotifier._is_current_turn_event).
+    """
+    try:
+        with open(trace_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
+            chunk = fh.read()
+    except OSError:
+        return []  # missing/unreadable trace → silent skip
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    # Drop a likely-partial first record when we started mid-file.
+    if size > tail_bytes and lines:
+        lines = lines[1:]
+    cutoff = now - timedelta(seconds=max_age_secs)
+    out: list[dict] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("event_type") != _EVENT_MCP_CONNECT_FAILURE:
+            continue
+        ts = ProgressNotifier._parse_event_timestamp(event)
+        if ts is not None and ts < cutoff:
+            continue
+        out.append(event)
+    return out
+
+
+def _post_operator_telegram(
+    *, notify_url: str, notify_secret: str, user_id: int, message: str
+) -> None:
+    """Fire-and-forget operator Telegram notify for the boot path. Mirrors
+    ProgressNotifier._post_notify; failures are logged and swallowed so a scan
+    never breaks daemon spawn."""
+    try:
+        payload = json.dumps({"user_id": user_id, "message": message}).encode()
+        req = request.Request(
+            url=notify_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Secret": notify_secret,
+            },
+        )
+        with request.urlopen(req, timeout=5.0):
+            pass
+    except Exception as exc:
+        print(
+            f"[gateway-manager] boot mcp-failure notify failed: {exc}",
+            flush=True,
+        )
+
+
 def forward_webhook_to_child(
     instance: DaemonInstance,
     *,
@@ -3127,11 +3384,6 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         settings.manager_root,
         seed_tokens=[legacy_bearer_token] if legacy_bearer_token else (),
     )
-    registry = GatewayRegistry(
-        settings=settings,
-        bootstrapper=WorkspaceBootstrapper(settings),
-    )
-    registry.recover_from_workspaces()
     timeout = settings.request_timeout_secs
     notify_url = os.getenv("NOTIFY_URL", "")
     notify_secret = os.getenv("NOTIFY_SECRET", "")
@@ -3147,6 +3399,46 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     )
     fallback_state: dict[str, float] = {}
     fallback_lock = threading.Lock()
+    # fork(mcp-resilience C2): one shared burst tracker for mcp_connect_failure
+    # events, plumbed into every ProgressNotifier (webhook path) AND the daemon
+    # spawn scanner (boot path) so failures across daemons, turns, and boots
+    # coalesce into a single deduplicated operator alert. Conservative defaults
+    # (>= 3 failures / 5 min); overridable via env.
+    mcp_failure_tracker = _McpFailureTracker(
+        threshold=int(os.environ.get("MCP_CONNECT_FAILURE_ALERT_THRESHOLD", "3")),
+        window_secs=float(
+            os.environ.get("MCP_CONNECT_FAILURE_ALERT_WINDOW_SECS", "300")
+        ),
+    )
+
+    def _scan_boot_trace_for_mcp_failures(trace_path: Path) -> None:
+        # Boot-path counterpart of ProgressNotifier._handle_mcp_connect_failure:
+        # read the recent trace tail and drive each event through the SAME
+        # tracker + operator alert. Guarded by notify config (empty → disabled).
+        if not notify_url or not operator_user_id:
+            return
+        events = _read_recent_mcp_failures(
+            trace_path, now=datetime.now(timezone.utc)
+        )
+        for event in events:
+            _consume_mcp_connect_failure(
+                event,
+                tracker=mcp_failure_tracker,
+                operator_user_id=operator_user_id,
+                post_notify=lambda uid, msg: _post_operator_telegram(
+                    notify_url=notify_url,
+                    notify_secret=notify_secret,
+                    user_id=uid,
+                    message=msg,
+                ),
+            )
+
+    registry = GatewayRegistry(
+        settings=settings,
+        bootstrapper=WorkspaceBootstrapper(settings),
+        on_daemon_spawn=_scan_boot_trace_for_mcp_failures,
+    )
+    registry.recover_from_workspaces()
     operator_error_notifier = OperatorErrorNotifier(
         operator_user_id=operator_user_id,
         notify_url=notify_url,
@@ -3176,6 +3468,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 fallback_state=fallback_state,
                 fallback_lock=fallback_lock,
                 fallback_window_secs=fallback_window_secs,
+                mcp_failure_tracker=mcp_failure_tracker,
             )
             notifier.start()
         try:
