@@ -154,21 +154,24 @@ impl ContextCompressor {
         self.context_window = window;
     }
 
-    /// Fast-path: trim oversized tool results in non-protected messages.
-    /// Returns total characters saved. No LLM call needed.
-    fn fast_trim_tool_results(&self, history: &mut [ChatMessage]) -> usize {
+    /// Truncate oversized `tool` results within [protect_first_n .. len-protect_last_n).
+    /// Shared core for the normal fast-trim pass and the emergency tail-trim pass.
+    fn trim_tool_results_in_range(
+        &self,
+        history: &mut [ChatMessage],
+        protect_first_n: usize,
+        protect_last_n: usize,
+    ) -> usize {
         let max = self.config.tool_result_retrim_chars;
         if max == 0 {
             return 0;
         }
         let mut saved = 0;
-        let protect_start = self.config.protect_first_n.min(history.len());
-        let protect_end = history.len().saturating_sub(self.config.protect_last_n);
-
+        let protect_start = protect_first_n.min(history.len());
+        let protect_end = history.len().saturating_sub(protect_last_n);
         if protect_start >= protect_end {
             return 0;
         }
-
         for msg in &mut history[protect_start..protect_end] {
             if msg.role != "tool" {
                 continue;
@@ -194,6 +197,16 @@ impl ContextCompressor {
             saved += original_len - msg.content.len();
         }
         saved
+    }
+
+    /// Fast-path: trim oversized tool results in non-protected messages.
+    /// Returns total characters saved. No LLM call needed.
+    fn fast_trim_tool_results(&self, history: &mut [ChatMessage]) -> usize {
+        self.trim_tool_results_in_range(
+            history,
+            self.config.protect_first_n,
+            self.config.protect_last_n,
+        )
     }
 
     /// Main entry point. Compresses history in-place if over threshold.
