@@ -5764,6 +5764,21 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Same tool called with DIFFERENT args but identical result this many times
+    /// before the no-progress detector's first escalation (Warning). Block at
+    /// N+1, circuit-breaker Break at N+2. Defaults to 8 (was hardcoded 5).
+    /// Value 0 disables the no-progress detector. If greater than
+    /// `loop_detection_window_size` the detector effectively never fires.
+    #[serde(default = "default_loop_detection_no_progress_min_calls")]
+    pub loop_detection_no_progress_min_calls: usize,
+
+    /// Two tools alternating A->B->A->B for this many full cycles before the
+    /// ping-pong detector's first escalation (Warning). Block at N+1, Break at
+    /// N+2. Defaults to 6 (was hardcoded 4). Value 0 disables the ping-pong
+    /// detector. Detection needs `2 * value <= loop_detection_window_size`.
+    #[serde(default = "default_loop_detection_ping_pong_min_cycles")]
+    pub loop_detection_ping_pong_min_cycles: usize,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -5778,6 +5793,14 @@ fn default_loop_detection_max_repeats() -> usize {
     3
 }
 
+fn default_loop_detection_no_progress_min_calls() -> usize {
+    8
+}
+
+fn default_loop_detection_ping_pong_min_cycles() -> usize {
+    6
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -5788,6 +5811,8 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
+            loop_detection_ping_pong_min_cycles: default_loop_detection_ping_pong_min_cycles(),
         }
     }
 }
@@ -30512,6 +30537,16 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_max_repeats,
             manual.loop_detection_max_repeats
         );
+        assert_eq!(
+            from_toml.loop_detection_no_progress_min_calls,
+            manual.loop_detection_no_progress_min_calls
+        );
+        assert_eq!(
+            from_toml.loop_detection_ping_pong_min_cycles,
+            manual.loop_detection_ping_pong_min_cycles
+        );
+        assert_eq!(from_toml.loop_detection_no_progress_min_calls, 8);
+        assert_eq!(from_toml.loop_detection_ping_pong_min_cycles, 6);
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");

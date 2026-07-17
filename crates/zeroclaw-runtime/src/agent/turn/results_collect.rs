@@ -353,10 +353,15 @@ mod tests {
     }
 
     fn detector() -> LoopDetector {
+        // Pin the no-progress / ping-pong thresholds to the historical defaults
+        // (5 / 4) so these escalation-math tests keep their meaning after the
+        // production defaults were raised to 8 / 6.
         LoopDetector::new(crate::agent::loop_detector::LoopDetectorConfig {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            no_progress_min_calls: 5,
+            ping_pong_min_cycles: 4,
         })
     }
 
@@ -462,7 +467,13 @@ mod tests {
     /// different args but return an identical `output` string, with the given
     /// `success` flag.
     fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
-        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        // Historical no-progress threshold (5) so `run(8, ...)` still trips the
+        // breaker after the production default was raised to 8.
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            no_progress_min_calls: 5,
+            ping_pong_min_cycles: 4,
+            ..LoopDetectorConfig::default()
+        });
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut tool_calls: Vec<ParsedToolCall> = Vec::new();

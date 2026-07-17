@@ -3,11 +3,14 @@
 //! Monitors a sliding window of recent tool calls and their results to detect
 //! three repetitive patterns that indicate the agent is stuck:
 //!
-//! 1. **Exact repeat** — same tool + args called 3+ times consecutively.
-//! 2. **Ping-pong** — two tools alternating (A->B->A->B) for 4+ cycles.
-//! 3. **No progress** — same tool called 5+ times with different args but
-//!    identical result hash each time, counted across the window rather than
-//!    only consecutively, so interleaving other calls does not evade it.
+//! 1. **Exact repeat** — same tool + args called `max_repeats`+ times
+//!    consecutively.
+//! 2. **Ping-pong** — two tools alternating (A->B->A->B) for a configurable
+//!    number of cycles (`ping_pong_min_cycles`, default 6; `0` disables).
+//! 3. **No progress** — same tool called a configurable number of times
+//!    (`no_progress_min_calls`, default 8; `0` disables) with different args
+//!    but identical result hash each time, counted across the window rather
+//!    than only consecutively, so interleaving other calls does not evade it.
 //!
 //! Detection triggers escalating responses: `Warning` -> `Block` -> `Break`.
 
@@ -27,6 +30,12 @@ pub struct LoopDetectorConfig {
     pub window_size: usize,
     /// How many consecutive exact-repeat calls before escalation starts.
     pub max_repeats: usize,
+    /// No-progress threshold (same tool, different args, identical result).
+    /// Warning@N, Block@N+1, Break@N+2. 0 disables this pattern.
+    pub no_progress_min_calls: usize,
+    /// Ping-pong threshold in full A->B cycles. Warning@N, Block@N+1, Break@N+2.
+    /// 0 disables this pattern.
+    pub ping_pong_min_cycles: usize,
 }
 
 impl Default for LoopDetectorConfig {
@@ -35,6 +44,8 @@ impl Default for LoopDetectorConfig {
             enabled: true,
             window_size: 20,
             max_repeats: 3,
+            no_progress_min_calls: 8,
+            ping_pong_min_cycles: 6,
         }
     }
 }
@@ -202,11 +213,15 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 2: Two tools alternating (A->B->A->B) for 4+ full cycles
-    /// (i.e. 8 consecutive entries following the pattern).
+    /// Pattern 2: Two tools alternating (A->B->A->B) for a configurable number
+    /// of full cycles (`ping_pong_min_cycles`; `0` disables the pattern). Each
+    /// cycle is two consecutive entries following the pattern.
     fn detect_ping_pong(&self) -> Option<LoopDetectionResult> {
-        const MIN_CYCLES: usize = 4;
-        let needed = MIN_CYCLES * 2; // each cycle = 2 calls
+        let min_cycles = self.config.ping_pong_min_cycles;
+        if min_cycles == 0 {
+            return None; // detector disabled
+        }
+        let needed = min_cycles.saturating_mul(2); // each cycle = 2 calls
 
         if self.window.len() < needed {
             return None;
@@ -234,9 +249,9 @@ impl LoopDetector {
         }
 
         // Count total alternating length for escalation.
-        let mut cycles = MIN_CYCLES;
+        let mut cycles = min_cycles;
         let extended: Vec<&ToolCallRecord> = self.window.iter().rev().collect();
-        for extra_pair in extended.chunks(2).skip(MIN_CYCLES) {
+        for extra_pair in extended.chunks(2).skip(min_cycles) {
             if extra_pair.len() == 2
                 && &extra_pair[0].name == a_name
                 && &extra_pair[1].name == b_name
@@ -247,12 +262,12 @@ impl LoopDetector {
             }
         }
 
-        if cycles >= MIN_CYCLES + 2 {
+        if cycles >= min_cycles + 2 {
             Some(LoopDetectionResult::Break(format!(
                 "Circuit breaker: tools '{}' and '{}' have been alternating for {} cycles",
                 a_name, b_name, cycles
             )))
-        } else if cycles > MIN_CYCLES {
+        } else if cycles > min_cycles {
             Some(LoopDetectionResult::Block(format!(
                 "Blocked: tools '{}' and '{}' have been alternating for {} cycles",
                 a_name, b_name, cycles
@@ -266,13 +281,18 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 3: Same tool called 5+ times (with different args each time)
-    /// but producing the exact same result hash every time, counted across the
-    /// whole window so interleaved unrelated calls do not reset the streak.
+    /// Pattern 3: Same tool called a configurable number of times
+    /// (`no_progress_min_calls`; `0` disables the pattern) with different args
+    /// each time but producing the exact same result hash every time, counted
+    /// across the whole window so interleaved unrelated calls do not reset the
+    /// streak.
     fn detect_no_progress(&self) -> Option<LoopDetectionResult> {
-        const MIN_CALLS: usize = 5;
+        let min_calls = self.config.no_progress_min_calls;
+        if min_calls == 0 {
+            return None; // detector disabled
+        }
 
-        if self.window.len() < MIN_CALLS {
+        if self.window.len() < min_calls {
             return None;
         }
 
@@ -287,7 +307,7 @@ impl LoopDetector {
             .collect();
 
         let count = same_tool_same_result.len();
-        if count < MIN_CALLS {
+        if count < min_calls {
             return None;
         }
 
@@ -299,12 +319,12 @@ impl LoopDetector {
             return None;
         }
 
-        if count >= MIN_CALLS + 2 {
+        if count >= min_calls + 2 {
             Some(LoopDetectionResult::Break(format!(
                 "Circuit breaker: tool '{}' called {} times with different arguments but identical results — no progress",
                 last.name, count
             )))
-        } else if count > MIN_CALLS {
+        } else if count > min_calls {
             Some(LoopDetectionResult::Block(format!(
                 "Blocked: tool '{}' called {} times with different arguments but identical results",
                 last.name, count
@@ -330,9 +350,16 @@ mod tests {
 
     fn config_with_repeats(max_repeats: usize) -> LoopDetectorConfig {
         LoopDetectorConfig {
-            enabled: true,
-            window_size: 20,
             max_repeats,
+            ..LoopDetectorConfig::default()
+        }
+    }
+
+    fn config_with_thresholds(no_progress: usize, ping_pong: usize) -> LoopDetectorConfig {
+        LoopDetectorConfig {
+            no_progress_min_calls: no_progress,
+            ping_pong_min_cycles: ping_pong,
+            ..LoopDetectorConfig::default()
         }
     }
 
@@ -417,7 +444,7 @@ mod tests {
 
     #[test]
     fn ping_pong_warning_at_four_cycles() {
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
         let args = json!({});
 
         // 4 full cycles = 8 calls: A B A B A B A B
@@ -441,7 +468,7 @@ mod tests {
 
     #[test]
     fn ping_pong_escalates_with_more_cycles() {
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
         let args = json!({});
 
         // 5 cycles = 10 calls.  The 10th call (completing cycle 5) triggers Block.
@@ -485,7 +512,7 @@ mod tests {
 
     #[test]
     fn no_progress_warning_at_five_different_args_same_result() {
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
 
         for i in 0..5 {
             let args = json!({"query": format!("attempt_{i}")});
@@ -506,7 +533,7 @@ mod tests {
 
     #[test]
     fn no_progress_escalates_to_block_and_break() {
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
 
         // 6 calls with different args, same result.
         for i in 0..6 {
@@ -541,7 +568,7 @@ mod tests {
         // #7143: same tool + same result repeated non-consecutively, with
         // varied unrelated calls interleaved, must still be detected. The old
         // take_while logic reset the streak on any interleaved call.
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
 
         let mut last = LoopDetectionResult::Ok;
         for i in 0..5 {
@@ -607,9 +634,8 @@ mod tests {
     #[test]
     fn window_size_limits_memory() {
         let config = LoopDetectorConfig {
-            enabled: true,
             window_size: 5,
-            max_repeats: 3,
+            ..LoopDetectorConfig::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -630,7 +656,7 @@ mod tests {
 
     #[test]
     fn ping_pong_detects_alternation_with_varying_args() {
-        let mut det = LoopDetector::new(default_config());
+        let mut det = LoopDetector::new(config_with_thresholds(5, 4));
 
         // A->B->A->B with different args each time — ping-pong cares only
         // about tool names, not argument equality.
@@ -658,9 +684,8 @@ mod tests {
     #[test]
     fn window_eviction_prevents_stale_pattern_detection() {
         let config = LoopDetectorConfig {
-            enabled: true,
             window_size: 6,
-            max_repeats: 3,
+            ..LoopDetectorConfig::default()
         };
         let mut det = LoopDetector::new(config);
         let args = json!({"x": 1});
@@ -724,6 +749,61 @@ mod tests {
                 assert!(msg.contains("identical arguments"));
             }
             other => panic!("expected exact-repeat Warning, got {other:?}"),
+        }
+    }
+
+    // ── Raised defaults + 0-guard ────────────────────────────────
+
+    #[test]
+    fn no_progress_breaks_at_default_min_calls_plus_two() {
+        let mut det = LoopDetector::new(default_config()); // min_calls = 8
+        let mut broke_at = None;
+        for i in 0..12 {
+            let r = det.record("file_read", &json!({"path": format!("/x/{i}")}), "same");
+            if matches!(r, LoopDetectionResult::Break(_)) {
+                broke_at = Some(i + 1);
+                break;
+            }
+        }
+        assert_eq!(broke_at, Some(10)); // Warning@8, Block@9, Break@10
+    }
+
+    #[test]
+    fn ping_pong_breaks_at_default_min_cycles_plus_two() {
+        let mut det = LoopDetector::new(default_config()); // ping_pong = 6
+        let mut broke_at = None;
+        for i in 0..20 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let r = det.record(name, &json!({"attempt": i}), &format!("r{i}"));
+            if matches!(r, LoopDetectionResult::Break(_)) {
+                broke_at = Some(i + 1);
+                break;
+            }
+        }
+        // Break at 8 full cycles = 16 calls (Warning@6, Block@7, Break@8).
+        assert_eq!(broke_at, Some(16));
+    }
+
+    #[test]
+    fn zero_thresholds_disable_detectors_without_panic() {
+        let mut det = LoopDetector::new(config_with_thresholds(0, 0));
+        // no-progress shape: same tool, different args, identical result.
+        for i in 0..20 {
+            let r = det.record("file_read", &json!({"path": format!("/x/{i}")}), "same");
+            assert!(
+                !matches!(r, LoopDetectionResult::Break(_)),
+                "no-progress disabled must never Break"
+            );
+        }
+        // ping-pong shape: two tools alternating with distinct results.
+        let mut det = LoopDetector::new(config_with_thresholds(0, 0));
+        for i in 0..20 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let r = det.record(name, &json!({"attempt": i}), &format!("r{i}"));
+            assert!(
+                !matches!(r, LoopDetectionResult::Break(_)),
+                "ping-pong disabled must never Break"
+            );
         }
     }
 }
