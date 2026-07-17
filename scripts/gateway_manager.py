@@ -2402,11 +2402,11 @@ class _McpFailureTracker:
     Dedup / idempotence: the manager re-reads the rolling trace from offset 0
     after every trim, so the same line can be handed to us repeatedly. We count
     each event exactly once, keyed by a caller-supplied content key (the trace
-    ``id`` when present, else a digest of timestamp + server/stage/timeout —
-    ``mcp_connect_failure`` boot-path events may carry no id). Entries outside
-    the window are pruned, so the counter reflects only recent failures. After
-    an alert we stay silent for one window; a sustained outage re-alerts at most
-    once per window rather than once per event.
+    ``id`` — the Rust emitter stamps a UUID id on every event today; the digest
+    of timestamp + server/stage/timeout is kept as a defensive fallback).
+    Entries outside the window are pruned, so the counter reflects only recent
+    failures. After an alert we stay silent for one window; a sustained outage
+    re-alerts at most once per window rather than once per event.
     """
 
     def __init__(
@@ -2493,11 +2493,17 @@ def _consume_mcp_connect_failure(
         return
     window_min = max(int(tracker.window_secs // 60), 1)
     timeout_txt = timeout_secs if timeout_secs is not None else "?"
+    # Tailor the remediation hint to the failing server: the codemap* servers
+    # live on the Hetzner box, but lalafo-db/graylog (VPN) or context7 (hosted)
+    # would mislead with a codemap hint, so fall back to a neutral one.
+    if server.startswith("codemap"):
+        hint = "Похоже на сатурацию MCP-бокса — проверь codemap/Hetzner."
+    else:
+        hint = "Проверь доступность MCP-сервера (VPN/сеть/апстрим)."
     message = (
         f"⚠ MCP connect-таймауты: {burst} отказ(ов) за ~{window_min} мин "
         f"(последний: сервер {server or '?'}, стадия {stage or '?'}, "
-        f"timeout {timeout_txt}с). Похоже на сатурацию MCP-бокса — "
-        "проверь codemap/Hetzner."
+        f"timeout {timeout_txt}с). {hint}"
     )
     post_notify(int(operator_user_id), message)
 
@@ -3239,8 +3245,14 @@ class ProgressNotifier:
 _BOOT_TRACE_TAIL_BYTES = 64 * 1024
 # Only count failures written recently relative to the scan, so a normal spawn
 # does not re-page on stale boot events from an earlier cold start. The health
-# budget is ~90s; 180s leaves headroom for clock skew between writer and reader.
-_BOOT_MCP_FAILURE_MAX_AGE_SECS = 180.0
+# budget is 240s (permanent since Phase A — fly.toml [env]=240, v451), and boot
+# connect timeouts can be written early in a failed 240s health-wait; 300s
+# covers the full budget plus clock-skew margin between writer and reader.
+# Interplay with the tracker window: keeping max_age (300) <= tracker window
+# (300) makes the id-less re-count edge unreachable — a stale line aged past the
+# window is also past max_age, so it is never re-handed to record(); the
+# once-per-window alert guard covers the boundary equality case.
+_BOOT_MCP_FAILURE_MAX_AGE_SECS = 300.0
 
 
 def _read_recent_mcp_failures(
