@@ -2882,34 +2882,21 @@ fn emit_provider_fallback_event(
     );
 }
 
-/// fork(Phase C): emit a structured `mcp_connect_failure` trace event when a
-/// configured MCP server fails its boot connect (transport spawn, handshake
-/// timeout, or protocol error). `connect_all` skips the server non-fatally;
-/// this only records the failure so the `gateway_manager.py` consumer can spot
-/// shared-box saturation (#30) early. Mirrors `emit_provider_fallback_event`.
-///
-/// On-disk contract (C2 depends on this exact shape): a legacy JSONL row with
-/// `event_type: "mcp_connect_failure"` and `payload` = `{server, stage,
-/// timeout_secs, session_id}`. `stage` is one of `transport_setup`,
-/// `boot_connect_timeout`, `boot_connect_error`.
+/// fork(Phase C): emit a structured `mcp_connect_failure` trace event from the
+/// per-turn webhook path (`channel = "webhook"`) when a configured MCP server
+/// fails its boot connect. Thin wrapper over the shared
+/// `runtime_trace::record_mcp_connect_failure` (the single source of the C2
+/// on-disk contract, also used by the daemon boot/assemble path with
+/// `channel = "assemble"`): `event_type: "mcp_connect_failure"`, `payload` =
+/// `{server, stage, timeout_secs, session_id}`, `stage` one of
+/// `transport_setup` / `boot_connect_timeout` / `boot_connect_error`.
+/// `connect_all` skips the server non-fatally; this only records the failure.
 fn emit_mcp_connect_failure_event(
     failure: &zeroclaw_tools::mcp_client::McpConnectFailure,
     session_id: Option<&str>,
 ) {
-    zeroclaw_runtime::observability::runtime_trace::record_event(
-        "mcp_connect_failure",
-        Some("webhook"),
-        None,        // provider — not applicable
-        None,        // model — not applicable
-        None,        // turn_id — best-effort, none at this site
-        Some(false), // success — the connect failed
-        None,
-        serde_json::json!({
-            "server": failure.server,
-            "stage": failure.stage.as_str(),
-            "timeout_secs": failure.timeout_secs,
-            "session_id": session_id.unwrap_or_default(),
-        }),
+    zeroclaw_runtime::observability::runtime_trace::record_mcp_connect_failure(
+        failure, "webhook", session_id,
     );
 }
 

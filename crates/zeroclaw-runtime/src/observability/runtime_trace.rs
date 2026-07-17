@@ -298,6 +298,41 @@ pub fn record_event(
     }
 }
 
+/// fork(Phase C): record an `mcp_connect_failure` trace event — a configured
+/// MCP server failed its boot connect (transport spawn, handshake timeout, or
+/// protocol error). `connect_all` skips the server non-fatally; this only
+/// records the failure so the `gateway_manager.py` consumer can spot
+/// shared-box saturation (#30) early.
+///
+/// Single source of the C2 on-disk contract, shared by the daemon boot/assemble
+/// path (`channel = "assemble"`) and the per-turn webhook path
+/// (`channel = "webhook"`): `event_type: "mcp_connect_failure"` with `payload`
+/// = `{server, stage, timeout_secs, session_id}`. `stage` is one of
+/// `transport_setup` / `boot_connect_timeout` / `boot_connect_error`. Only
+/// `channel` and `session_id` differ by call site — the three payload identity
+/// fields are identical.
+pub fn record_mcp_connect_failure(
+    failure: &zeroclaw_tools::mcp_client::McpConnectFailure,
+    channel: &str,
+    session_id: Option<&str>,
+) {
+    record_event(
+        "mcp_connect_failure",
+        Some(channel),
+        None,        // provider — not applicable
+        None,        // model — not applicable
+        None,        // turn_id — none at connect time
+        Some(false), // success — the connect failed
+        None,
+        serde_json::json!({
+            "server": failure.server,
+            "stage": failure.stage.as_str(),
+            "timeout_secs": failure.timeout_secs,
+            "session_id": session_id.unwrap_or_default(),
+        }),
+    );
+}
+
 /// Record a "turn cancelled" trace event from the gateway webhook path.
 ///
 /// `iterations_completed` and `tool_calls_executed` are best-effort counters;

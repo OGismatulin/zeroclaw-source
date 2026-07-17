@@ -314,8 +314,20 @@ impl ScopedToolRegistry {
                     )
                 );
             }
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
+            match tools::McpRegistry::connect_all_with_failures(&agent_mcp_servers).await {
+                Ok((registry, connect_failures)) => {
+                    // fork(Phase C): emit a boot-connect failure event per
+                    // skipped server so the #30 warmup-saturation scenario is
+                    // observable even when the box recovers before the first
+                    // webhook turn. Non-fatal: `registry` already excludes them.
+                    // Boot/assemble has no webhook session — use a distinct
+                    // `channel` and an empty session_id; the C2 payload identity
+                    // fields (server/stage/timeout_secs) stay identical.
+                    for failure in &connect_failures {
+                        crate::observability::runtime_trace::record_mcp_connect_failure(
+                            failure, "assemble", None,
+                        );
+                    }
                     let registry = Arc::new(registry);
                     // Origin set: every `<server>__<tool>` name the registry knows.
                     // Deferred stubs derive from the same `tool_names()` call, so
@@ -946,6 +958,98 @@ mod tests {
         assert_eq!(
             eager_names, deferred_names,
             "eager and deferred /api/tools listings must match (#8302)"
+        );
+    }
+
+    // ── fork(Phase C): boot-path mcp_connect_failure emission ──────────────
+
+    /// An HTTP MCP server that rejects `initialize` within budget → a
+    /// deterministic, fast boot-connect *error* (stage `boot_connect_error`).
+    async fn mock_mcp_http_server_rejecting() -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"initialize"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nope"}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn init_trace_to(dir: &std::path::Path) {
+        use zeroclaw_config::schema::{LogPersistence, ObservabilityConfig};
+        let cfg = ObservabilityConfig {
+            log_persistence: LogPersistence::Rolling,
+            log_persistence_path: dir.join("trace.jsonl").to_string_lossy().into_owned(),
+            log_persistence_max_entries: 50,
+            ..ObservabilityConfig::default()
+        };
+        crate::observability::runtime_trace::init_from_config(&cfg, dir);
+    }
+
+    fn mcp_connect_failure_events(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(dir.join("trace.jsonl")).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|ev| ev["event_type"] == "mcp_connect_failure")
+            .collect()
+    }
+
+    /// The daemon BOOT assemble path must emit one `mcp_connect_failure` event
+    /// per server that fails its boot connect, while staying non-fatal (the
+    /// healthy server is still registered). This is the #30 warmup-saturation
+    /// scenario: a boot connect that fails before the first webhook turn.
+    #[tokio::test]
+    async fn assemble_emits_one_mcp_connect_failure_per_failed_boot_connect() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_trace_to(tmp.path());
+
+        // "remote" rejects (fails), "remote2" is healthy (succeeds).
+        let rejecting = mock_mcp_http_server_rejecting().await;
+        let healthy = mock_mcp_http_server().await;
+        let config = config_with_bundled_mcp(rejecting.uri(), healthy.uri());
+
+        let names = assemble_listing_for(&config).await;
+        // Non-fatal: the healthy server's tools are still present.
+        assert!(
+            names.iter().any(|n| n == "remote2__echo"),
+            "assemble must still register the healthy server (non-fatal): {names:?}"
+        );
+
+        let events = mcp_connect_failure_events(tmp.path());
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one event for the one failed boot connect; got {events:?}"
+        );
+        let ev = &events[0];
+        assert_eq!(ev["event_type"], "mcp_connect_failure");
+        assert_eq!(ev["channel"], "assemble");
+        assert_eq!(ev["payload"]["server"], "remote");
+        assert_eq!(ev["payload"]["stage"], "boot_connect_error");
+        assert!(ev["payload"]["timeout_secs"].is_number());
+        assert!(ev["payload"].get("session_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn assemble_emits_no_mcp_connect_failure_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_trace_to(tmp.path());
+
+        let s1 = mock_mcp_http_server().await;
+        let s2 = mock_mcp_http_server().await;
+        let config = config_with_bundled_mcp(s1.uri(), s2.uri());
+
+        let _ = assemble_listing_for(&config).await;
+        assert!(
+            mcp_connect_failure_events(tmp.path()).is_empty(),
+            "a successful boot connect must emit no mcp_connect_failure event"
         );
     }
 
