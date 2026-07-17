@@ -1270,8 +1270,14 @@ mod tests {
             .compress_if_needed(&mut history, &provider, "model", None)
             .await
             .unwrap();
-        assert!(result.compressed, "emergency pass должен пометить compressed");
-        assert!(result.tokens_after <= 500, "должен увести под threshold (500)");
+        assert!(
+            result.compressed,
+            "emergency pass должен пометить compressed"
+        );
+        assert!(
+            result.tokens_after <= 500,
+            "должен увести под threshold (500)"
+        );
         assert_eq!(
             history.last().unwrap().content,
             "small tail",
