@@ -986,6 +986,12 @@ mod tests {
     }
 
     #[test]
+    fn context_compression_config_default_emergency_protect_last_n() {
+        let config = ContextCompressionConfig::default();
+        assert_eq!(config.emergency_protect_last_n, 2);
+    }
+
+    #[test]
     fn test_config_serde_defaults() {
         let json = "{}";
         let config: ContextCompressionConfig = serde_json::from_str(json).unwrap();
