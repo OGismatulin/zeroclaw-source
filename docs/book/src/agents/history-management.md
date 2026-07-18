@@ -53,13 +53,25 @@ pruning and no summarization step.
 
 ## The budget
 
-The budget comes from `ResolvedRuntime::effective_context_budget()`:
+The whole-turn trim budget is model-aware. Every path that knows the active
+model name resolves it through `ResolvedRuntime::effective_context_budget_for_model(model)`:
 
-- When `history_pruning.enabled` is set with a positive `history_pruning.max_tokens`,
-  the budget is the lower of that floor and `max_context_tokens`, so an explicit
-  budget trims earlier than the hard ceiling.
-- Otherwise the budget is `max_context_tokens` and the hard ceiling is the only
-  trigger.
+- The model's window comes from `context_compression.model_windows[model]`; a
+  model with no registry entry (or a non-positive entry) falls back to the
+  profile's `max_context_tokens`. `max_context_tokens` is only a fallback here,
+  not a universal ceiling for a registered model.
+- Headroom is reserved via `context_compression.threshold_ratio` (the whole-turn
+  trim in `turn::mod` trims to exactly the budget with no reserve of its own, so
+  the room for the system prompt, tool schemas and response must be built into
+  the budget).
+- An explicit `history_pruning.max_tokens` (when `history_pruning.enabled`) is
+  applied as a lower floor, so an operator cap trims earlier than the window.
+
+The raw window itself (`context_window_for_model(model)`, without the trim
+headroom) is what the overflow-recovery target (× 0.9) and the CLI context-meter
+denominator use. The older model-agnostic `effective_context_budget()` — which
+returned a flat `max_context_tokens` — is retained only for callers with no
+model in scope.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. It is a heuristic,

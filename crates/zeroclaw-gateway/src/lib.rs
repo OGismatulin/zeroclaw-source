@@ -3227,13 +3227,10 @@ async fn run_gateway_webhook_agentic(
     // from a 800K-window model down to a 128K-window model on a long session
     // could overflow the provider on the first call.
     if cross_model_switch {
-        let context_window = agent
-            .resolved
-            .context_compression
-            .model_windows
-            .get(model_name)
-            .copied()
-            .unwrap_or(agent.resolved.max_context_tokens);
+        // Shared model-aware resolver: registry window for a known model,
+        // `max_context_tokens` only as unknown-model fallback (identical result
+        // to the previous manual lookup, kept in one place — schema.rs).
+        let context_window = agent.resolved.context_window_for_model(model_name);
         let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
             agent.resolved.context_compression.clone(),
             context_window,
@@ -3415,13 +3412,7 @@ async fn run_gateway_webhook_agentic(
     // trim_history below. Symmetric with trim_history — runs on any outcome
     // (Ok / Cancelled / Err). On failure we fall through silently and let
     // trim_history clamp the message count.
-    let context_window = agent
-        .resolved
-        .context_compression
-        .model_windows
-        .get(model_name)
-        .copied()
-        .unwrap_or(agent.resolved.max_context_tokens);
+    let context_window = agent.resolved.context_window_for_model(model_name);
     let threshold =
         (context_window as f64 * agent.resolved.context_compression.threshold_ratio) as usize;
     let tokens_before_for_event =

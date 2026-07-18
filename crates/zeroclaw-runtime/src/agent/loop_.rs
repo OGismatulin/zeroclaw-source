@@ -1419,7 +1419,9 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_model_context_window = agent.resolved.model_context_window;
+        // Model context window is now resolved dynamically per current `model_name`
+        // via `agent.resolved.context_window_for_model(&model_name)` (recovery + meter),
+        // so it survives a mid-loop `model_switch`. The old static capture went stale.
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -2121,7 +2123,7 @@ pub async fn run(
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         context_token_budget: agent
                                             .resolved
-                                            .effective_context_budget(),
+                                            .effective_context_budget_for_model(&model_name),
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
@@ -2340,7 +2342,9 @@ pub async fn run(
                             &config.multimodal,
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
-                            agent.resolved.max_context_tokens,
+                            agent
+                                .resolved
+                                .effective_context_budget_for_model(&model_name),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
                         ),
@@ -2687,7 +2691,7 @@ pub async fn run(
                                                 .max_tool_result_chars,
                                             context_token_budget: agent
                                                 .resolved
-                                                .effective_context_budget(),
+                                                .effective_context_budget_for_model(&model_name),
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
@@ -2814,7 +2818,8 @@ pub async fn run(
                                 // intentionally different — the in-loop path drops
                                 // aggressively before retry, this outer path lands the retry
                                 // inside the window with margin. See the note2.md 🟡 warning.
-                                let recovery_budget = eff_model_context_window * 9 / 10;
+                                let recovery_budget =
+                                    agent.resolved.context_window_for_model(&model_name) * 9 / 10;
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
                                     recovery_budget,
@@ -2863,8 +2868,9 @@ pub async fn run(
                                 // (#5808).
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
-                                let context_token_budget =
-                                    agent.resolved.effective_context_budget();
+                                let context_token_budget = agent
+                                    .resolved
+                                    .effective_context_budget_for_model(&model_name);
                                 let floor_exceeds_budget = system_floor >= context_token_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -2954,7 +2960,7 @@ pub async fn run(
                     // double-counts the shared history.
                     let effective_input_tokens = usage.last_input_tokens;
                     if effective_input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
+                        let max_ctx = agent.resolved.context_window_for_model(&model_name) as u64;
                         let pct = if max_ctx > 0 {
                             (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {
@@ -14344,6 +14350,65 @@ Let me check the result."#;
             result.tokens_after < model_context_window,
             "headroom must leave us strictly below the model window: got {}",
             result.tokens_after
+        );
+    }
+
+    /// Pins the model-aware budget contract at the runtime layer — the numbers
+    /// the cron/daemon, delegate-analyst and skill-review builders now feed into
+    /// `context_token_budget`, plus the raw window used by CLI recovery/meter.
+    ///
+    /// Before this fix all of them used `effective_context_budget()`, which
+    /// returned the flat `max_context_tokens` profile fallback (128K in prod),
+    /// prematurely over-trimming a model whose real window is registered in
+    /// `model_windows` (deepseek-v4-flash = 800K, gpt-5.6-luna = 353K). A
+    /// mid-loop `model_switch` must re-resolve to the new model's window.
+    #[test]
+    fn model_windows_govern_runtime_budgets() {
+        use zeroclaw_config::schema::ResolvedRuntime;
+
+        let rt = ResolvedRuntime {
+            // real prod profile fallback (default/agent_default)
+            max_context_tokens: 128_000,
+            context_compression: zeroclaw_config::scattered_types::ContextCompressionConfig {
+                threshold_ratio: 0.5,
+                model_windows: std::collections::HashMap::from([
+                    ("deepseek-v4-flash".to_owned(), 800_000usize),
+                    ("gpt-5.6-luna".to_owned(), 353_000usize),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Whole-turn trim budget (cron/daemon 2126, REPL 2694, delegate 3069,
+        // review caller 2347): model window × headroom, NOT the 128K fallback.
+        assert_eq!(
+            rt.effective_context_budget_for_model("deepseek-v4-flash"),
+            400_000
+        );
+        assert!(rt.effective_context_budget_for_model("deepseek-v4-flash") > 128_000);
+        // `model_switch` mid-loop re-resolves to the new model's window.
+        assert_eq!(
+            rt.effective_context_budget_for_model("gpt-5.6-luna"),
+            176_500
+        );
+        // Unknown model still clamps to the profile ceiling (backward compat).
+        assert_eq!(
+            rt.effective_context_budget_for_model("unregistered"),
+            64_000
+        );
+
+        // Recovery target (2822 ×0.9) and meter denominator (2964) use the RAW
+        // window, not the pruned safe budget, and re-resolve on switch too.
+        assert_eq!(rt.context_window_for_model("deepseek-v4-flash"), 800_000);
+        assert_eq!(
+            rt.context_window_for_model("deepseek-v4-flash") * 9 / 10,
+            720_000
+        );
+        assert_eq!(rt.context_window_for_model("gpt-5.6-luna"), 353_000);
+        assert_eq!(
+            rt.context_window_for_model("gpt-5.6-luna") * 9 / 10,
+            317_700
         );
     }
 

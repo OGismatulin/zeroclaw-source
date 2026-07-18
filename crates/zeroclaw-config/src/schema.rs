@@ -3347,12 +3347,61 @@ impl ResolvedRuntime {
     /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
     /// trims earlier than the hard context ceiling; otherwise the ceiling is
     /// the only trigger. Reuses the existing `history_pruning.*` idents.
+    ///
+    /// DEPRECATED for agent turns: this is model-agnostic and treats
+    /// `max_context_tokens` as a universal cap, which prematurely trims a model
+    /// whose real window is recorded in `context_compression.model_windows`.
+    /// Prefer [`ResolvedRuntime::effective_context_budget_for_model`] on every
+    /// path that knows the active model name. Kept for callers that genuinely
+    /// have no model in scope.
     pub fn effective_context_budget(&self) -> usize {
         if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
             self.max_context_tokens.min(self.history_pruning.max_tokens)
         } else {
             self.max_context_tokens
         }
+    }
+
+    /// Raw context window (max input tokens) for `model`.
+    ///
+    /// A registry hit in `context_compression.model_windows` wins; a model with
+    /// no entry falls back to `max_context_tokens`. A non-positive entry (or an
+    /// empty key) is treated as "unknown" and also falls back — a 0 window would
+    /// otherwise disable history trimming, since `turn/mod.rs` treats a budget
+    /// of 0 as "do not trim". `max_context_tokens` is only a fallback here, NOT
+    /// a universal ceiling: a registered model uses its own recorded window.
+    ///
+    /// This is the RAW window. Consumers that need headroom (gateway compressor
+    /// `threshold_ratio`, CLI overflow-recovery `×0.9`, context-meter
+    /// denominator) apply it themselves. For the whole-turn history-trim budget
+    /// use [`ResolvedRuntime::effective_context_budget_for_model`].
+    pub fn context_window_for_model(&self, model: &str) -> usize {
+        match self.context_compression.model_windows.get(model).copied() {
+            Some(window) if window > 0 => window,
+            _ => self.max_context_tokens,
+        }
+    }
+
+    /// Safe token budget for preemptive whole-turn history trimming for `model`.
+    ///
+    /// Starts from [`ResolvedRuntime::context_window_for_model`] and reserves
+    /// headroom via the compression `threshold_ratio` (for system prompt + tool
+    /// schemas + response) — the whole-turn trim in `turn/mod.rs` trims to
+    /// exactly this budget with no reserve of its own, so the headroom must live
+    /// here. An explicit `history_pruning.max_tokens` remains an operator floor
+    /// (applied as a minimum). Never returns 0 for a positive window.
+    pub fn effective_context_budget_for_model(&self, model: &str) -> usize {
+        let window = self.context_window_for_model(model);
+        let ratio = self.context_compression.threshold_ratio;
+        let mut budget = if ratio > 0.0 && ratio < 1.0 {
+            ((window as f64) * ratio) as usize
+        } else {
+            window
+        };
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            budget = budget.min(self.history_pruning.max_tokens);
+        }
+        budget.max(1)
     }
 }
 
@@ -34731,5 +34780,101 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
+    }
+
+    // ── model-aware context window resolver ──────────────────────────
+    //
+    // `context_window_for_model` is the RAW model window (used by the gateway
+    // compressor, CLI recovery and context-meter, each of which applies its
+    // own headroom). `effective_context_budget_for_model` is the SAFE
+    // whole-turn history-trim budget: raw window × `threshold_ratio` headroom
+    // (the turn-trim in `turn/mod.rs` trims to exactly the budget with no
+    // reserve of its own), then floored by an explicit `history_pruning.max_tokens`.
+
+    fn model_window_fixture() -> super::ResolvedRuntime {
+        super::ResolvedRuntime {
+            max_context_tokens: 1_000_000,
+            context_compression: crate::scattered_types::ContextCompressionConfig {
+                threshold_ratio: 0.5,
+                model_windows: std::collections::HashMap::from([
+                    ("deepseek-v4-flash".to_owned(), 800_000usize),
+                    ("gpt-5.6-luna".to_owned(), 353_000usize),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn context_window_for_model_prefers_registry_over_fallback() {
+        let rt = model_window_fixture();
+        // registered models resolve to their own window, NOT max_context_tokens
+        assert_eq!(rt.context_window_for_model("deepseek-v4-flash"), 800_000);
+        assert_eq!(rt.context_window_for_model("gpt-5.6-luna"), 353_000);
+        // unknown model falls back to max_context_tokens without panic
+        assert_eq!(rt.context_window_for_model("missing-model"), 1_000_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn context_window_for_model_zero_entry_falls_back() {
+        // A 0 window would disable history trimming (turn/mod.rs treats
+        // budget==0 as "do not trim"), so a non-positive registry entry — or
+        // an empty key — must be treated as "unknown" and fall back.
+        let mut rt = model_window_fixture();
+        rt.context_compression.model_windows =
+            std::collections::HashMap::from([("bad".to_owned(), 0usize), (String::new(), 0usize)]);
+        assert_eq!(rt.context_window_for_model("bad"), 1_000_000);
+        assert_eq!(rt.context_window_for_model(""), 1_000_000);
+        assert_ne!(rt.context_window_for_model("bad"), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn effective_context_budget_for_model_applies_threshold_headroom() {
+        let rt = model_window_fixture();
+        // safe budget = window × threshold_ratio (0.5)
+        assert_eq!(
+            rt.effective_context_budget_for_model("deepseek-v4-flash"),
+            400_000
+        );
+        assert_eq!(
+            rt.effective_context_budget_for_model("gpt-5.6-luna"),
+            176_500
+        );
+        // unknown model: fallback window (1M) × ratio
+        assert_eq!(
+            rt.effective_context_budget_for_model("missing-model"),
+            500_000
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn raw_window_and_effective_budget_are_distinct_contracts() {
+        // The two helpers must not be interchangeable: raw window feeds
+        // recovery/meter, the pruned safe budget feeds whole-turn trim.
+        let rt = model_window_fixture();
+        assert_eq!(rt.context_window_for_model("deepseek-v4-flash"), 800_000);
+        assert_eq!(
+            rt.effective_context_budget_for_model("deepseek-v4-flash"),
+            400_000
+        );
+        assert_ne!(
+            rt.context_window_for_model("deepseek-v4-flash"),
+            rt.effective_context_budget_for_model("deepseek-v4-flash")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn explicit_history_pruning_floor_beats_threshold_but_not_raw_window() {
+        let mut rt = model_window_fixture();
+        rt.history_pruning.enabled = true;
+        rt.history_pruning.max_tokens = 300_000;
+        // window×ratio = 400K, floored by explicit pruning cap 300K
+        assert_eq!(
+            rt.effective_context_budget_for_model("deepseek-v4-flash"),
+            300_000
+        );
+        // raw window is unaffected by the pruning floor
+        assert_eq!(rt.context_window_for_model("deepseek-v4-flash"), 800_000);
     }
 }

@@ -2476,7 +2476,7 @@ impl Agent {
                                 context_token_budget: self
                                     .config
                                     .resolved
-                                    .effective_context_budget(),
+                                    .effective_context_budget_for_model(&effective_model),
                                 knobs: &knobs,
                             },
                         ),
@@ -2854,7 +2854,7 @@ impl Agent {
                                     context_token_budget: self
                                         .config
                                         .resolved
-                                        .effective_context_budget(),
+                                        .effective_context_budget_for_model(&effective_model),
                                     knobs: &knobs,
                                 },
                             ),

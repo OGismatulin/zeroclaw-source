@@ -3064,7 +3064,10 @@ impl DelegateTool {
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.max_context_tokens,
+                        // Model-aware: analysts on deepseek-v4-flash (800K window) get their
+                        // real window instead of the profile's max_context_tokens fallback.
+                        context_token_budget: loop_runtime
+                            .effective_context_budget_for_model(model),
                         knobs: &LoopKnobs::default(),
                     },
                 ),
