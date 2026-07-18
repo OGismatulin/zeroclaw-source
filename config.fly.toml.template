@@ -562,7 +562,7 @@ compact_context = false
 max_tool_iterations = 200
 max_actions_per_hour = 1_000_000
 max_history_messages = 200
-max_context_tokens = 256_000
+max_context_tokens = 1_048_576
 agentic_timeout_secs = 1800
 parallel_tools = true
 tool_dispatcher = "native"
@@ -609,19 +609,19 @@ runtime_profile = "default"
 mcp_bundles = ["all"]
 
 [agents.jira_coordinator]
-model_provider = "openai.codex_worker"
+model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.jira_worker]
-model_provider = "openai.codex_worker"
+model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.worker]
-model_provider = "openai.codex_worker"
+model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]

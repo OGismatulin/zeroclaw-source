@@ -491,7 +491,13 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-27 = Jira package agents use the isolated jira_analysis profile (256k
 #         context budget and 1800s agent cap); jira_coordinator owns cron runs
 #         and jira_worker handles source translation and visual artifacts.
-CURRENT_CONFIG_MARKER = "v3-27"
+# v3-28 = Move jira_coordinator/jira_worker/worker off codex_worker (gpt-5.6-luna
+#         returns 400 "Stream must be set to true" non_retryable on the cron/agent
+#         path) to opencode.go/deepseek-v4-flash; raise jira_analysis
+#         max_context_tokens 256k -> 1_048_576 so per-model model_windows govern
+#         (was capping deepseek 800k / gpt-5.6-sol 353k down to 256k). SOL judge
+#         stays gpt-5.6-sol. Root luna-streaming fix tracked as a separate spec.
+CURRENT_CONFIG_MARKER = "v3-28"
 
 
 def sanitize_filename(filename: str) -> str:
