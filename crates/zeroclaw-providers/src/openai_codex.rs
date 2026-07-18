@@ -42,7 +42,14 @@ pub struct OpenAiCodexModelProvider {
     auth: AuthService,
     auth_profile_override: Option<String>,
     responses_url: String,
+    /// True when `responses_url` is a non-default endpoint — selects gateway
+    /// API-key auth mode (see `resolve_credentials`).
     custom_endpoint: bool,
+    /// True when `responses_url` is the default Codex endpoint, which rejects
+    /// `stream=false` with `400 "Stream must be set to true"`. A distinct
+    /// concern from `custom_endpoint` (auth-mode): it gates whether the
+    /// non-streaming decode-failure fallback may be attempted at all.
+    streaming_mandatory_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
     client: Client,
@@ -142,6 +149,7 @@ impl OpenAiCodexModelProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
+            streaming_mandatory_endpoint: is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
@@ -1401,6 +1409,29 @@ impl OpenAiCodexModelProvider {
                     return Err(stream_err);
                 }
 
+                // The default Codex endpoint mandates streaming: retrying with
+                // `stream=false` there is guaranteed to fail with
+                // `400 "Stream must be set to true"` (non-retryable), killing the
+                // turn. Only attempt the non-streaming fallback on custom
+                // endpoints where non-streaming is allowed. On the default
+                // endpoint, surface a fixed, keyword-free error so reliability
+                // classifies it as retryable (same-alias retry) instead of
+                // sending the invalid request. The raw decode error may embed
+                // the upstream body, so it is only logged — never returned —
+                // to avoid tripping the string-based retry classifier.
+                if self.streaming_mandatory_endpoint {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", stream_err)})),
+                        "OpenAI Codex streaming decode failed on streaming-mandatory endpoint; surfacing as retryable (non-streaming retry skipped)"
+                    );
+                    return Err(anyhow::Error::msg(
+                        "OpenAI Codex streaming response decode failed on streaming-mandatory endpoint; retrying",
+                    ));
+                }
+
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2347,6 +2378,91 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         assert_eq!(requests.len(), 2, "expected one retry request");
         assert_eq!(requests[0]["stream"], true);
         assert_eq!(requests[1]["stream"], false);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_retry_stream_decode_fail_on_default_endpoint() {
+        // Default (streaming-mandatory) endpoint: a stream decode failure must
+        // NOT trigger a second `stream=false` request (that endpoint rejects it
+        // with 400 "Stream must be set to true"). The error must surface as
+        // retryable so reliability can same-alias retry instead of dying.
+        let (mut provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            // Only ONE reply is queued: if a second (stream=false) request were
+            // sent it would fall through to the default 500 and the len check
+            // below would still catch the extra request.
+            MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+        ])
+        .await;
+        // Force the streaming-mandatory (default-endpoint) code path while
+        // keeping `custom_endpoint=true` so the mock's gateway API-key auth
+        // (`test-key`) still resolves — the two flags are distinct concerns.
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("default-endpoint decode failure must not fall back to stream=false");
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "no second (stream=false) request may be sent on the default endpoint"
+        );
+        assert_eq!(requests[0]["stream"], true);
+        drop(requests);
+
+        assert!(
+            !crate::reliable::is_non_retryable(&err),
+            "surfaced error must be retryable, got non-retryable: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_decode_fail_is_retryable_even_with_trigger_words_in_body() {
+        // Guard against string-classification fragility: the raw upstream body
+        // must not leak into the surfaced error, or a body containing
+        // "model not found" (or a 4xx digit) would flip `is_non_retryable` to
+        // true. The fix returns a fixed, keyword-free message.
+        let (mut provider, captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(
+                "data: model not found\n\ndata: [DONE]\n",
+            )])
+            .await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("decode failure on default endpoint must error");
+
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        assert!(
+            !crate::reliable::is_non_retryable(&err),
+            "error must stay retryable regardless of upstream body content: {err}"
+        );
 
         server_handle.abort();
     }
