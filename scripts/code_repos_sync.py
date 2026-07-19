@@ -79,10 +79,22 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 def get_repos_dir() -> Path:
-    """Determine code-repos directory based on environment."""
+    """Determine code-repos directory based on environment.
+
+    Precedence:
+    1. ZEROCLAW_DATA_ROOT env (explicit override).
+    2. /zeroclaw-data (Fly volume) if present — robust even when the daemon
+       shell strips ZEROCLAW_DATA_ROOT from the agent's env (it is NOT in
+       shell_env_passthrough). Without this, `add` from the agent shell fell
+       back to <script_parent>/code-repos = /usr/local/code-repos, which is
+       both off-volume and blocked by security policy.
+    3. <script_parent>/code-repos (local dev checkout).
+    """
     data_root = os.environ.get("ZEROCLAW_DATA_ROOT")
     if data_root:
         return Path(data_root) / "code-repos"
+    if Path("/zeroclaw-data").is_dir():
+        return Path("/zeroclaw-data") / "code-repos"
     return Path(__file__).resolve().parent.parent / "code-repos"
 
 
