@@ -145,6 +145,45 @@ pub fn trim_to_reported_budget(
     }
 }
 
+/// Truncate oversized `tool` results within [protect_first_n .. len-protect_last_n).
+/// Shared by the post-turn emergency tail-trim (ContextCompressor) and the in-loop
+/// context-overflow recovery. Returns characters saved. No LLM call.
+pub(crate) fn trim_oversized_tool_results_in_range(
+    history: &mut [ChatMessage],
+    max_chars: usize,
+    protect_first_n: usize,
+    protect_last_n: usize,
+    exempt: &[String],
+) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+    let mut saved = 0;
+    let protect_start = protect_first_n.min(history.len());
+    let protect_end = history.len().saturating_sub(protect_last_n);
+    if protect_start >= protect_end {
+        return 0;
+    }
+    for msg in &mut history[protect_start..protect_end] {
+        if msg.role != "tool" {
+            continue;
+        }
+        if msg.content.len() <= max_chars {
+            continue;
+        }
+        if exempt.iter().any(|t| msg.content.contains(t.as_str())) {
+            continue;
+        }
+        if msg.content.contains("data:image/") {
+            continue;
+        }
+        let original_len = msg.content.len();
+        msg.content = crate::agent::history::truncate_tool_message(&msg.content, max_chars);
+        saved += original_len - msg.content.len();
+    }
+    saved
+}
+
 fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
     boundaries
         .iter()
@@ -493,5 +532,33 @@ mod tests {
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+    }
+
+    #[test]
+    fn trim_oversized_tool_results_in_range_truncates_only_unprotected_tool() {
+        let big = "X".repeat(10_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool(big.clone()), // trimmable (in range)
+            ChatMessage::tool(big.clone()), // protected by protect_last_n=1
+        ];
+        // protect_first_n=1, protect_last_n=1, max=100
+        let saved = trim_oversized_tool_results_in_range(&mut history, 100, 1, 1, &[]);
+        assert!(saved > 0, "first tool must be truncated");
+        assert!(history[1].content.len() <= 200, "truncated toward max");
+        assert_eq!(history[2].content.len(), 10_000, "tail protected");
+        assert_eq!(history[0].content, "sys", "system untouched (protect_first_n)");
+    }
+
+    #[test]
+    fn trim_oversized_tool_results_in_range_zero_max_is_noop() {
+        let mut history = vec![
+            ChatMessage::system("s"),
+            ChatMessage::tool("X".repeat(5000)),
+        ];
+        assert_eq!(
+            trim_oversized_tool_results_in_range(&mut history, 0, 0, 0, &[]),
+            0
+        );
     }
 }

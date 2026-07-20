@@ -162,41 +162,13 @@ impl ContextCompressor {
         protect_first_n: usize,
         protect_last_n: usize,
     ) -> usize {
-        let max = self.config.tool_result_retrim_chars;
-        if max == 0 {
-            return 0;
-        }
-        let mut saved = 0;
-        let protect_start = protect_first_n.min(history.len());
-        let protect_end = history.len().saturating_sub(protect_last_n);
-        if protect_start >= protect_end {
-            return 0;
-        }
-        for msg in &mut history[protect_start..protect_end] {
-            if msg.role != "tool" {
-                continue;
-            }
-            if msg.content.len() <= max {
-                continue;
-            }
-            // Skip exempt tools
-            if self
-                .config
-                .tool_result_trim_exempt
-                .iter()
-                .any(|t| msg.content.contains(t.as_str()))
-            {
-                continue;
-            }
-            // Skip base64 images
-            if msg.content.contains("data:image/") {
-                continue;
-            }
-            let original_len = msg.content.len();
-            msg.content = crate::agent::history::truncate_tool_message(&msg.content, max);
-            saved += original_len - msg.content.len();
-        }
-        saved
+        crate::agent::history_trim::trim_oversized_tool_results_in_range(
+            history,
+            self.config.tool_result_retrim_chars,
+            protect_first_n,
+            protect_last_n,
+            &self.config.tool_result_trim_exempt,
+        )
     }
 
     /// Fast-path: trim oversized tool results in non-protected messages.
