@@ -497,7 +497,9 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         max_context_tokens 256k -> 1_048_576 so per-model model_windows govern
 #         (was capping deepseek 800k / gpt-5.6-sol 353k down to 256k). SOL judge
 #         stays gpt-5.6-sol. Root luna-streaming fix tracked as a separate spec.
-CURRENT_CONFIG_MARKER = "v3-28"
+# v3-29 = jira_analysis agentic cap 1800s -> 3600s for coordinator, analysts
+#         and SOL after DV-34366 outlived the former 30-minute budget.
+CURRENT_CONFIG_MARKER = "v3-29"
 
 
 def sanitize_filename(filename: str) -> str:
