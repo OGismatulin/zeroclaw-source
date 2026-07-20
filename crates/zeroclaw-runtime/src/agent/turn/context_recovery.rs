@@ -53,6 +53,16 @@ pub(crate) fn record_llm_failure(
     );
 }
 
+/// Config slice for the emergency tool-result retrim fallback in
+/// `try_recover_context_overflow`. Built by the caller from the resolved
+/// context-compression config (serde defaults when unreachable — see plan Task 0).
+pub(crate) struct ToolRetrimParams {
+    pub retrim_chars: usize,
+    pub protect_first_n: usize,
+    pub emergency_protect_last_n: usize,
+    pub exempt: Vec<String>,
+}
+
 /// Context overflow recovery: trim history and retry.
 ///
 /// Returns `true` when the history was trimmed and the caller should
@@ -69,6 +79,7 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
+    tool_retrim: &ToolRetrimParams,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -129,6 +140,65 @@ pub(crate) async fn try_recover_context_overflow(
             }
             observer.record_event(&ObserverEvent::HistoryTrimmed {
                 dropped_messages,
+                kept_turns,
+                reason,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            });
+            return true;
+        }
+
+        // Whole-turn dropping yielded nothing (e.g. a single turn whose oversized
+        // tool results dominate). Before declaring unrecoverable, escalate an
+        // emergency tool-result retrim on the surviving history, reusing the same
+        // truncation the post-turn compaction uses (fork-patch #31).
+        let tokens_before_retrim = estimate_history_tokens(history);
+        let mut retrim_saved = 0usize;
+        let mut protect = tool_retrim.emergency_protect_last_n;
+        loop {
+            retrim_saved += crate::agent::history_trim::trim_oversized_tool_results_in_range(
+                history,
+                tool_retrim.retrim_chars,
+                tool_retrim.protect_first_n,
+                protect,
+                &tool_retrim.exempt,
+            );
+            if estimate_history_tokens(history) <= budget || protect == 0 {
+                break;
+            }
+            protect -= 1;
+        }
+        if retrim_saved > 0 && estimate_history_tokens(history) < tokens_before_retrim {
+            // Dedup breadcrumb (unlike the raw .insert() on the whole-turn path
+            // above): repeated retrim recoveries in one turn must not stack crumbs.
+            // The two branches never fire in the same call.
+            crate::agent::history_trim::insert_breadcrumb_deduped(history);
+            let tokens_after_retrim = estimate_history_tokens(history);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "retrim_saved": retrim_saved,
+                        "tokens_before": tokens_before_retrim,
+                        "tokens_after": tokens_after_retrim,
+                        "budget": budget,
+                    })),
+                "Context recovery: retrimmed oversized tool results, retrying"
+            );
+            let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        dropped_messages: 0,
+                        kept_turns,
+                        reason: reason.clone(),
+                    })
+                    .await;
+            }
+            observer.record_event(&ObserverEvent::HistoryTrimmed {
+                dropped_messages: 0,
                 kept_turns,
                 reason,
                 channel: None,
@@ -203,7 +273,21 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(
+                &mut history,
+                &err,
+                1,
+                Some(&tx),
+                &observer,
+                32_000,
+                &ToolRetrimParams {
+                    retrim_chars: 2000,
+                    protect_first_n: 3,
+                    emergency_protect_last_n: 2,
+                    exempt: vec![],
+                },
+            )
+            .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -248,7 +332,21 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100).await;
+            try_recover_context_overflow(
+                &mut history,
+                &err,
+                1,
+                Some(&tx),
+                &observer,
+                100,
+                &ToolRetrimParams {
+                    retrim_chars: 2000,
+                    protect_first_n: 3,
+                    emergency_protect_last_n: 2,
+                    exempt: vec![],
+                },
+            )
+            .await;
 
         assert!(
             !recovered,
@@ -275,7 +373,21 @@ mod tests {
         let observer = NoopObserver;
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 32_000).await;
+            try_recover_context_overflow(
+                &mut history,
+                &err,
+                1,
+                Some(&tx),
+                &observer,
+                32_000,
+                &ToolRetrimParams {
+                    retrim_chars: 2000,
+                    protect_first_n: 3,
+                    emergency_protect_last_n: 2,
+                    exempt: vec![],
+                },
+            )
+            .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -307,7 +419,21 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, &observer, budget).await;
+            try_recover_context_overflow(
+                &mut history,
+                &err,
+                1,
+                None,
+                &observer,
+                budget,
+                &ToolRetrimParams {
+                    retrim_chars: 2000,
+                    protect_first_n: 3,
+                    emergency_protect_last_n: 2,
+                    exempt: vec![],
+                },
+            )
+            .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
@@ -370,5 +496,107 @@ mod tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    // Test 1 (terra-replay): ONE turn dominated by oversized role=="tool"; whole-turn drop
+    // can't drop the last turn (trimmed==false) → tool-retrim fallback truncates → true.
+    #[tokio::test]
+    async fn recovery_retrims_tool_results_when_no_turns_to_drop() {
+        let observer = NoopObserver;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let big = "X".repeat(60_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("go"),
+            ChatMessage::tool(big.clone()),
+            ChatMessage::tool(big.clone()),
+        ];
+        let params = ToolRetrimParams {
+            retrim_chars: 100,
+            protect_first_n: 1,
+            emergency_protect_last_n: 1,
+            exempt: vec![],
+        };
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let before = estimate_history_tokens(&history);
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            1_000_000,
+            &params,
+        )
+        .await;
+        assert!(recovered, "tool-retrim fallback must recover");
+        assert!(
+            estimate_history_tokens(&history) < before,
+            "tokens dropped"
+        );
+        let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        assert!(
+            history.iter().any(|m| m.content.contains(&crumb)),
+            "breadcrumb inserted"
+        );
+    }
+
+    // Test 2 (assistant-bloat residual): mass in role=="assistant" → saved==0 → false,
+    // unrecoverable still (no regression).
+    #[tokio::test]
+    async fn recovery_no_retrim_on_assistant_bloat() {
+        let observer = NoopObserver;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let big = "X".repeat(60_000);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("go"),
+            ChatMessage::assistant(big.clone()),
+        ];
+        let params = ToolRetrimParams {
+            retrim_chars: 100,
+            protect_first_n: 1,
+            emergency_protect_last_n: 1,
+            exempt: vec![],
+        };
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            100,
+            &params,
+        )
+        .await;
+        assert!(!recovered, "no tool to trim → unrecoverable");
+        assert_eq!(history[2].content.len(), 60_000, "assistant untouched");
+    }
+
+    // Test 3 (multi-turn no-change): several turns → whole-turn drop fires, fallback not reached.
+    #[tokio::test]
+    async fn recovery_multi_turn_still_drops_whole_turns() {
+        let observer = NoopObserver;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut history = overflowing_history(); // existing helper in this test module
+        let params = ToolRetrimParams {
+            retrim_chars: 100,
+            protect_first_n: 1,
+            emergency_protect_last_n: 1,
+            exempt: vec![],
+        };
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+            &params,
+        )
+        .await;
+        assert!(recovered, "whole-turn drop recovers as before");
     }
 }
