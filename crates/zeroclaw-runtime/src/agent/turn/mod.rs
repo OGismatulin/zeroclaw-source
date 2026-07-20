@@ -766,12 +766,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 // The context-compression config is not reachable in the turn
                 // module, so build the retrim params from serde defaults
                 // (retrim_chars=2000, protect_first_n=3, emergency_protect_last_n=2).
-                let __cc = zeroclaw_config::scattered_types::ContextCompressionConfig::default();
+                let cc = zeroclaw_config::scattered_types::ContextCompressionConfig::default();
                 let tool_retrim = crate::agent::turn::context_recovery::ToolRetrimParams {
-                    retrim_chars: __cc.tool_result_retrim_chars,
-                    protect_first_n: __cc.protect_first_n,
-                    emergency_protect_last_n: __cc.emergency_protect_last_n,
-                    exempt: __cc.tool_result_trim_exempt.clone(),
+                    retrim_chars: cc.tool_result_retrim_chars,
+                    protect_first_n: cc.protect_first_n,
+                    emergency_protect_last_n: cc.emergency_protect_last_n,
+                    exempt: cc.tool_result_trim_exempt.clone(),
                 };
                 let recovered = try_recover_context_overflow(
                     history,

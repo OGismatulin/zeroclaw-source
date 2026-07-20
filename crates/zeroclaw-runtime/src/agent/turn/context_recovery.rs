@@ -54,8 +54,10 @@ pub(crate) fn record_llm_failure(
 }
 
 /// Config slice for the emergency tool-result retrim fallback in
-/// `try_recover_context_overflow`. Built by the caller from the resolved
-/// context-compression config (serde defaults when unreachable — see plan Task 0).
+/// `try_recover_context_overflow`. Built by the caller; the current turn-loop
+/// caller uses `ContextCompressionConfig` serde defaults because the resolved
+/// config is unreachable in the `turn/` module (plan Task 0). Post-turn
+/// compaction still honors user overrides; this recovery path uses defaults.
 pub(crate) struct ToolRetrimParams {
     pub retrim_chars: usize,
     pub protect_first_n: usize,
@@ -272,22 +274,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(
-                &mut history,
-                &err,
-                1,
-                Some(&tx),
-                &observer,
-                32_000,
-                &ToolRetrimParams {
-                    retrim_chars: 2000,
-                    protect_first_n: 3,
-                    emergency_protect_last_n: 2,
-                    exempt: vec![],
-                },
-            )
-            .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+            &ToolRetrimParams {
+                retrim_chars: 2000,
+                protect_first_n: 3,
+                emergency_protect_last_n: 2,
+                exempt: vec![],
+            },
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -331,22 +332,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(
-                &mut history,
-                &err,
-                1,
-                Some(&tx),
-                &observer,
-                100,
-                &ToolRetrimParams {
-                    retrim_chars: 2000,
-                    protect_first_n: 3,
-                    emergency_protect_last_n: 2,
-                    exempt: vec![],
-                },
-            )
-            .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            100,
+            &ToolRetrimParams {
+                retrim_chars: 2000,
+                protect_first_n: 3,
+                emergency_protect_last_n: 2,
+                exempt: vec![],
+            },
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -372,22 +372,21 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(
-                &mut history,
-                &err,
-                1,
-                Some(&tx),
-                &observer,
-                32_000,
-                &ToolRetrimParams {
-                    retrim_chars: 2000,
-                    protect_first_n: 3,
-                    emergency_protect_last_n: 2,
-                    exempt: vec![],
-                },
-            )
-            .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            &observer,
+            32_000,
+            &ToolRetrimParams {
+                retrim_chars: 2000,
+                protect_first_n: 3,
+                emergency_protect_last_n: 2,
+                exempt: vec![],
+            },
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -418,22 +417,21 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(
-                &mut history,
-                &err,
-                1,
-                None,
-                &observer,
-                budget,
-                &ToolRetrimParams {
-                    retrim_chars: 2000,
-                    protect_first_n: 3,
-                    emergency_protect_last_n: 2,
-                    exempt: vec![],
-                },
-            )
-            .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            &observer,
+            budget,
+            &ToolRetrimParams {
+                retrim_chars: 2000,
+                protect_first_n: 3,
+                emergency_protect_last_n: 2,
+                exempt: vec![],
+            },
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
@@ -530,10 +528,7 @@ mod tests {
         )
         .await;
         assert!(recovered, "tool-retrim fallback must recover");
-        assert!(
-            estimate_history_tokens(&history) < before,
-            "tokens dropped"
-        );
+        assert!(estimate_history_tokens(&history) < before, "tokens dropped");
         let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
         assert!(
             history.iter().any(|m| m.content.contains(&crumb)),
@@ -560,16 +555,9 @@ mod tests {
             exempt: vec![],
         };
         let err = anyhow::Error::msg("maximum context length exceeded");
-        let recovered = try_recover_context_overflow(
-            &mut history,
-            &err,
-            1,
-            Some(&tx),
-            &observer,
-            100,
-            &params,
-        )
-        .await;
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer, 100, &params)
+                .await;
         assert!(!recovered, "no tool to trim → unrecoverable");
         assert_eq!(history[2].content.len(), 60_000, "assistant untouched");
     }

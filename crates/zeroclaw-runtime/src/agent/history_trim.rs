@@ -547,7 +547,10 @@ mod tests {
         assert!(saved > 0, "first tool must be truncated");
         assert!(history[1].content.len() <= 200, "truncated toward max");
         assert_eq!(history[2].content.len(), 10_000, "tail protected");
-        assert_eq!(history[0].content, "sys", "system untouched (protect_first_n)");
+        assert_eq!(
+            history[0].content, "sys",
+            "system untouched (protect_first_n)"
+        );
     }
 
     #[test]
