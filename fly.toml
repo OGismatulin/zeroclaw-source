@@ -35,7 +35,6 @@ swap_size_mb = 512
   ZEROCLAW_CHILD_HOST = '127.0.0.1'
   ZEROCLAW_AUTONOMY_LEVEL = 'full'
   ZEROCLAW_GATEWAY_TIMEOUT_SECS = '1800'
-  ZEROCLAW_REASONING_EFFORT = 'medium'
   # Provider-fallback observability (stabilization 2026-06-13): operator gets a
   # deduped Telegram alert when a turn answered via a DIFFERENT provider/model.
   # Empty operator → alerts disabled; this activates them. Oleg = 83292437.

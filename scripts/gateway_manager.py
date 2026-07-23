@@ -499,7 +499,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         stays gpt-5.6-sol. Root luna-streaming fix tracked as a separate spec.
 # v3-29 = jira_analysis agentic cap 1800s -> 3600s for coordinator, analysts
 #         and SOL after DV-34366 outlived the former 30-minute budget.
-CURRENT_CONFIG_MARKER = "v3-29"
+CURRENT_CONFIG_MARKER = "v3-30"
 
 
 def sanitize_filename(filename: str) -> str:

@@ -21,6 +21,11 @@ schema_version = 3
 model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
+# Go-router accepts reasoning_effort in the request body; deepseek gates the
+# structured field to None, so we pass it via provider_extra (flattens into the
+# body top-level). Separate knob from codex — config.runtime.reasoning_effort
+# stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
+provider_extra = { reasoning_effort = "high" }
 
 # Subagent analyst_mimo runs mimo-v2.5-pro on the same opencode-go endpoint.
 [providers.models.opencode.mimo]
