@@ -88,41 +88,40 @@ api_key = ""
 model = "minimax-m2.7"
 api_key = ""
 
-# Custom-URL provider (neuralwatt, OpenAI-compatible). Reached ONLY via the bot's
-# per-request /model override (provider="custom.neuralwatt"); not the daemon
-# default. NO `model` key on purpose: a pinned model would make ModelPinnedProvider
-# rewrite every request to it — without it the request model flows through
-# (glm-5.2-fast / kimi-k2.7-code). Key via env ZEROCLAW_API_KEY (generic fallback).
-# Spec: docs/superpowers/specs/2026-06-19-neuralwatt-custom-provider-model-switching-design.md
-[providers.models.custom.neuralwatt]
-uri = "https://api.neuralwatt.com/v1"
+# Custom-URL provider (Cline / api.cline.bot, OpenAI-compatible). Replaced
+# neuralwatt 2026-07-23 (neuralwatt no longer used). Reached ONLY via the bot's
+# per-request /model override (provider="custom.cline"); not the daemon default.
+# NO `model` key on purpose: a pinned model would make ModelPinnedProvider rewrite
+# every request to it — without it the request model flows through (z-ai/glm-5.2,
+# moonshotai/kimi-k3, qwen/qwen3.7-max, minimax/minimax-m3). Key via env
+# ZEROCLAW_API_KEY (generic fallback slot for the custom family; = the Cline key).
+# Cline wraps non-streaming responses in {"data":{choices},"success"} — the fork
+# patch in compatible.rs (parse_chat_response_body) unwraps that envelope.
+# Spec: docs/superpowers/specs/2026-07-23-cline-provider-and-jira-analyst-design.md
+[providers.models.custom.cline]
+uri = "https://api.cline.bot/api/v1"
 api_key = ""
-# neuralwatt supports native OpenAI tool-calling (verified via curl). The custom
-# family disables native tools by default (text <tool_call> protocol), which
-# glm-5.2-fast emits malformed -> parser drops it -> raw text leaks to the user
-# (prod incident 2026-06-20). Opt back into native tool-calling.
+# Cline supports native OpenAI tool-calling (verified via curl, all 4 models).
+# The custom family disables native tools by default (text <tool_call> protocol),
+# which leaks raw markup to the user (prod incident 2026-06-20). Opt back in.
 native_tools = true
 # NO per-alias `fallback`: v0.8.2 broke the alias fallback-build path
-# (create_resilient_model_provider_for_alias -> append_fallback_chain) — it now demands a
-# "profile-resolved credential" and can't resolve opencode.go's env key (OPENCODE_GO_API_KEY),
-# so a `fallback = ["opencode.go"]` here makes the WHOLE override init fail ("failed to init
-# override provider") -> hard "временно недоступен" on EVERY neuralwatt request (prod incident
-# 2026-07-09, all users). Removed. Trade-off: a real neuralwatt 429 now hard-fails instead of
-# degrading to deepseek. Restoring graceful-degrade needs a fork fix to the alias credential
-# resolution, not this line.
+# (create_resilient_model_provider_for_alias -> append_fallback_chain) — it demands a
+# "profile-resolved credential" and can't resolve opencode.go's env key, so a
+# `fallback = [...]` here makes the WHOLE override init fail ("failed to init override
+# provider") -> hard "временно недоступен" on EVERY request (prod incident 2026-07-09).
+# Trade-off: a real Cline 429 hard-fails instead of degrading to deepseek.
 
-# Pinned neuralwatt alias for the analyst_glm_nwt subagent. Unlike the
+# Pinned Cline alias for the analyst_kimi subagent (Jira ensemble). Unlike the
 # flow-through alias above, this one MUST pin `model`: subagents resolve their
-# model from the provider entry, and pinning here is exactly the desired
-# behavior (ModelPinnedProvider rewriting to glm-5.2 is the point).
-# glm-5.2 on neuralwatt = zai-org/GLM-5.2-FP8 (tool-calling smoke-verified 2026-07-05).
-[providers.models.custom.neuralwatt_glm]
-model = "glm-5.2"
-uri = "https://api.neuralwatt.com/v1"
+# model from the provider entry. moonshotai/kimi-k3 native tool-calling smoke-
+# verified 2026-07-23. NO fallback — preserves the analyst failure domain
+# (jira-analysis-pipeline D2: same-provider retry x3, no cross-provider fallback).
+[providers.models.custom.cline_kimi]
+model = "moonshotai/kimi-k3"
+uri = "https://api.cline.bot/api/v1"
 api_key = ""
 native_tools = true
-# NO per-alias fallback — same v0.8.2 alias-fallback-build regression as neuralwatt above
-# (opencode.go env credential unresolvable in append_fallback_chain -> init fails). Removed 2026-07-09.
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
@@ -154,8 +153,6 @@ fallback_providers = ["opencode-go"]
 "minimax-m3"         = ["deepseek-v4-flash"]
 "kimi-k2.7-code"     = ["deepseek-v4-flash"]
 "glm-5.2"            = ["deepseek-v4-flash"]
-# neuralwatt custom-URL (2026-06-19) — only glm-5.2-fast is new; kimi-k2.7-code above
-"glm-5.2-fast"       = ["deepseek-v4-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
@@ -491,8 +488,11 @@ protect_last_n = 10
 "qwen3.7-plus"            = 1_000_000
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
-"glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
+"z-ai/glm-5.2"            = 200_000
+"moonshotai/kimi-k3"      = 256_000
+"qwen/qwen3.7-max"        = 256_000
+"minimax/minimax-m3"      = 200_000
 "minimax-m2.7"            = 196_608
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
@@ -539,8 +539,11 @@ protect_last_n = 10
 "qwen3.7-plus"            = 1_000_000
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
-"glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
+"z-ai/glm-5.2"            = 200_000
+"moonshotai/kimi-k3"      = 256_000
+"qwen/qwen3.7-max"        = 256_000
+"minimax/minimax-m3"      = 200_000
 "minimax-m2.7"            = 196_608
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
@@ -586,8 +589,11 @@ protect_last_n = 10
 "qwen3.7-plus"            = 1_000_000
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
-"glm-5.2-fast"            = 1_048_576
 "kimi-k2.7-code"          = 256_000
+"z-ai/glm-5.2"            = 200_000
+"moonshotai/kimi-k3"      = 256_000
+"qwen/qwen3.7-max"        = 256_000
+"minimax/minimax-m3"      = 200_000
 "minimax-m2.7"            = 196_608
 "gpt-5.5"                 = 256_000
 "gpt-5.4"                 = 256_000
@@ -656,12 +662,15 @@ mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-[agents.analyst_deepseek_flash]
-model_provider = "deepseek.flash"
+# analyst_kimi = Kimi K3 via Cline (replaced analyst_deepseek_flash 2026-07-23).
+# Pinned alias custom.cline_kimi resolves moonshotai/kimi-k3. Renamed for audit
+# truth so pipeline diagnostics (keyed on analyst name) reflect the real model.
+[agents.analyst_kimi]
+model_provider = "custom.cline_kimi"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
-[agents.analyst_deepseek_flash.workspace]
+[agents.analyst_kimi.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]
@@ -670,14 +679,6 @@ risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 [agents.analyst_glm.workspace]
-path = "/zeroclaw-data/template/workspace/personas/analyst"
-
-[agents.analyst_glm_nwt]
-model_provider = "custom.neuralwatt_glm"
-risk_profile = "default"
-runtime_profile = "jira_analysis"
-mcp_bundles = ["all"]
-[agents.analyst_glm_nwt.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_sol]

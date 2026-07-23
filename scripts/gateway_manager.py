@@ -491,15 +491,16 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-27 = Jira package agents use the isolated jira_analysis profile (256k
 #         context budget and 1800s agent cap); jira_coordinator owns cron runs
 #         and jira_worker handles source translation and visual artifacts.
-# v3-28 = Move jira_coordinator/jira_worker/worker off codex_worker (gpt-5.6-luna
-#         returns 400 "Stream must be set to true" non_retryable on the cron/agent
-#         path) to opencode.go/deepseek-v4-flash; raise jira_analysis
-#         max_context_tokens 256k -> 1_048_576 so per-model model_windows govern
-#         (was capping deepseek 800k / gpt-5.6-sol 353k down to 256k). SOL judge
-#         stays gpt-5.6-sol. Root luna-streaming fix tracked as a separate spec.
+# v3-28 = jira_analysis max_context_tokens raised to 1_048_576 and Jira workers
+#         moved off codex_worker; shipped from the fork before integration sync.
 # v3-29 = jira_analysis agentic cap 1800s -> 3600s for coordinator, analysts
 #         and SOL after DV-34366 outlived the former 30-minute budget.
-CURRENT_CONFIG_MARKER = "v3-30"
+# v3-31 = Cline custom-URL provider replaces neuralwatt: aliases custom.cline
+#         (flow-through, 4 bot /model buttons) + custom.cline_kimi (pinned
+#         moonshotai/kimi-k3 for analyst_kimi, renamed from analyst_deepseek_flash).
+#         neuralwatt aliases + analyst_glm_nwt removed; model_windows/fallbacks
+#         cleaned. Needs fork envelope patch in compatible.rs (Cline data-wrap).
+CURRENT_CONFIG_MARKER = "v3-31"
 
 
 def sanitize_filename(filename: str) -> str:

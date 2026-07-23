@@ -1873,7 +1873,29 @@ fn sse_bytes_to_events_for_contract(
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str(body).map_err(|_| {
+    // Fast path: standard OpenAI shape with top-level `choices`. Standard
+    // backends (vLLM, llama.cpp, LM Studio, neuralwatt, …) always take this
+    // branch, so their behavior is unchanged.
+    if let Ok(response) = serde_json::from_str::<ApiChatResponse>(body) {
+        return Ok(response);
+    }
+
+    // fork: some OpenAI-compatible gateways (Cline / api.cline.bot) wrap the
+    // non-streaming completion in a `{"data": {...}, "success": bool}` envelope
+    // instead of returning top-level `choices`. Unwrap `data` and retry before
+    // declaring the payload malformed. Error envelopes (`{"error": ...,
+    // "success": false}`) carry no `data.choices` and fall through to the
+    // sanitized error below (Cline also returns proper 4xx/5xx status for most
+    // of them, caught upstream before this parse).
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(data) = value.get("data")
+        && data.get("choices").is_some()
+        && let Ok(response) = serde_json::from_value::<ApiChatResponse>(data.clone())
+    {
+        return Ok(response);
+    }
+
+    let err = || {
         let sanitized = super::sanitize_api_error(body);
         ::zeroclaw_log::record!(
             ERROR,
@@ -1888,7 +1910,8 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
         anyhow::Error::msg(format!(
             "{name} API returned an unexpected chat-completions payload; body={sanitized}"
         ))
-    })
+    };
+    Err(err())
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -3001,7 +3024,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             ));
         }
 
-        let native_response: ApiChatResponse = response.json().await?;
+        // fork: parse via parse_chat_response_body (not response.json()) so the
+        // Cline `{"data": {...}}` envelope is unwrapped on the native tool path
+        // too, not only the text/history path.
+        let body = response.text().await?;
+        let native_response = parse_chat_response_body(&self.name, &body)?;
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
             .choices
@@ -3862,6 +3889,36 @@ mod tests {
             resp.choices[0].message.content,
             Some("Hello from Venice!".to_string())
         );
+    }
+
+    #[test]
+    fn parse_chat_response_body_standard_top_level_choices() {
+        // fork: standard OpenAI shape still parses via the fast path unchanged.
+        let json = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+        let resp = parse_chat_response_body("custom", json).expect("standard body parses");
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("ok"));
+        assert_eq!(resp.usage.and_then(|u| u.prompt_tokens), Some(3));
+    }
+
+    #[test]
+    fn parse_chat_response_body_unwraps_cline_data_envelope() {
+        // fork: Cline (api.cline.bot) wraps the completion in a `data` envelope
+        // with a `success` flag instead of returning top-level `choices`.
+        let json = r#"{"data":{"choices":[{"message":{"content":"envelope ok"}}]},"success":true}"#;
+        let resp = parse_chat_response_body("custom", json).expect("data envelope unwraps");
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("envelope ok")
+        );
+    }
+
+    #[test]
+    fn parse_chat_response_body_error_envelope_fails() {
+        // fork: `{"error": ..., "success": false}` carries no `data.choices` and
+        // must be rejected (not silently treated as an empty completion).
+        let json = r#"{"error":"model not found","success":false}"#;
+        parse_chat_response_body("custom", json)
+            .expect_err("error envelope must not parse as a completion");
     }
 
     #[test]
