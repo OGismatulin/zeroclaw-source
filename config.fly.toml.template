@@ -27,6 +27,17 @@ api_key = ""
 # stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
 provider_extra = { reasoning_effort = "high" }
 
+# Isolated coordinator alias: same deepseek-v4-flash on the same Go endpoint, but
+# reasoning_effort = "max" (Go-router valid — NOT minimal→400). Only
+# [agents.jira_coordinator] points here; worker/default/jira_worker stay on
+# opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
+# bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
+[providers.models.opencode.go_coordinator]
+model = "deepseek-v4-flash"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
+provider_extra = { reasoning_effort = "max" }
+
 # Subagent analyst_mimo runs mimo-v2.5-pro on the same opencode-go endpoint.
 [providers.models.opencode.mimo]
 model = "mimo-v2.5-pro"
@@ -622,7 +633,7 @@ runtime_profile = "default"
 mcp_bundles = ["all"]
 
 [agents.jira_coordinator]
-model_provider = "opencode.go"
+model_provider = "opencode.go_coordinator"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]

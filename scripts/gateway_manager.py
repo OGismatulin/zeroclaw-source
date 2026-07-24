@@ -505,7 +505,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         was too slow for the analyst role; both models stay bot /model buttons.
 # v3-33 = Cline routed via ClinePass subscription: model ids cline-pass/<model>
 #         replace OpenRouter-style ids; analyst_qwen -> cline-pass/qwen3.7-max.
-CURRENT_CONFIG_MARKER = "v3-33"
+CURRENT_CONFIG_MARKER = "v3-34"
 
 
 def sanitize_filename(filename: str) -> str:
