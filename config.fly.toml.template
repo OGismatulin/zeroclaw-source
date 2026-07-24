@@ -112,13 +112,15 @@ native_tools = true
 # provider") -> hard "временно недоступен" on EVERY request (prod incident 2026-07-09).
 # Trade-off: a real Cline 429 hard-fails instead of degrading to deepseek.
 
-# Pinned Cline alias for the analyst_kimi subagent (Jira ensemble). Unlike the
+# Pinned Cline alias for the analyst_qwen subagent (Jira ensemble). Unlike the
 # flow-through alias above, this one MUST pin `model`: subagents resolve their
-# model from the provider entry. moonshotai/kimi-k3 native tool-calling smoke-
-# verified 2026-07-23. NO fallback — preserves the analyst failure domain
-# (jira-analysis-pipeline D2: same-provider retry x3, no cross-provider fallback).
-[providers.models.custom.cline_kimi]
-model = "moonshotai/kimi-k3"
+# model from the provider entry. qwen/qwen3.7-max native tool-calling smoke-
+# verified via Cline 2026-07-23 (all 4 Cline models). Replaced moonshotai/kimi-k3
+# on 2026-07-24 — kimi-k3 was too slow for the analyst role. NO fallback —
+# preserves the analyst failure domain (jira-analysis-pipeline D2: same-provider
+# retry x3, no cross-provider fallback).
+[providers.models.custom.cline_qwen]
+model = "qwen/qwen3.7-max"
 uri = "https://api.cline.bot/api/v1"
 api_key = ""
 native_tools = true
@@ -662,15 +664,16 @@ mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-# analyst_kimi = Kimi K3 via Cline (replaced analyst_deepseek_flash 2026-07-23).
-# Pinned alias custom.cline_kimi resolves moonshotai/kimi-k3. Renamed for audit
-# truth so pipeline diagnostics (keyed on analyst name) reflect the real model.
-[agents.analyst_kimi]
-model_provider = "custom.cline_kimi"
+# analyst_qwen = Qwen3.7-Max via Cline (replaced analyst_kimi 2026-07-24; kimi-k3
+# was too slow). Pinned alias custom.cline_qwen resolves qwen/qwen3.7-max. Renamed
+# for audit truth so pipeline diagnostics (keyed on analyst name) reflect the real
+# model.
+[agents.analyst_qwen]
+model_provider = "custom.cline_qwen"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
-[agents.analyst_kimi.workspace]
+[agents.analyst_qwen.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]

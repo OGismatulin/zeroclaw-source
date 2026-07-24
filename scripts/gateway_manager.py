@@ -500,7 +500,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         moonshotai/kimi-k3 for analyst_kimi, renamed from analyst_deepseek_flash).
 #         neuralwatt aliases + analyst_glm_nwt removed; model_windows/fallbacks
 #         cleaned. Needs fork envelope patch in compatible.rs (Cline data-wrap).
-CURRENT_CONFIG_MARKER = "v3-31"
+# v3-32 = Jira analyst kimi -> qwen: pinned alias custom.cline_kimi -> custom.cline_qwen
+#         (qwen/qwen3.7-max via Cline), agent analyst_kimi -> analyst_qwen. kimi-k3
+#         was too slow for the analyst role; both models stay bot /model buttons.
+CURRENT_CONFIG_MARKER = "v3-32"
 
 
 def sanitize_filename(filename: str) -> str:
