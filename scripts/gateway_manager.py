@@ -503,7 +503,9 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-32 = Jira analyst kimi -> qwen: pinned alias custom.cline_kimi -> custom.cline_qwen
 #         (qwen/qwen3.7-max via Cline), agent analyst_kimi -> analyst_qwen. kimi-k3
 #         was too slow for the analyst role; both models stay bot /model buttons.
-CURRENT_CONFIG_MARKER = "v3-32"
+# v3-33 = Cline routed via ClinePass subscription: model ids cline-pass/<model>
+#         replace OpenRouter-style ids; analyst_qwen -> cline-pass/qwen3.7-max.
+CURRENT_CONFIG_MARKER = "v3-33"
 
 
 def sanitize_filename(filename: str) -> str:

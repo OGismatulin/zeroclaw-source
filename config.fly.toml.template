@@ -92,8 +92,8 @@ api_key = ""
 # neuralwatt 2026-07-23 (neuralwatt no longer used). Reached ONLY via the bot's
 # per-request /model override (provider="custom.cline"); not the daemon default.
 # NO `model` key on purpose: a pinned model would make ModelPinnedProvider rewrite
-# every request to it — without it the request model flows through (z-ai/glm-5.2,
-# moonshotai/kimi-k3, qwen/qwen3.7-max, minimax/minimax-m3). Key via env
+# every request to it — without it the request model flows through (the four
+# ClinePass slugs cline-pass/{glm-5.2,kimi-k3,qwen3.7-max,minimax-m3}). Key via env
 # ZEROCLAW_API_KEY (generic fallback slot for the custom family; = the Cline key).
 # Cline wraps non-streaming responses in {"data":{choices},"success"} — the fork
 # patch in compatible.rs (parse_chat_response_body) unwraps that envelope.
@@ -114,13 +114,13 @@ native_tools = true
 
 # Pinned Cline alias for the analyst_qwen subagent (Jira ensemble). Unlike the
 # flow-through alias above, this one MUST pin `model`: subagents resolve their
-# model from the provider entry. qwen/qwen3.7-max native tool-calling smoke-
-# verified via Cline 2026-07-23 (all 4 Cline models). Replaced moonshotai/kimi-k3
-# on 2026-07-24 — kimi-k3 was too slow for the analyst role. NO fallback —
-# preserves the analyst failure domain (jira-analysis-pipeline D2: same-provider
-# retry x3, no cross-provider fallback).
+# model from the provider entry. The ClinePass slug cline-pass/qwen3.7-max is
+# native tool-calling smoke-verified (ClinePass subscription tract; the earlier
+# pay-as-you-go id format returned 402 insufficient_credits — 2026-07-24). kimi
+# was swapped out earlier for being too slow. NO fallback — preserves the analyst
+# failure domain (jira-analysis-pipeline D2: same-provider retry x3, no fallback).
 [providers.models.custom.cline_qwen]
-model = "qwen/qwen3.7-max"
+model = "cline-pass/qwen3.7-max"
 uri = "https://api.cline.bot/api/v1"
 api_key = ""
 native_tools = true
@@ -491,10 +491,10 @@ protect_last_n = 10
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
 "kimi-k2.7-code"          = 256_000
-"z-ai/glm-5.2"            = 200_000
-"moonshotai/kimi-k3"      = 256_000
-"qwen/qwen3.7-max"        = 256_000
-"minimax/minimax-m3"      = 200_000
+"cline-pass/glm-5.2"      = 200_000
+"cline-pass/kimi-k3"      = 256_000
+"cline-pass/qwen3.7-max"  = 256_000
+"cline-pass/minimax-m3"   = 200_000
 "minimax-m2.7"            = 196_608
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
@@ -542,10 +542,10 @@ protect_last_n = 10
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
 "kimi-k2.7-code"          = 256_000
-"z-ai/glm-5.2"            = 200_000
-"moonshotai/kimi-k3"      = 256_000
-"qwen/qwen3.7-max"        = 256_000
-"minimax/minimax-m3"      = 200_000
+"cline-pass/glm-5.2"      = 200_000
+"cline-pass/kimi-k3"      = 256_000
+"cline-pass/qwen3.7-max"  = 256_000
+"cline-pass/minimax-m3"   = 200_000
 "minimax-m2.7"            = 196_608
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
@@ -592,10 +592,10 @@ protect_last_n = 10
 "minimax-m3"              = 1_000_000
 "glm-5.2"                 = 1_000_000
 "kimi-k2.7-code"          = 256_000
-"z-ai/glm-5.2"            = 200_000
-"moonshotai/kimi-k3"      = 256_000
-"qwen/qwen3.7-max"        = 256_000
-"minimax/minimax-m3"      = 200_000
+"cline-pass/glm-5.2"      = 200_000
+"cline-pass/kimi-k3"      = 256_000
+"cline-pass/qwen3.7-max"  = 256_000
+"cline-pass/minimax-m3"   = 200_000
 "minimax-m2.7"            = 196_608
 "gpt-5.5"                 = 256_000
 "gpt-5.4"                 = 256_000
@@ -665,7 +665,7 @@ mcp_bundles = ["all"]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 # analyst_qwen = Qwen3.7-Max via Cline (replaced analyst_kimi 2026-07-24; kimi-k3
-# was too slow). Pinned alias custom.cline_qwen resolves qwen/qwen3.7-max. Renamed
+# was too slow). Pinned alias custom.cline_qwen resolves cline-pass/qwen3.7-max. Renamed
 # for audit truth so pipeline diagnostics (keyed on analyst name) reflect the real
 # model.
 [agents.analyst_qwen]
