@@ -193,7 +193,9 @@ COPY scripts/cron_template_install.py /usr/local/bin/cron_template_install.py
 COPY scripts/bootstrap_default_cron_jobs.py /usr/local/bin/bootstrap_default_cron_jobs.py
 COPY scripts/backfill_cron_agent_alias.py /usr/local/bin/backfill_cron_agent_alias.py
 
-RUN pip install --no-cache-dir --break-system-packages requests pandas croniter psycopg2-binary httpx "mcp[cli]" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn yt-dlp
+# mcp pinned <2: 2.0.0 removed mcp.server.fastmcp (renamed to mcp.server.MCPServer),
+# which mcp_db_server.py imports — unpinned float broke lalafo-db MCP in prod 2026-08-03.
+RUN pip install --no-cache-dir --break-system-packages requests pandas croniter psycopg2-binary httpx "mcp[cli]<2" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn yt-dlp
 
 RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py /usr/local/bin/backfill_cron_agent_alias.py
 
