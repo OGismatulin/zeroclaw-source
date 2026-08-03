@@ -5,19 +5,27 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
+// Only the Unix lock paths sleep between flock(2) retries; the non-Unix
+// fallback returns immediately, so gate the import to keep Windows clippy clean.
+#[cfg(unix)]
 use tokio::time::sleep;
 use zeroclaw_config::secrets::SecretStore;
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 const PROFILES_FILENAME: &str = "auth-profiles.json";
 const LOCK_FILENAME: &str = "auth-profiles.lock";
+// Retry cadence and budget for the Unix flock(2) wait loops. The
+// `cfg(not(unix))` fallback takes no lock, so these are dead there.
+#[cfg(unix)]
 const LOCK_WAIT_MS: u64 = 50;
+#[cfg(unix)]
 const LOCK_TIMEOUT_MS: u64 = 10_000;
 // Dedicated cross-process refresh lock (flock(2)) lives next to the REAL
 // (symlink-resolved) store file so every daemon flocks the same inode.
 const REFRESH_LOCK_FILENAME: &str = "auth-profiles.refresh.lock";
 // > store LOCK_TIMEOUT_MS: must outlast a queue of 2-3 daemons each holding the
 // lock for one bounded HTTP refresh.
+#[cfg(unix)]
 const REFRESH_LOCK_TIMEOUT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
