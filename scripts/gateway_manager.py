@@ -505,7 +505,11 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         was too slow for the analyst role; both models stay bot /model buttons.
 # v3-33 = Cline routed via ClinePass subscription: model ids cline-pass/<model>
 #         replace OpenRouter-style ids; analyst_qwen -> cline-pass/qwen3.7-max.
-CURRENT_CONFIG_MARKER = "v3-34"
+# v3-35 = codemap-fs__{resolve_repo,read_file,list_dir} added to
+#         risk_profiles.default.allowed_tools so Bounded delegates see them: the
+#         delegate tool filter applies the STRICT caller policy first (no MCP
+#         auto-admit), so unlisted codemap-fs__* was stripped from subagents.
+CURRENT_CONFIG_MARKER = "v3-35"
 
 
 def sanitize_filename(filename: str) -> str:

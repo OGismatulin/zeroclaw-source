@@ -460,6 +460,11 @@ allowed_tools = [
     # codemap-semantic: read-only tools only (O3). index_codebase (heavy) + clear_index
     # (destructive) are operator/cron-only, NOT granted to the agent.
     "codemap-semantic__search_code", "codemap-semantic__get_indexing_status",
+    # codemap-fs: read-only file access to the indexed monorepa (.git denied
+    # server-side). Explicit listing is what makes these reachable to delegates —
+    # the Bounded delegate filter runs the STRICT caller policy first (no MCP
+    # auto-admit), so an unlisted codemap-fs__* is stripped from the subagent.
+    "codemap-fs__resolve_repo", "codemap-fs__read_file", "codemap-fs__list_dir",
 ]
 
 [risk_profiles.default.delegation_policy]
