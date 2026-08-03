@@ -56,6 +56,12 @@ wasmtime `43` → `45.0.3` bump in `crates/zeroclaw-plugins/Cargo.toml`
 (see PR #8542, awaiting maintainer re-approval after the latest
 `upstream/master` merge).
 
+`RUSTSEC-2026-0222` was handled the same way on 2026-08-03 — `45.0.3` →
+`47.0.3` for `wasmtime`, `wasmtime-wasi` and `wasmtime-wasi-http` — so it
+needs no ignore entry at all. Note the fix window is disjoint
+(`>=46.0.2,<47.0.0` **or** `>=47.0.3`): a bump to `47.0.0`–`47.0.2` would
+still be vulnerable.
+
 **Process for this category:**
 
 - Add the entry with a single-line `reason` ending in the tracking
@@ -157,5 +163,22 @@ two tools have drifted again. Open or update the tracking issue.
   `proc-macro-error` ignore was dropped, `ttf-parser` is being handled
   by PR #8547, and the `unic-*` group remains blocked by upstream
   `pulldown-cmark` / `mime_guess`. (PR #8543)
+- 2026-08-03: Cleared 12 advisories without adding a single advisory
+  ignore. `wasmtime`/`wasmtime-wasi`/`wasmtime-wasi-http` 45.0.3 -> 47.0.3
+  (`RUSTSEC-2026-0222`); `nostr` 0.44.3 -> 0.44.7 and `nostr-relay-pool`
+  0.44.1 -> 0.44.3 (`RUSTSEC-2026-0216/0219/0224/0225/0226/0227/0228/0229/
+  0230/0231/0232`). No source changes were required. Two lessons worth
+  keeping: (1) `cargo update -p X --precise` re-solves the graph and can
+  **downgrade** unrelated crates - an earlier attempt at the nostr bump
+  pushed `windows-sys` 0.61.2 -> 0.60.2/0.59.0 and `base64` 0.22.1 -> 0.21.7,
+  turning `cargo deny check bans` red; plain `cargo update -p X` moved only
+  the intended crates. (2) The nostr bump makes three `windows-sys` versions
+  reachable in the deny graph, so `[[bans.skip]]` entries for `=0.59.0`,
+  `=0.60.2` and `windows_i686_gnullvm =0.52.6` accompany it - Windows-only
+  shims on a Linux/macOS deployment target. Verified locally before push:
+  `cargo deny check` -> advisories/bans/licenses/sources ok, `cargo audit`
+  -> exit 0 (4 allowed warnings), and `cargo check -p zeroclaw-plugins
+  --no-default-features` green for all three backends plus
+  `-p zeroclaw-channels --features channel-nostr`.
 - 2026-06-30: Initial doc. Created alongside PR #8542 (wasmtime
   43 → 45.0.3 bump) and PR #8519 (the master audit-tracking issue).

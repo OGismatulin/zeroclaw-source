@@ -40,6 +40,10 @@ ignore = [
     # audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.
+    # RUSTSEC-2026-0222 cleared the same way: wasmtime/wasmtime-wasi/wasmtime-wasi-http
+    # 45.0.3 -> 47.0.3 (2026-08-03). Advisory listed >=46.0.2,<47.0.0 OR >=47.0.3;
+    # 47.0.3 is the current stable line and needs no source changes (the crate only
+    # uses component::{bindgen,Linker,HasSelf}, Store, Result). MSRV 1.94 <= CI 1.96.1.
     # GTK3 stack unmaintained via zeroclaw-desktop (tauri -> webkit2gtk); tracking #8519.
     { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
     { id = "RUSTSEC-2024-0412", reason = "gdk unmaintained gtk-rs GTK3 bindings; tracking #8519" },
@@ -224,6 +228,11 @@ version = "=0.48.5"
 name = "windows_i686_msvc"
 version = "=0.52.6"
 
+# Same origin as the windows-sys 0.59.0/0.60.2 skips above (nostr 0.44.7 bump).
+[[bans.skip]]
+name = "windows_i686_gnullvm"
+version = "=0.52.6"
+
 [[bans.skip]]
 name = "windows-link"
 version = "=0.1.3"
@@ -235,6 +244,19 @@ version = "=0.48.0"
 [[bans.skip]]
 name = "windows-sys"
 version = "=0.52.0"
+
+# Reachable in the graph since the nostr 0.44.3 -> 0.44.7 security bump
+# (2026-08-03, clears RUSTSEC-2026-0216/0219/0225/0226/0227/0228/0229/0230 +
+# nostr-relay-pool 0224/0231/0232). The canonical version stays 0.61.2; these
+# two are Windows-only shims on a Linux/macOS deployment target, so the split
+# costs nothing at runtime. Drop these skips when the nostr stack converges.
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.59.0"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.60.2"
 
 [[bans.skip]]
 name = "windows-targets"
