@@ -22,6 +22,15 @@ ignore = [
     # for the 0.8.x copy in our tree; the 0.7.x copy predates rand::rng() entirely
     # and is not affected; the 0.9.x copy is outside the advisory's affected range
     { id = "RUSTSEC-2026-0097", reason = "rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected" },
+    # lru -- LruCache::pop() is not panic-safe: a panicking Drop on the key skips
+    # detach(), leaving a dangling node that a later eviction dereferences.
+    # Fixed in lru 0.18.2, but 0.16.4 stays in the tree regardless: nostr-database
+    # 0.44 pins a range that excludes 0.18, so bumping our own direct deps does not
+    # remove the affected copy. Not reachable here -- the advisory needs
+    # catch_unwind together with a key type whose Drop can panic, and every
+    # LruCache in this tree is keyed by String/integer ids, whose Drop cannot panic.
+    # Removing it for real means bumping nostr-sdk; tracked separately.
+    { id = "RUSTSEC-2026-0253", reason = "lru LruCache::pop() panic-safety unsoundness; affected 0.16.4 copy is transitive via nostr-database 0.44 which excludes the patched 0.18.2; unreachable without catch_unwind plus a panicking key Drop, and all keys here are String/integer" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
