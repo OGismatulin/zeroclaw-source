@@ -260,7 +260,20 @@ enabled = true
 base_url = "https://yallaclassifieds.atlassian.net"
 email = "oleg.gismatulin@lalafo.com"
 api_token = ""
-allowed_actions = ["get_ticket", "search_tickets", "comment_ticket"]
+# Full action surface (all 8 implemented in jira_tool.rs; verified against the
+# deployed image before enabling -- an unknown action panics the daemon at boot).
+# Write actions (comment_ticket, transition_ticket, create_ticket) are gated by
+# the skill, not by config: the agent uses them only on explicit user request.
+allowed_actions = [
+    "get_ticket",
+    "search_tickets",
+    "comment_ticket",
+    "list_projects",
+    "myself",
+    "list_transitions",
+    "transition_ticket",
+    "create_ticket",
+]
 timeout_secs = 30
 
 # ── Delegate ──────────────────────────────────────────────────────────────

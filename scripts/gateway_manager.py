@@ -509,7 +509,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         risk_profiles.default.allowed_tools so Bounded delegates see them: the
 #         delegate tool filter applies the STRICT caller policy first (no MCP
 #         auto-admit), so unlisted codemap-fs__* was stripped from subagents.
-CURRENT_CONFIG_MARKER = "v3-35"
+CURRENT_CONFIG_MARKER = "v3-36"
 
 
 def sanitize_filename(filename: str) -> str:
