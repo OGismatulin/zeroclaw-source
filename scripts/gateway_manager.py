@@ -509,7 +509,12 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         risk_profiles.default.allowed_tools so Bounded delegates see them: the
 #         delegate tool filter applies the STRICT caller policy first (no MCP
 #         auto-admit), so unlisted codemap-fs__* was stripped from subagents.
-CURRENT_CONFIG_MARKER = "v3-36"
+# v3-37 = model catalog re-sync 2026-08-16: analyst_mimo -> analyst_luna
+#         (opencode.luna = gpt-5.6-luna on the Go router, reasoning_effort max),
+#         analyst_glm off the out-of-balance z.ai account onto opencode.glm
+#         (glm-5.3), coder -> gpt-5.6-sol, minimax-m3, cline-pass/qwen3.8-max;
+#         model_fallbacks + model_windows pruned to the live catalog.
+CURRENT_CONFIG_MARKER = "v3-37"
 
 
 def sanitize_filename(filename: str) -> str:
