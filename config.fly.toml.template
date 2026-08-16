@@ -48,14 +48,6 @@ uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
 
-# Analyst slot: GLM 5.3 via the Go subscription. Moved off [providers.models.zai.default]
-# on 2026-08-16 — the direct z.ai account returns 429 "Insufficient balance" for every
-# model, so the zai-backed analyst failed on every run.
-[providers.models.opencode.glm]
-model = "glm-5.3"
-uri = "https://opencode.ai/zen/go/v1"
-api_key = ""
-
 # Codex subagents fold under the `openai` family with the codex OAuth runtime
 # (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
 # migration applies to "openai-codex"). worker = gpt-5.6-luna (cheap GPT-5.6
@@ -97,9 +89,12 @@ api_key = ""
 model = "deepseek-v4-flash"
 api_key = ""
 
-# Not referenced by any agent since 2026-08-16: the direct z.ai account is out of
-# balance (429 "Insufficient balance" on every model), so analyst_glm moved to
-# [providers.models.opencode.glm]. Kept as a reference entry for a topped-up account.
+# GLM via the z.ai Coding Plan subscription. The provider name decides the endpoint:
+# `zai` → https://api.z.ai/api/coding/paas/v4 (subscription, ZAI_API_KEY), while `glm`
+# → https://api.z.ai/api/paas/v4 (pay-per-use credits). Probing the pay-per-use path
+# answers 429 "Insufficient balance" even though the subscription is healthy — that is
+# a wrong-endpoint symptom, not a dead account (glm-provider.md §4/§10).
+# Backs [agents.analyst_glm]; glm-5.3 tool-loop verified on the subscription 2026-08-16.
 [providers.models.zai.default]
 model = "glm-5.3"
 api_key = ""
@@ -705,7 +700,7 @@ mcp_bundles = ["all"]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]
-model_provider = "opencode.glm"
+model_provider = "zai.default"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]

@@ -511,10 +511,16 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         auto-admit), so unlisted codemap-fs__* was stripped from subagents.
 # v3-37 = model catalog re-sync 2026-08-16: analyst_mimo -> analyst_luna
 #         (opencode.luna = gpt-5.6-luna on the Go router, reasoning_effort max),
-#         analyst_glm off the out-of-balance z.ai account onto opencode.glm
-#         (glm-5.3), coder -> gpt-5.6-sol, minimax-m3, cline-pass/qwen3.8-max;
-#         model_fallbacks + model_windows pruned to the live catalog.
-CURRENT_CONFIG_MARKER = "v3-37"
+#         analyst_glm glm-5.2 -> glm-5.3, coder -> gpt-5.6-sol, minimax-m3,
+#         cline-pass/qwen3.8-max; model_fallbacks + model_windows pruned to the
+#         live catalog.
+# v3-38 = revert of the analyst_glm provider move made in v3-37. The z.ai
+#         subscription is healthy: the provider name picks the endpoint, and only
+#         `glm` (pay-per-use /api/paas/v4) answers 429 "Insufficient balance" —
+#         `zai` (/api/coding/paas/v4, ZAI_API_KEY) serves glm-5.3 fine
+#         (tool-loop verified from the Fly machine). analyst_glm is back on
+#         zai.default and the throwaway opencode.glm alias is gone.
+CURRENT_CONFIG_MARKER = "v3-38"
 
 
 def sanitize_filename(filename: str) -> str:
