@@ -897,6 +897,7 @@ turn-stream-interrupted = [stream interrupted]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-reasoning-roundtrip = provider requires reasoning round-trip; dropped one plain assistant turn
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
