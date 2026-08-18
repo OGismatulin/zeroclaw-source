@@ -285,8 +285,7 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
     e: &anyhow::Error,
     iteration: usize,
     repaired: &mut bool,
-    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
-    observer: &dyn Observer,
+    ctx: &TurnCtx<'_>,
 ) -> bool {
     if !zeroclaw_providers::reliable::is_reasoning_roundtrip_rejected(e) {
         return false;
@@ -328,10 +327,16 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
             .with_category(::zeroclaw_log::EventCategory::Provider)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
+                "model": ctx.model,
                 "iteration": iteration + 1,
                 "repaired": repair_index.is_some(),
                 "already_repaired_this_turn": *repaired,
                 "assistant_shapes": shapes,
+                // Attribution: one daemon runs the coordinator and every
+                // delegate, so without these the event cannot be tied to the
+                // turn that produced it.
+                "agent_alias": ctx.agent_alias,
+                "trace_id": ctx.turn_id,
             })),
         "reasoning_roundtrip_rejected"
     );
@@ -343,7 +348,7 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
     *repaired = true;
 
     let reason = crate::i18n::get_required_cli_string("history-trim-reason-reasoning-roundtrip");
-    if let Some(tx) = event_tx {
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                 dropped_messages: 1,
@@ -352,13 +357,13 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
             })
             .await;
     }
-    observer.record_event(&ObserverEvent::HistoryTrimmed {
+    ctx.observer.record_event(&ObserverEvent::HistoryTrimmed {
         dropped_messages: 1,
         kept_turns: 0,
         reason,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(ToString::to_string),
+        turn_id: Some(ctx.turn_id.to_string()),
     });
     true
 }
@@ -379,6 +384,34 @@ mod tests {
         h
     }
 
+    /// Minimal `TurnCtx` for the repair tests: only observer/model/turn_id/
+    /// event_tx are read by the code under test.
+    fn repair_ctx<'a>(
+        pacing: &'a zeroclaw_config::schema::PacingConfig,
+        dedup_exempt_tools: &'a [String],
+        event_tx: Option<&'a tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            observer: &NoopObserver,
+            provider_name: "deepseek",
+            model: "deepseek-v4-pro",
+            temperature: None,
+            approval: None,
+            channel_name: "test-channel",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx,
+            hooks: None,
+            dedup_exempt_tools,
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "turn-roundtrip-test",
+            agent_alias: Some("analyst_deepseek_pro"),
+        }
+    }
+
     fn roundtrip_error() -> anyhow::Error {
         anyhow::Error::msg(
             r#"DeepSeek API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#,
@@ -390,6 +423,8 @@ mod tests {
     // be reconstructed) and it cannot orphan a tool_call/tool pair.
     #[tokio::test]
     async fn drops_last_plain_assistant_turn_and_retries() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("u1"),
@@ -402,8 +437,7 @@ mod tests {
             &roundtrip_error(),
             3,
             &mut repaired,
-            None,
-            &NoopObserver,
+            &repair_ctx(&pacing, &dedup_exempt_tools, None),
         )
         .await;
 
@@ -418,6 +452,8 @@ mod tests {
 
     #[tokio::test]
     async fn repairs_at_most_once_per_turn() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut history = vec![
             ChatMessage::user("u"),
             ChatMessage::assistant("a1"),
@@ -429,8 +465,7 @@ mod tests {
             &roundtrip_error(),
             4,
             &mut repaired,
-            None,
-            &NoopObserver,
+            &repair_ctx(&pacing, &dedup_exempt_tools, None),
         )
         .await;
 
@@ -440,6 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_candidate_means_no_repair() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut history = vec![
             ChatMessage::user("u"),
             ChatMessage::assistant(
@@ -453,8 +490,7 @@ mod tests {
             &roundtrip_error(),
             5,
             &mut repaired,
-            None,
-            &NoopObserver,
+            &repair_ctx(&pacing, &dedup_exempt_tools, None),
         )
         .await;
 
@@ -468,6 +504,8 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_other_error_classes() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("a")];
         let mut repaired = false;
         let err =
@@ -477,8 +515,7 @@ mod tests {
             &err,
             6,
             &mut repaired,
-            None,
-            &NoopObserver,
+            &repair_ctx(&pacing, &dedup_exempt_tools, None),
         )
         .await;
 
@@ -491,6 +528,8 @@ mod tests {
 
     #[tokio::test]
     async fn repair_emits_history_trimmed_event_with_its_own_reason() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
         let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("plain")];
         let mut repaired = false;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -501,8 +540,7 @@ mod tests {
                 &roundtrip_error(),
                 7,
                 &mut repaired,
-                Some(&tx),
-                &NoopObserver,
+                &repair_ctx(&pacing, &dedup_exempt_tools, Some(&tx)),
             )
             .await
         );
@@ -524,6 +562,98 @@ mod tests {
             }
             other => panic!("expected HistoryTrimmed, got {other:?}"),
         }
+    }
+
+    // G13: the emitted record itself must be attributable (model, trace_id,
+    // agent_alias) and must carry SHAPE only — never message content. Asserting
+    // on the helper alone would not prove what actually lands in the log.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn diagnostic_record_carries_attribution_and_no_message_content() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let secret_prose = "SENSITIVE-ASSISTANT-PROSE-42";
+        let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant(secret_prose)];
+        let mut repaired = false;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        assert!(
+            try_recover_reasoning_roundtrip(
+                &mut history,
+                &roundtrip_error(),
+                7,
+                &mut repaired,
+                &repair_ctx(&pacing, &dedup_exempt_tools, None),
+            )
+            .await
+        );
+
+        let mut record: Option<serde_json::Value> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while record.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, log_rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("reasoning_roundtrip_rejected")
+                    {
+                        record = Some(value);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        let record = record.expect("no reasoning_roundtrip_rejected record observed");
+        let attrs = record
+            .get("attributes")
+            .expect("record must carry attributes");
+        assert_eq!(
+            attrs.get("model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-pro")
+        );
+        assert_eq!(
+            attrs.get("trace_id").and_then(|v| v.as_str()),
+            Some("turn-roundtrip-test")
+        );
+        assert_eq!(
+            attrs.get("agent_alias").and_then(|v| v.as_str()),
+            Some("analyst_deepseek_pro")
+        );
+        assert_eq!(attrs.get("repaired").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(attrs.get("iteration").and_then(|v| v.as_u64()), Some(8));
+        let shapes = attrs
+            .get("assistant_shapes")
+            .and_then(|v| v.as_array())
+            .expect("shapes array");
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(
+            shapes[0].get("content_kind").and_then(|v| v.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            shapes[0].get("has_reasoning").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            shapes[0].get("has_tool_calls").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+
+        let serialized = record.to_string();
+        assert!(
+            !serialized.contains(secret_prose),
+            "the diagnostic record must never carry message content: {serialized}"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[test]
