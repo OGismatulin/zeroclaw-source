@@ -960,7 +960,15 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     .await?;
             }
 
-            let msg = ChatMessage::assistant(response_text.clone());
+            // fork patch #33: the FINAL assistant turn is the one a thinking
+            // provider demands back on the NEXT request, so it must keep the
+            // reasoning-preserving form `interpret_chat_response` produced.
+            // Pushing `response_text` here dropped it and left the cross-turn
+            // 400 unfixed even with the producer patch in place (found by an
+            // end-to-end probe against a provider that enforces the contract).
+            // With the capability off — or no reasoning — this value IS
+            // `response_text`, so the shape is unchanged for everyone else.
+            let msg = ChatMessage::assistant(assistant_history_content.clone());
             if let Some(out) = new_messages_out.as_deref_mut() {
                 out.push(msg.clone());
             }
