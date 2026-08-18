@@ -800,8 +800,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &e,
                     iteration,
                     &mut reasoning_roundtrip_repaired,
-                    event_tx.as_ref(),
-                    observer,
+                    &ctx,
                 )
                 .await
                 {

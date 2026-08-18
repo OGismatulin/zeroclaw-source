@@ -269,10 +269,18 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
 ///
 /// Both hints are required: `reasoning_content` alone appears in unrelated
 /// provider prose (#7725 "stop reasoning_content from leaking"), and `passed
-/// back` appears in other providers' messages. The HTTP status is deliberately
-/// not consulted — a proxied rejection can arrive wrapped in the router's own
-/// envelope, so the sentence is the reliable signal.
+/// back` appears in other providers' messages.
+///
+/// The HTTP status is deliberately NOT required to be 4xx: three of the four
+/// production occurrences arrived wrapped in Console Go's own envelope, whose
+/// status belongs to the router rather than to DeepSeek, so a 5xx can carry a
+/// genuine round-trip rejection. Rate limits are the one class excluded
+/// outright — a 429 is never fixed by dropping a history message, so letting it
+/// through would mutate history for nothing.
 pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
+    if is_rate_limited(err) {
+        return false;
+    }
     let lower = error_chain_text(err).to_lowercase();
     lower.contains("reasoning_content") && lower.contains("passed back")
 }
@@ -5620,6 +5628,27 @@ mod tests {
             r#"OpenCode Zen API error (400 Bad Request): {"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#,
         );
         assert!(is_reasoning_roundtrip_rejected(&err));
+    }
+
+    // A proxied rejection can carry the router's own 5xx while the inner
+    // sentence is DeepSeek's — that case MUST still classify (3 of 4 production
+    // events were wrapped by Console Go). Pins the status-agnostic decision.
+    #[test]
+    fn classifies_reasoning_roundtrip_behind_a_router_5xx() {
+        let err = anyhow::Error::msg(
+            r#"OpenCode Zen API error (502 Bad Gateway): {"error":{"message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#,
+        );
+        assert!(is_reasoning_roundtrip_rejected(&err));
+    }
+
+    // A rate limit is never repaired by dropping a history message, so it is
+    // excluded even when the body echoes the round-trip sentence.
+    #[test]
+    fn does_not_classify_rate_limits_even_with_the_roundtrip_sentence() {
+        let err = anyhow::Error::msg(
+            r#"Custom API error (429 Too Many Requests): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API."}}"#,
+        );
+        assert!(!is_reasoning_roundtrip_rejected(&err));
     }
 
     #[test]
