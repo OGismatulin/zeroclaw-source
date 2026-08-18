@@ -2490,6 +2490,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        // `convert_messages` already reconstructs this exact shape: assistant
+        // JSON with `reasoning_content`/`reasoning` and no `tool_calls` key
+        // (#6233). Producing it keeps DeepSeek-family thinking round-trips valid.
+        true
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
@@ -3541,6 +3548,14 @@ mod tests {
         OpenAiCompatibleModelProvider::new("test", name, url, key, AuthStyle::Bearer)
     }
 
+    // Fork patch #33: convert_messages already parses the reasoning-only
+    // assistant history form (#6233), so this family declares the capability.
+    #[test]
+    fn compatible_provider_supports_reasoning_only_history() {
+        let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        assert!(p.supports_reasoning_only_history());
+    }
+
     #[test]
     fn creates_with_key() {
         let p = make_model_provider(
@@ -4424,6 +4439,43 @@ mod tests {
         assert!(id0.chars().all(|c| c.is_ascii_alphanumeric()));
         assert!(id1.chars().all(|c| c.is_ascii_alphanumeric()));
         assert_ne!(id0, id1);
+    }
+
+    // Fork patch #33 round-trip: the producer's reasoning-only history entry must
+    // come back out of the converter as a NativeMessage carrying
+    // `reasoning_content` and no tool_calls, otherwise DeepSeek-family thinking
+    // models reject the next request (#6233).
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_only_assistant_history() {
+        let input = vec![ChatMessage::assistant(
+            r#"{"content":"hello","reasoning_content":"because"}"#,
+        )];
+
+        let provider = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[0].reasoning_content.as_deref(), Some("because"));
+        assert!(converted[0].tool_calls.is_none());
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(value)) if value == "hello"
+        ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_round_trips_reasoning_only_history_with_null_content() {
+        let input = vec![ChatMessage::assistant(
+            r#"{"content":null,"reasoning_content":"because"}"#,
+        )];
+
+        let provider = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[0].reasoning_content.as_deref(), Some("because"));
+        assert!(converted[0].tool_calls.is_none());
+        assert!(converted[0].content.is_none());
     }
 
     #[test]

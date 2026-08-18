@@ -251,6 +251,118 @@ pub(crate) async fn try_recover_context_overflow(
     false
 }
 
+/// Shape of one assistant history entry — diagnostics only, never content.
+///
+/// Returns `(has_reasoning, has_tool_calls, content_kind)`.
+fn assistant_shape(content: &str) -> (bool, bool, &'static str) {
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value) if value.is_object() => (
+            value.get("reasoning_content").is_some() || value.get("reasoning").is_some(),
+            value.get("tool_calls").is_some(),
+            "json",
+        ),
+        _ if content.trim().is_empty() => (false, false, "empty"),
+        _ => (false, false, "text"),
+    }
+}
+
+/// Reasoning-round-trip recovery (fork patch #33).
+///
+/// Thinking-mode providers reject a request whose previous assistant turn lost
+/// its `reasoning_content` ("The `reasoning_content` in the thinking mode must be
+/// passed back to the API"). The lost value cannot be reconstructed — it is gone
+/// from the history by the time the rejection arrives, or the model never sent
+/// one — so the repair drops that single plain assistant turn and retries.
+///
+/// The candidate is the last assistant entry carrying neither reasoning nor
+/// `tool_calls`: plain text that no `role=tool` message references, so removing
+/// it cannot orphan a tool_call/tool pair. At most one repair per turn
+/// (`repaired`), otherwise a persistently broken history would spin the loop.
+///
+/// Returns `true` when the caller should `continue` the loop.
+pub(crate) async fn try_recover_reasoning_roundtrip(
+    history: &mut Vec<ChatMessage>,
+    e: &anyhow::Error,
+    iteration: usize,
+    repaired: &mut bool,
+    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    observer: &dyn Observer,
+) -> bool {
+    if !zeroclaw_providers::reliable::is_reasoning_roundtrip_rejected(e) {
+        return false;
+    }
+
+    // Diagnostics first, and unconditionally: the shape of the last assistant
+    // messages is the only way the NEXT occurrence is provable. `runtime-trace`
+    // is a rolling window and daemon-stderr at floor=warn carries no request
+    // shapes, so the incident window is gone before anyone looks. Shape only —
+    // no message content, no credentials.
+    let shapes: Vec<serde_json::Value> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == "assistant")
+        .rev()
+        .take(5)
+        .map(|(index, message)| {
+            let (has_reasoning, has_tool_calls, content_kind) = assistant_shape(&message.content);
+            ::serde_json::json!({
+                "index": index,
+                "has_reasoning": has_reasoning,
+                "has_tool_calls": has_tool_calls,
+                "content_kind": content_kind,
+            })
+        })
+        .collect();
+
+    let candidate = history.iter().rposition(|message| {
+        message.role == "assistant" && {
+            let (has_reasoning, has_tool_calls, _) = assistant_shape(&message.content);
+            !has_reasoning && !has_tool_calls
+        }
+    });
+    let repair_index = candidate.filter(|_| !*repaired);
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "iteration": iteration + 1,
+                "repaired": repair_index.is_some(),
+                "already_repaired_this_turn": *repaired,
+                "assistant_shapes": shapes,
+            })),
+        "reasoning_roundtrip_rejected"
+    );
+
+    let Some(index) = repair_index else {
+        return false;
+    };
+    history.remove(index);
+    *repaired = true;
+
+    let reason = crate::i18n::get_required_cli_string("history-trim-reason-reasoning-roundtrip");
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                dropped_messages: 1,
+                kept_turns: 0,
+                reason: reason.clone(),
+            })
+            .await;
+    }
+    observer.record_event(&ObserverEvent::HistoryTrimmed {
+        dropped_messages: 1,
+        kept_turns: 0,
+        reason,
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +377,171 @@ mod tests {
             h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
         }
         h
+    }
+
+    fn roundtrip_error() -> anyhow::Error {
+        anyhow::Error::msg(
+            r#"DeepSeek API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#,
+        )
+    }
+
+    // Fork patch #33: a plain-text assistant turn is what the thinking provider
+    // rejects; dropping it is the only available repair (the lost reasoning cannot
+    // be reconstructed) and it cannot orphan a tool_call/tool pair.
+    #[tokio::test]
+    async fn drops_last_plain_assistant_turn_and_retries() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("plain text turn"),
+            ChatMessage::user("u2"),
+        ];
+        let mut repaired = false;
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &roundtrip_error(),
+            3,
+            &mut repaired,
+            None,
+            &NoopObserver,
+        )
+        .await;
+
+        assert!(recovered, "the turn must be retried after the repair");
+        assert!(repaired, "the per-turn repair budget must be consumed");
+        assert_eq!(history.len(), 3);
+        assert!(
+            history.iter().all(|m| m.content != "plain text turn"),
+            "the offending assistant turn must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn repairs_at_most_once_per_turn() {
+        let mut history = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::assistant("a2"),
+        ];
+        let mut repaired = true; // already repaired earlier in this same turn
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &roundtrip_error(),
+            4,
+            &mut repaired,
+            None,
+            &NoopObserver,
+        )
+        .await;
+
+        assert!(!recovered, "a second repair in one turn would risk a loop");
+        assert_eq!(history.len(), 3, "history must be untouched");
+    }
+
+    #[tokio::test]
+    async fn no_candidate_means_no_repair() {
+        let mut history = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant(
+                r#"{"content":"x","tool_calls":[{"id":"1","name":"t","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::assistant(r#"{"content":"y","reasoning_content":"r"}"#),
+        ];
+        let mut repaired = false;
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &roundtrip_error(),
+            5,
+            &mut repaired,
+            None,
+            &NoopObserver,
+        )
+        .await;
+
+        assert!(
+            !recovered,
+            "nothing to repair: every assistant turn is well formed"
+        );
+        assert!(!repaired);
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn ignores_other_error_classes() {
+        let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("a")];
+        let mut repaired = false;
+        let err =
+            anyhow::Error::msg("API error (400 Bad Request): maximum context length exceeded");
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &err,
+            6,
+            &mut repaired,
+            None,
+            &NoopObserver,
+        )
+        .await;
+
+        assert!(
+            !recovered,
+            "context-window failures belong to the other recovery"
+        );
+        assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repair_emits_history_trimmed_event_with_its_own_reason() {
+        let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("plain")];
+        let mut repaired = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        assert!(
+            try_recover_reasoning_roundtrip(
+                &mut history,
+                &roundtrip_error(),
+                7,
+                &mut repaired,
+                Some(&tx),
+                &NoopObserver,
+            )
+            .await
+        );
+
+        match rx
+            .try_recv()
+            .expect("repair must not be silent to subscribers")
+        {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                reason,
+                ..
+            } => {
+                assert_eq!(dropped_messages, 1);
+                assert_eq!(
+                    reason,
+                    crate::i18n::get_required_cli_string("history-trim-reason-reasoning-roundtrip")
+                );
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_shape_classifies_history_forms_without_leaking_content() {
+        assert_eq!(assistant_shape("plain text"), (false, false, "text"));
+        assert_eq!(assistant_shape("   "), (false, false, "empty"));
+        assert_eq!(
+            assistant_shape(r#"{"content":"x","reasoning_content":"r"}"#),
+            (true, false, "json")
+        );
+        assert_eq!(
+            assistant_shape(r#"{"content":"x","reasoning":"r"}"#),
+            (true, false, "json")
+        );
+        assert_eq!(
+            assistant_shape(r#"{"content":null,"tool_calls":[{"id":"1"}]}"#),
+            (false, true, "json")
+        );
     }
 
     #[tokio::test]

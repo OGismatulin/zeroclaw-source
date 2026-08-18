@@ -656,6 +656,19 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         self.capabilities().vision
     }
 
+    /// Whether this model_provider's request converter understands the
+    /// reasoning-only assistant history form: a JSON `content` carrying
+    /// `reasoning_content` and **no** `tool_calls` key.
+    ///
+    /// Thinking-mode families (DeepSeek V4 and routers proxying them) reject the
+    /// next request with a 400 when the previous assistant turn's reasoning was
+    /// not passed back (#6233), while converters that cannot parse the form would
+    /// leak literal JSON as assistant text. Hence the default is `false` and only
+    /// families whose converter handles the shape opt in.
+    fn supports_reasoning_only_history(&self) -> bool {
+        false
+    }
+
     /// Warm up the HTTP connection pool.
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
@@ -778,6 +791,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn supports_vision(&self) -> bool {
         self.as_ref().supports_vision()
+    }
+
+    fn supports_reasoning_only_history(&self) -> bool {
+        self.as_ref().supports_reasoning_only_history()
     }
 
     async fn chat_with_system(

@@ -59,6 +59,33 @@ pub(crate) fn build_native_assistant_history(
     obj.to_string()
 }
 
+/// Assistant history entry for a text-only turn from a thinking-mode provider:
+/// JSON `content` plus `reasoning_content`, with **no** `tool_calls` key.
+///
+/// Two upstream constraints meet here. Strict validators (DeepSeek V4, NVIDIA
+/// NIM) reject an assistant message carrying `tool_calls: []` (#6298), so the key
+/// must be absent rather than empty. DeepSeek-family thinking models reject the
+/// NEXT request when the previous assistant turn's `reasoning_content` was not
+/// passed back (#6233) — the shape `compatible.rs::convert_messages` already
+/// parses. Gated by `ModelProvider::supports_reasoning_only_history` so
+/// converters that cannot read it never receive literal JSON as assistant text.
+pub(crate) fn build_reasoning_only_assistant_history(
+    text: &str,
+    reasoning_content: &str,
+) -> String {
+    let content = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.trim().to_string())
+    };
+
+    serde_json::json!({
+        "content": content,
+        "reasoning_content": reasoning_content,
+    })
+    .to_string()
+}
+
 pub(crate) fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -276,8 +303,17 @@ pub(crate) async fn interpret_chat_response(
     // Preserve native tool call IDs in assistant history so role=tool
     // follow-up messages can reference the exact call id.
     let reasoning_content = resp.reasoning_content.clone();
+    let reasoning_only_history = reasoning_content
+        .as_deref()
+        .filter(|rc| !rc.is_empty())
+        .filter(|_| specs.use_native_tools && specs.reasoning_only_history);
     let assistant_history_content = if resp.tool_calls.is_empty() {
-        if specs.use_native_tools {
+        if let Some(rc) = reasoning_only_history {
+            // Text-only turn on a thinking provider: keep the reasoning so the
+            // next request round-trips it (#6233); the `tool_calls` key stays
+            // absent (#6298).
+            build_reasoning_only_assistant_history(&response_text, rc)
+        } else if specs.use_native_tools {
             build_native_assistant_history_from_parsed_calls(
                 &response_text,
                 &calls,
@@ -425,6 +461,7 @@ mod cost_usd_regression_tests {
             tool_specs: vec![],
             known_tool_names: HashSet::new(),
             use_native_tools: false,
+            reasoning_only_history: false,
         };
 
         let resp = ChatResponse {
@@ -506,5 +543,121 @@ mod cost_usd_regression_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+}
+
+#[cfg(test)]
+mod reasoning_only_history_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Drive the REAL `interpret_chat_response` (not a private helper) and return
+    /// the assistant history entry it would push. `capability` mirrors
+    /// `ModelProvider::supports_reasoning_only_history` as carried by the
+    /// iteration specs.
+    async fn assistant_history(
+        capability: bool,
+        native_tools: bool,
+        reasoning: Option<&str>,
+        text: &str,
+    ) -> String {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let ctx = TurnCtx {
+            observer: &crate::observability::NoopObserver,
+            provider_name: "deepseek",
+            model: "deepseek-v4-pro",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: "turn-reasoning-roundtrip",
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: vec![],
+            known_tool_names: HashSet::new(),
+            use_native_tools: native_tools,
+            reasoning_only_history: capability,
+        };
+        let resp = ChatResponse {
+            text: Some(text.to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: reasoning.map(str::to_string),
+        };
+        let now = std::time::Instant::now();
+        interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false)
+            .await
+            .assistant_history_content
+    }
+
+    #[tokio::test]
+    async fn text_turn_keeps_reasoning_when_provider_supports_reasoning_only_history() {
+        let history = assistant_history(true, true, Some("because"), "hello").await;
+        let value: serde_json::Value = serde_json::from_str(&history).expect("JSON history");
+        assert_eq!(value["content"], "hello");
+        assert_eq!(value["reasoning_content"], "because");
+        assert!(
+            value.get("tool_calls").is_none(),
+            "#6298: strict validators reject `tool_calls: []`, the key must be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_turn_stays_plain_when_capability_is_off() {
+        assert_eq!(
+            assistant_history(false, true, Some("because"), "hello").await,
+            "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_turn_stays_plain_without_reasoning() {
+        assert_eq!(assistant_history(true, true, None, "hello").await, "hello");
+        assert_eq!(
+            assistant_history(true, true, Some(""), "hello").await,
+            "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_text_turn_with_reasoning_encodes_null_content() {
+        let history = assistant_history(true, true, Some("because"), "").await;
+        let value: serde_json::Value = serde_json::from_str(&history).expect("JSON history");
+        assert!(value["content"].is_null());
+        assert_eq!(value["reasoning_content"], "because");
+    }
+
+    #[tokio::test]
+    async fn non_native_path_is_untouched() {
+        assert_eq!(
+            assistant_history(true, false, Some("because"), "hello").await,
+            "hello",
+            "the prompt-guided (non-native) path must not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_branch_emits_an_empty_tool_calls_array() {
+        for capability in [true, false] {
+            for native in [true, false] {
+                for reasoning in [Some("r"), None] {
+                    let history = assistant_history(capability, native, reasoning, "hello").await;
+                    assert!(
+                        !history.contains("\"tool_calls\":[]"),
+                        "regression #6298: empty tool_calls array leaked into history: {history}"
+                    );
+                }
+            }
+        }
     }
 }

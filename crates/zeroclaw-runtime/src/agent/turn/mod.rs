@@ -73,7 +73,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    record_llm_failure, try_recover_context_overflow, try_recover_reasoning_roundtrip,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
@@ -420,6 +422,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
     };
+
+    // Fork patch #33: one reasoning-round-trip repair per turn. A persistently
+    // broken history must fail honestly instead of spinning the loop.
+    let mut reasoning_roundtrip_repaired = false;
 
     for iteration in 0..max_iterations {
         // Steering: fold caller-pushed mid-turn messages into history before
@@ -784,6 +790,21 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 )
                 .await;
                 if recovered {
+                    continue;
+                }
+                // Thinking-mode providers reject the request when the previous
+                // assistant turn lost its `reasoning_content`; drop that one
+                // plain turn and retry (fork patch #33).
+                if try_recover_reasoning_roundtrip(
+                    history,
+                    &e,
+                    iteration,
+                    &mut reasoning_roundtrip_repaired,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await
+                {
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the
