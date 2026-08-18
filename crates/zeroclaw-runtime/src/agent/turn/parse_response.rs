@@ -425,6 +425,7 @@ mod cost_usd_regression_tests {
             tool_specs: vec![],
             known_tool_names: HashSet::new(),
             use_native_tools: false,
+            reasoning_only_history: false,
         };
 
         let resp = ChatResponse {

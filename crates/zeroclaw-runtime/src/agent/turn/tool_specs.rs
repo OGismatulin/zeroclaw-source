@@ -11,12 +11,17 @@ pub(crate) struct IterationToolSpecs {
     pub(crate) tool_specs: Vec<ToolSpec>,
     pub(crate) known_tool_names: HashSet<String>,
     pub(crate) use_native_tools: bool,
+    /// Provider converter understands the reasoning-only assistant history form
+    /// (see `ModelProvider::supports_reasoning_only_history`). Read by
+    /// `interpret_chat_response` when a turn produced text without tool calls.
+    pub(crate) reasoning_only_history: bool,
 }
 
 impl IterationToolSpecs {
     pub(crate) fn refresh_native_tool_mode(&mut self, model_provider: &dyn ModelProvider) {
         self.use_native_tools =
             model_provider.supports_native_tools() && !self.tool_specs.is_empty();
+        self.reasoning_only_history = model_provider.supports_reasoning_only_history();
     }
 }
 
@@ -57,11 +62,13 @@ pub(crate) fn build_iteration_tool_specs(
         .map(|tool| tool.name.to_ascii_lowercase())
         .collect();
     let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+    let reasoning_only_history = model_provider.supports_reasoning_only_history();
 
     Ok(IterationToolSpecs {
         tool_specs,
         known_tool_names,
         use_native_tools,
+        reasoning_only_history,
     })
 }
 
@@ -138,6 +145,70 @@ mod tests {
         fn alias(&self) -> &str {
             "test-prompt-tools-provider"
         }
+    }
+
+    struct ReasoningOnlyHistoryProvider;
+
+    #[async_trait]
+    impl ModelProvider for ReasoningOnlyHistoryProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn supports_reasoning_only_history(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("test provider should not execute chat")
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ReasoningOnlyHistoryProvider {
+        fn role(&self) -> Role {
+            Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-reasoning-only-history-provider"
+        }
+    }
+
+    // Fork patch #33: the producer reads this flag off the iteration specs, so it
+    // must be populated on the initial build...
+    #[test]
+    fn iteration_specs_carry_reasoning_only_history_capability() {
+        let specs = build_iteration_tool_specs(&ReasoningOnlyHistoryProvider, &[], &[], None)
+            .expect("specs build");
+        assert!(specs.reasoning_only_history);
+
+        let specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None)
+            .expect("specs build");
+        assert!(!specs.reasoning_only_history);
+    }
+
+    // ...and refreshed when the model (hence provider) switches inside a turn.
+    #[test]
+    fn refresh_native_tool_mode_also_refreshes_reasoning_only_history() {
+        let mut specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None)
+            .expect("specs build");
+        assert!(!specs.reasoning_only_history);
+        specs.refresh_native_tool_mode(&ReasoningOnlyHistoryProvider);
+        assert!(
+            specs.reasoning_only_history,
+            "a model switch inside a turn must refresh the capability"
+        );
+        specs.refresh_native_tool_mode(&NativeToolsProvider);
+        assert!(!specs.reasoning_only_history);
     }
 
     struct CountingTool {
