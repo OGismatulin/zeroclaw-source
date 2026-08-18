@@ -458,7 +458,10 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "nothing to repair: every assistant turn is well formed");
+        assert!(
+            !recovered,
+            "nothing to repair: every assistant turn is well formed"
+        );
         assert!(!repaired);
         assert_eq!(history.len(), 3);
     }
@@ -467,7 +470,8 @@ mod tests {
     async fn ignores_other_error_classes() {
         let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant("a")];
         let mut repaired = false;
-        let err = anyhow::Error::msg("API error (400 Bad Request): maximum context length exceeded");
+        let err =
+            anyhow::Error::msg("API error (400 Bad Request): maximum context length exceeded");
         let recovered = try_recover_reasoning_roundtrip(
             &mut history,
             &err,
@@ -478,7 +482,10 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "context-window failures belong to the other recovery");
+        assert!(
+            !recovered,
+            "context-window failures belong to the other recovery"
+        );
         assert_eq!(history.len(), 2);
     }
 
@@ -500,7 +507,10 @@ mod tests {
             .await
         );
 
-        match rx.try_recv().expect("repair must not be silent to subscribers") {
+        match rx
+            .try_recv()
+            .expect("repair must not be silent to subscribers")
+        {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
                 dropped_messages,
                 reason,

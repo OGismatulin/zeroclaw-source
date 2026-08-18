@@ -5609,7 +5609,7 @@ mod tests {
     #[test]
     fn classifies_direct_deepseek_reasoning_roundtrip_400() {
         let err = anyhow::Error::msg(
-            r#"DeepSeek API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#
+            r#"DeepSeek API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#,
         );
         assert!(is_reasoning_roundtrip_rejected(&err));
     }
@@ -5617,7 +5617,7 @@ mod tests {
     #[test]
     fn classifies_console_go_wrapped_reasoning_roundtrip_400() {
         let err = anyhow::Error::msg(
-            r#"OpenCode Zen API error (400 Bad Request): {"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#
+            r#"OpenCode Zen API error (400 Bad Request): {"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#,
         );
         assert!(is_reasoning_roundtrip_rejected(&err));
     }

@@ -191,16 +191,16 @@ mod tests {
             .expect("specs build");
         assert!(specs.reasoning_only_history);
 
-        let specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None)
-            .expect("specs build");
+        let specs =
+            build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None).expect("specs build");
         assert!(!specs.reasoning_only_history);
     }
 
     // ...and refreshed when the model (hence provider) switches inside a turn.
     #[test]
     fn refresh_native_tool_mode_also_refreshes_reasoning_only_history() {
-        let mut specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None)
-            .expect("specs build");
+        let mut specs =
+            build_iteration_tool_specs(&NativeToolsProvider, &[], &[], None).expect("specs build");
         assert!(!specs.reasoning_only_history);
         specs.refresh_native_tool_mode(&ReasoningOnlyHistoryProvider);
         assert!(

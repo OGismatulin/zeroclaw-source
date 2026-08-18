@@ -69,7 +69,10 @@ pub(crate) fn build_native_assistant_history(
 /// passed back (#6233) — the shape `compatible.rs::convert_messages` already
 /// parses. Gated by `ModelProvider::supports_reasoning_only_history` so
 /// converters that cannot read it never receive literal JSON as assistant text.
-pub(crate) fn build_reasoning_only_assistant_history(text: &str, reasoning_content: &str) -> String {
+pub(crate) fn build_reasoning_only_assistant_history(
+    text: &str,
+    reasoning_content: &str,
+) -> String {
     let content = if text.trim().is_empty() {
         serde_json::Value::Null
     } else {
@@ -620,7 +623,10 @@ mod reasoning_only_history_tests {
     #[tokio::test]
     async fn text_turn_stays_plain_without_reasoning() {
         assert_eq!(assistant_history(true, true, None, "hello").await, "hello");
-        assert_eq!(assistant_history(true, true, Some(""), "hello").await, "hello");
+        assert_eq!(
+            assistant_history(true, true, Some(""), "hello").await,
+            "hello"
+        );
     }
 
     #[tokio::test]
