@@ -297,6 +297,14 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or(false)
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        // Default provider decides, never any route (#6589 shape).
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_reasoning_only_history())
+            .unwrap_or(false)
+    }
+
     fn supports_streaming(&self) -> bool {
         self.model_providers
             .iter()
@@ -927,6 +935,72 @@ mod tests {
             inner.insert(format!("{model}.output"), output);
         }
         map
+    }
+
+    // Fork patch #33: the bot's /model override path runs through the router, so
+    // the capability must reflect the DEFAULT provider, not any route (#6589 shape).
+    #[test]
+    fn router_forwards_reasoning_only_history_from_default_provider() {
+        struct ReasoningHistoryMock(bool);
+
+        #[async_trait]
+        impl ModelProvider for ReasoningHistoryMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_reasoning_only_history(&self) -> bool {
+                self.0
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ReasoningHistoryMock"
+            }
+        }
+
+        fn router(default_supports: bool, route_supports: bool) -> RouterModelProvider {
+            RouterModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "default".into(),
+                        Box::new(ReasoningHistoryMock(default_supports)) as Box<dyn ModelProvider>,
+                    ),
+                    (
+                        "other".into(),
+                        Box::new(ReasoningHistoryMock(route_supports)) as Box<dyn ModelProvider>,
+                    ),
+                ],
+                vec![(
+                    "hint:other".into(),
+                    Route {
+                        provider_name: "other".into(),
+                        model: "other-model".into(),
+                    },
+                )],
+                "default-model".into(),
+            )
+        }
+
+        assert!(router(true, false).supports_reasoning_only_history());
+        assert!(
+            !router(false, true).supports_reasoning_only_history(),
+            "a non-supporting default must not inherit the capability from a route"
+        );
     }
 
     #[test]

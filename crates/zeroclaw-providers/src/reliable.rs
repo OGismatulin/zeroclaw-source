@@ -1841,6 +1841,14 @@ impl ModelProvider for ReliableModelProvider {
             .unwrap_or(false)
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        // Primary decides, never `.any()` across the fallback chain (#6589).
+        self.model_providers
+            .first()
+            .map(|entry| entry.provider.supports_reasoning_only_history())
+            .unwrap_or(false)
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -5578,6 +5586,83 @@ mod tests {
         );
 
         assert!(provider.supports_vision());
+    }
+
+    // Fork patch #33: the reasoning-only history capability must reach the turn
+    // engine through this wrapper (every delegate runs behind it), and it must
+    // reflect the primary provider, not .any() across the fallback chain (#6589).
+    #[test]
+    fn supports_reasoning_only_history_reflects_first_provider() {
+        struct ReasoningHistoryMock(bool);
+
+        #[async_trait]
+        impl ModelProvider for ReasoningHistoryMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_reasoning_only_history(&self) -> bool {
+                self.0
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "ReasoningHistoryMock"
+            }
+        }
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(ReasoningHistoryMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(ReasoningHistoryMock(false)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert!(
+            provider.supports_reasoning_only_history(),
+            "ReliableModelProvider must propagate supports_reasoning_only_history from the first provider"
+        );
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(ReasoningHistoryMock(false)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(ReasoningHistoryMock(true)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert!(
+            !provider.supports_reasoning_only_history(),
+            "a non-supporting primary must not inherit the capability from a fallback"
+        );
     }
 
     #[tokio::test]

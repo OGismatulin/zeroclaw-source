@@ -2490,6 +2490,13 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        // `convert_messages` already reconstructs this exact shape: assistant
+        // JSON with `reasoning_content`/`reasoning` and no `tool_calls` key
+        // (#6233). Producing it keeps DeepSeek-family thinking round-trips valid.
+        true
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
@@ -3539,6 +3546,14 @@ mod tests {
         key: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::new("test", name, url, key, AuthStyle::Bearer)
+    }
+
+    // Fork patch #33: convert_messages already parses the reasoning-only
+    // assistant history form (#6233), so this family declares the capability.
+    #[test]
+    fn compatible_provider_supports_reasoning_only_history() {
+        let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        assert!(p.supports_reasoning_only_history());
     }
 
     #[test]

@@ -66,6 +66,10 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.supports_vision()
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        self.inner.supports_reasoning_only_history()
+    }
+
     fn supports_streaming(&self) -> bool {
         self.inner.supports_streaming()
     }
@@ -181,5 +185,68 @@ impl zeroclaw_api::attribution::Attributable for ModelPinnedProvider {
     }
     fn alias(&self) -> &str {
         self.descriptor.actual_provider()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use zeroclaw_api::model_provider::ModelProvider;
+
+    struct ReasoningHistoryMock(bool);
+
+    #[async_trait]
+    impl ModelProvider for ReasoningHistoryMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_reasoning_only_history(&self) -> bool {
+            self.0
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ReasoningHistoryMock"
+        }
+    }
+
+    fn pinned(inner: bool) -> ModelPinnedProvider {
+        ModelPinnedProvider::new(
+            ProviderCandidateDescriptor::pinned("deepseek", Some("pro"), "deepseek-v4-pro"),
+            Box::new(ReasoningHistoryMock(inner)),
+        )
+    }
+
+    // Fork patch #33: aliases that pin `model` (deepseek.pro, custom.cline_qwen)
+    // are wrapped here; without the forward the capability is silently false and
+    // the producer patch never reaches production.
+    #[test]
+    fn model_pin_forwards_reasoning_only_history() {
+        assert!(pinned(true).supports_reasoning_only_history());
+        assert!(!pinned(false).supports_reasoning_only_history());
+    }
+
+    #[test]
+    fn arc_blanket_forwards_reasoning_only_history() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(ReasoningHistoryMock(true));
+        assert!(provider.supports_reasoning_only_history());
+        let provider: Arc<dyn ModelProvider> = Arc::new(ReasoningHistoryMock(false));
+        assert!(!provider.supports_reasoning_only_history());
     }
 }
