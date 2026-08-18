@@ -263,6 +263,20 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
+/// Thinking-mode providers reject the NEXT request when the previous assistant
+/// turn's `reasoning_content` was not passed back (DeepSeek V4 directly, and
+/// routers such as OpenCode Zen's Console Go that proxy it verbatim).
+///
+/// Both hints are required: `reasoning_content` alone appears in unrelated
+/// provider prose (#7725 "stop reasoning_content from leaking"), and `passed
+/// back` appears in other providers' messages. The HTTP status is deliberately
+/// not consulted — a proxied rejection can arrive wrapped in the router's own
+/// envelope, so the sentence is the reliable signal.
+pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
+    let lower = error_chain_text(err).to_lowercase();
+    lower.contains("reasoning_content") && lower.contains("passed back")
+}
+
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
     if let Some(code) = typed_http_status(err) {
@@ -5586,6 +5600,43 @@ mod tests {
         );
 
         assert!(provider.supports_vision());
+    }
+
+    // Fork patch #33: classify the DeepSeek-family thinking round-trip rejection.
+    // Both real production texts must match: the direct DeepSeek 400 (DV-34735,
+    // analyst_deepseek_pro) and the same sentence proxied by OpenCode Zen's
+    // Console Go router (DV-34729).
+    #[test]
+    fn classifies_direct_deepseek_reasoning_roundtrip_400() {
+        let err = anyhow::Error::msg(
+            r#"DeepSeek API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#
+        );
+        assert!(is_reasoning_roundtrip_rejected(&err));
+    }
+
+    #[test]
+    fn classifies_console_go_wrapped_reasoning_roundtrip_400() {
+        let err = anyhow::Error::msg(
+            r#"OpenCode Zen API error (400 Bad Request): {"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#
+        );
+        assert!(is_reasoning_roundtrip_rejected(&err));
+    }
+
+    #[test]
+    fn does_not_classify_unrelated_provider_errors_as_reasoning_roundtrip() {
+        for text in [
+            "API error (400 Bad Request): maximum context length exceeded",
+            // #7725 prose mentions reasoning_content without the round-trip demand.
+            "API error (400 Bad Request): stop reasoning_content from leaking into response text",
+            r#"Custom API error (429 Too Many Requests): {"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: You have reached your monthly Clinepass limit."}}"#,
+            "API error (500): internal server error",
+        ] {
+            let err = anyhow::Error::msg(text.to_string());
+            assert!(
+                !is_reasoning_roundtrip_rejected(&err),
+                "must not classify as reasoning round-trip: {text}"
+            );
+        }
     }
 
     // Fork patch #33: the reasoning-only history capability must reach the turn
