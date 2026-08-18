@@ -278,6 +278,14 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
 /// outright — a 429 is never fixed by dropping a history message, so letting it
 /// through would mutate history for nothing.
 pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
+    // Already classified at the provider boundary: the summary Display of a
+    // TerminalProviderFailure drops the provider body, so the kind is the only
+    // surviving evidence by the time the turn engine sees the error.
+    if terminal_provider_failure(err)
+        .is_some_and(|failure| failure.diagnostic().kind() == "reasoning_roundtrip")
+    {
+        return true;
+    }
     if is_rate_limited(err) {
         return false;
     }
@@ -801,6 +809,24 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             disposition,
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
+            endpoint,
+            status,
+            retry_after_secs,
+        };
+    }
+
+    // fork patch #33: classify HERE, where the provider body is still attached.
+    // `TerminalProviderFailure`'s Display carries only the summary line
+    // (`provider call failed: ... kind=... disposition=...`), so a consumer above
+    // the reliability layer — the turn engine's recovery — can never see the
+    // sentence. Carrying it as a distinct `kind` is how `context_window` already
+    // solves the same problem.
+    if is_reasoning_roundtrip_rejected(err) {
+        return ProviderErrorDiagnostic {
+            kind: "reasoning_roundtrip",
+            disposition,
+            phase: "request_validation",
+            hint: "pass the previous turn's reasoning_content back, or drop that turn",
             endpoint,
             status,
             retry_after_secs,
@@ -5628,6 +5654,30 @@ mod tests {
             r#"OpenCode Zen API error (400 Bad Request): {"error":{"param":null,"type":"invalid_request_error","code":"invalid_request_error","message":"Error from provider (Console Go): Upstream request failed: [invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API."}}"#,
         );
         assert!(is_reasoning_roundtrip_rejected(&err));
+    }
+
+    // The turn engine only ever sees the summary Display of a wrapped terminal
+    // failure, so the kind must survive the wrap. Without this the recovery is
+    // dead code in production (found by an end-to-end probe on 2026-08-18).
+    #[test]
+    fn wrapped_terminal_failure_keeps_the_reasoning_roundtrip_kind() {
+        let raw = anyhow::Error::msg(
+            r#"Custom API error (400 Bad Request): {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#,
+        );
+        let wrapped = ensure_terminal_provider_failure(
+            raw,
+            "cline",
+            "fake-thinking-model",
+            ProviderRoute::Main,
+        );
+
+        let terminal = terminal_provider_failure(&wrapped).expect("terminal failure");
+        assert_eq!(terminal.diagnostic().kind(), "reasoning_roundtrip");
+        // The summary line no longer contains the sentence...
+        let summary = format!("{wrapped}");
+        assert!(!summary.to_lowercase().contains("passed back"), "{summary}");
+        // ...yet the predicate still recognises it through the kind.
+        assert!(is_reasoning_roundtrip_rejected(&wrapped));
     }
 
     // A proxied rejection can carry the router's own 5xx while the inner
