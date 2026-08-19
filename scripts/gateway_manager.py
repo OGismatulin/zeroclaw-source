@@ -530,7 +530,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         where luna silently runs at the codex xhigh default. The opencode.luna
 #         alias is gone. Live-probed on Fly 2026-08-19: luna/terra/sol answer 200
 #         to max|xhigh|medium and echo the requested effort (no silent downgrade).
-CURRENT_CONFIG_MARKER = "v3-39"
+CURRENT_CONFIG_MARKER = "v3-40"
 
 
 def sanitize_filename(filename: str) -> str:
