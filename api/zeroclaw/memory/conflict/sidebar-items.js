@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["check_and_resolve_conflicts","find_text_conflicts","jaccard_similarity","judge_conflicts","mark_superseded"]};
