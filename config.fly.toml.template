@@ -38,16 +38,6 @@ uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
 
-# Analyst slot: GPT-5.6 Luna on the Go router (NOT the codex OAuth runtime).
-# reasoning_effort = "max" goes through provider_extra (flattens to the request
-# body top-level, bypassing the zeroclaw enum which caps at xhigh); the Go router
-# validates it and accepts max — verified 2026-08-16. Referenced by [agents.analyst_luna].
-[providers.models.opencode.luna]
-model = "gpt-5.6-luna"
-uri = "https://opencode.ai/zen/go/v1"
-api_key = ""
-provider_extra = { reasoning_effort = "max" }
-
 # Codex subagents fold under the `openai` family with the codex OAuth runtime
 # (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
 # migration applies to "openai-codex"). worker = gpt-5.6-luna (cheap GPT-5.6
@@ -73,17 +63,43 @@ model = "gpt-5.6-sol"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
+# Per-alias thinking budget (fork patch #34, 2026-08-19): codex reads
+# provider_extra.reasoning_effort the same way the compat families do, so each
+# analyst alias sets its own level instead of sharing [runtime].reasoning_effort.
+# The judge runs deliberately lower than the analysts it grades.
+provider_extra = { reasoning_effort = "medium" }
 
 [providers.models.openai.codex_terra]
 model = "gpt-5.6-terra"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
+# Explicit rather than implicit: xhigh is also the codex default, but pinning it
+# here keeps the alias unaffected by a future [runtime].reasoning_effort change.
+provider_extra = { reasoning_effort = "xhigh" }
+
+# analyst_luna moved off the Go router onto the codex OAuth subscription
+# (2026-08-19). Same gpt-5.6-luna model, and `max` survives the move: fork patch
+# #34 teaches the codex wire to read provider_extra.reasoning_effort per alias.
+# Live-probed 2026-08-19: luna/terra/sol all answer 200 to max|xhigh|medium and
+# echo back the requested effort. Referenced by [agents.analyst_luna].
+[providers.models.openai.codex_luna]
+model = "gpt-5.6-luna"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+provider_extra = { reasoning_effort = "max" }
 
 # deepseek subagents: pro (deepseek-v4-pro) and flash (deepseek-v4-flash).
 [providers.models.deepseek.pro]
 model = "deepseek-v4-pro"
 api_key = ""
+# Max thinking budget for the ensemble analyst. deepseek has no typed per-alias
+# reasoning knob, so it goes through provider_extra (flattens to the request body
+# top-level, bypassing the zeroclaw enum which caps at xhigh). api.deepseek.com
+# accepts reasoning_effort = "max" on deepseek-v4-pro — probed 2026-08-19 (200,
+# reasoning_tokens > the same prompt at "high").
+provider_extra = { reasoning_effort = "max" }
 
 [providers.models.deepseek.flash]
 model = "deepseek-v4-flash"
@@ -665,11 +681,14 @@ risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]
 
-# analyst_luna = GPT-5.6 Luna on the Go router; replaced mimo-v2.5-pro 2026-08-16.
-# Renamed (was analyst_mimo) for audit truth — pipeline diagnostics key on the
-# agent name, so a stale name would misattribute every ensemble output.
+# analyst_luna = GPT-5.6 Luna on the codex OAuth subscription (moved off the Go
+# router 2026-08-19; replaced mimo-v2.5-pro 2026-08-16). Renamed (was
+# analyst_mimo) for audit truth — pipeline diagnostics key on the agent name, so
+# a stale name would misattribute every ensemble output. NOTE: this puts three
+# roles (analyst_luna, analyst_terra, judge analyst_sol) in the openai-codex
+# failure domain — a codex outage now takes out the judge and 2 of 5 analysts.
 [agents.analyst_luna]
-model_provider = "opencode.luna"
+model_provider = "openai.codex_luna"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]

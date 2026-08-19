@@ -520,7 +520,17 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         `zai` (/api/coding/paas/v4, ZAI_API_KEY) serves glm-5.3 fine
 #         (tool-loop verified from the Fly machine). analyst_glm is back on
 #         zai.default and the throwaway opencode.glm alias is gone.
-CURRENT_CONFIG_MARKER = "v3-38"
+# v3-39 = analyst_luna moves off the Go router onto the codex OAuth subscription
+#         (openai.codex_luna, same gpt-5.6-luna) AND per-alias reasoning effort
+#         lands on codex (fork patch #34): the codex wire now reads
+#         provider_extra.reasoning_effort like the compat families do, so each
+#         analyst sets its own level instead of sharing [runtime].reasoning_effort.
+#         luna = max, terra = xhigh, sol (judge) = medium, deepseek.pro = max.
+#         Shipped as ONE marker on purpose: splitting it would deploy a window
+#         where luna silently runs at the codex xhigh default. The opencode.luna
+#         alias is gone. Live-probed on Fly 2026-08-19: luna/terra/sol answer 200
+#         to max|xhigh|medium and echo the requested effort (no silent downgrade).
+CURRENT_CONFIG_MARKER = "v3-39"
 
 
 def sanitize_filename(filename: str) -> str:

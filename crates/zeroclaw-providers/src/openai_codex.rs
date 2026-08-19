@@ -152,7 +152,8 @@ impl OpenAiCodexModelProvider {
             streaming_mandatory_endpoint: is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
-            reasoning_effort: options.reasoning_effort.clone(),
+            reasoning_effort: alias_reasoning_effort(alias, options)
+                .or_else(|| options.reasoning_effort.clone()),
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(std::time::Duration::from_secs(300))
@@ -160,6 +161,62 @@ impl OpenAiCodexModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         })
     }
+}
+
+/// Efforts the Codex wire accepts. `max` is verified against
+/// `gpt-5.6-luna|terra|sol` (2026-08-19); `clamp_reasoning_effort` downgrades it
+/// for the older families that only take `high`.
+const ALIAS_REASONING_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Per-alias reasoning effort from `[providers.models.openai.<alias>].provider_extra`.
+///
+/// The compat families carry `provider_extra` straight into the request body
+/// (`factory.rs`), which is how `opencode.go` pins its effort. The Codex wire
+/// builds `reasoning.effort` itself, so it has to read the same key explicitly —
+/// otherwise the only knob is the process-wide `[runtime].reasoning_effort`,
+/// which cannot differ between the ensemble analysts sharing this family.
+///
+/// Fails closed: anything that is not a known effort string returns `None` and
+/// falls back to the global value. `provider_extra` is an untyped
+/// `serde_json::Value` with no schema validation, so an author typo would
+/// otherwise reach the wire and come back 400 — non-retryable
+/// (`reliable.rs`), and alias providers carry no fallback chain, which for the
+/// judge alias means the whole ensemble run degrades to PRELIMINARY.
+fn alias_reasoning_effort(alias: &str, options: &ModelProviderRuntimeOptions) -> Option<String> {
+    let extra = options.provider_extra.as_ref()?;
+    let Some(object) = extra.as_object() else {
+        warn_bad_alias_effort(alias, "provider_extra must be a JSON object");
+        return None;
+    };
+    let value = object.get("reasoning_effort")?;
+    let Some(text) = value.as_str() else {
+        warn_bad_alias_effort(alias, "provider_extra.reasoning_effort must be a string");
+        return None;
+    };
+    let normalized = text.trim().to_ascii_lowercase();
+    if !ALIAS_REASONING_EFFORTS.contains(&normalized.as_str()) {
+        warn_bad_alias_effort(
+            alias,
+            "provider_extra.reasoning_effort is not a known effort level",
+        );
+        return None;
+    }
+    Some(normalized)
+}
+
+fn warn_bad_alias_effort(alias: &str, reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "alias": alias,
+                "reason": reason,
+                "config_path": format!("[providers.models.openai.{alias}].provider_extra"),
+                "allowed": ALIAS_REASONING_EFFORTS,
+            })),
+        format!("openai_codex: ignoring per-alias reasoning effort: {reason}"),
+    );
 }
 
 fn default_zeroclaw_dir() -> PathBuf {
@@ -507,14 +564,21 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "minimal" {
         return "low".to_string();
     }
-    if id.starts_with("gpt-5-codex") && effort == "xhigh" {
+    // These families document low|medium|high|xhigh and no `max`. They are also
+    // unreachable on a ChatGPT-account Codex token (probe 2026-08-19 returned
+    // "model is not supported"), so downgrading to the highest documented level
+    // is strictly safer than betting an alias-configured `max` on a 400.
+    if (id.starts_with("gpt-5.2") || id.starts_with("gpt-5.3")) && effort == "max" {
+        return "xhigh".to_string();
+    }
+    if id.starts_with("gpt-5-codex") && matches!(effort, "xhigh" | "max") {
         return "high".to_string();
     }
-    if id == "gpt-5.1" && effort == "xhigh" {
+    if id == "gpt-5.1" && matches!(effort, "xhigh" | "max") {
         return "high".to_string();
     }
     if id == "gpt-5.1-codex-mini" {
-        return if effort == "high" || effort == "xhigh" {
+        return if matches!(effort, "high" | "xhigh" | "max") {
             "high".to_string()
         } else {
             "medium".to_string()
@@ -1376,6 +1440,7 @@ impl OpenAiCodexModelProvider {
                         "alias": &self.alias,
                         "request_api": WIRE_API,
                         "model": &request.model,
+                        "effort": &request.reasoning.effort,
                         "stream": true,
                         "tools_count": tools_count,
                         "tool_choice": request.tool_choice.as_deref(),
@@ -1645,6 +1710,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                             "alias": &provider.alias,
                             "request_api": WIRE_API,
                             "model": &request.model,
+                            "effort": &request.reasoning.effort,
                             "stream": true,
                             "tools_count": tools_count,
                             "tool_choice": request.tool_choice.as_deref(),
@@ -2087,6 +2153,21 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
     ) {
+        mock_codex_provider_with_extra(replies, None).await
+    }
+
+    /// Same harness, but able to pin `provider_extra` on the alias — the only
+    /// way to prove the per-alias effort reaches the serialized request body
+    /// instead of merely the constructor field.
+    async fn mock_codex_provider_with_extra(
+        replies: Vec<MockCodexReply>,
+        provider_extra: Option<serde_json::Value>,
+    ) -> (
+        OpenAiCodexModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
         use axum::http::header;
         use axum::response::IntoResponse;
         use axum::{Json, Router, routing::post};
@@ -2140,11 +2221,76 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             provider_api_url: Some(format!("http://{addr}")),
             zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
             secrets_encrypt: false,
+            provider_extra,
             ..ModelProviderRuntimeOptions::default()
         };
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
         (provider, captured, server_handle, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn alias_effort_reaches_the_serialized_request_body() {
+        // Asserting the constructor field alone would pass even if the request
+        // builder ignored it. This checks the wire: what the provider actually
+        // POSTs. Red before the patch (the old constructor dropped
+        // provider_extra, so effort would be the xhigh default).
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider_with_extra(
+            vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": []
+            }))],
+            Some(serde_json::json!({"reasoning_effort": "max"})),
+        )
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5.6-luna",
+                None,
+            )
+            .await
+            .expect("mock codex call");
+
+        let body = captured.lock().expect("capture lock poisoned")[0].clone();
+        assert_eq!(body["reasoning"]["effort"], serde_json::json!("max"));
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn alias_effort_downgrade_reaches_the_serialized_request_body() {
+        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider_with_extra(
+            vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": []
+            }))],
+            Some(serde_json::json!({"reasoning_effort": "medium"})),
+        )
+        .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5.6-sol",
+                None,
+            )
+            .await
+            .expect("mock codex call");
+
+        let body = captured.lock().expect("capture lock poisoned")[0].clone();
+        assert_eq!(body["reasoning"]["effort"], serde_json::json!("medium"));
+        server_handle.abort();
     }
 
     #[test]
@@ -2296,6 +2442,90 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         assert!(!is_default_responses_url(
             "https://api.tonsof.blue/v1/responses"
         ));
+    }
+
+    fn options_with_extra(extra: serde_json::Value) -> ModelProviderRuntimeOptions {
+        ModelProviderRuntimeOptions {
+            provider_extra: Some(extra),
+            ..ModelProviderRuntimeOptions::default()
+        }
+    }
+
+    #[test]
+    fn alias_provider_extra_effort_wins_over_runtime() {
+        let mut options = options_with_extra(serde_json::json!({"reasoning_effort": "MAX"}));
+        options.reasoning_effort = Some("high".to_string());
+
+        let provider = OpenAiCodexModelProvider::new("codex_luna", &options, None).unwrap();
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn alias_effort_supports_downgrade() {
+        let mut options = options_with_extra(serde_json::json!({"reasoning_effort": "medium"}));
+        options.reasoning_effort = Some("xhigh".to_string());
+
+        let provider = OpenAiCodexModelProvider::new("codex_sol", &options, None).unwrap();
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("medium"));
+        // and it survives the clamp for the models the ensemble actually uses
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5.6-sol", Some("medium")),
+            "medium"
+        );
+    }
+
+    #[test]
+    fn alias_effort_falls_back_to_runtime_when_absent() {
+        let options = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("high".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+
+        let provider = OpenAiCodexModelProvider::new("codex_worker", &options, None).unwrap();
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
+
+        // provider_extra without the key must not shadow the global value either
+        let mut with_other_key = options_with_extra(serde_json::json!({"verbosity": "low"}));
+        with_other_key.reasoning_effort = Some("high".to_string());
+        let provider =
+            OpenAiCodexModelProvider::new("codex_worker", &with_other_key, None).unwrap();
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn alias_effort_ignores_non_string_empty_and_unknown() {
+        for extra in [
+            serde_json::json!({"reasoning_effort": 5}),
+            serde_json::json!({"reasoning_effort": "   "}),
+            serde_json::json!("not-an-object"),
+            // typo in the value must fail closed to the default, not reach the
+            // wire: a 400 here is non-retryable and the judge alias has no
+            // fallback chain, which would sink the whole ensemble run.
+            serde_json::json!({"reasoning_effort": "maximum"}),
+            serde_json::json!({"reasoning_effort": "turbo"}),
+        ] {
+            let options = options_with_extra(extra);
+            let provider = OpenAiCodexModelProvider::new("codex_luna", &options, None).unwrap();
+            assert_eq!(provider.reasoning_effort, None);
+            // unset effort keeps the documented codex default
+            assert_eq!(resolve_reasoning_effort("gpt-5.6-luna", None), "xhigh");
+        }
+    }
+
+    #[test]
+    fn clamp_downgrades_max_for_restricted_models() {
+        assert_eq!(clamp_reasoning_effort("gpt-5-codex", "max"), "high");
+        assert_eq!(clamp_reasoning_effort("gpt-5-codex-mini", "max"), "high");
+        // 5.2/5.3 document up to xhigh only -> max lands on the highest level
+        // they do document instead of a 400.
+        assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "max"), "xhigh");
+        assert_eq!(clamp_reasoning_effort("gpt-5.2-codex", "max"), "xhigh");
+        assert_eq!(clamp_reasoning_effort("gpt-5.3-codex", "xhigh"), "xhigh");
+        assert_eq!(clamp_reasoning_effort("gpt-5.1", "max"), "high");
+        assert_eq!(clamp_reasoning_effort("gpt-5.1-codex-mini", "max"), "high");
+        // the GPT-5.6 tier the ensemble runs on takes max verbatim (probed 2026-08-19)
+        assert_eq!(clamp_reasoning_effort("gpt-5.6-luna", "max"), "max");
+        assert_eq!(clamp_reasoning_effort("gpt-5.6-terra", "xhigh"), "xhigh");
     }
 
     #[test]

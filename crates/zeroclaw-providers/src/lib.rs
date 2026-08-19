@@ -812,6 +812,11 @@ pub fn options_for_provider_ref(
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
+            // provider_extra is alias-specific (reasoning_effort, per-vendor body
+            // knobs); a bare family name carries no alias, so inheriting it would
+            // silently apply one alias's tuning to another provider — visible since
+            // the Codex wire started consuming reasoning_effort from it.
+            options.provider_extra = None;
             options
         }
     }
@@ -3100,6 +3105,22 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+    }
+
+    #[test]
+    fn bare_route_does_not_inherit_alias_provider_extra() {
+        // provider_extra tunes ONE alias (reasoning_effort, per-vendor body
+        // knobs). A bare family name names no alias, so inheriting it would
+        // hand e.g. deepseek.pro's "max" to a bare codex route.
+        let inherited = ModelProviderRuntimeOptions {
+            provider_extra: Some(serde_json::json!({"reasoning_effort": "max"})),
+            ..Default::default()
+        };
+        let config = zeroclaw_config::schema::Config::default();
+
+        let route_options = options_for_provider_ref(&config, "openai-codex", &inherited);
+
+        assert_eq!(route_options.provider_extra, None);
     }
 
     #[test]
