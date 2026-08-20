@@ -33,6 +33,14 @@ import httpx
 DEFAULT_PORT = int(os.environ.get("GRAYLOG_MCP_PORT", "4001"))
 GRAYLOG_BASE_URL = os.environ.get("GRAYLOG_BASE_URL", "https://graylog.yallasvc.net")
 GRAYLOG_STATE_DIR = Path(os.environ.get("GRAYLOG_STATE_DIR", "/zeroclaw-data/mcp_graylog"))
+# Narrow MS-cookie hand-off for the admin perimeter (perimeter_sso.py in the agent
+# workspace). Deliberately OUTSIDE GRAYLOG_STATE_DIR: that directory is in
+# autonomy.forbidden_paths and also holds the graylog session + audit log, which the
+# perimeter must never see. See spec
+# docs/superpowers/specs/2026-08-20-perimeter-cookie-sharing-and-remaining-gates-design.md
+PERIMETER_STATE_DIR = Path(
+    os.environ.get("PERIMETER_STATE_DIR", "/zeroclaw-data/perimeter"))
+PERIMETER_SCHEMA_VERSION = 1
 GRAYLOG_SESSION_COOKIE_B64 = os.environ.get("GRAYLOG_SESSION_COOKIE", "")
 # Graylog API token (Basic auth, username=token, password="token"). Independent
 # of oauth2-proxy session cookie — both are required in this deployment because
@@ -212,6 +220,64 @@ class SessionExpired(Exception):
     """Raised when oauth2-proxy returns sign-in HTML response."""
 
 
+def publish_perimeter_cookies(
+    cookies: dict[str, str],
+    *,
+    source: str,
+    bootstrap_fingerprint: str,
+    persistent_fingerprint: str,
+) -> bool:
+    """Publish the CURRENT MS cookies for the admin perimeter. Best-effort.
+
+    The admin path (workspace skill perimeter_sso.py) cannot read this process's
+    state file, so the rotated cookies are handed over through a narrow file:
+    cookies + fingerprints only, never the graylog session or the audit log.
+
+    `bootstrap_fingerprint` is what lets the consumer tell "rotated descendant of
+    the current env secret" from "operator replaced the secret after publication"
+    (see the consumer's load_ms_cookies). Returns True on success; a failure is
+    logged without values and MUST NOT break the Graylog refresh that triggered it.
+    """
+    if not cookies:
+        return False
+    log = logging.getLogger("mcp_graylog.perimeter")
+    target = PERIMETER_STATE_DIR / "ms_session.json"
+    try:
+        PERIMETER_STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(PERIMETER_STATE_DIR, 0o700)
+        payload = {
+            "schema_version": PERIMETER_SCHEMA_VERSION,
+            "cookies": cookies,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "bootstrap_fingerprint": bootstrap_fingerprint,
+            "persistent_fingerprint": persistent_fingerprint,
+            "source": source,
+        }
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(PERIMETER_STATE_DIR), prefix=".ms_session.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(payload, handle, indent=2)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+    except Exception as exc:  # noqa: BLE001 - best-effort, never breaks the caller
+        log.warning(
+            "perimeter cookie publication failed: %s: %s "
+            "(names=%s, persistent_fingerprint=%s)",
+            type(exc).__name__, exc, sorted(cookies), persistent_fingerprint,
+        )
+        return False
+    log.info(
+        "published perimeter cookies (names=%d, source=%s, persistent_fingerprint=%s)",
+        len(cookies), source, persistent_fingerprint,
+    )
+    return True
+
+
 class MSSessionAuth:
     """Microsoft Entra session cookies for silent SSO refresh.
 
@@ -289,6 +355,11 @@ class MSSessionAuth:
                     self._cookies = saved.get("cookies", {})
                     if self._cookies:
                         self.status = self.STATUS_HEALTHY
+                        # Warm restart returns WITHOUT writing state, so the perimeter
+                        # hand-off must be published here too — otherwise every deploy
+                        # leaves the admin path on the frozen env secret until the first
+                        # refresh (up to ~25 min), and forever if the session is dead.
+                        self._publish_perimeter(saved.get("source") or "state_reload")
                         return
                 else:
                     # operator re-bootstrapped → ignore stale state
@@ -333,6 +404,19 @@ class MSSessionAuth:
         self.status = self.STATUS_HEALTHY
         self._last_diagnosis = None
 
+    def _publish_perimeter(self, source: str) -> None:
+        """Hand the current MS cookies to the admin perimeter. Never raises."""
+        try:
+            publish_perimeter_cookies(
+                self._cookies,
+                source=source,
+                bootstrap_fingerprint=self._bootstrap_fingerprint,
+                persistent_fingerprint=self.current_persistent_fingerprint,
+            )
+        except Exception:  # noqa: BLE001 - Graylog refresh outranks the hand-off
+            logging.getLogger("mcp_graylog.perimeter").warning(
+                "perimeter publication raised, continuing", exc_info=False)
+
     def _write_state_atomic(self, source: str) -> None:
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -349,6 +433,7 @@ class MSSessionAuth:
                 tmp.replace(self._state_path)
             finally:
                 fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        self._publish_perimeter(source)
 
 
 class MSSessionExpired(Exception):
