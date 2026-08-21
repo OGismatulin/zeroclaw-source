@@ -530,7 +530,15 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         where luna silently runs at the codex xhigh default. The opencode.luna
 #         alias is gone. Live-probed on Fly 2026-08-19: luna/terra/sol answer 200
 #         to max|xhigh|medium and echo the requested effort (no silent downgrade).
-CURRENT_CONFIG_MARKER = "v3-40"
+# v3-41 = ClinePass dropped. The whole `custom` provider family goes away
+#         (custom.cline flow-through + custom.cline_qwen), the 4 cline-pass/*
+#         model_windows entries go with it, and analyst_qwen moves to the new
+#         opencode.qwen alias — qwen3.8-max, the SAME model the analyst ran under
+#         Cline, on the Go subscription instead (reasoning_effort = max; native
+#         tool_calls and a closing multi-turn loop re-probed 2026-08-21, the
+#         2026-08-16 "qwen3.8-max answers 503" note no longer holds). qwen3.8-max
+#         also returns as an ogo /model button with its own window + fallback.
+CURRENT_CONFIG_MARKER = "v3-41"
 
 
 def sanitize_filename(filename: str) -> str:

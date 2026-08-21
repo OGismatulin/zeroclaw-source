@@ -125,42 +125,22 @@ api_key = ""
 model = "minimax-m3"
 api_key = ""
 
-# Custom-URL provider (Cline / api.cline.bot, OpenAI-compatible). Replaced
-# neuralwatt 2026-07-23 (neuralwatt no longer used). Reached ONLY via the bot's
-# per-request /model override (provider="custom.cline"); not the daemon default.
-# NO `model` key on purpose: a pinned model would make ModelPinnedProvider rewrite
-# every request to it — without it the request model flows through (the four
-# ClinePass slugs cline-pass/{glm-5.3,kimi-k3,qwen3.8-max,minimax-m3}). Key via env
-# ZEROCLAW_API_KEY (generic fallback slot for the custom family; = the Cline key).
-# Cline wraps non-streaming responses in {"data":{choices},"success"} — the fork
-# patch in compatible.rs (parse_chat_response_body) unwraps that envelope.
-# Spec: docs/superpowers/specs/2026-07-23-cline-provider-and-jira-analyst-design.md
-[providers.models.custom.cline]
-uri = "https://api.cline.bot/api/v1"
+# Qwen analyst slot on the Go router (2026-08-21). Replaced the Cline provider,
+# which was dropped together with the ClinePass subscription — the whole `custom`
+# family is gone with it, so the bot offers no cline/* buttons either. Same model
+# the analyst ran under Cline (qwen3.8-max), just on the Go subscription now.
+# Re-probed against /zen/go/v1 on 2026-08-21: turn 1 returns a native tool_calls
+# array and the multi-turn tool loop closes with HTTP 200 at high|xhigh|max. The
+# 2026-08-16 note claiming qwen3.8-max answers 503 no longer holds (grok-4.5 still
+# does). reasoning_effort = max matches the other ensemble analysts; note that the
+# ceiling is per-model on this router — qwen3.7-plus rejects "max" with a 400.
+# NO fallback — preserves the analyst failure domain (jira-analysis-pipeline D2:
+# same-provider retry x3, no fallback).
+[providers.models.opencode.qwen]
+model = "qwen3.8-max"
+uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
-# Cline supports native OpenAI tool-calling (verified via curl, all 4 models).
-# The custom family disables native tools by default (text <tool_call> protocol),
-# which leaks raw markup to the user (prod incident 2026-06-20). Opt back in.
-native_tools = true
-# NO per-alias `fallback`: v0.8.2 broke the alias fallback-build path
-# (create_resilient_model_provider_for_alias -> append_fallback_chain) — it demands a
-# "profile-resolved credential" and can't resolve opencode.go's env key, so a
-# `fallback = [...]` here makes the WHOLE override init fail ("failed to init override
-# provider") -> hard "временно недоступен" on EVERY request (prod incident 2026-07-09).
-# Trade-off: a real Cline 429 hard-fails instead of degrading to deepseek.
-
-# Pinned Cline alias for the analyst_qwen subagent (Jira ensemble). Unlike the
-# flow-through alias above, this one MUST pin `model`: subagents resolve their
-# model from the provider entry. The ClinePass slug cline-pass/qwen3.8-max is
-# native tool-calling smoke-verified 2026-08-16 (ClinePass subscription tract; the
-# pay-as-you-go id format returns 402 insufficient_credits). kimi
-# was swapped out earlier for being too slow. NO fallback — preserves the analyst
-# failure domain (jira-analysis-pipeline D2: same-provider retry x3, no fallback).
-[providers.models.custom.cline_qwen]
-model = "cline-pass/qwen3.8-max"
-uri = "https://api.cline.bot/api/v1"
-api_key = ""
-native_tools = true
+provider_extra = { reasoning_effort = "max" }
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]
@@ -170,9 +150,7 @@ fallback_providers = ["opencode-go"]
 # Re-synced to the live catalog 2026-08-16: retired ids (GLM-5.1, Qwen3.5-397B-A17B,
 # gpt-5.5, gpt-5.4*, glm-5-turbo, glm-5.1, glm-5.2, minimax-m2.7, mimo-v2.5,
 # kimi-k2.7-code) dropped. deepseek-v4-flash is the fallback target, so it is never
-# a key. cline-pass/* deliberately absent: a per-alias fallback on the custom family
-# breaks the whole override init (v0.8.2 alias-fallback-build regression, see
-# [providers.models.custom.cline]).
+# a key.
 # Codex family
 "gpt-5.6-sol"        = ["deepseek-v4-flash"]
 "gpt-5.6-terra"      = ["deepseek-v4-flash"]
@@ -183,6 +161,7 @@ fallback_providers = ["opencode-go"]
 "minimax-m3"         = ["deepseek-v4-flash"]
 "mimo-v2.5-pro"      = ["deepseek-v4-flash"]
 "qwen3.7-plus"       = ["deepseek-v4-flash"]
+"qwen3.8-max"        = ["deepseek-v4-flash"]
 "hy3"                = ["deepseek-v4-flash"]
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
 
@@ -539,11 +518,8 @@ protect_last_n = 10
 # Conservative: the exact GLM-5.3 window is unpublished.
 "glm-5.3"                 = 200_000
 "kimi-k3"                 = 256_000
+"qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
-"cline-pass/glm-5.3"      = 200_000
-"cline-pass/kimi-k3"      = 256_000
-"cline-pass/qwen3.8-max"  = 256_000
-"cline-pass/minimax-m3"   = 200_000
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
 # ~258K (gpt-5.x) / ~353K (gpt-5.6). At 400K the 0.70 trigger (280K) sat ABOVE the
@@ -583,11 +559,8 @@ protect_last_n = 10
 # Conservative: the exact GLM-5.3 window is unpublished.
 "glm-5.3"                 = 200_000
 "kimi-k3"                 = 256_000
+"qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
-"cline-pass/glm-5.3"      = 200_000
-"cline-pass/kimi-k3"      = 256_000
-"cline-pass/qwen3.8-max"  = 256_000
-"cline-pass/minimax-m3"   = 200_000
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
 # ~258K (gpt-5.x) / ~353K (gpt-5.6). At 400K the 0.70 trigger (280K) sat ABOVE the
@@ -628,11 +601,8 @@ protect_last_n = 10
 # Conservative: the exact GLM-5.3 window is unpublished.
 "glm-5.3"                 = 200_000
 "kimi-k3"                 = 256_000
+"qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
-"cline-pass/glm-5.3"      = 200_000
-"cline-pass/kimi-k3"      = 256_000
-"cline-pass/qwen3.8-max"  = 256_000
-"cline-pass/minimax-m3"   = 200_000
 # Codex-effective windows (NOT the 1.05M API / 400K published cap). The ChatGPT
 # Codex backend reserves ~128K output + ~5% CLI headroom, so real usable input is
 # ~258K (gpt-5.x) / ~353K (gpt-5.6). At 400K the 0.70 trigger (280K) sat ABOVE the
@@ -706,12 +676,11 @@ mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-# analyst_qwen = Qwen3.8-Max via Cline (replaced analyst_kimi 2026-07-24; kimi-k3
-# was too slow). Pinned alias custom.cline_qwen resolves cline-pass/qwen3.8-max. Renamed
-# for audit truth so pipeline diagnostics (keyed on analyst name) reflect the real
-# model.
+# analyst_qwen = Qwen3.8-Max on the Go router (2026-08-21, moved off Cline when the
+# ClinePass subscription was dropped — same model, different subscription; before
+# that analyst_kimi). Alias opencode.qwen pins model + reasoning_effort = max.
 [agents.analyst_qwen]
-model_provider = "custom.cline_qwen"
+model_provider = "opencode.qwen"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
