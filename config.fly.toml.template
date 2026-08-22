@@ -17,14 +17,34 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
+# Boot-default model = ox-alpha-free (2026-08-22). ZEROCLAW_PROVIDER=opencode-go
+# hard-maps to THIS alias (normalize_provider_type → opencode.go) and the webhook
+# default path reads the boot slot, not agents.default — so the default model can
+# only be changed here. Verified 2026-08-22: single-turn 200, multi-turn native
+# tool loop 200, reasoning_content round-trip, reasoning_effort high|max accepted,
+# 900k-token prompt accepted. It is a free alpha slot and answered 503 "Endpoint is
+# unavailable" on 4 of 10 calls, so its model_fallbacks entry is load-bearing.
+# deepseek-v4-flash moved to [providers.models.opencode.flash] (worker/jira_worker).
 [providers.models.opencode.go]
-model = "deepseek-v4-flash"
+model = "ox-alpha-free"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
 # structured field to None, so we pass it via provider_extra (flattens into the
 # body top-level). Separate knob from codex — config.runtime.reasoning_effort
 # stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
+provider_extra = { reasoning_effort = "high" }
+
+# Worker alias: deepseek-v4-flash, the model the boot slot carried until
+# 2026-08-22. [agents.worker] and [agents.jira_worker] point here so the jira
+# analysis pipeline and the cron/heartbeat workers keep the model they were tuned
+# around while chat's boot default moves to ox-alpha-free (a free alpha slot that
+# answers 503 on ~40% of calls — fine for chat with a fallback, not for a
+# multi-hour pipeline).
+[providers.models.opencode.flash]
+model = "deepseek-v4-flash"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
 provider_extra = { reasoning_effort = "high" }
 
 # Isolated coordinator alias: same deepseek-v4-flash on the same Go endpoint, but
@@ -164,6 +184,8 @@ fallback_providers = ["opencode-go"]
 "qwen3.8-max"        = ["deepseek-v4-flash"]
 "hy3"                = ["deepseek-v4-flash"]
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
+"ox-alpha-free"      = ["deepseek-v4-flash"]
+"muse-spark-1.2-contributor" = ["deepseek-v4-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
@@ -530,6 +552,10 @@ protect_last_n = 10
 "gpt-5.6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
 "gpt-5.6-luna"            = 353_000
+# Probed 2026-08-22 (windows unpublished): ox-alpha-free accepted a 900k-token
+# prompt; muse-spark-1.2-contributor accepted 600k and rejected 1M. Verified floor.
+"ox-alpha-free"           = 800_000
+"muse-spark-1.2-contributor" = 600_000
 
 # Subagent runtime profile. Shares default's context_compression + model_windows
 # so cross-model windows still resolve. Subagents do real work inside cron
@@ -571,6 +597,10 @@ protect_last_n = 10
 "gpt-5.6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
 "gpt-5.6-luna"            = 353_000
+# Probed 2026-08-22 (windows unpublished): ox-alpha-free accepted a 900k-token
+# prompt; muse-spark-1.2-contributor accepted 600k and rejected 1M. Verified floor.
+"ox-alpha-free"           = 800_000
+"muse-spark-1.2-contributor" = 600_000
 
 # Jira package runs load a large immutable source manifest and invoke the full
 # tool surface.  The measured system floor is already above 205k tokens, so
@@ -634,13 +664,13 @@ runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.jira_worker]
-model_provider = "opencode.go"
+model_provider = "opencode.flash"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.worker]
-model_provider = "opencode.go"
+model_provider = "opencode.flash"
 risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]

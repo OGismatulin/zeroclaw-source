@@ -538,7 +538,14 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         tool_calls and a closing multi-turn loop re-probed 2026-08-21, the
 #         2026-08-16 "qwen3.8-max answers 503" note no longer holds). qwen3.8-max
 #         also returns as an ogo /model button with its own window + fallback.
-CURRENT_CONFIG_MARKER = "v3-41"
+# v3-42 = Two new Go-plan slots (2026-08-22): ox-alpha-free becomes the boot
+#         default via a new [providers.models.opencode.ox] alias (opencode.go
+#         stays deepseek-v4-flash for worker/jira_worker, so the jira pipeline is
+#         untouched), and muse-spark-1.2-contributor joins as a chat pick. Both
+#         got windows (800k / 600k, probed — unpublished) and a deepseek-v4-flash
+#         fallback: ox-alpha-free is a free alpha slot that answered 503 on 4 of
+#         10 calls, so the fallback is load-bearing, not decorative.
+CURRENT_CONFIG_MARKER = "v3-42"
 
 
 def sanitize_filename(filename: str) -> str:
