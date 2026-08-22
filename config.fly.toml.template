@@ -17,14 +17,19 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Boot-default model = ox-alpha-free (2026-08-22). ZEROCLAW_PROVIDER=opencode-go
-# hard-maps to THIS alias (normalize_provider_type → opencode.go) and the webhook
-# default path reads the boot slot, not agents.default — so the default model can
-# only be changed here. Verified 2026-08-22: single-turn 200, multi-turn native
-# tool loop 200, reasoning_content round-trip, reasoning_effort high|max accepted,
-# 900k-token prompt accepted. It is a free alpha slot and answered 503 "Endpoint is
-# unavailable" on 4 of 10 calls, so its model_fallbacks entry is load-bearing.
-# deepseek-v4-flash moved to [providers.models.opencode.flash] (worker/jira_worker).
+# Single default model for the whole runtime = ox-alpha-free (2026-08-22).
+# ZEROCLAW_PROVIDER=opencode-go hard-maps to THIS alias (normalize_provider_type ->
+# opencode.go) and the webhook default path reads the boot slot, not agents.default,
+# so the default can only be changed here. default/worker/jira_worker all point at
+# this one entry on purpose: one model everywhere, no per-agent split to keep in
+# sync. go_coordinator is the same model with reasoning_effort = "max".
+# Verified 2026-08-22: single-turn 200, multi-turn native tool loop 200,
+# reasoning_content round-trip, reasoning_effort high|max accepted, 900k-token
+# prompt accepted; re-measured after the key switch: 15/15 single-turn and 8/8
+# closed tool loops. The 4-of-10 503 burst seen earlier that day was a Console Go
+# upstream window (deepseek-v4-flash took 503s in the same series), not a property
+# of this model; a model-specific 503 looks like grok-4.5, which fails every time
+# and has no button. Trade-off accepted: p50 3.6s vs 1.4s for deepseek-v4-flash.
 [providers.models.opencode.go]
 model = "ox-alpha-free"
 uri = "https://opencode.ai/zen/go/v1"
@@ -35,25 +40,13 @@ api_key = ""
 # stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
 provider_extra = { reasoning_effort = "high" }
 
-# Worker alias: deepseek-v4-flash, the model the boot slot carried until
-# 2026-08-22. [agents.worker] and [agents.jira_worker] point here so the jira
-# analysis pipeline and the cron/heartbeat workers keep the model they were tuned
-# around while chat's boot default moves to ox-alpha-free (a free alpha slot that
-# answers 503 on ~40% of calls — fine for chat with a fallback, not for a
-# multi-hour pipeline).
-[providers.models.opencode.flash]
-model = "deepseek-v4-flash"
-uri = "https://opencode.ai/zen/go/v1"
-api_key = ""
-provider_extra = { reasoning_effort = "high" }
-
 # Isolated coordinator alias: same deepseek-v4-flash on the same Go endpoint, but
 # reasoning_effort = "max" (Go-router valid — NOT minimal→400). Only
 # [agents.jira_coordinator] points here; worker/default/jira_worker stay on
 # opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
 # bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
-model = "deepseek-v4-flash"
+model = "ox-alpha-free"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
@@ -664,13 +657,13 @@ runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.jira_worker]
-model_provider = "opencode.flash"
+model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.worker]
-model_provider = "opencode.flash"
+model_provider = "opencode.go"
 risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]

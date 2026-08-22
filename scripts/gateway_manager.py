@@ -538,14 +538,18 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         tool_calls and a closing multi-turn loop re-probed 2026-08-21, the
 #         2026-08-16 "qwen3.8-max answers 503" note no longer holds). qwen3.8-max
 #         also returns as an ogo /model button with its own window + fallback.
-# v3-42 = Two new Go-plan slots (2026-08-22): ox-alpha-free becomes the boot
-#         default via a new [providers.models.opencode.ox] alias (opencode.go
-#         stays deepseek-v4-flash for worker/jira_worker, so the jira pipeline is
-#         untouched), and muse-spark-1.2-contributor joins as a chat pick. Both
-#         got windows (800k / 600k, probed — unpublished) and a deepseek-v4-flash
-#         fallback: ox-alpha-free is a free alpha slot that answered 503 on 4 of
-#         10 calls, so the fallback is load-bearing, not decorative.
-CURRENT_CONFIG_MARKER = "v3-42"
+# v3-42 = Two new Go-plan slots (2026-08-22): ox-alpha-free and
+#         muse-spark-1.2-contributor, both with a window (800k / 600k, probed --
+#         the vendor publishes none) and a deepseek-v4-flash fallback.
+# v3-43 = One default model for the whole runtime: ox-alpha-free on the boot slot
+#         [providers.models.opencode.go], with default/worker/jira_worker all
+#         pointing at that single entry and go_coordinator carrying the same model
+#         at reasoning_effort = "max". v3-42 had briefly split deepseek-v4-flash
+#         onto an opencode.flash alias for the workers; that split is reverted --
+#         its premise (ox answering 503 on ~40% of calls) was a Console Go upstream
+#         window, not a property of the model (re-measured: 15/15 single-turn 200,
+#         8/8 closed tool loops), and one model everywhere is the operator's rule.
+CURRENT_CONFIG_MARKER = "v3-43"
 
 
 def sanitize_filename(filename: str) -> str:
