@@ -17,26 +17,30 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Single default model for the whole runtime = deepseek-v4-flash.
+# Single default model for the whole runtime = muse-spark-1.2-contributor
+# (operator's call 2026-08-22: cheaper and better than deepseek-v4-flash).
 # ZEROCLAW_PROVIDER=opencode-go hard-maps to THIS alias (normalize_provider_type ->
 # opencode.go) and the webhook default path reads the boot slot, not agents.default,
 # so the default can only be changed here. default/worker/jira_worker all point at
-# this one entry on purpose: one model everywhere, no per-agent split to keep in
-# sync. go_coordinator is the same model with reasoning_effort = "max".
+# this one entry on purpose: one model everywhere, no per-agent split to keep in sync.
+# go_coordinator is the same model with reasoning_effort = "max".
 #
-# Do NOT put a freshly launched Go slot here. Tried on 2026-08-22 and both reverted
-# the same day: ox-alpha-free (v3-42/43) collected 24 "Endpoint is unavailable" 503s
-# in one day of prod daemon-stderr -- zero for every other catalog model -- and burned
-# a DV-34767 visual dispatch; muse-spark-1.2-contributor (v3-44) started answering 503
-# too. Short client probes cannot tell these models apart (5/5, 4/5, 5/5 on heavy
-# tool loops); the discriminator is the per-model 503 count in prod over a day.
-# It matters more than for a chat model because delegates retry same-provider x3 with
-# NO fallback by design (ensemble failure-domain invariant D2), so
-# [reliability.model_fallbacks] never covers the ensemble, the visual worker or cron:
-# the default model has to hold on its own. Both stay available as /model buttons,
-# where retry + fallback do apply.
+# Standing watch (2026-08-22): ox-alpha-free was tried here and pulled the same day
+# with 24 "Endpoint is unavailable" 503s in one day of prod daemon-stderr against
+# zero for every other catalog model; it burned a DV-34767 visual dispatch. That
+# matters for the boot slot specifically because delegates retry same-provider x3
+# with NO fallback by design (ensemble failure-domain invariant D2), so
+# [reliability.model_fallbacks] never covers the ensemble, the visual worker or cron.
+# muse-spark-1.2-contributor has NO prod 503 record (0 in the same log) but did throw
+# one 503 in 5 heavy client tool-loops -- a single event, and ox scored 5/5 in that
+# same batch, so client probes discriminate nothing. The check that does:
+#   grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
+#     | grep -c muse-spark
+# If that counter climbs while other models stay at zero, move the boot slot back to
+# deepseek-v4-flash (zero 503s over the observation window) and keep muse as a
+# /model button, where retry and fallback do apply.
 [providers.models.opencode.go]
-model = "deepseek-v4-flash"
+model = "muse-spark-1.2-contributor"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
@@ -51,7 +55,7 @@ provider_extra = { reasoning_effort = "high" }
 # opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
 # bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
-model = "deepseek-v4-flash"
+model = "muse-spark-1.2-contributor"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }

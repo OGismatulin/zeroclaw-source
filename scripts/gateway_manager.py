@@ -549,13 +549,16 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         after ox collected 24 "Endpoint is unavailable" 503s in a day of prod
 #         daemon-stderr (zero for every other catalog model) and burned a
 #         DV-34767 visual dispatch.
-# v3-45 = Default model back on deepseek-v4-flash: muse-spark-1.2-contributor
-#         started answering 503 as well, so the failure class is "freshly
-#         launched Go slot", not one specific model. deepseek-v4-flash held zero
-#         503s over the same observation window. Both new slots remain /model
-#         buttons (chat has retry + fallback); the boot slot does not, because
-#         delegates retry same-provider x3 with NO fallback by design (D2).
-CURRENT_CONFIG_MARKER = "v3-45"
+# v3-45 = Default model back on deepseek-v4-flash after ox-alpha-free collected
+#         24 "Endpoint is unavailable" 503s in a day of prod daemon-stderr.
+# v3-46 = Default model = muse-spark-1.2-contributor (operator's call: cheaper and
+#         better than deepseek-v4-flash). Correcting the record from v3-45: muse has
+#         NO prod 503 (0 in the same log that holds 24 for ox) -- it barely served as
+#         default before the revert; the only muse 503 came from one client probe out
+#         of five heavy tool loops, and ox scored 5/5 in that same batch, so probes
+#         discriminate nothing. Watch the per-model 503 counter in daemon-stderr; if
+#         muse climbs while others stay at zero, go back to deepseek-v4-flash.
+CURRENT_CONFIG_MARKER = "v3-46"
 
 
 def sanitize_filename(filename: str) -> str:
