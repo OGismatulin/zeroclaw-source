@@ -545,15 +545,17 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         default/worker/jira_worker sharing the boot slot and go_coordinator
 #         carrying the same model at reasoning_effort = "max"; the short-lived
 #         opencode.flash worker split from v3-42 reverted.
-# v3-44 = Default model moved off ox-alpha-free onto muse-spark-1.2-contributor.
-#         Prod evidence: daemon-stderr logged 24 "Endpoint is unavailable" 503s
-#         against ox-alpha-free and zero against every other catalog model; the
-#         failures hit long multi-iteration delegate turns (short probes were
-#         15/15 200), which killed the DV-34767 visual worker. Delegates retry
-#         same-provider x3 with NO fallback by design (ensemble failure-domain
-#         invariant D2), so model_fallbacks cannot cover them -- the default model
-#         has to hold on its own. Shape is unchanged: still one model everywhere.
-CURRENT_CONFIG_MARKER = "v3-44"
+# v3-44 = Default model moved off ox-alpha-free onto muse-spark-1.2-contributor
+#         after ox collected 24 "Endpoint is unavailable" 503s in a day of prod
+#         daemon-stderr (zero for every other catalog model) and burned a
+#         DV-34767 visual dispatch.
+# v3-45 = Default model back on deepseek-v4-flash: muse-spark-1.2-contributor
+#         started answering 503 as well, so the failure class is "freshly
+#         launched Go slot", not one specific model. deepseek-v4-flash held zero
+#         503s over the same observation window. Both new slots remain /model
+#         buttons (chat has retry + fallback); the boot slot does not, because
+#         delegates retry same-provider x3 with NO fallback by design (D2).
+CURRENT_CONFIG_MARKER = "v3-45"
 
 
 def sanitize_filename(filename: str) -> str:

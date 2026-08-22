@@ -17,26 +17,26 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Single default model for the whole runtime = muse-spark-1.2-contributor
-# (2026-08-22). ZEROCLAW_PROVIDER=opencode-go hard-maps to THIS alias
-# (normalize_provider_type -> opencode.go) and the webhook default path reads the
-# boot slot, not agents.default, so the default can only be changed here.
-# default/worker/jira_worker all point at this one entry on purpose: one model
-# everywhere, no per-agent split to keep in sync. go_coordinator is the same model
-# with reasoning_effort = "max".
+# Single default model for the whole runtime = deepseek-v4-flash.
+# ZEROCLAW_PROVIDER=opencode-go hard-maps to THIS alias (normalize_provider_type ->
+# opencode.go) and the webhook default path reads the boot slot, not agents.default,
+# so the default can only be changed here. default/worker/jira_worker all point at
+# this one entry on purpose: one model everywhere, no per-agent split to keep in
+# sync. go_coordinator is the same model with reasoning_effort = "max".
 #
-# Why not ox-alpha-free (tried as the default for ~2 hours the same day): prod
-# daemon-stderr logged 24 "Endpoint is unavailable" 503s against ox-alpha-free and
-# ZERO against every other model in the catalog. Short probes never saw it (15/15
-# 200); the failures land on long multi-iteration delegate turns. That killed the
-# DV-34767 visual worker -- delegates retry same-provider x3 with NO fallback by
-# design (ensemble failure-domain invariant D2), so [reliability.model_fallbacks]
-# cannot cover them and the default model has to hold on its own.
-# muse-spark-1.2-contributor: 10/10 and 15/15 short-turn 200, multi-turn native
-# tool loop 200, reasoning_effort high|max accepted, 600k-token prompt accepted
-# (rejects 1M). Window pinned at 600_000 in model_windows.
+# Do NOT put a freshly launched Go slot here. Tried on 2026-08-22 and both reverted
+# the same day: ox-alpha-free (v3-42/43) collected 24 "Endpoint is unavailable" 503s
+# in one day of prod daemon-stderr -- zero for every other catalog model -- and burned
+# a DV-34767 visual dispatch; muse-spark-1.2-contributor (v3-44) started answering 503
+# too. Short client probes cannot tell these models apart (5/5, 4/5, 5/5 on heavy
+# tool loops); the discriminator is the per-model 503 count in prod over a day.
+# It matters more than for a chat model because delegates retry same-provider x3 with
+# NO fallback by design (ensemble failure-domain invariant D2), so
+# [reliability.model_fallbacks] never covers the ensemble, the visual worker or cron:
+# the default model has to hold on its own. Both stay available as /model buttons,
+# where retry + fallback do apply.
 [providers.models.opencode.go]
-model = "muse-spark-1.2-contributor"
+model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
@@ -51,7 +51,7 @@ provider_extra = { reasoning_effort = "high" }
 # opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
 # bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
-model = "muse-spark-1.2-contributor"
+model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
