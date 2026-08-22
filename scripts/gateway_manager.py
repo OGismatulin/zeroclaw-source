@@ -551,14 +551,17 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         DV-34767 visual dispatch.
 # v3-45 = Default model back on deepseek-v4-flash after ox-alpha-free collected
 #         24 "Endpoint is unavailable" 503s in a day of prod daemon-stderr.
-# v3-46 = Default model = muse-spark-1.2-contributor (operator's call: cheaper and
-#         better than deepseek-v4-flash). Correcting the record from v3-45: muse has
-#         NO prod 503 (0 in the same log that holds 24 for ox) -- it barely served as
-#         default before the revert; the only muse 503 came from one client probe out
-#         of five heavy tool loops, and ox scored 5/5 in that same batch, so probes
-#         discriminate nothing. Watch the per-model 503 counter in daemon-stderr; if
-#         muse climbs while others stay at zero, go back to deepseek-v4-flash.
-CURRENT_CONFIG_MARKER = "v3-46"
+# v3-46 = Default model = muse-spark-1.2-contributor, correcting the v3-45 claim
+#         that muse also 503s (prod log had zero for muse, 24 for ox-alpha-free).
+# v3-47 = Split along the one axis that matters: who has a fallback. Chat default
+#         (boot slot opencode.go) = ox-alpha-free -- a 503 there retries and falls
+#         back to deepseek-v4-flash, so the user gets a slower answer, not an error.
+#         Background work rides the new opencode.flash = deepseek-v4-flash:
+#         worker/jira_worker (and go_coordinator) have NO fallback by design (D2), so
+#         a 503 burst would hit the ensemble, the visual worker and cron directly --
+#         exactly how DV-34767 lost a visual dispatch. This supersedes the "one model
+#         everywhere" shape of v3-43..v3-46 on purpose.
+CURRENT_CONFIG_MARKER = "v3-47"
 
 
 def sanitize_filename(filename: str) -> str:

@@ -17,30 +17,30 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Single default model for the whole runtime = muse-spark-1.2-contributor
-# (operator's call 2026-08-22: cheaper and better than deepseek-v4-flash).
-# ZEROCLAW_PROVIDER=opencode-go hard-maps to THIS alias (normalize_provider_type ->
-# opencode.go) and the webhook default path reads the boot slot, not agents.default,
-# so the default can only be changed here. default/worker/jira_worker all point at
-# this one entry on purpose: one model everywhere, no per-agent split to keep in sync.
-# go_coordinator is the same model with reasoning_effort = "max".
-#
-# Standing watch (2026-08-22): ox-alpha-free was tried here and pulled the same day
-# with 24 "Endpoint is unavailable" 503s in one day of prod daemon-stderr against
-# zero for every other catalog model; it burned a DV-34767 visual dispatch. That
-# matters for the boot slot specifically because delegates retry same-provider x3
-# with NO fallback by design (ensemble failure-domain invariant D2), so
-# [reliability.model_fallbacks] never covers the ensemble, the visual worker or cron.
-# muse-spark-1.2-contributor has NO prod 503 record (0 in the same log) but did throw
-# one 503 in 5 heavy client tool-loops -- a single event, and ox scored 5/5 in that
-# same batch, so client probes discriminate nothing. The check that does:
-#   grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
-#     | grep -c muse-spark
-# If that counter climbs while other models stay at zero, move the boot slot back to
-# deepseek-v4-flash (zero 503s over the observation window) and keep muse as a
-# /model button, where retry and fallback do apply.
+# Chat default = ox-alpha-free; background work = deepseek-v4-flash (2026-08-22,
+# operator's call). Deliberate split along ONE axis: who has a fallback.
+#   * Chat (this boot slot) survives a provider 503: the turn retries and
+#     [reliability.model_fallbacks] routes ox-alpha-free -> deepseek-v4-flash, so the
+#     user sees a slower answer, not a failure. ZEROCLAW_PROVIDER=opencode-go
+#     hard-maps to THIS alias (normalize_provider_type -> opencode.go) and the webhook
+#     default path reads the boot slot, not agents.default, so the chat default can
+#     only be set here.
+#   * Delegates and background agents do NOT have that safety net: delegate calls retry
+#     same-provider x3 with NO fallback by design (ensemble failure-domain invariant
+#     D2), so a 503 burst lands directly on the ensemble, the visual worker and cron.
+#     They ride [providers.models.opencode.flash] = deepseek-v4-flash, which logged
+#     zero "Endpoint is unavailable" over the observation window.
+# Evidence for the split: ox-alpha-free collected 24 x 503 in one day of prod
+# daemon-stderr against zero for every other catalog model, and it burned a DV-34767
+# visual dispatch (worker died with attempts=3 kind=provider_server). Client probes
+# discriminate nothing here -- they were clean for ox (15/15, 6/6, 5/5) and dirty for
+# muse (4/5), the opposite of the prod record.
+# Watch: grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
+#          | grep -oE "model=[a-z0-9.-]+" | sort | uniq -c
+# If chat 503s stop recovering (no "Provider recovered" after the retries), move this
+# slot to deepseek-v4-flash too.
 [providers.models.opencode.go]
-model = "muse-spark-1.2-contributor"
+model = "ox-alpha-free"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
@@ -49,13 +49,22 @@ api_key = ""
 # stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
 provider_extra = { reasoning_effort = "high" }
 
+# Background/delegate alias: deepseek-v4-flash, the model with zero 503s over the
+# observation window. [agents.worker] and [agents.jira_worker] point here because
+# delegate turns have no fallback (D2) -- see the boot-slot note above.
+[providers.models.opencode.flash]
+model = "deepseek-v4-flash"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
+provider_extra = { reasoning_effort = "high" }
+
 # Isolated coordinator alias: same deepseek-v4-flash on the same Go endpoint, but
 # reasoning_effort = "max" (Go-router valid — NOT minimal→400). Only
 # [agents.jira_coordinator] points here; worker/default/jira_worker stay on
 # opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
 # bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
-model = "muse-spark-1.2-contributor"
+model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
@@ -666,13 +675,13 @@ runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.jira_worker]
-model_provider = "opencode.go"
+model_provider = "opencode.flash"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
 [agents.worker]
-model_provider = "opencode.go"
+model_provider = "opencode.flash"
 risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]
