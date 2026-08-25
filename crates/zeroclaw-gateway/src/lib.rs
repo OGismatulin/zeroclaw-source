@@ -810,11 +810,22 @@ pub async fn run_gateway(
             })
             .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
+    // fork(boot-slot alias): pass the DOTTED ref when the boot entry exists.
+    // A bare family name takes the alias-less branch of
+    // `create_resilient_model_provider_from_ref`, which builds the family's
+    // standard provider and never sees the entry — so entry-only discriminators
+    // are lost. For `openai` that means `requires_openai_auth` (the Codex
+    // OAuth routing flag in `OpenAIModelProviderConfig::create_provider`) is
+    // dropped: the boot provider became plain OpenAI, resolved the generic
+    // `ZEROCLAW_API_KEY` as its credential and answered every default turn with
+    // `401 invalid_api_key`, after which reliability silently served the turn
+    // from the fallback model. Prod 2026-08-25 (v3-48, chat default moved to
+    // openai.codex).
+    let boot_ref = boot_model_provider_ref(&boot_family, &boot_alias, fallback.is_some());
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
         match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
-            model_provider_name,
+            boot_ref.as_str(),
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
@@ -831,7 +842,7 @@ pub async fn run_gateway(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "model_provider": model_provider_name,
+                            "model_provider": boot_ref.as_str(),
                             "alias": boot_alias,
                             "error": format!("{e}"),
                         })),
@@ -870,7 +881,7 @@ pub async fn run_gateway(
             Some(m) => m.to_string(),
             None => match config.resolve_default_model() {
                 Some(m) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": boot_ref.as_str(), "model": m})), "first model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set \
                      [providers.models.<type>.<alias>] model = \"...\" to silence \
                      this warning.");
@@ -3577,6 +3588,21 @@ fn config_gated_tool_descs(config: &Config) -> Vec<(&'static str, &'static str)>
         ));
     }
     descs
+}
+
+/// Provider ref for the gateway boot slot.
+///
+/// Dotted `<family>.<alias>` when the slot resolves to a real
+/// `[providers.models.<family>.<alias>]` entry, so the provider factory can read
+/// entry-only fields (`requires_openai_auth`, `wire_api`, `fallback_models`).
+/// Bare family otherwise — there is no entry to read, and the alias-less branch
+/// is the historical behaviour for that case.
+fn boot_model_provider_ref(family: &str, alias: &str, has_entry: bool) -> String {
+    if has_entry {
+        format!("{family}.{alias}")
+    } else {
+        family.to_string()
+    }
 }
 
 fn provider_exists_in_registry(config: &Config, name: &str) -> bool {
@@ -8326,6 +8352,22 @@ mod tests {
         assert!(key1.starts_with("webhook_msg_"));
         assert!(key2.starts_with("webhook_msg_"));
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn boot_model_provider_ref_is_dotted_when_entry_exists() {
+        // Entry-only discriminators (requires_openai_auth → Codex OAuth routing,
+        // wire_api, fallback_models) are readable only on the dotted path.
+        assert_eq!(
+            boot_model_provider_ref("openai", "codex", true),
+            "openai.codex"
+        );
+        assert_eq!(boot_model_provider_ref("opencode", "go", true), "opencode.go");
+    }
+
+    #[test]
+    fn boot_model_provider_ref_falls_back_to_family_without_entry() {
+        assert_eq!(boot_model_provider_ref("openrouter", "default", false), "openrouter");
     }
 
     #[test]
