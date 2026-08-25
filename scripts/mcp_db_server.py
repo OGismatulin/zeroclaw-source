@@ -256,13 +256,18 @@ _PG_POOL: dict[tuple, list] = {}
 _PG_POOL_LOCK = threading.Lock()
 
 # Without these a half-dead VPN tunnel leaves a socket that never errors and
-# never answers -- the observed "MCP hangs and every DB tool times out".
+# never answers -- the observed "MCP hangs and every DB tool times out". A dead
+# peer is now detected in ~60s (idle 30 + 3x10).
+#
+# NO tcp_user_timeout here: measured against the prod replica over the VPN on
+# 2026-08-25 it breaks healthy connects, because a retransmit during the
+# handshake already exceeds the budget -- 15000ms failed 3 of 6 connects,
+# 60000ms 1 of 6, and without it 6 of 6 succeeded (keepalives alone: 6 of 6).
 PG_KEEPALIVE_KWARGS = {
     "keepalives": 1,
     "keepalives_idle": 30,
     "keepalives_interval": 10,
     "keepalives_count": 3,
-    "tcp_user_timeout": 15000,
 }
 
 
