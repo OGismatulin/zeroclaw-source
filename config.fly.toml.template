@@ -17,30 +17,29 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Chat default = ox-alpha-free; background work = deepseek-v4-flash (2026-08-22,
-# operator's call). Deliberate split along ONE axis: who has a fallback.
-#   * Chat (this boot slot) survives a provider 503: the turn retries and
-#     [reliability.model_fallbacks] routes ox-alpha-free -> deepseek-v4-flash, so the
-#     user sees a slower answer, not a failure. ZEROCLAW_PROVIDER=opencode-go
-#     hard-maps to THIS alias (normalize_provider_type -> opencode.go) and the webhook
-#     default path reads the boot slot, not agents.default, so the chat default can
-#     only be set here.
-#   * Delegates and background agents do NOT have that safety net: delegate calls retry
-#     same-provider x3 with NO fallback by design (ensemble failure-domain invariant
-#     D2), so a 503 burst lands directly on the ensemble, the visual worker and cron.
-#     They ride [providers.models.opencode.flash] = deepseek-v4-flash, which logged
-#     zero "Endpoint is unavailable" over the observation window.
-# Evidence for the split: ox-alpha-free collected 24 x 503 in one day of prod
-# daemon-stderr against zero for every other catalog model, and it burned a DV-34767
-# visual dispatch (worker died with attempts=3 kind=provider_server). Client probes
-# discriminate nothing here -- they were clean for ox (15/15, 6/6, 5/5) and dirty for
-# muse (4/5), the opposite of the prod record.
+# Chat default = codex gpt-5.6-luna at reasoning_effort=high (2026-08-25, operator's
+# call after a measured bench). ZEROCLAW_PROVIDER=openai-codex hard-maps to
+# [providers.models.openai.codex] (normalize_provider_type -> openai.codex) and the
+# webhook default path reads THAT boot slot, not agents.default, so the chat default
+# can only be set there.
+#   * Why off the Go router: every 503 "Endpoint is unavailable" and every 401
+#     CreditsError in the prod log arrives on OPENCODE_GO_API_KEY, which ALL Go
+#     channels share (chat, worker/jira_worker, coordinator, analyst_qwen, cron). Chat
+#     on codex OAuth means an exhausted Go key no longer takes the chat down with the
+#     delegates, and [reliability.model_fallbacks] still routes gpt-5.6-luna ->
+#     deepseek-v4-flash if codex itself fails.
+#   * Why `high` and not the codex default `xhigh`: same three real tasks (weather,
+#     an SQL count, a Creatio report), same answers (Creatio 59/840 identical), 181 s
+#     total vs 220 s. Bench doc: docs/analysis/2026-08-25-chat-default-model-bench.md.
+#   * Delegates keep their own slots and have NO fallback by design (invariant D2), so
+#     they stay on proven models: [providers.models.opencode.flash] = deepseek-v4-flash.
 # Watch: grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
 #          | grep -oE "model=[a-z0-9.-]+" | sort | uniq -c
-# If chat 503s stop recovering (no "Provider recovered" after the retries), move this
-# slot to deepseek-v4-flash too.
+# Go rollback slot: no longer the chat default (see the header), kept on a proven
+# model so flipping ZEROCLAW_PROVIDER back to opencode-go lands on deepseek-v4-flash,
+# not on ox-alpha-free (54 x 503 in the prod log).
 [providers.models.opencode.go]
-model = "ox-alpha-free"
+model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
@@ -74,6 +73,20 @@ provider_extra = { reasoning_effort = "max" }
 # migration applies to "openai-codex"). worker = gpt-5.6-luna (cheap GPT-5.6
 # tier; reachable on Codex only via fork patch #22 originator=codex_cli_rs —
 # 404 under the old `pi` identity), coder = gpt-5.6-sol.
+# CHAT BOOT SLOT. ZEROCLAW_PROVIDER=openai-codex resolves here
+# (normalize_provider_type("openai-codex", ..) -> family "openai", alias "codex",
+# schema/v2.rs), and both the synthesized default agent and the gateway boot provider
+# read this entry -- the webhook default path answers with it. reasoning_effort must
+# live on the alias: a bare family override gets provider_extra = None and silently
+# falls back to the codex default xhigh (providers/src/lib.rs:812-820).
+# gpt-5.6-luna has no clamp, so "high" reaches the wire as high.
+[providers.models.openai.codex]
+model = "gpt-5.6-luna"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+provider_extra = { reasoning_effort = "high" }
+
 [providers.models.openai.codex_worker]
 model = "gpt-5.6-luna"
 api_key = ""
@@ -663,7 +676,7 @@ protect_last_n = 10
 # delegate gate (caller+target same profile) passes.
 
 [agents.default]
-model_provider = "opencode.go"
+model_provider = "openai.codex"
 risk_profile = "default"
 runtime_profile = "default"
 mcp_bundles = ["all"]
