@@ -285,19 +285,30 @@ def _pg_close_quietly(conn) -> None:
 
 
 def _pg_acquire(connect_kwargs: dict):
-    """Take a live pooled connection, or open one. Returns (conn, pooled)."""
+    """Take a live pooled connection, or open one. Returns (conn, pooled).
+
+    Nothing is ever closed while the lock is held: `close()` on a half-dead
+    socket blocks until TCP gives up, and doing that under the shared lock
+    wedges every other request in the process -- the whole MCP server went
+    unresponsive that way on 2026-08-25 (`mcp:000` on a plain GET).
+    """
     key = _pool_key(connect_kwargs)
     now = time.monotonic()
+    reuse = None
+    discard = []
     with _PG_POOL_LOCK:
-        bucket = _PG_POOL.get(key) or []
+        bucket = _PG_POOL.setdefault(key, [])
         while bucket:
             conn, last_used = bucket.pop()
             if conn.closed or now - last_used > PG_POOL_IDLE_SECS:
-                _pg_close_quietly(conn)
+                discard.append(conn)
                 continue
-            _PG_POOL[key] = bucket
-            return conn, True
-        _PG_POOL[key] = bucket
+            reuse = conn
+            break
+    for conn in discard:
+        _pg_close_quietly(conn)
+    if reuse is not None:
+        return reuse, True
     conn = psycopg2.connect(**connect_kwargs, **PG_KEEPALIVE_KWARGS,
                             connect_timeout=10)
     return conn, False
@@ -329,10 +340,11 @@ def _pg_release(connect_kwargs: dict, conn) -> None:
     key = _pool_key(connect_kwargs)
     with _PG_POOL_LOCK:
         bucket = _PG_POOL.setdefault(key, [])
-        if len(bucket) >= PG_POOL_MAX_PER_KEY:
-            _pg_close_quietly(conn)
-            return
-        bucket.append((conn, time.monotonic()))
+        overflow = len(bucket) >= PG_POOL_MAX_PER_KEY
+        if not overflow:
+            bucket.append((conn, time.monotonic()))
+    if overflow:                      # close outside the lock, see _pg_acquire
+        _pg_close_quietly(conn)
 
 
 def _execute_pg_with_retry(
