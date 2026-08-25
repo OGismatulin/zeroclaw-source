@@ -8362,12 +8362,18 @@ mod tests {
             boot_model_provider_ref("openai", "codex", true),
             "openai.codex"
         );
-        assert_eq!(boot_model_provider_ref("opencode", "go", true), "opencode.go");
+        assert_eq!(
+            boot_model_provider_ref("opencode", "go", true),
+            "opencode.go"
+        );
     }
 
     #[test]
     fn boot_model_provider_ref_falls_back_to_family_without_entry() {
-        assert_eq!(boot_model_provider_ref("openrouter", "default", false), "openrouter");
+        assert_eq!(
+            boot_model_provider_ref("openrouter", "default", false),
+            "openrouter"
+        );
     }
 
     #[test]
