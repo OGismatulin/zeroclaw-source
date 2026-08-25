@@ -250,7 +250,7 @@ def _wait_for_vpn_route(host: str) -> None:
 # across the VPN (measured on Fly 2026-08-25). Reads are pooled per
 # (host, db, user) so a skill doing N queries pays one handshake, not N.
 # Writes (DML) keep the old open-and-hand-over path untouched.
-PG_POOL_IDLE_SECS = 240
+PG_POOL_IDLE_SECS = 60
 PG_POOL_MAX_PER_KEY = 2
 _PG_POOL: dict[tuple, list] = {}
 _PG_POOL_LOCK = threading.Lock()
@@ -296,6 +296,22 @@ def _pg_acquire(connect_kwargs: dict):
     conn = psycopg2.connect(**connect_kwargs, **PG_KEEPALIVE_KWARGS,
                             connect_timeout=10)
     return conn, False
+
+
+def _pg_drop_key(connect_kwargs: dict) -> None:
+    """Close every pooled connection for this key.
+
+    Called when a pooled socket turns out to be dead: the siblings idled in the
+    same pool over the same network, so they are equally suspect. Without this,
+    a replica restart left `PG_POOL_MAX_PER_KEY` dead sockets and the single
+    free retry only covered the first one -- the query then failed (two
+    timeouts in five prod runs, 2026-08-25).
+    """
+    key = _pool_key(connect_kwargs)
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.pop(key, [])
+    for conn, _ in bucket:
+        _pg_close_quietly(conn)
 
 
 def _pg_release(connect_kwargs: dict, conn) -> None:
@@ -353,6 +369,8 @@ def _execute_pg_with_retry(
         except psycopg2.Error as exc:
             last_exc = exc
             failed = True
+            if pooled:
+                _pg_drop_key(connect_kwargs)
             if pooled and pooled_grace:
                 # A socket that was idle in the pool can die in ways a fresh
                 # connect never shows (SSL EOF, broken pipe). That failure says
