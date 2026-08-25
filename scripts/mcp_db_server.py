@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -162,6 +163,14 @@ _RETRYABLE_PG_PATTERNS = (
     "the database system is starting up",
     "no route to host",
     "network is unreachable",
+    # a pooled socket the server (or the VPN) dropped since last use
+    "connection already closed",
+    "ssl connection has been closed unexpectedly",
+    "ssl syscall error",
+    "eof detected",
+    "broken pipe",
+    "consuming input failed",
+    "terminating connection",
 )
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BACKOFFS_SECS = (0.5, 1.5)
@@ -233,6 +242,111 @@ def _wait_for_vpn_route(host: str) -> None:
     raise RuntimeError(f"vpn_unavailable: route to {host} ({ip}) is not via tun0")
 
 
+# ---------------------------------------------------------------------------
+# PG connection reuse
+# ---------------------------------------------------------------------------
+# A trivial `SELECT 1` cost ~2.5-6s end to end while the query itself took
+# 0.24s: every call paid a fresh TCP+TLS+auth handshake to the prod replica
+# across the VPN (measured on Fly 2026-08-25). Reads are pooled per
+# (host, db, user) so a skill doing N queries pays one handshake, not N.
+# Writes (DML) keep the old open-and-hand-over path untouched.
+PG_POOL_IDLE_SECS = 60
+PG_POOL_MAX_PER_KEY = 2
+_PG_POOL: dict[tuple, list] = {}
+_PG_POOL_LOCK = threading.Lock()
+
+# Without these a half-dead VPN tunnel leaves a socket that never errors and
+# never answers -- the observed "MCP hangs and every DB tool times out". A dead
+# peer is now detected in ~60s (idle 30 + 3x10).
+#
+# NO tcp_user_timeout here: measured against the prod replica over the VPN on
+# 2026-08-25 it breaks healthy connects, because a retransmit during the
+# handshake already exceeds the budget -- 15000ms failed 3 of 6 connects,
+# 60000ms 1 of 6, and without it 6 of 6 succeeded (keepalives alone: 6 of 6).
+PG_KEEPALIVE_KWARGS = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+}
+
+
+def _pool_key(connect_kwargs: dict) -> tuple:
+    return tuple(sorted(
+        (k, v) for k, v in connect_kwargs.items() if k != "password"
+    ))
+
+
+def _pg_close_quietly(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _pg_acquire(connect_kwargs: dict):
+    """Take a live pooled connection, or open one. Returns (conn, pooled).
+
+    Nothing is ever closed while the lock is held: `close()` on a half-dead
+    socket blocks until TCP gives up, and doing that under the shared lock
+    wedges every other request in the process -- the whole MCP server went
+    unresponsive that way on 2026-08-25 (`mcp:000` on a plain GET).
+    """
+    key = _pool_key(connect_kwargs)
+    now = time.monotonic()
+    reuse = None
+    discard = []
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.setdefault(key, [])
+        while bucket:
+            conn, last_used = bucket.pop()
+            if conn.closed or now - last_used > PG_POOL_IDLE_SECS:
+                discard.append(conn)
+                continue
+            reuse = conn
+            break
+    for conn in discard:
+        _pg_close_quietly(conn)
+    if reuse is not None:
+        return reuse, True
+    conn = psycopg2.connect(**connect_kwargs, **PG_KEEPALIVE_KWARGS,
+                            connect_timeout=10)
+    return conn, False
+
+
+def _pg_drop_key(connect_kwargs: dict) -> None:
+    """Close every pooled connection for this key.
+
+    Called when a pooled socket turns out to be dead: the siblings idled in the
+    same pool over the same network, so they are equally suspect. Without this,
+    a replica restart left `PG_POOL_MAX_PER_KEY` dead sockets and the single
+    free retry only covered the first one -- the query then failed (two
+    timeouts in five prod runs, 2026-08-25).
+    """
+    key = _pool_key(connect_kwargs)
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.pop(key, [])
+    for conn, _ in bucket:
+        _pg_close_quietly(conn)
+
+
+def _pg_release(connect_kwargs: dict, conn) -> None:
+    """Return a read connection to the pool, ending its transaction first."""
+    try:
+        conn.rollback()          # never leave it idle-in-transaction
+    except Exception:
+        _pg_close_quietly(conn)
+        return
+    key = _pool_key(connect_kwargs)
+    with _PG_POOL_LOCK:
+        bucket = _PG_POOL.setdefault(key, [])
+        overflow = len(bucket) >= PG_POOL_MAX_PER_KEY
+        if not overflow:
+            bucket.append((conn, time.monotonic()))
+    if overflow:                      # close outside the lock, see _pg_acquire
+        _pg_close_quietly(conn)
+
+
 def _execute_pg_with_retry(
     connect_kwargs: dict,
     sql: str,
@@ -242,13 +356,24 @@ def _execute_pg_with_retry(
     retry_safe = _sql_is_retry_safe(sql)
     last_exc: BaseException | None = None
     host = connect_kwargs.get("host")
-    for attempt in range(RETRY_MAX_ATTEMPTS):
+    # A pooled connection the server closed in the meantime costs one free
+    # retry: that failure is not evidence the database is unhealthy.
+    pooled_grace = 1
+    attempt = 0
+    while attempt < RETRY_MAX_ATTEMPTS:
         conn = None
         is_dml = False
+        pooled = False
+        failed = False
         try:
             if host:
                 _wait_for_vpn_route(host)
-            conn = psycopg2.connect(**connect_kwargs, connect_timeout=10)
+            if retry_safe:
+                conn, pooled = _pg_acquire(connect_kwargs)
+            else:
+                conn = psycopg2.connect(**connect_kwargs,
+                                        **PG_KEEPALIVE_KWARGS,
+                                        connect_timeout=10)
             with conn.cursor() as cur:
                 cur.execute(f"SET statement_timeout = {statement_timeout_ms}")
                 cur.execute(sql)
@@ -260,6 +385,17 @@ def _execute_pg_with_retry(
                 return ("rows", columns, rows)
         except psycopg2.Error as exc:
             last_exc = exc
+            failed = True
+            if pooled:
+                _pg_drop_key(connect_kwargs)
+            if pooled and pooled_grace:
+                # A socket that was idle in the pool can die in ways a fresh
+                # connect never shows (SSL EOF, broken pipe). That failure says
+                # nothing about the database, so it is retried unconditionally
+                # and without spending an attempt -- pooling only ever applies
+                # to retry-safe reads.
+                pooled_grace -= 1
+                continue
             if (
                 not retry_safe
                 or not _is_transient_pg_error(exc)
@@ -272,12 +408,18 @@ def _execute_pg_with_retry(
                 flush=True,
             )
             time.sleep(RETRY_BACKOFFS_SECS[attempt])
+            attempt += 1
+        else:
+            attempt += 1
         finally:
             if conn is not None and not is_dml:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                # A connection that just failed goes in the bin, never back in
+                # the pool -- otherwise the same dead socket is handed out again
+                # and the free retry is burned on it.
+                if retry_safe and not failed and not conn.closed:
+                    _pg_release(connect_kwargs, conn)
+                else:
+                    _pg_close_quietly(conn)
     raise last_exc or RuntimeError("unreachable pg retry state")
 
 
