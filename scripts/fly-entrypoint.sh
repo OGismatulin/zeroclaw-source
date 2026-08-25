@@ -74,6 +74,69 @@ start_openvpn_watchdog() {
   echo "[fly-entrypoint] OpenVPN watchdog started (pid=$VPN_WATCHDOG_PID)"
 }
 
+start_mcp_db_watchdog() {
+  # The MCP DB sidecar can wedge while its process is still alive: prod
+  # 2026-08-25 showed pid up, 1 thread, ~0 CPU, 40 sockets in CLOSE_WAIT and
+  # every request (even a plain GET /health) hanging for 42+ minutes, so every
+  # DB-backed skill silently timed out until the machine was restarted by hand.
+  # /health lives on the same event loop as /mcp, so a hung loop fails it.
+  # Restart budget mirrors the OpenVPN watchdog above.
+  (
+    set +e
+    failures=0
+    restarts=0
+    restarts_window_start=$(date +%s)
+    restarts_limit=${MCP_DB_WATCHDOG_MAX_RESTARTS:-5}
+    restarts_window_secs=${MCP_DB_WATCHDOG_RESTARTS_WINDOW_SECS:-3600}
+    cooldown_secs=${MCP_DB_WATCHDOG_COOLDOWN_SECS:-900}
+    probe_timeout=${MCP_DB_WATCHDOG_PROBE_TIMEOUT_SECS:-5}
+    while true; do
+      if curl -s -m "$probe_timeout" -o /dev/null "http://localhost:${MCP_DB_PORT:-4000}/health"; then
+        failures=0
+      else
+        failures=$((failures + 1))
+        echo "[mcp-db-watchdog] /health unhealthy (failures=$failures)" >&2
+        if [ "$failures" -ge 3 ]; then
+          now=$(date +%s)
+          if [ "$((now - restarts_window_start))" -ge "$restarts_window_secs" ]; then
+            restarts=0
+            restarts_window_start=$now
+          fi
+          if [ "$restarts" -ge "$restarts_limit" ]; then
+            echo "[mcp-db-watchdog] CRITICAL: ${restarts_limit} restarts in last ${restarts_window_secs}s; backing off ${cooldown_secs}s before next attempt" >&2
+            sleep "$cooldown_secs"
+            restarts=0
+            restarts_window_start=$(date +%s)
+            failures=0
+            continue
+          fi
+          restarts=$((restarts + 1))
+          echo "[mcp-db-watchdog] restarting mcp_db_server (restart $restarts/$restarts_limit in window)" >&2
+          # TERM is not enough on its own: a process wedged (or stopped) keeps
+          # holding the port, and the replacement then cannot bind -- the
+          # restart budget burns down while nothing recovers.
+          pkill -f "python3 /usr/local/bin/mcp_db_server.py" || true
+          sleep 2
+          pkill -KILL -f "python3 /usr/local/bin/mcp_db_server.py" || true
+          sleep 1
+          python3 /usr/local/bin/mcp_db_server.py &
+          # Give the replacement time to bind before probing again, or the next
+          # three probes fail against a still-booting server and spend another
+          # restart.
+          for _ in $(seq 1 "${MCP_DB_WATCHDOG_READY_WAIT_SECS:-30}"); do
+            curl -s -m "$probe_timeout" -o /dev/null "http://localhost:${MCP_DB_PORT:-4000}/health" && break
+            sleep 1
+          done
+          failures=0
+        fi
+      fi
+      sleep "${MCP_DB_WATCHDOG_INTERVAL_SECS:-30}"
+    done
+  ) &
+  MCP_DB_WATCHDOG_PID=$!
+  echo "[fly-entrypoint] MCP DB watchdog started (pid=$MCP_DB_WATCHDOG_PID)"
+}
+
 copy_sanitized_workspace_template() {
   python3 - "$1" "$2" <<'PY'
 from pathlib import Path
@@ -195,6 +258,7 @@ if ip link show tun0 > /dev/null 2>&1; then
     else
         echo "[fly-entrypoint] WARNING: MCP DB Server started (pid=$MCP_DB_PID) but /health is not healthy"
     fi
+    start_mcp_db_watchdog
 fi
 
 # --- MCP Graylog Server — independent of VPN ---
