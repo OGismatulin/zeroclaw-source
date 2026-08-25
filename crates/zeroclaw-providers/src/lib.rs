@@ -1783,6 +1783,23 @@ fn append_fallback_chain(
 /// dispatch through the typed alias factory so endpoint URI, family
 /// extras, and per-alias credentials from `[providers.models.<family>.<alias>]`
 /// are honored; bare names route through the family factory directly.
+/// Build a resilient provider from either shape of `name` — and the two shapes
+/// take DIFFERENT branches:
+///
+/// * `<family>.<alias>` → alias-aware: reads `[providers.models.<family>.<alias>]`,
+///   so entry-only fields are honored, plus per-alias `fallback` and model-pinned
+///   entries for the alias's `model`/`fallback_models`.
+/// * `<family>` (bare) → alias-less: builds the family's STANDARD provider and
+///   never reads an entry. Silently lost: `requires_openai_auth` (Codex OAuth
+///   routing in `OpenAIModelProviderConfig::create_provider`), `wire_api`,
+///   `fallback_models`, `provider_extra` (incl. `reasoning_effort`),
+///   `native_tools`, `think`.
+///
+/// Pass the DOTTED ref whenever an entry exists; the bare form is for the case
+/// where there is genuinely no entry to read. A lost discriminator does not fail
+/// loudly — it surfaces as a foreign-credential 401 or the wrong wire protocol
+/// (prod 2026-08-25: bare `openai` boot slot became plain OpenAI, resolved the
+/// generic `ZEROCLAW_API_KEY` and 401'd every default turn). See invariant I37.
 pub fn create_resilient_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
