@@ -77,6 +77,9 @@ apps/*
 !apps/tauri/
 !apps/tauri/Cargo.toml
 !apps/zerocode/
+# ALLOWLIST (в отличие от .dockerignore интеграционного репо, который exclude-only):
+# всё под scripts/ выбрасывается из build-контекста, ниже возвращаются поимённо нужные.
+# Новый scripts/X.py БЕЗ строки !scripts/X.py => файла нет в контексте => COPY роняет сборку.
 scripts/
 !scripts/gateway_manager.py
 !scripts/bootstrap_nightly_retro_cron.py

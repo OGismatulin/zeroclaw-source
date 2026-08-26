@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1.7
+# ЭТОТ файл собирает прод (zc-build-image.yml: file: ./Dockerfile.deploy).
+# Парный интеграционный ./Dockerfile — только локальная сборка; правки нужны в ОБА.
+# Новый COPY scripts/X.py требует ещё и строки !scripts/X.py в .dockerignore рядом
+# (он тут allowlist), иначе файла нет в контексте и сборка падает. Инвариант I41.
 #
 # Deploy Dockerfile for ghcr.io/ogismatulin/zeroclaw (ai-forge-zeroclaw on Fly).
 #
