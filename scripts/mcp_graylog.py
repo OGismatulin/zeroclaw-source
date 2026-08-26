@@ -1495,6 +1495,37 @@ def _validate_out_name(name: str) -> str:
     return name
 
 
+# Only files this tool itself produced: <8 hex>__<name>.<fmt>[.meta.json].
+_DUMP_NAME_RE = re.compile(r"^[0-9a-f]{8}__.+\.(csv|json|parquet)(\.meta\.json)?$")
+
+
+def _purge_old_dumps(
+    target_dir: Path, *, max_age_days: float = 7.0, now: float | None = None
+) -> int:
+    """Drop this tool's own stale dumps. Best-effort: never raises.
+
+    Same safety floor as the central janitor: nothing younger than 24h, and
+    nothing whose name we did not generate ourselves.
+    """
+    moment = time.time() if now is None else now
+    cutoff = moment - max(float(max_age_days), 1.0) * 86_400
+    removed = 0
+    try:
+        entries = list(target_dir.iterdir())
+    except OSError:
+        return 0
+    for item in entries:
+        try:
+            if not item.is_file() or not _DUMP_NAME_RE.match(item.name):
+                continue
+            if item.stat().st_mtime < cutoff:
+                item.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def _resolve_upload_path(workspace: str, out_name: str, fmt: str) -> Path:
     """Return absolute path inside <workspace>/uploads/graylog/. Validates no escape."""
     out = _validate_out_name(out_name)
@@ -1668,6 +1699,7 @@ async def tool_search_to_file(
     capped_timeout = min(int(timeout_secs), EXPORT_HARD_TIMEOUT_S)
     try:
         out_path = _resolve_upload_path(workspace, out_name, format)
+        _purge_old_dumps(out_path.parent)
     except ValueError as e:
         _audit_tool(
             "search_to_file",

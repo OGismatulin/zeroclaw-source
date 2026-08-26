@@ -26,6 +26,11 @@ from typing import Callable, TextIO, TypedDict
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
 
+try:  # image layout: both scripts live side by side in /usr/local/bin
+    import volume_janitor
+except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
+    from scripts import volume_janitor
+
 
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
 INCIDENT_ID_PATTERN = re.compile(r"^zc-[0-9a-f]{16}$")
@@ -1939,12 +1944,14 @@ class GatewayManagerServer:
         registry: GatewayRegistry | object | None,
         forward_webhook: Callable[..., tuple[int, dict[str, object]]],
         operator_error_notifier: OperatorErrorNotifier | object | None = None,
+        volume_janitor: object | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
         self.registry = registry
         self.forward_webhook = forward_webhook
         self.operator_error_notifier = operator_error_notifier
+        self.volume_janitor = volume_janitor
 
     def finalize_error(
         self,
@@ -3463,6 +3470,130 @@ def install_shutdown_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var without ever raising into manager startup."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[gateway-manager] ignoring invalid {name}={raw!r}; using {default}",
+            flush=True,
+        )
+        return default
+    if value <= 0 or value != value:  # non-positive or NaN
+        print(
+            f"[gateway-manager] ignoring out-of-range {name}={raw!r}; using {default}",
+            flush=True,
+        )
+        return default
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class VolumeJanitor:
+    """Periodic retention sweep over the data volume. Never raises into the manager."""
+
+    def __init__(
+        self,
+        *,
+        data_root: Path,
+        interval_secs: float = 86_400.0,
+        initial_delay_secs: float = 900.0,
+        dry_run: bool = False,
+        low_space_ratio: float = 0.15,
+        sweeper: Callable[..., dict[str, object]] = volume_janitor.sweep,
+        alert: Callable[[str, str, str], None] | None = None,
+    ) -> None:
+        self._data_root = data_root
+        self._interval = max(interval_secs, 60.0)
+        self._initial_delay = max(initial_delay_secs, 0.0)
+        self._dry_run = dry_run
+        self._low_space_ratio = low_space_ratio
+        self._sweeper = sweeper
+        self._alert = alert
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="volume-janitor", daemon=True
+        )
+        self._thread.start()
+        print(
+            "[gateway-manager] janitor: thread started"
+            f" (dry_run={self._dry_run}, first sweep in {int(self._initial_delay)}s,"
+            f" then every {int(self._interval)}s)",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> dict[str, object]:
+        try:
+            report = self._sweeper(self._data_root, apply=not self._dry_run)
+        except Exception as exc:  # a sweep failure must not kill the loop
+            self._emit(
+                "janitor_failed",
+                f"volume janitor sweep failed: {exc}",
+                "Check manager logs; retention is not running",
+            )
+            return {"errors": [{"error": str(exc)}]}
+        free = int(report.get("free_bytes", 0) or 0)
+        total = int(report.get("total_bytes", 0) or 0)
+        print(
+            "[gateway-manager] janitor:"
+            f" dry_run={report.get('dry_run')}"
+            f" planned={report.get('planned')}"
+            f" deleted={report.get('deleted')}"
+            f" failed={report.get('failed')}"
+            f" freed_mib={int(report.get('freed_bytes', 0)) // (1024 * 1024)}"
+            f" free_mib={free // (1024 * 1024)}",
+            flush=True,
+        )
+        if report.get("errors"):
+            self._emit(
+                "janitor_failed",
+                f"volume janitor hit {len(report['errors'])} errors",
+                "See state/retention/last-run.json in the affected workspace",
+            )
+        if total > 0 and free / total < self._low_space_ratio:
+            self._emit(
+                "volume_low_space",
+                f"data volume free space is {free * 100 // total}%"
+                f" ({free // (1024 * 1024)} MiB)",
+                "Review retention windows or resize the Fly volume",
+            )
+        return report
+
+    def _emit(self, code: str, error: str, hint: str) -> None:
+        if self._alert is None:
+            return
+        try:
+            self._alert(code, error, hint)
+        except Exception:
+            pass
+
+    def _loop(self) -> None:
+        if self._stop.wait(self._initial_delay):
+            return
+        while not self._stop.is_set():
+            self.run_once()
+            if self._stop.wait(self._interval):
+                return
+
+
 def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     legacy_bearer_token = os.getenv("ZEROCLAW_BEARER_TOKEN", "").strip()
     pairing_state = PairingState(
@@ -3564,12 +3695,41 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
             if notifier:
                 notifier.stop()
 
+    def _janitor_alert(code: str, error: str, hint: str) -> None:
+        operator_error_notifier.notify(
+            user_id=None,
+            payload=build_error_payload(
+                code=code,
+                component="manager",
+                retryable=False,
+                error=error,
+                hint=hint,
+            ),
+            operator={"scope": "volume-janitor"},
+        )
+
+    janitor: VolumeJanitor | None = None
+    if _env_bool("ZEROCLAW_JANITOR_ENABLED", True):
+        janitor = VolumeJanitor(
+            data_root=settings.data_root,
+            interval_secs=_env_float("ZEROCLAW_JANITOR_INTERVAL_HOURS", 24.0) * 3600.0,
+            initial_delay_secs=_env_float(
+                "ZEROCLAW_JANITOR_INITIAL_DELAY_SECS", 900.0
+            ),
+            dry_run=_env_bool("ZEROCLAW_JANITOR_DRY_RUN", False),
+            alert=_janitor_alert,
+        )
+        janitor.start()
+    else:
+        print("[gateway-manager] janitor: disabled by env", flush=True)
+
     return GatewayManagerServer(
         settings=settings,
         pairing_state=pairing_state,
         registry=registry,
         forward_webhook=_forward,
         operator_error_notifier=operator_error_notifier,
+        volume_janitor=janitor,
     )
 
 
@@ -3711,6 +3871,9 @@ def main() -> int:
         notifier = app.operator_error_notifier
         if notifier is not None and hasattr(notifier, "close"):
             notifier.close()
+        active_janitor = getattr(app, "volume_janitor", None)
+        if active_janitor is not None:
+            active_janitor.stop()
     return 0
 
 
