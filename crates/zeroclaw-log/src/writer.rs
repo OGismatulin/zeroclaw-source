@@ -491,15 +491,21 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     }
     let skip = total - state.policy.max_entries;
 
-    let tmp = state.policy.path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-    ));
+    // fork(#35): a unique temp name (tmp.<pid>.<nanos>) under create_new leaked one
+    // full copy of the tail every time the writer failed to reach the rename — a
+    // killed daemon (deploy, respawn, machine restart) or any I/O error, since the
+    // error path has no cleanup. Measured 2026-08-26 in production: 51 orphans /
+    // 246 MiB after 13 deploys. A fixed name is self-healing: the next trim reuses
+    // (and truncates) whatever the previous attempt left behind, so at most one temp
+    // file can exist per workspace, and no directory scan lands on this hot path
+    // (rolling storage trims on every event). Safe because the log worker is
+    // single-threaded and the manager reaps the old daemon before spawning its
+    // replacement.
+    let tmp = state.policy.path.with_extension("tmp");
 
     {
         let mut opts = OpenOptions::new();
-        opts.create_new(true).write(true);
+        opts.create(true).write(true).truncate(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -983,6 +989,52 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first_dead, &second.worker_dead),
             "re-init must install a fresh WriterState, not mutate the old one"
+        );
+    }
+
+    #[test]
+    fn rolling_trim_reuses_one_fixed_temp_and_leaves_no_orphans() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 3);
+        let path = runtime_trace_path().unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+
+        // An orphan left behind by a previous process, carrying the fixed name.
+        let orphan = path.with_extension("tmp");
+        fs::write(&orphan, "{\"stale\":true}\n").unwrap();
+
+        for i in 0..6 {
+            emit(&format!("event-{i}"));
+        }
+        flush_for_test().unwrap();
+
+        assert_eq!(count_lines(&path), 3, "trim keeps the configured tail");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains("stale"),
+            "orphan content never leaks into the log"
+        );
+
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.len() <= 1,
+            "at most one temp file may ever exist, got {leftovers:?}"
+        );
+        // The abandoned temp must have been reused (truncated), not left to rot
+        // beside a brand-new uniquely named one.
+        let orphan_still_stale = fs::read_to_string(&orphan)
+            .map(|s| s.contains("stale"))
+            .unwrap_or(false);
+        assert!(
+            !orphan_still_stale,
+            "a previous process's temp must be reused by the next trim"
         );
     }
 
