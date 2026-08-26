@@ -1441,6 +1441,14 @@ def health() -> str:
         os.environ.get("OPENVPN_LOG_PATH", "/tmp/openvpn.log"),
         window_secs=300,
     )
+    # Pool size is otherwise invisible from outside: a caller that sees slow
+    # first-query-per-database and fast repeats can confirm reuse here instead
+    # of guessing from timings.
+    with _PG_POOL_LOCK:
+        result["pg_pool"] = {
+            "keys": len(_PG_POOL),
+            "idle_connections": sum(len(b) for b in _PG_POOL.values()),
+        }
 
     if (
         result["vpn"] != "tun0 up"
