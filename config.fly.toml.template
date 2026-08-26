@@ -134,7 +134,8 @@ wire_api = "responses"
 requires_openai_auth = true
 provider_extra = { reasoning_effort = "max" }
 
-# deepseek subagents: pro (deepseek-v4-pro) and flash (deepseek-v4-flash).
+# deepseek direct-API slots — UNREFERENCED rollback slots since 2026-08-26
+# (analyst_deepseek_pro moved to [providers.models.opencode.deepseek]).
 [providers.models.deepseek.pro]
 model = "deepseek-v4-pro"
 api_key = ""
@@ -148,6 +149,21 @@ provider_extra = { reasoning_effort = "max" }
 [providers.models.deepseek.flash]
 model = "deepseek-v4-flash"
 api_key = ""
+
+# Ensemble analyst alias on the Go router (2026-08-26): deepseek-v4-flash instead
+# of deepseek-v4-pro on api.deepseek.com — the analyst now rides the opencode-go
+# subscription key (OPENCODE_GO_API_KEY) instead of DEEPSEEK_API_KEY. Same
+# reasoning_effort = "max" as the other analysts (Go-router valid on this model —
+# [providers.models.opencode.go_coordinator] runs it). Own alias, not a reuse of
+# opencode.flash/go_coordinator, so the analyst keeps its own rollback point and
+# audit identity. NO fallback — preserves the analyst failure domain
+# (jira-analysis-pipeline D2: same-provider retry x3, no fallback).
+# Rollback = repoint [agents.analyst_deepseek_pro] back to deepseek.pro + marker bump.
+[providers.models.opencode.deepseek]
+model = "deepseek-v4-flash"
+uri = "https://opencode.ai/zen/go/v1"
+api_key = ""
+provider_extra = { reasoning_effort = "max" }
 
 # GLM via the z.ai Coding Plan subscription. The provider name decides the endpoint:
 # `zai` → https://api.z.ai/api/coding/paas/v4 (subscription, ZAI_API_KEY), while `glm`
@@ -723,7 +739,7 @@ mcp_bundles = ["all"]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_deepseek_pro]
-model_provider = "deepseek.pro"
+model_provider = "opencode.deepseek"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
