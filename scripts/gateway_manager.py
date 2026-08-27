@@ -566,7 +566,14 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         a 503 burst would hit the ensemble, the visual worker and cron directly --
 #         exactly how DV-34767 lost a visual dispatch. This supersedes the "one model
 #         everywhere" shape of v3-43..v3-46 on purpose.
-CURRENT_CONFIG_MARKER = "v3-50"
+# v3-51 = Catalog refresh 2026-08-27. Dropped ox-alpha-free (router now answers
+#         401 "Model ox-alpha-free is not supported" -- gone from /models, and it
+#         had 40 prod failures) and muse-spark-1.2-contributor (500 "Internal
+#         server error" on 3 probes, both keys). Added glm-5.3-flash and
+#         longcat-2.0 (single + multi-turn tool loop PASS x2) with conservative
+#         windows (200k / 128k, unpublished and unprobed) and a
+#         deepseek-v4-flash fallback each.
+CURRENT_CONFIG_MARKER = "v3-51"
 
 
 def sanitize_filename(filename: str) -> str:

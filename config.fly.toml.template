@@ -37,7 +37,7 @@ schema_version = 3
 #          | grep -oE "model=[a-z0-9.-]+" | sort | uniq -c
 # Go rollback slot: no longer the chat default (see the header), kept on a proven
 # model so flipping ZEROCLAW_PROVIDER back to opencode-go lands on deepseek-v4-flash,
-# not on ox-alpha-free (54 x 503 in the prod log).
+# not on a flaky slot (ox-alpha-free had 54 x 503 and is now off the router entirely).
 [providers.models.opencode.go]
 model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
@@ -207,10 +207,11 @@ provider_extra = { reasoning_effort = "max" }
 fallback_providers = ["opencode-go"]
 
 [reliability.model_fallbacks]
-# Re-synced to the live catalog 2026-08-16: retired ids (GLM-5.1, Qwen3.5-397B-A17B,
+# Re-synced to the live catalog 2026-08-27: retired ids (GLM-5.1, Qwen3.5-397B-A17B,
 # gpt-5.5, gpt-5.4*, glm-5-turbo, glm-5.1, glm-5.2, minimax-m2.7, mimo-v2.5,
-# kimi-k2.7-code) dropped. deepseek-v4-flash is the fallback target, so it is never
-# a key.
+# kimi-k2.7-code, ox-alpha-free, muse-spark-1.2-contributor) dropped;
+# glm-5.3-flash + longcat-2.0 added (single + multi-turn tool loop PASS, 2 probes
+# each). deepseek-v4-flash is the fallback target, so it is never a key.
 # Codex family
 "gpt-5.6-sol"        = ["deepseek-v4-flash"]
 "gpt-5.6-terra"      = ["deepseek-v4-flash"]
@@ -224,8 +225,8 @@ fallback_providers = ["opencode-go"]
 "qwen3.8-max"        = ["deepseek-v4-flash"]
 "hy3"                = ["deepseek-v4-flash"]
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
-"ox-alpha-free"      = ["deepseek-v4-flash"]
-"muse-spark-1.2-contributor" = ["deepseek-v4-flash"]
+"glm-5.3-flash"      = ["deepseek-v4-flash"]
+"longcat-2.0"        = ["deepseek-v4-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
@@ -592,10 +593,13 @@ protect_last_n = 10
 "gpt-5.6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
 "gpt-5.6-luna"            = 353_000
-# Probed 2026-08-22 (windows unpublished): ox-alpha-free accepted a 900k-token
-# prompt; muse-spark-1.2-contributor accepted 600k and rejected 1M. Verified floor.
-"ox-alpha-free"           = 800_000
-"muse-spark-1.2-contributor" = 600_000
+# Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
+# (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
+# each; ox also had 40 prod failures). Windows of the two replacements are
+# unpublished and NOT probed -- conservative floors, a too-small window only
+# compacts earlier. glm-5.3-flash mirrors glm-5.3.
+"glm-5.3-flash"           = 200_000
+"longcat-2.0"             = 128_000
 
 # Subagent runtime profile. Shares default's context_compression + model_windows
 # so cross-model windows still resolve. Subagents do real work inside cron
@@ -637,10 +641,13 @@ protect_last_n = 10
 "gpt-5.6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
 "gpt-5.6-luna"            = 353_000
-# Probed 2026-08-22 (windows unpublished): ox-alpha-free accepted a 900k-token
-# prompt; muse-spark-1.2-contributor accepted 600k and rejected 1M. Verified floor.
-"ox-alpha-free"           = 800_000
-"muse-spark-1.2-contributor" = 600_000
+# Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
+# (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
+# each; ox also had 40 prod failures). Windows of the two replacements are
+# unpublished and NOT probed -- conservative floors, a too-small window only
+# compacts earlier. glm-5.3-flash mirrors glm-5.3.
+"glm-5.3-flash"           = 200_000
+"longcat-2.0"             = 128_000
 
 # Jira package runs load a large immutable source manifest and invoke the full
 # tool surface.  The measured system floor is already above 205k tokens, so
