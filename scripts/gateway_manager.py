@@ -566,7 +566,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         a 503 burst would hit the ensemble, the visual worker and cron directly --
 #         exactly how DV-34767 lost a visual dispatch. This supersedes the "one model
 #         everywhere" shape of v3-43..v3-46 on purpose.
-CURRENT_CONFIG_MARKER = "v3-49"
+CURRENT_CONFIG_MARKER = "v3-50"
 
 
 def sanitize_filename(filename: str) -> str:
