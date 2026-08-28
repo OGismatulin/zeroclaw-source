@@ -573,7 +573,17 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         longcat-2.0 (single + multi-turn tool loop PASS x2) with conservative
 #         windows (200k / 128k, unpublished and unprobed) and a
 #         deepseek-v4-flash fallback each.
-CURRENT_CONFIG_MARKER = "v3-51"
+# v3-52 = Bright Data enrichment for business-discovery: BRIGHTDATA_API_KEY added
+#         to shell_env_passthrough so
+#         skills/business-discovery/scripts/brightdata_enrich.py can read it from
+#         os.environ (shell policy strips $VAR from commands). Fly secret only;
+#         no template placeholder, no entrypoint change.
+# v3-53 = HikerAPI + Apify enrichment for business-discovery: HIKERAPI_KEY and
+#         APIFY_TOKEN added to shell_env_passthrough so
+#         skills/business-discovery/scripts/{hiker,apify}_enrich.py can read them
+#         from os.environ (shell policy strips $VAR from commands). Fly secrets
+#         only; no template placeholder, no entrypoint change.
+CURRENT_CONFIG_MARKER = "v3-53"
 
 
 def sanitize_filename(filename: str) -> str:
