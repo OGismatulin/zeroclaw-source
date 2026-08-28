@@ -25,6 +25,12 @@ swap_size_mb = 512
   # inert on V3 (model comes from [providers.models.openai.codex].model);
   # kept in sync so the file does not misreport the live default.
   ZEROCLAW_MODEL = 'gpt-5.6-luna'
+  # Hot key rotation (fork patch #35): the daemon reads the opencode-go key from
+  # this file first and falls back to the OPENCODE_GO_API_KEY secret when the
+  # file is absent. Rotating = rewriting the file; no restart, no respawn.
+  # Path is duplicated as DEFAULT_KEY_FILE in workspace/scripts/opencode_usage.py
+  # (gated by tests/test_configuration.py).
+  OPENCODE_GO_API_KEY_FILE = '/zeroclaw-data/opencode/go_api_key'
   ZEROCLAW_MANAGER_HOST = '0.0.0.0'
   ZEROCLAW_MANAGER_PORT = '3000'
   ZEROCLAW_MANAGER_BASE_PORT = '3001'

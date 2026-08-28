@@ -1041,6 +1041,65 @@ fn provider_env_candidates(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// fork patch #35: read a credential from the file named by `<CAND>_FILE`.
+///
+/// Enables hot key rotation: the daemon's own `std::env` cannot be changed from
+/// the outside, but a file on the volume can, and every live path rebuilds its
+/// provider per request (webhook override, delegate spawn, cron job).
+///
+/// A missing file is the normal pre-rollout state and the documented rollback,
+/// so it stays silent. A file that exists but cannot be read is a real fault and
+/// is logged WARN — never with its contents, and at most once per process per
+/// variable: this runs on every provider construction, so an unconditional WARN
+/// would flood daemon-stderr.log on every message, delegate and cron tick.
+/// Malformed-but-non-empty content is deliberately NOT validated here; the
+/// rotation script validates on write.
+fn credential_from_file_env(file_env_var: &str) -> Option<String> {
+    // one WARN per process per variable + reason (see doc comment)
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let warn_once = |reason: &str, detail: String| {
+        let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let key = format!("{file_env_var}:{reason}");
+        // A poisoned lock must not suppress the warning, hence is_ok_and(false).
+        // The guard drops with the expression, so it is not held across logging.
+        if set.lock().is_ok_and(|mut seen| !seen.insert(key)) {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "env_var": file_env_var,
+                    "reason": reason,
+                    "detail": detail,
+                })),
+            "Credential file unusable; falling back to the environment variable"
+        );
+    };
+    let path = std::env::var(file_env_var).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                warn_once("empty_file", String::new());
+                return None;
+            }
+            Some(trimmed.to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn_once("unreadable", format!("{:?}", e.kind()));
+            None
+        }
+    }
+}
+
 fn resolve_model_provider_credential(
     name: &str,
     credential_override: Option<&str>,
@@ -1052,6 +1111,9 @@ fn resolve_model_provider_credential(
         return Some(value.to_string());
     }
     for env_var in provider_env_candidates(name) {
+        if let Some(value) = credential_from_file_env(&format!("{env_var}_FILE")) {
+            return Some(value);
+        }
         if let Ok(value) = std::env::var(env_var) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -2698,6 +2760,9 @@ mod tests {
     #[test]
     fn resolve_model_provider_credential_opencode_go_env() {
         let _env_lock = env_lock();
+        // fork(#35): without this guard the test reads the runner's real key
+        // file when /zeroclaw-data is mounted (container runs).
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
         let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("go-test-key"));
         let _opencode_guard = EnvGuard::set("OPENCODE_API_KEY", None);
         let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
@@ -2710,11 +2775,108 @@ mod tests {
     #[test]
     fn resolve_model_provider_credential_deepseek_env() {
         let _env_lock = env_lock();
+        let _file_guard = EnvGuard::set("DEEPSEEK_API_KEY_FILE", None);
         let _provider_guard = EnvGuard::set("DEEPSEEK_API_KEY", Some("deepseek-test-key"));
         let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
         let resolved = resolve_model_provider_credential("deepseek", None);
         assert_eq!(resolved.as_deref(), Some("deepseek-test-key"));
+    }
+
+    // fork(#35): a credential read from `<CAND>_FILE` beats the same-named env
+    // var — this is the hot key rotation mechanism (the daemon's own std::env
+    // cannot be changed from outside, a file on the volume can).
+    #[test]
+    fn resolve_model_provider_credential_from_file_wins_over_env() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("go_api_key");
+        std::fs::write(&path, "file-key\n").expect("write");
+
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(path.to_str().unwrap()));
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("env-key"));
+        let _opencode_guard = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        // The trailing newline is trimmed: the file is written by tools that add it.
+        assert_eq!(
+            resolve_model_provider_credential("opencode", None).as_deref(),
+            Some("file-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_credential_from_file_absent_falls_back() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent");
+
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(path.to_str().unwrap()));
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("env-key"));
+        let _opencode_guard = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        // A missing file is the normal pre-rollout state and the documented rollback.
+        assert_eq!(
+            resolve_model_provider_credential("opencode", None).as_deref(),
+            Some("env-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_credential_from_file_blank_falls_back() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blank");
+        std::fs::write(&path, "   \n").expect("write");
+
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(path.to_str().unwrap()));
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("env-key"));
+        let _opencode_guard = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        assert_eq!(
+            resolve_model_provider_credential("opencode", None).as_deref(),
+            Some("env-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_credential_from_file_unreadable_falls_back() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory instead of a file is the portable way to force a read
+        // error without depending on permissions (tests also run as root).
+        let path = dir.path().join("as_dir");
+        std::fs::create_dir(&path).expect("mkdir");
+
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(path.to_str().unwrap()));
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", Some("env-key"));
+        let _opencode_guard = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        assert_eq!(
+            resolve_model_provider_credential("opencode", None).as_deref(),
+            Some("env-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_provider_credential_from_file_loses_to_alias_key() {
+        let _env_lock = env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("go_api_key");
+        std::fs::write(&path, "file-key").expect("write");
+
+        let _file_guard = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(path.to_str().unwrap()));
+        let _provider_guard = EnvGuard::set("OPENCODE_GO_API_KEY", None);
+        let _zeroclaw_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        // An explicit typed-alias api_key stays the highest priority.
+        assert_eq!(
+            resolve_model_provider_credential("opencode", Some("alias-key")).as_deref(),
+            Some("alias-key")
+        );
     }
 
     #[test]
