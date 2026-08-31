@@ -24,7 +24,7 @@ schema_version = 3
 # can only be set there.
 #   * Why off the Go router: every 503 "Endpoint is unavailable" and every 401
 #     CreditsError in the prod log arrives on OPENCODE_GO_API_KEY, which ALL Go
-#     channels share (chat, worker/jira_worker, coordinator, analyst_qwen, cron). Chat
+#     channels share (chat, worker/jira_worker, coordinator, analyst_glm_flash, cron). Chat
 #     on codex OAuth means an exhausted Go key no longer takes the chat down with the
 #     delegates, and [reliability.model_fallbacks] still routes gpt-5.6-luna ->
 #     deepseek-v4-flash if codex itself fails.
@@ -203,19 +203,21 @@ api_key = ""
 model = "minimax-m3"
 api_key = ""
 
-# Qwen analyst slot on the Go router (2026-08-21). Replaced the Cline provider,
-# which was dropped together with the ClinePass subscription — the whole `custom`
-# family is gone with it, so the bot offers no cline/* buttons either. Same model
-# the analyst ran under Cline (qwen3.8-max), just on the Go subscription now.
-# Re-probed against /zen/go/v1 on 2026-08-21: turn 1 returns a native tool_calls
-# array and the multi-turn tool loop closes with HTTP 200 at high|xhigh|max. The
-# 2026-08-16 note claiming qwen3.8-max answers 503 no longer holds (grok-4.5 still
-# does). reasoning_effort = max matches the other ensemble analysts; note that the
-# ceiling is per-model on this router — qwen3.7-plus rejects "max" with a 400.
+# GLM-5.3-Flash analyst slot on the Go router (2026-09-01). Replaced the
+# opencode.qwen slot (qwen3.8-max) this analyst used since 2026-08-21 — same
+# router, same subscription, different model. qwen3.8-max itself stays in the
+# bot catalog (model_fallbacks + model_windows), it is only no longer an
+# analyst. glm-5.3-flash entered the catalog 2026-08-27 (single + multi-turn
+# tool-loop PASS) and has a 200k window entry.
+# Probed against /zen/go/v1 on 2026-09-01 with reasoning_effort = "max" on a
+# healthy key: turn 1 -> HTTP 200 + native tool_calls (+ reasoning_content),
+# turn 2 (assistant tool_calls + reasoning_content + tool result) -> HTTP 200
+# finish_reason=stop. The effort ceiling is per-model on this router
+# (qwen3.7-plus rejects "max" with a 400), so this pin is measured, not assumed.
 # NO fallback — preserves the analyst failure domain (jira-analysis-pipeline D2:
 # same-provider retry x3, no fallback).
-[providers.models.opencode.qwen]
-model = "qwen3.8-max"
+[providers.models.opencode.glm_flash]
+model = "glm-5.3-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
@@ -796,15 +798,17 @@ mcp_bundles = ["all"]
 [agents.analyst_deepseek_pro.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-# analyst_qwen = Qwen3.8-Max on the Go router (2026-08-21, moved off Cline when the
-# ClinePass subscription was dropped — same model, different subscription; before
-# that analyst_kimi). Alias opencode.qwen pins model + reasoning_effort = max.
-[agents.analyst_qwen]
-model_provider = "opencode.qwen"
+# analyst_glm_flash = GLM-5.3-Flash on the Go router (2026-09-01, replaced
+# analyst_qwen/qwen3.8-max in the ensemble roster; before that analyst_kimi).
+# Alias opencode.glm_flash pins model + reasoning_effort = max. Distinct from
+# analyst_glm (zai.default = glm-5.3): different model id, different host,
+# different subscription.
+[agents.analyst_glm_flash]
+model_provider = "opencode.glm_flash"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
-[agents.analyst_qwen.workspace]
+[agents.analyst_glm_flash.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]

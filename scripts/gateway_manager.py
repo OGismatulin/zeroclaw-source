@@ -583,7 +583,15 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         skills/business-discovery/scripts/{hiker,apify}_enrich.py can read them
 #         from os.environ (shell policy strips $VAR from commands). Fly secrets
 #         only; no template placeholder, no entrypoint change.
-CURRENT_CONFIG_MARKER = "v3-56"
+# v3-57 = Ensemble analyst swap 2026-09-01: analyst_qwen (opencode.qwen =
+#         qwen3.8-max) replaced by analyst_glm_flash (new alias
+#         opencode.glm_flash = glm-5.3-flash), reasoning_effort = max probed on a
+#         healthy key (turn 1 native tool_calls, turn 2 stop, both HTTP 200).
+#         Same router, same OPENCODE_GO_API_KEY -- this is a model swap, not a
+#         failure-domain change. qwen3.8-max stays a bot /model button with its
+#         fallback + window; only the analyst moved. ANALYST_ROSTER and
+#         FAILURE_DOMAINS in skills/jira/scripts/jira_analysis_run.py follow.
+CURRENT_CONFIG_MARKER = "v3-57"
 
 
 def sanitize_filename(filename: str) -> str:
