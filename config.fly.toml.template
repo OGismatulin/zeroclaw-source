@@ -716,6 +716,17 @@ risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
+# jira_html_worker = HTML-отчёт пакета (действие render_html, 2026-08-31).
+# Тот же alias, что у analyst_luna (gpt-5.6-luna + reasoning_effort = max):
+# отчёт читают люди и принимают по нему решение, поэтому он идёт на сильнейшую
+# доступную модель, а не на фоновый deepseek. jira_worker остаётся на
+# opencode.flash — он переводит OpenSpec и обслуживает legacy visual runs.
+[agents.jira_html_worker]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+
 [agents.worker]
 model_provider = "opencode.flash"
 risk_profile = "default"
