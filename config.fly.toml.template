@@ -245,6 +245,10 @@ fallback_providers = ["opencode-go"]
 "deepseek-v4-pro"    = ["deepseek-v4-flash"]
 "glm-5.3-flash"      = ["deepseek-v4-flash"]
 "longcat-2.0"        = ["deepseek-v4-flash"]
+# Catalog v7 (2026-08-31): new on the Go router, single + multi-turn tool
+# loop PASS x2 each on a healthy key.
+"qwen3.8-flash"      = ["deepseek-v4-flash"]
+"hy4-preview"        = ["deepseek-v4-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
@@ -618,6 +622,11 @@ protect_last_n = 10
 # compacts earlier. glm-5.3-flash mirrors glm-5.3.
 "glm-5.3-flash"           = 200_000
 "longcat-2.0"             = 128_000
+# Catalog v7 (2026-08-31): windows unpublished and NOT probed -- conservative
+# floors (a too-small window only compacts earlier). qwen3.8-flash mirrors
+# qwen3.8-max; hy4-preview gets the plain 128k floor until its cap is known.
+"qwen3.8-flash"           = 256_000
+"hy4-preview"             = 128_000
 
 # Subagent runtime profile. Shares default's context_compression + model_windows
 # so cross-model windows still resolve. Subagents do real work inside cron
@@ -666,6 +675,11 @@ protect_last_n = 10
 # compacts earlier. glm-5.3-flash mirrors glm-5.3.
 "glm-5.3-flash"           = 200_000
 "longcat-2.0"             = 128_000
+# Catalog v7 (2026-08-31): windows unpublished and NOT probed -- conservative
+# floors (a too-small window only compacts earlier). qwen3.8-flash mirrors
+# qwen3.8-max; hy4-preview gets the plain 128k floor until its cap is known.
+"qwen3.8-flash"           = 256_000
+"hy4-preview"             = 128_000
 
 # Jira package runs load a large immutable source manifest and invoke the full
 # tool surface.  The measured system floor is already above 205k tokens, so
