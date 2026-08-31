@@ -57,11 +57,11 @@ uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "high" }
 
-# Isolated coordinator alias: same deepseek-v4-flash on the same Go endpoint, but
-# reasoning_effort = "max" (Go-router valid — NOT minimal→400). Only
-# [agents.jira_coordinator] points here; worker/default/jira_worker stay on
-# opencode.go (high). Rollback = repoint jira_coordinator back to opencode.go and
-# bump the marker. Spec: 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
+# UNREFERENCED rollback slot since 2026-08-31: the coordinator moved to
+# [providers.models.openai.codex_coordinator] after a Go rolling-window rate
+# limit stranded a live run. Kept so a repoint of [agents.jira_coordinator] plus
+# a marker bump is the whole rollback. Spec:
+# 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
 model = "deepseek-v4-flash"
 uri = "https://opencode.ai/zen/go/v1"
@@ -81,6 +81,24 @@ provider_extra = { reasoning_effort = "max" }
 # falls back to the codex default xhigh (providers/src/lib.rs:812-820).
 # gpt-5.6-luna has no clamp, so "high" reaches the wire as high.
 [providers.models.openai.codex]
+model = "gpt-5.6-luna"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+provider_extra = { reasoning_effort = "high" }
+
+# Coordinator on the codex OAuth runtime (2026-08-31, owner decision). It moved
+# off the shared Go router because a rolling-window rate limit there killed the
+# actuator turn of a live analysis run while the ensemble itself was already
+# done: the coordinator is the ONE agent whose death strands a finished run.
+# gpt-5.6-luna at "high" on purpose -- the coordinator orchestrates, it never
+# investigates (invariant #10), so frontier reasoning would only buy latency.
+# Own alias rather than a reuse of [providers.models.openai.codex]: that one is
+# the boot slot resolving ZEROCLAW_PROVIDER, and a future chat-default change
+# must not silently move the coordinator with it.
+# Rollback = repoint [agents.jira_coordinator] at opencode.go_coordinator (kept
+# below as an unreferenced slot) and bump the marker.
+[providers.models.openai.codex_coordinator]
 model = "gpt-5.6-luna"
 api_key = ""
 wire_api = "responses"
@@ -705,7 +723,7 @@ runtime_profile = "default"
 mcp_bundles = ["all"]
 
 [agents.jira_coordinator]
-model_provider = "opencode.go_coordinator"
+model_provider = "openai.codex_coordinator"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]

@@ -583,7 +583,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         skills/business-discovery/scripts/{hiker,apify}_enrich.py can read them
 #         from os.environ (shell policy strips $VAR from commands). Fly secrets
 #         only; no template placeholder, no entrypoint change.
-CURRENT_CONFIG_MARKER = "v3-54"
+CURRENT_CONFIG_MARKER = "v3-55"
 
 
 def sanitize_filename(filename: str) -> str:
