@@ -221,6 +221,16 @@ model = "glm-5.3-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
+# 300s instead of the 120s default (create_resilient_model_provider_from_ref:
+# entry.timeout_secs.unwrap_or(120)). Measured on this analyst's first real run
+# (DV-34754, 2026-08-31): it worked through 55 tool-loop iterations, then a
+# single request on the by-then-large prompt exceeded 120s three times in a row
+# (kind=timeout, exactly 120s apart) and the delegate died with zero output.
+# The model is not slow per call -- effort=max on a long context is. Delegates
+# retry same-provider x3 with NO fallback (D2), so a per-request ceiling below
+# the model's worst case costs the whole analyst. Stays well inside the task
+# budget [delegate].agentic_timeout_secs = 3600.
+timeout_secs = 300
 
 # ── Reliability ───────────────────────────────────────────────────────────
 [reliability]

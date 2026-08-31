@@ -591,7 +591,15 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         failure-domain change. qwen3.8-max stays a bot /model button with its
 #         fallback + window; only the analyst moved. ANALYST_ROSTER and
 #         FAILURE_DOMAINS in skills/jira/scripts/jira_analysis_run.py follow.
-CURRENT_CONFIG_MARKER = "v3-57"
+# v3-58 = opencode.glm_flash gets timeout_secs = 300 (default is 120 --
+#         create_resilient_model_provider_from_ref: entry.timeout_secs
+#         .unwrap_or(120)). analyst_glm_flash's first real run (DV-34754) got
+#         through 55 tool-loop iterations, then one request on the large prompt
+#         blew the 120s ceiling three times in a row (kind=timeout, 120s apart)
+#         and the delegate died with zero output. Delegates retry same-provider
+#         x3 with NO fallback (D2), so the per-request ceiling has to cover the
+#         model's worst case, not its median.
+CURRENT_CONFIG_MARKER = "v3-58"
 
 
 def sanitize_filename(filename: str) -> str:
