@@ -293,6 +293,33 @@ pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
     lower.contains("reasoning_content") && lower.contains("passed back")
 }
 
+/// True when the provider finished a turn that carried no usable content.
+///
+/// Live shape (2026-09-01, `codex_coordinator` / gpt-5.6-luna at effort=high):
+/// the response completes normally -- `response.output_item.done`,
+/// `response.output_text.done`, `response.completed` all arrive -- but the text
+/// item is empty and there is no tool call, and `usage` shows the whole output
+/// budget went to reasoning (e.g. 128 output tokens of which 122 reasoning).
+/// The provider is right to reject it; the turn engine, however, can recover by
+/// nudging instead of dying, which is what 37 dead coordinator turns cost before
+/// this was classified.
+///
+/// Classified as its own `kind` for the same reason `context_window` and
+/// `reasoning_roundtrip` are: `TerminalProviderFailure`'s Display keeps only the
+/// summary line, so the sentence never reaches the turn engine.
+pub fn is_empty_completion_error(err: &anyhow::Error) -> bool {
+    if terminal_provider_failure(err)
+        .is_some_and(|failure| failure.diagnostic().kind() == "empty_completion")
+    {
+        return true;
+    }
+    if is_rate_limited(err) {
+        return false;
+    }
+    let lower = error_chain_text(err).to_lowercase();
+    lower.contains("no response from") && lower.contains("stream payload")
+}
+
 /// Check if an error is a rate-limit (429) error.
 fn is_rate_limited(err: &anyhow::Error) -> bool {
     if let Some(code) = typed_http_status(err) {
@@ -827,6 +854,18 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             disposition,
             phase: "request_validation",
             hint: "pass the previous turn's reasoning_content back, or drop that turn",
+            endpoint,
+            status,
+            retry_after_secs,
+        };
+    }
+
+    if is_empty_completion_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "empty_completion",
+            disposition,
+            phase: "response_parse",
+            hint: "model returned no text and no tool call; nudge the turn instead of failing",
             endpoint,
             status,
             retry_after_secs,
@@ -5678,6 +5717,21 @@ mod tests {
         assert!(!summary.to_lowercase().contains("passed back"), "{summary}");
         // ...yet the predicate still recognises it through the kind.
         assert!(is_reasoning_roundtrip_rejected(&wrapped));
+    }
+
+    #[test]
+    fn empty_completion_is_its_own_kind_and_survives_the_summary_line() {
+        // The live shape: response.completed with an empty text item, no tool
+        // call, the output budget spent on reasoning. Text matching alone would
+        // not survive TerminalProviderFailure's Display, hence the kind.
+        let err = anyhow::Error::msg(
+            "No response from OpenAI Codex stream payload: event: response.created",
+        );
+        assert!(is_empty_completion_error(&err));
+        assert_eq!(provider_error_diagnostic(&err).kind(), "empty_completion");
+
+        let unrelated = anyhow::Error::msg("429 Too Many Requests: rate limit");
+        assert!(!is_empty_completion_error(&unrelated));
     }
 
     // A proxied rejection can carry the router's own 5xx while the inner

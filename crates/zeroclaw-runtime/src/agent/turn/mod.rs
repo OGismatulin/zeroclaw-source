@@ -74,7 +74,8 @@ pub(crate) mod vision_route;
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{
-    record_llm_failure, try_recover_context_overflow, try_recover_reasoning_roundtrip,
+    record_llm_failure, try_recover_context_overflow, try_recover_empty_completion,
+    try_recover_reasoning_roundtrip,
 };
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
@@ -426,6 +427,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     // Fork patch #33: one reasoning-round-trip repair per turn. A persistently
     // broken history must fail honestly instead of spinning the loop.
     let mut reasoning_roundtrip_repaired = false;
+    let mut empty_completion_nudges: u8 = 0;
 
     for iteration in 0..max_iterations {
         // Steering: fold caller-pushed mid-turn messages into history before
@@ -800,6 +802,21 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &e,
                     iteration,
                     &mut reasoning_roundtrip_repaired,
+                    &ctx,
+                )
+                .await
+                {
+                    continue;
+                }
+                // The provider finished a response that carried neither text nor
+                // a tool call (codex at high reasoning effort spends the whole
+                // output budget thinking). Retrying the identical request just
+                // reproduces it, so nudge once or twice instead of dying.
+                if try_recover_empty_completion(
+                    history,
+                    &e,
+                    iteration,
+                    &mut empty_completion_nudges,
                     &ctx,
                 )
                 .await

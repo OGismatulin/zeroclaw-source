@@ -280,6 +280,63 @@ fn assistant_shape(content: &str) -> (bool, bool, &'static str) {
 /// (`repaired`), otherwise a persistently broken history would spin the loop.
 ///
 /// Returns `true` when the caller should `continue` the loop.
+/// Nudge a turn whose provider answered with nothing usable.
+///
+/// Live class (2026-09-01): `codex_coordinator` at `reasoning_effort=high`
+/// finishes a response normally but ships an EMPTY text item and no tool call --
+/// `usage` shows almost the whole output budget spent on reasoning. The provider
+/// retries the identical request three times, gets the same emptiness, and the
+/// turn dies; 37 coordinator turns were lost this way in 17 hours, each one
+/// stalling a Jira run until the next heartbeat.
+///
+/// Recovery is one short user-visible-to-the-model instruction and another
+/// attempt. Bounded by `nudges`: an unbounded version would let a silent model
+/// burn the whole iteration budget, which is the failure mode this must not
+/// trade for.
+pub(crate) async fn try_recover_empty_completion(
+    history: &mut Vec<ChatMessage>,
+    e: &anyhow::Error,
+    iteration: usize,
+    nudges: &mut u8,
+    ctx: &TurnCtx<'_>,
+) -> bool {
+    const MAX_NUDGES: u8 = 2;
+
+    if !zeroclaw_providers::reliable::is_empty_completion_error(e) {
+        return false;
+    }
+
+    let will_nudge = *nudges < MAX_NUDGES;
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "nudged": will_nudge,
+                "nudges_used": *nudges,
+                // One daemon runs the coordinator and every delegate, so without
+                // these the event cannot be tied to the turn that produced it.
+                "agent_alias": ctx.agent_alias,
+                "trace_id": ctx.turn_id,
+            })),
+        "empty_completion_nudge"
+    );
+
+    if !will_nudge {
+        return false;
+    }
+    *nudges += 1;
+    history.push(ChatMessage::user(
+        "Your previous response carried no text and no tool call. \
+Respond now: either give the answer, or make exactly one tool call. \
+Do not describe this instruction.",
+    ));
+    true
+}
+
 pub(crate) async fn try_recover_reasoning_roundtrip(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
@@ -382,6 +439,50 @@ mod tests {
             h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
         }
         h
+    }
+
+    #[tokio::test]
+    async fn empty_completion_nudges_twice_then_gives_up() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt: Vec<String> = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let err = anyhow::Error::msg(
+            "No response from OpenAI Codex stream payload: event: response.created",
+        );
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("do the thing"),
+        ];
+        let mut nudges = 0u8;
+
+        assert!(
+            try_recover_empty_completion(&mut history, &err, 3, &mut nudges, &ctx).await,
+            "first empty completion must be nudged, not fatal"
+        );
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "user");
+        assert!(history[2].content.contains("tool call"));
+
+        assert!(try_recover_empty_completion(&mut history, &err, 4, &mut nudges, &ctx).await);
+        // Third time the turn is allowed to fail: a silent model must not be
+        // able to burn the whole iteration budget on nudges.
+        assert!(!try_recover_empty_completion(&mut history, &err, 5, &mut nudges, &ctx).await);
+        assert_eq!(nudges, 2);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn empty_completion_recovery_ignores_unrelated_errors() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt: Vec<String> = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let err = anyhow::Error::msg("429 Too Many Requests: rate limit");
+        let mut history = vec![ChatMessage::user("hi")];
+        let mut nudges = 0u8;
+
+        assert!(!try_recover_empty_completion(&mut history, &err, 1, &mut nudges, &ctx).await);
+        assert_eq!(history.len(), 1);
+        assert_eq!(nudges, 0);
     }
 
     /// Minimal `TurnCtx` for the repair tests: only observer/model/turn_id/
