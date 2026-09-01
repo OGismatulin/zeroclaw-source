@@ -1025,43 +1025,93 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
 ///
 /// The plain `payload` attribute is truncated to the FIRST 500 characters, which
 /// for this failure is always the same `response.created` prefix and therefore
-/// cannot distinguish "upstream cut the stream" from "upstream finished but the
-/// turn carried only reasoning items". This summary answers that: it counts the
-/// event types actually delivered, keeps the last ones in order, and carries the
-/// TAIL of the body. Error path only -- the happy path never re-parses.
+/// cannot distinguish a body the upstream cut short from one it finished with
+/// nothing but reasoning items. This summary answers that: it counts the event
+/// types actually delivered, keeps the last ones, carries the terminal
+/// `response` object's shape (output item types + token usage) and the TAIL of
+/// the body.
+///
+/// Scope note: a transport-level abort never reaches here -- `decode_responses_body`
+/// fails earlier with `error reading response stream` / `incomplete UTF-8`. What
+/// lands in this branch is a body received to EOF, so the two live classes are
+/// "upstream closed cleanly mid-event" and "upstream completed without payload".
+///
+/// Error path only -- the happy path never re-parses.
 fn summarize_sse_body(body: &str) -> Value {
+    const MAX_TRACKED_TYPES: usize = 64;
+    const MAX_TYPE_LEN: usize = 64;
+    const TAIL_BYTES: usize = 600;
+
     let mut type_counts: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut ordered_types: Vec<String> = Vec::new();
+    let mut recent_types: std::collections::VecDeque<String> = Default::default();
     let mut saw_done = false;
     let mut response_status: Option<String> = None;
     let mut incomplete_reason: Option<String> = None;
+    let mut output_item_types: Vec<String> = Vec::new();
+    let mut usage: Option<Value> = None;
 
-    for line in body.lines() {
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() {
+    let note = |type_counts: &mut std::collections::BTreeMap<String, usize>,
+                recent: &mut std::collections::VecDeque<String>,
+                raw: &str| {
+        let mut label = raw.chars().take(MAX_TYPE_LEN).collect::<String>();
+        if !type_counts.contains_key(&label) && type_counts.len() >= MAX_TRACKED_TYPES {
+            label = "other".to_string();
+        }
+        *type_counts.entry(label.clone()).or_default() += 1;
+        if recent.len() == 6 {
+            recent.pop_front();
+        }
+        recent.push_back(label);
+    };
+
+    // Mirror `process_sse_chunk`'s framing: events are separated by a blank line
+    // and a single event may carry several `data:` lines that belong to ONE JSON
+    // document. Scanning line by line would report a well-formed multi-line event
+    // as N unparsed fragments -- exactly inverting the diagnosis this summary exists to make.
+    let mut frames: Vec<&str> = body.split("\n\n").collect();
+    if let Some(last) = frames.last()
+        && last.trim().is_empty()
+    {
+        frames.pop();
+    }
+
+    for frame in frames {
+        let data_lines: Vec<&str> = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if data_lines.is_empty() {
             continue;
         }
-        if payload == "[DONE]" {
-            saw_done = true;
-            ordered_types.push("[DONE]".to_string());
-            *type_counts.entry("[DONE]".to_string()).or_default() += 1;
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(payload) else {
-            *type_counts.entry("unparsed".to_string()).or_default() += 1;
-            continue;
+        let joined = data_lines.join("\n");
+        let candidates: Vec<String> = match serde_json::from_str::<Value>(&joined) {
+            Ok(_) => vec![joined],
+            Err(_) => data_lines.into_iter().map(str::to_string).collect(),
         };
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("untyped")
-            .to_string();
-        *type_counts.entry(event_type.clone()).or_default() += 1;
-        ordered_types.push(event_type);
-        if let Some(response) = event.get("response") {
+
+        for candidate in candidates {
+            if candidate == "[DONE]" {
+                saw_done = true;
+                note(&mut type_counts, &mut recent_types, "[DONE]");
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(&candidate) else {
+                note(&mut type_counts, &mut recent_types, "unparsed");
+                continue;
+            };
+            note(
+                &mut type_counts,
+                &mut recent_types,
+                event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("untyped"),
+            );
+            let Some(response) = event.get("response") else {
+                continue;
+            };
             if let Some(status) = response.get("status").and_then(Value::as_str) {
                 response_status = Some(status.to_string());
             }
@@ -1072,23 +1122,37 @@ fn summarize_sse_body(body: &str) -> Value {
             {
                 incomplete_reason = Some(reason.to_string());
             }
+            if let Some(items) = response.get("output").and_then(Value::as_array) {
+                output_item_types = items
+                    .iter()
+                    .filter_map(|item| item.get("type").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+            }
+            if let Some(reported) = response.get("usage") {
+                usage = Some(reported.clone());
+            }
         }
     }
 
-    let tail_start = body.len().saturating_sub(600);
+    // Secrets are scrubbed, but the length cap is NOT applied: `sanitize_api_error`
+    // trims from the head, which on an ASCII body would drop the very end -- the
+    // part that shows whether the last event was finished.
+    let tail_start = body.len().saturating_sub(TAIL_BYTES);
     let tail_start = (tail_start..=body.len())
         .find(|idx| body.is_char_boundary(*idx))
         .unwrap_or(body.len());
-    let tail = super::sanitize_api_error(&body[tail_start..]);
-    let last_types: Vec<String> = ordered_types.iter().rev().take(6).cloned().collect();
+    let tail = super::scrub_secret_patterns(&body[tail_start..]);
 
     ::serde_json::json!({
         "body_len": body.len(),
         "event_type_counts": type_counts,
-        "last_event_types_reversed": last_types,
+        "last_event_types": Vec::from(recent_types),
         "saw_done_sentinel": saw_done,
         "response_status": response_status,
         "incomplete_reason": incomplete_reason,
+        "output_item_types": output_item_types,
+        "usage": usage,
         "tail": tail,
     })
 }
@@ -2908,22 +2972,26 @@ data: [DONE]
     }
 
     #[test]
-    fn summarize_sse_body_separates_cut_stream_from_reasoning_only_turn() {
-        let cut = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"";
-        let cut_shape = summarize_sse_body(cut);
-        assert_eq!(cut_shape["saw_done_sentinel"], serde_json::json!(false));
+    fn summarize_sse_body_separates_truncated_body_from_payloadless_completion() {
+        let truncated = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"";
+        let truncated_shape = summarize_sse_body(truncated);
         assert_eq!(
-            cut_shape["event_type_counts"]["unparsed"],
+            truncated_shape["saw_done_sentinel"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            truncated_shape["event_type_counts"]["unparsed"],
             serde_json::json!(1)
         );
+        assert_eq!(truncated_shape["response_status"], serde_json::json!(null));
 
-        let reasoning_only = concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\"}}\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n",
-            "data: [DONE]\n",
+        let payloadless = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"reasoning\"}],\"usage\":{\"output_tokens\":4096}}}\n\n",
+            "data: [DONE]\n\n",
         );
-        let done_shape = summarize_sse_body(reasoning_only);
+        let done_shape = summarize_sse_body(payloadless);
         assert_eq!(done_shape["saw_done_sentinel"], serde_json::json!(true));
         assert_eq!(
             done_shape["response_status"],
@@ -2934,8 +3002,69 @@ data: [DONE]
             serde_json::json!("max_output_tokens")
         );
         assert_eq!(
-            done_shape["event_type_counts"]["response.completed"],
+            done_shape["output_item_types"],
+            serde_json::json!(["reasoning"])
+        );
+        assert_eq!(
+            done_shape["usage"]["output_tokens"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            done_shape["last_event_types"],
+            serde_json::json!([
+                "response.created",
+                "response.reasoning_summary_text.delta",
+                "response.completed",
+                "[DONE]"
+            ])
+        );
+    }
+
+    #[test]
+    fn summarize_sse_body_reports_completion_without_incomplete_details() {
+        // The upstream says "all good" and still ships no message and no tool call.
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_3\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\"}]}}\n\n",
+        );
+        let shape = summarize_sse_body(body);
+        assert_eq!(shape["response_status"], serde_json::json!("completed"));
+        assert_eq!(shape["incomplete_reason"], serde_json::json!(null));
+        assert_eq!(shape["output_item_types"], serde_json::json!(["reasoning"]));
+        assert_eq!(
+            shape["event_type_counts"]["unparsed"],
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
+    fn summarize_sse_body_reads_multi_line_data_event_as_one() {
+        // `process_sse_chunk` joins several `data:` lines of one frame into a single
+        // JSON document; scanning line by line would call this two unparsed fragments
+        // and invert the diagnosis.
+        let body = "data: {\"type\":\"response.completed\",\ndata: \"response\":{\"status\":\"completed\"}}\n\n";
+        let shape = summarize_sse_body(body);
+        assert_eq!(
+            shape["event_type_counts"]["response.completed"],
             serde_json::json!(1)
+        );
+        assert_eq!(
+            shape["event_type_counts"]["unparsed"],
+            serde_json::json!(null)
+        );
+    }
+
+    #[test]
+    fn summarize_sse_body_tail_keeps_the_end_and_scrubs_secrets() {
+        let filler = "x".repeat(900);
+        let body =
+            format!("data: {{\"pad\":\"{filler}\",\"token\":\"sk-ABCDEFGHIJKLMNOPQRST\"}}ZZZEND");
+        let shape = summarize_sse_body(&body);
+        let tail = shape["tail"].as_str().expect("tail is a string");
+        assert!(tail.ends_with("ZZZEND"), "tail must keep the end: {tail}");
+        assert!(
+            !tail.contains("sk-ABCDEFGHIJKLMNOPQRST"),
+            "tail must scrub secrets: {tail}"
         );
     }
 
