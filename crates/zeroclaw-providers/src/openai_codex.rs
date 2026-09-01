@@ -1021,6 +1021,78 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
+/// Describe an SSE body that produced no text and no tool calls.
+///
+/// The plain `payload` attribute is truncated to the FIRST 500 characters, which
+/// for this failure is always the same `response.created` prefix and therefore
+/// cannot distinguish "upstream cut the stream" from "upstream finished but the
+/// turn carried only reasoning items". This summary answers that: it counts the
+/// event types actually delivered, keeps the last ones in order, and carries the
+/// TAIL of the body. Error path only -- the happy path never re-parses.
+fn summarize_sse_body(body: &str) -> Value {
+    let mut type_counts: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut ordered_types: Vec<String> = Vec::new();
+    let mut saw_done = false;
+    let mut response_status: Option<String> = None;
+    let mut incomplete_reason: Option<String> = None;
+
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            saw_done = true;
+            ordered_types.push("[DONE]".to_string());
+            *type_counts.entry("[DONE]".to_string()).or_default() += 1;
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            *type_counts.entry("unparsed".to_string()).or_default() += 1;
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("untyped")
+            .to_string();
+        *type_counts.entry(event_type.clone()).or_default() += 1;
+        ordered_types.push(event_type);
+        if let Some(response) = event.get("response") {
+            if let Some(status) = response.get("status").and_then(Value::as_str) {
+                response_status = Some(status.to_string());
+            }
+            if let Some(reason) = response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+            {
+                incomplete_reason = Some(reason.to_string());
+            }
+        }
+    }
+
+    let tail_start = body.len().saturating_sub(600);
+    let tail_start = (tail_start..=body.len())
+        .find(|idx| body.is_char_boundary(*idx))
+        .unwrap_or(body.len());
+    let tail = super::sanitize_api_error(&body[tail_start..]);
+    let last_types: Vec<String> = ordered_types.iter().rev().take(6).cloned().collect();
+
+    ::serde_json::json!({
+        "body_len": body.len(),
+        "event_type_counts": type_counts,
+        "last_event_types_reversed": last_types,
+        "saw_done_sentinel": saw_done,
+        "response_status": response_status,
+        "incomplete_reason": incomplete_reason,
+        "tail": tail,
+    })
+}
+
 fn ensure_nonempty_responses_turn(
     result: ResponsesTurnResult,
     empty_error: impl FnOnce() -> anyhow::Error,
@@ -1129,11 +1201,15 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         let result = parse_sse_turn(body)?;
         return ensure_nonempty_responses_turn(result, || {
             let sanitized = super::sanitize_api_error(body);
+            let shape = summarize_sse_body(body);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"payload": &sanitized})),
+                    .with_attrs(::serde_json::json!({
+                        "payload": &sanitized,
+                        "shape": shape,
+                    })),
                 "openai_codex: empty SSE stream payload"
             );
             anyhow::Error::msg(format!(
@@ -2828,6 +2904,32 @@ data: [DONE]
         assert_eq!(
             parse_sse_turn(payload).unwrap().text.as_deref(),
             Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn summarize_sse_body_separates_cut_stream_from_reasoning_only_turn() {
+        let cut = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"";
+        let cut_shape = summarize_sse_body(cut);
+        assert_eq!(cut_shape["saw_done_sentinel"], serde_json::json!(false));
+        assert_eq!(cut_shape["event_type_counts"]["unparsed"], serde_json::json!(1));
+
+        let reasoning_only = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\"}}\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n",
+            "data: [DONE]\n",
+        );
+        let done_shape = summarize_sse_body(reasoning_only);
+        assert_eq!(done_shape["saw_done_sentinel"], serde_json::json!(true));
+        assert_eq!(done_shape["response_status"], serde_json::json!("incomplete"));
+        assert_eq!(
+            done_shape["incomplete_reason"],
+            serde_json::json!("max_output_tokens")
+        );
+        assert_eq!(
+            done_shape["event_type_counts"]["response.completed"],
+            serde_json::json!(1)
         );
     }
 
