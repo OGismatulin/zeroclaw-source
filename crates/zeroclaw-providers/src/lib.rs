@@ -877,6 +877,14 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 }
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
+/// Trim an error MESSAGE for logging: scrub secrets, keep the HEAD.
+///
+/// Not for dumping a response body. A body's head is often constant boilerplate
+/// (`event: response.created` on every codex SSE), so head-trimming a dump hides
+/// exactly the part that differs between failures -- that blindness cost ten
+/// hours of misdiagnosis on 2026-09-01 (invariant I55). For a body, keep the
+/// tail: slice the last N bytes at a char boundary and pass them through
+/// [`scrub_secret_patterns`] without a length cap.
 pub fn sanitize_api_error(input: &str) -> String {
     let scrubbed = scrub_secret_patterns(input);
 
