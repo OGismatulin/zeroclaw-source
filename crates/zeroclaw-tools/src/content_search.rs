@@ -44,6 +44,8 @@ enum SearchBackend {
     Internal,
 }
 
+const NO_MATCHES: &str = "No matches found.";
+
 fn detect_search_backend() -> SearchBackend {
     if which::which("rg").is_ok() {
         SearchBackend::Ripgrep
@@ -330,6 +332,18 @@ impl Tool for ContentSearchTool {
             }
         };
 
+        // An empty result under an `include` filter is ambiguous: the regex may
+        // have missed, or the filter may have excluded every file. Naming the
+        // filter is what lets the caller change the right knob -- without it an
+        // agent rewrites its pattern, gets the identical string back, and the
+        // loop detector kills the turn as no-progress (analyst_luna, DV-34754).
+        let formatted = match include {
+            Some(glob) if formatted.trim() == NO_MATCHES => {
+                format!("{NO_MATCHES} (include filter {glob:?} was applied)")
+            }
+            _ => formatted,
+        };
+
         // Truncate output if too large
         let final_output = if formatted.len() > MAX_OUTPUT_BYTES {
             let mut truncated = truncate_utf8(&formatted, MAX_OUTPUT_BYTES).to_string();
@@ -449,14 +463,26 @@ fn run_internal_search_with_deadline(
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
         .build()?;
-    let include_pattern = include.map(glob::Pattern::new).transpose()?;
+    // Same brace problem as grep: `glob::Pattern` treats `{`/`}` literally.
+    let include_patterns = match include {
+        Some(raw) => expand_glob_braces(raw)
+            .iter()
+            .map(|alternative| glob::Pattern::new(alternative))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    let include_patterns = if include_patterns.is_empty() {
+        None
+    } else {
+        Some(include_patterns)
+    };
 
     let mut raw_lines = Vec::new();
     let mut results_seen = 0usize;
     visit_internal_search_path(
         search_path,
         workspace_canon,
-        include_pattern.as_ref(),
+        include_patterns.as_ref(),
         security,
         &regex,
         output_mode,
@@ -487,7 +513,7 @@ fn check_internal_deadline(deadline: Instant) -> anyhow::Result<()> {
 fn visit_internal_search_path(
     path: &Path,
     workspace_canon: &Path,
-    include: Option<&glob::Pattern>,
+    include: Option<&Vec<glob::Pattern>>,
     security: &SecurityPolicy,
     regex: &regex::Regex,
     output_mode: &str,
@@ -662,11 +688,13 @@ fn search_internal_file(
 fn internal_include_matches(
     path: &Path,
     workspace_canon: &Path,
-    include: Option<&glob::Pattern>,
+    include: Option<&Vec<glob::Pattern>>,
 ) -> bool {
     let Some(include) = include else {
         return true;
     };
+    // `include` is the expanded alternative set (see expand_glob_braces), so a
+    // file passes when ANY alternative matches.
 
     let relative = path.strip_prefix(workspace_canon).unwrap_or(path);
     let relative = relative.to_string_lossy().replace('\\', "/");
@@ -675,7 +703,9 @@ fn internal_include_matches(
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
 
-    include.matches(&relative) || include.matches(&file_name)
+    include
+        .iter()
+        .any(|pattern| pattern.matches(&relative) || pattern.matches(&file_name))
 }
 
 fn append_internal_content_matches(
@@ -784,6 +814,44 @@ fn build_rg_command(
     cmd
 }
 
+/// Expand one level of shell-style `{a,b}` alternatives in a glob.
+///
+/// The `include` argument is written by a model that has shell habits, and
+/// `*.{ts,tsx}` is the natural way to say "TypeScript". Nothing downstream
+/// understands it: GNU grep's `--include` is fnmatch (braces are shell syntax,
+/// and we exec without a shell) and `glob::Pattern` treats `{`/`}` as literal
+/// characters. Both then match ZERO files and the search reports the same
+/// "No matches found." as a genuine miss -- so an analyst rewrites its regex,
+/// gets a byte-identical answer, and the loop detector kills the turn as
+/// no-progress. That is exactly how analyst_luna died on DV-34754 (2026-08-31):
+/// 10 different patterns, one broken filter, `*.{ts,tsx}` = 0 files while
+/// `--include=*.ts --include=*.tsx` = 10.
+///
+/// Returns one entry when there is nothing to expand, so callers can always
+/// treat the result as the full alternative set.
+fn expand_glob_braces(glob: &str) -> Vec<String> {
+    let Some(open) = glob.find('{') else {
+        return vec![glob.to_string()];
+    };
+    let Some(close) = glob[open..].find('}').map(|idx| open + idx) else {
+        return vec![glob.to_string()];
+    };
+    let prefix = &glob[..open];
+    let suffix = &glob[close + 1..];
+    let mut expanded = Vec::new();
+    for alternative in glob[open + 1..close].split(',') {
+        let candidate = format!("{prefix}{}{suffix}", alternative.trim());
+        // Recurse: `*.{a,b}.{c,d}` and nested braces both terminate, because
+        // every step removes one `{`.
+        expanded.extend(expand_glob_braces(&candidate));
+    }
+    if expanded.is_empty() {
+        vec![glob.to_string()]
+    } else {
+        expanded
+    }
+}
+
 fn build_grep_command(
     pattern: &str,
     search_path: &std::path::Path,
@@ -823,7 +891,11 @@ fn build_grep_command(
     }
 
     if let Some(glob) = include {
-        cmd.arg("--include").arg(glob);
+        // One --include per alternative: GNU grep ORs repeated --include and
+        // does NOT understand `{a,b}` (see expand_glob_braces).
+        for alternative in expand_glob_braces(glob) {
+            cmd.arg("--include").arg(alternative);
+        }
     }
 
     cmd.arg("--");
@@ -864,7 +936,7 @@ fn format_line_output(
     max_results: usize,
 ) -> String {
     if raw.trim().is_empty() {
-        return "No matches found.".to_string();
+        return NO_MATCHES.to_string();
     }
 
     let workspace_prefix = workspace_canon.to_string_lossy();
@@ -949,7 +1021,7 @@ fn format_line_output(
     }
 
     if lines.is_empty() {
-        return "No matches found.".to_string();
+        return NO_MATCHES.to_string();
     }
 
     use std::fmt::Write;
@@ -1222,6 +1294,83 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("No matches found"));
+    }
+
+    #[test]
+    fn expand_glob_braces_covers_shell_style_alternatives() {
+        assert_eq!(expand_glob_braces("*.rs"), vec!["*.rs".to_string()]);
+        assert_eq!(
+            expand_glob_braces("*.{ts,tsx}"),
+            vec!["*.ts".to_string(), "*.tsx".to_string()]
+        );
+        // whitespace after a comma is a shell habit too
+        assert_eq!(
+            expand_glob_braces("*.{ts, tsx}"),
+            vec!["*.ts".to_string(), "*.tsx".to_string()]
+        );
+        // two groups multiply out, nesting terminates
+        assert_eq!(
+            expand_glob_braces("src/{a,b}/*.{ts,js}"),
+            vec![
+                "src/a/*.ts".to_string(),
+                "src/a/*.js".to_string(),
+                "src/b/*.ts".to_string(),
+                "src/b/*.js".to_string(),
+            ]
+        );
+        // unbalanced braces are left alone rather than silently dropped
+        assert_eq!(expand_glob_braces("*.{ts"), vec!["*.{ts".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn content_search_include_accepts_brace_alternatives() {
+        // The regression: `*.{ts,tsx}` matched ZERO files on every backend, so a
+        // real hit came back as "No matches found." (analyst_luna, DV-34754).
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "const replenishItem = 1;\n").unwrap();
+        std::fs::write(dir.path().join("b.tsx"), "const replenishItem = 2;\n").unwrap();
+        std::fs::write(dir.path().join("c.md"), "replenishItem in prose\n").unwrap();
+
+        let tool = ContentSearchTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({
+                "pattern": "replenishItem",
+                "include": "*.{ts,tsx}",
+                "output_mode": "files_with_matches",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("a.ts"), "output: {}", result.output);
+        assert!(result.output.contains("b.tsx"), "output: {}", result.output);
+        assert!(!result.output.contains("c.md"), "output: {}", result.output);
+    }
+
+    #[tokio::test]
+    async fn content_search_names_the_include_filter_when_nothing_matched() {
+        // Empty + a filter is ambiguous; naming the filter is what stops an
+        // agent from rewriting its regex against an identical answer forever.
+        let dir = TempDir::new().unwrap();
+        create_test_files(&dir);
+
+        let tool = ContentSearchTool::new(test_security(dir.path().to_path_buf()));
+        let result = tool
+            .execute(json!({
+                "pattern": "nonexistent_string_xyz",
+                "include": "*.py",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("No matches found"));
+        assert!(
+            result.output.contains("include filter"),
+            "output: {}",
+            result.output
+        );
+        assert!(result.output.contains("*.py"), "output: {}", result.output);
     }
 
     #[tokio::test]
