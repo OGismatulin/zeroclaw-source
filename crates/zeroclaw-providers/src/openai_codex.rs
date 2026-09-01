@@ -2912,7 +2912,10 @@ data: [DONE]
         let cut = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"";
         let cut_shape = summarize_sse_body(cut);
         assert_eq!(cut_shape["saw_done_sentinel"], serde_json::json!(false));
-        assert_eq!(cut_shape["event_type_counts"]["unparsed"], serde_json::json!(1));
+        assert_eq!(
+            cut_shape["event_type_counts"]["unparsed"],
+            serde_json::json!(1)
+        );
 
         let reasoning_only = concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\"}}\n",
@@ -2922,7 +2925,10 @@ data: [DONE]
         );
         let done_shape = summarize_sse_body(reasoning_only);
         assert_eq!(done_shape["saw_done_sentinel"], serde_json::json!(true));
-        assert_eq!(done_shape["response_status"], serde_json::json!("incomplete"));
+        assert_eq!(
+            done_shape["response_status"],
+            serde_json::json!("incomplete")
+        );
         assert_eq!(
             done_shape["incomplete_reason"],
             serde_json::json!("max_output_tokens")
