@@ -3192,6 +3192,50 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
     }
 
     #[tokio::test]
+    async fn codex_default_endpoint_incomplete_status_without_details_is_not_empty_completion() {
+        // Exercises the narrowing from the OTHER side of the `&&`: the
+        // `max_output_tokens` test above pins `incomplete_reason.is_some()`;
+        // this pins `response_status != Some("completed")`. Terminal event
+        // reports `status: "incomplete"` but ships no `incomplete_details`
+        // object at all -- a malformed/unexpected upstream shape. Fail-closed
+        // is the only safe behavior here: no marker, so a caller cannot
+        // mistake an incomplete turn for the payloadless-but-complete class
+        // #37 targets.
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_3\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"output\":[{\"type\":\"reasoning\"}],\"usage\":{\"output_tokens\":4096}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(body)]).await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("incomplete status without details must still error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
     async fn codex_default_endpoint_stream_api_error_is_not_empty_completion() {
         // An explicit upstream error event must keep surfacing as
         // `ResponsesStreamApiError`, not get folded into the payloadless
