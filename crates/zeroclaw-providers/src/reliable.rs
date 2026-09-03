@@ -313,11 +313,16 @@ pub fn is_empty_completion_error(err: &anyhow::Error) -> bool {
     {
         return true;
     }
-    if is_rate_limited(err) {
-        return false;
-    }
-    let lower = error_chain_text(err).to_lowercase();
-    lower.contains("no response from") && lower.contains("stream payload")
+    // fork patch #37: the provider states the class in a type instead of prose.
+    // The previous text predicate ("no response from" + "stream payload") is
+    // gone: the streaming-mandatory branch replaced that sentence with a fixed
+    // keyword-free string, so on the default endpoint -- all of production --
+    // the predicate was false always and #36 shipped inert for two days.
+    // No rate-limit guard is needed above this line the way the text branch
+    // needed one: a 429 never carries the marker, it fails before the body is
+    // ever parsed.
+    err.downcast_ref::<crate::openai_codex::EmptyCompletionPayload>()
+        .is_some()
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -5722,16 +5727,49 @@ mod tests {
     #[test]
     fn empty_completion_is_its_own_kind_and_survives_the_summary_line() {
         // The live shape: response.completed with an empty text item, no tool
-        // call, the output budget spent on reasoning. Text matching alone would
-        // not survive TerminalProviderFailure's Display, hence the kind.
-        let err = anyhow::Error::msg(
-            "No response from OpenAI Codex stream payload: event: response.created",
-        );
+        // call, the output budget spent on reasoning. Carried as a typed marker
+        // since fork patch #37 -- text matching would not survive the
+        // streaming-mandatory branch (which is why #36 was inert) nor
+        // TerminalProviderFailure's Display, hence the kind.
+        let err = anyhow::Error::new(crate::openai_codex::EmptyCompletionPayload);
         assert!(is_empty_completion_error(&err));
         assert_eq!(provider_error_diagnostic(&err).kind(), "empty_completion");
 
         let unrelated = anyhow::Error::msg("429 Too Many Requests: rate limit");
         assert!(!is_empty_completion_error(&unrelated));
+    }
+
+    /// The marker must stay same-alias retryable: the whole point is that the
+    /// turn engine gets another attempt to nudge into. A NonRetryable or
+    /// RateLimited disposition would kill the turn before recovery runs.
+    #[test]
+    fn empty_completion_marker_is_retryable_and_not_a_rate_limit() {
+        let err = anyhow::Error::new(crate::openai_codex::EmptyCompletionPayload);
+        let diagnostic = provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "empty_completion");
+        assert_eq!(
+            diagnostic.disposition(),
+            ProviderErrorDisposition::Retryable,
+            "got: {:?}",
+            diagnostic.disposition()
+        );
+        assert!(!is_non_retryable(&err));
+        assert!(!is_non_retryable_rate_limit(&err));
+        assert!(!is_rate_limited(&err));
+    }
+
+    /// Shadowing guard: `provider_error_diagnostic` runs
+    /// `is_context_window_exceeded` and `is_reasoning_roundtrip_rejected`
+    /// BEFORE `empty_completion`, and both match on text. The marker's fixed
+    /// phrase must land in none of those keyword lists -- otherwise a future
+    /// rewording of it would silently reroute the class.
+    #[test]
+    fn empty_completion_marker_text_is_not_claimed_by_neighbouring_classifiers() {
+        let err = anyhow::Error::new(crate::openai_codex::EmptyCompletionPayload);
+        assert!(!is_context_window_exceeded(&err));
+        assert!(!is_reasoning_roundtrip_rejected(&err));
+        assert!(!is_auth_error(&err));
+        assert!(!is_tool_schema_error(&err));
     }
 
     // A proxied rejection can carry the router's own 5xx while the inner

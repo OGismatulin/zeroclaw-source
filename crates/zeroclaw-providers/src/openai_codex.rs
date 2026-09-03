@@ -96,12 +96,18 @@ struct ResponsesReasoningOptions {
     summary: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
     output: Vec<Value>,
     #[serde(default)]
     output_text: Option<String>,
+    /// Only read to narrow the empty-payload marker to a normally finished
+    /// turn (fork patch #37); `incomplete` responses keep the plain error.
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -761,6 +767,32 @@ impl std::fmt::Display for ResponsesStreamApiError {
 
 impl std::error::Error for ResponsesStreamApiError {}
 
+/// Typed marker for a turn the upstream finished normally while shipping no
+/// text and no tool call (fork patch #37, spec §7.2).
+///
+/// It is created where the emptiness is DETECTED -- the two
+/// `ensure_nonempty_responses_turn` closures in `parse_responses_body` -- and
+/// never where the error leaves `chat()`: that exit branch catches every
+/// failure of `decode_responses_body` (transport read errors, incomplete
+/// UTF-8, unparsed SSE frames, JSON parse failures), so minting the marker
+/// there would nudge the model in reply to a dropped TCP connection and make
+/// `kind=empty_completion` stop being evidence of the class.
+///
+/// The `Display` text is fixed and carries no upstream body: that keeps the
+/// streaming-mandatory branch free to pass the error through unchanged, and
+/// keeps every string-based classifier above the provider (context window,
+/// reasoning round-trip, non-retryable, rate limit) from claiming it.
+#[derive(Debug)]
+pub struct EmptyCompletionPayload;
+
+impl std::fmt::Display for EmptyCompletionPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenAI Codex finished a turn with no text and no tool call")
+    }
+}
+
+impl std::error::Error for EmptyCompletionPayload {}
+
 pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
@@ -1266,6 +1298,17 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         return ensure_nonempty_responses_turn(result, || {
             let sanitized = super::sanitize_api_error(body);
             let shape = summarize_sse_body(body);
+            // Narrow the marker to a NORMALLY finished response: `status:
+            // completed` with no `incomplete_details`. A response with
+            // `incomplete_details.reason = max_output_tokens` also lands here
+            // with no text, but that is output-budget exhaustion -- nudging
+            // only repeats it, and the class would hide under the wrong name.
+            // Both fields are already collected by `summarize_sse_body`.
+            let normally_completed = shape.get("response_status").and_then(Value::as_str)
+                == Some("completed")
+                && shape
+                    .get("incomplete_reason")
+                    .is_none_or(|reason| reason.is_null());
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1276,6 +1319,9 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
                     })),
                 "openai_codex: empty SSE stream payload"
             );
+            if normally_completed {
+                return anyhow::Error::new(EmptyCompletionPayload);
+            }
             anyhow::Error::msg(format!(
                 "No response from OpenAI Codex stream payload: {sanitized}"
             ))
@@ -1298,6 +1344,9 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
             "OpenAI Codex JSON parse failed: {err}. Payload: {sanitized}"
         ))
     })?;
+    // Same narrowing as the SSE path, read off the deserialized response.
+    let normally_completed =
+        parsed.status.as_deref() == Some("completed") && parsed.incomplete_details.is_none();
     let result = responses_turn_from_response(&parsed);
     ensure_nonempty_responses_turn(result, || {
         let sanitized = super::sanitize_api_error(body);
@@ -1308,6 +1357,9 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
                 .with_attrs(::serde_json::json!({"payload": &sanitized})),
             "openai_codex: empty response"
         );
+        if normally_completed {
+            return anyhow::Error::new(EmptyCompletionPayload);
+        }
         anyhow::Error::msg(format!("No response from OpenAI Codex: {sanitized}"))
     })
 }
@@ -1609,6 +1661,17 @@ impl OpenAiCodexModelProvider {
             Err(stream_err) => {
                 if stream_err
                     .downcast_ref::<ResponsesStreamApiError>()
+                    .is_some()
+                {
+                    return Err(stream_err);
+                }
+
+                // fork patch #37: the payloadless-completion marker is minted
+                // at the point of detection and passes through untouched. Its
+                // Display text is fixed, so surfacing it here leaks no upstream
+                // body -- the reason the keyword-free string below exists.
+                if stream_err
+                    .downcast_ref::<EmptyCompletionPayload>()
                     .is_some()
                 {
                     return Err(stream_err);
@@ -2447,6 +2510,7 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         let response = ResponsesResponse {
             output: vec![],
             output_text: Some("hello".into()),
+            ..Default::default()
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("hello"));
     }
@@ -2465,6 +2529,7 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
                 ]
             })],
             output_text: None,
+            ..Default::default()
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
     }

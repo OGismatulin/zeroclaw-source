@@ -446,9 +446,12 @@ mod tests {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let exempt: Vec<String> = Vec::new();
         let ctx = repair_ctx(&pacing, &exempt, None);
-        let err = anyhow::Error::msg(
-            "No response from OpenAI Codex stream payload: event: response.created",
-        );
+        // Fork patch #37: the class arrives as the provider's typed marker, not
+        // as prose. The old prose input ("No response from OpenAI Codex stream
+        // payload: ...") no longer classifies -- the streaming-mandatory branch
+        // never let that sentence out on the default endpoint, which is exactly
+        // why patch #36 was inert in production while this test was green.
+        let err = anyhow::Error::new(zeroclaw_providers::openai_codex::EmptyCompletionPayload);
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("do the thing"),
@@ -483,6 +486,57 @@ mod tests {
         assert!(!try_recover_empty_completion(&mut history, &err, 1, &mut nudges, &ctx).await);
         assert_eq!(history.len(), 1);
         assert_eq!(nudges, 0);
+    }
+
+    /// Acceptance gate 0 of the design counts `empty_completion_nudge` records
+    /// with `nudged: true` and joins them to the turn by `trace_id`. Pin both
+    /// the message name and those attributes: a rename would leave the gate
+    /// reading zero and looking exactly like the inert patch #36.
+    #[tokio::test]
+    async fn empty_completion_nudge_record_carries_nudged_and_trace_id() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt: Vec<String> = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let err = anyhow::Error::new(zeroclaw_providers::openai_codex::EmptyCompletionPayload);
+        let mut history = vec![ChatMessage::user("do the thing")];
+        let mut nudges = 0u8;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        assert!(try_recover_empty_completion(&mut history, &err, 2, &mut nudges, &ctx).await);
+
+        let mut record: Option<serde_json::Value> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while record.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, log_rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("empty_completion_nudge")
+                    {
+                        record = Some(value);
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        let record = record.expect("no empty_completion_nudge record observed");
+        let attrs = record
+            .get("attributes")
+            .expect("record must carry attributes");
+        assert_eq!(attrs.get("nudged").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            attrs.get("trace_id").and_then(|v| v.as_str()),
+            Some("turn-roundtrip-test")
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     /// Minimal `TurnCtx` for the repair tests: only observer/model/turn_id/
