@@ -441,17 +441,30 @@ mod tests {
         h
     }
 
+    /// The error shape the recovery ladder actually receives in production.
+    ///
+    /// `provider_call.rs` wraps EVERY provider error in
+    /// `ensure_terminal_provider_failure` before the ladder runs, and that wrap
+    /// drops the raw cause: the marker is no longer in the chain, only
+    /// `diagnostic().kind()` survives. A test fed the bare marker exercises the
+    /// `downcast_ref` branch, which is unreachable at this call site -- exactly
+    /// the one-layer-up version of the #36 failure mode (green test, inert
+    /// production).
+    fn live_empty_completion_error() -> anyhow::Error {
+        zeroclaw_providers::reliable::ensure_terminal_provider_failure(
+            anyhow::Error::new(zeroclaw_providers::openai_codex::EmptyCompletionPayload),
+            "openai-codex",
+            "gpt-5.6-luna",
+            zeroclaw_providers::reliable::ProviderRoute::Main,
+        )
+    }
+
     #[tokio::test]
     async fn empty_completion_nudges_twice_then_gives_up() {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let exempt: Vec<String> = Vec::new();
         let ctx = repair_ctx(&pacing, &exempt, None);
-        // Fork patch #37: the class arrives as the provider's typed marker, not
-        // as prose. The old prose input ("No response from OpenAI Codex stream
-        // payload: ...") no longer classifies -- the streaming-mandatory branch
-        // never let that sentence out on the default endpoint, which is exactly
-        // why patch #36 was inert in production while this test was green.
-        let err = anyhow::Error::new(zeroclaw_providers::openai_codex::EmptyCompletionPayload);
+        let err = live_empty_completion_error();
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("do the thing"),
@@ -496,8 +509,12 @@ mod tests {
     async fn empty_completion_nudge_record_carries_nudged_and_trace_id() {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let exempt: Vec<String> = Vec::new();
-        let ctx = repair_ctx(&pacing, &exempt, None);
-        let err = anyhow::Error::new(zeroclaw_providers::openai_codex::EmptyCompletionPayload);
+        // Distinct turn_id: the sibling nudge test emits the same message with
+        // the shared `repair_ctx` id (and a `nudged: false` record on its third
+        // call), so a first-message-wins scan could otherwise latch onto it.
+        let mut ctx = repair_ctx(&pacing, &exempt, None);
+        ctx.turn_id = "turn-empty-completion-nudge";
+        let err = live_empty_completion_error();
         let mut history = vec![ChatMessage::user("do the thing")];
         let mut nudges = 0u8;
 
@@ -518,6 +535,11 @@ mod tests {
                 Ok(Ok(value)) => {
                     if value.get("message").and_then(|v| v.as_str())
                         == Some("empty_completion_nudge")
+                        && value
+                            .get("attributes")
+                            .and_then(|a| a.get("trace_id"))
+                            .and_then(|v| v.as_str())
+                            == Some("turn-empty-completion-nudge")
                     {
                         record = Some(value);
                     }
@@ -534,7 +556,7 @@ mod tests {
         assert_eq!(attrs.get("nudged").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             attrs.get("trace_id").and_then(|v| v.as_str()),
-            Some("turn-roundtrip-test")
+            Some("turn-empty-completion-nudge")
         );
         zeroclaw_log::clear_broadcast_hook();
     }

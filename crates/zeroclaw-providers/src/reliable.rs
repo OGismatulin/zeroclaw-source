@@ -5735,6 +5735,27 @@ mod tests {
         assert!(is_empty_completion_error(&err));
         assert_eq!(provider_error_diagnostic(&err).kind(), "empty_completion");
 
+        // The turn engine only ever sees the summary Display of a wrapped
+        // terminal failure (`provider_call.rs` wraps every provider error
+        // before the recovery ladder runs), so the kind must survive the wrap
+        // — the marker itself is gone from the chain by then. Mirrors
+        // `wrapped_terminal_failure_keeps_the_reasoning_roundtrip_kind`.
+        let wrapped = ensure_terminal_provider_failure(
+            anyhow::Error::new(crate::openai_codex::EmptyCompletionPayload),
+            "openai-codex",
+            "gpt-5.6-luna",
+            ProviderRoute::Main,
+        );
+        let terminal = terminal_provider_failure(&wrapped).expect("terminal failure");
+        assert_eq!(terminal.diagnostic().kind(), "empty_completion");
+        assert!(
+            wrapped
+                .downcast_ref::<crate::openai_codex::EmptyCompletionPayload>()
+                .is_none(),
+            "the wrap drops the raw cause; only the kind survives"
+        );
+        assert!(is_empty_completion_error(&wrapped));
+
         let unrelated = anyhow::Error::msg("429 Too Many Requests: rate limit");
         assert!(!is_empty_completion_error(&unrelated));
     }

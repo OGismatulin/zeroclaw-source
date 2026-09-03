@@ -2349,6 +2349,11 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         SseBytes(&'static [u8]),
         Json(serde_json::Value),
         Status(axum::http::StatusCode, &'static str),
+        /// 200 + `text/event-stream` whose body yields one chunk and then a
+        /// transport error — the real `chunk.map_err` path in
+        /// `decode_responses_body`. Observed in production (3 `error reading
+        /// OpenAI Codex response stream` lines).
+        SseStreamThenError(&'static str),
     }
 
     async fn mock_codex_provider(
@@ -2416,6 +2421,25 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
                         MockCodexReply::Json(body) => Json(body).into_response(),
                         MockCodexReply::Status(status, body) => {
                             (status, body.to_string()).into_response()
+                        }
+                        MockCodexReply::SseStreamThenError(prefix) => {
+                            // The first chunk must land (and the client's
+                            // `send()` resolve) BEFORE the stream errors, so
+                            // the failure hits `decode_responses_body`'s
+                            // `chunk.map_err` rather than the send call.
+                            let body = stream::once(async move {
+                                Ok::<Vec<u8>, std::io::Error>(prefix.as_bytes().to_vec())
+                            })
+                            .chain(stream::once(async {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                Err(std::io::Error::other("upstream stream aborted"))
+                            }));
+                            (
+                                axum::http::StatusCode::OK,
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                axum::body::Body::from_stream(body),
+                            )
+                                .into_response()
                         }
                     }
                 }
@@ -2945,7 +2969,8 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_reasoning\",\"type\":\"reasoning\"}}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"item_msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"id\":\"item_reasoning\",\"type\":\"reasoning\"},{\"id\":\"item_msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}],\"usage\":{\"output_tokens\":128,\"output_tokens_details\":{\"reasoning_tokens\":122}}}}\n\n",
-            "data: [DONE]\n\n",
+            // No `[DONE]` sentinel: all 68 production snapshots report
+            // `saw_done_sentinel: false`. Classification does not depend on it.
         );
 
         let (mut provider, captured, server_handle, _temp_dir) =
@@ -3079,6 +3104,47 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             "empty_completion",
             "got: {err}"
         );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_stream_read_failure_is_not_empty_completion() {
+        // A genuine transport read failure mid-body: the mock streams one valid
+        // chunk and then errors, so `decode_responses_body`'s `chunk.map_err`
+        // fires ("error reading OpenAI Codex response stream"). Observed class,
+        // not hypothetical — 3 such lines in the production logs. It must NOT
+        // be classified as an empty completion: nudging the model in reply to a
+        // dropped connection is exactly what minting the marker at the exit
+        // branch would have caused.
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::SseStreamThenError(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            )])
+            .await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("a stream read failure must surface as an error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+        assert!(!crate::reliable::is_non_retryable(&err), "{err}");
 
         server_handle.abort();
     }
