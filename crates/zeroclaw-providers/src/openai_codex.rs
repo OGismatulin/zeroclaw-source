@@ -2281,6 +2281,9 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
 
     enum MockCodexReply {
         Sse(&'static str),
+        /// Raw SSE bytes, not a `&'static str` — for a body that is not valid
+        /// UTF-8 (a `&str` literal cannot represent that at all).
+        SseBytes(&'static [u8]),
         Json(serde_json::Value),
         Status(axum::http::StatusCode, &'static str),
     }
@@ -2339,6 +2342,12 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
                             axum::http::StatusCode::OK,
                             [(header::CONTENT_TYPE, "text/event-stream")],
                             body.to_string(),
+                        )
+                            .into_response(),
+                        MockCodexReply::SseBytes(body) => (
+                            axum::http::StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            body.to_vec(),
                         )
                             .into_response(),
                         MockCodexReply::Json(body) => Json(body).into_response(),
@@ -2833,6 +2842,262 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             !crate::reliable::is_non_retryable(&err),
             "error must stay retryable regardless of upstream body content: {err}"
         );
+
+        server_handle.abort();
+    }
+
+    // --- fork-patch #37 seam: the classifier must see what the provider
+    // actually produces, not a hand-built string. Patch #36 shipped and was
+    // INERT for two days because `reliable.rs`'s only regression test built
+    // the error text itself instead of driving it through this provider code
+    // (see `docs/superpowers/specs/2026-09-01-codex-empty-sse-coordinator-turn-death-design.md`
+    // §7.1/§7.2). These tests go through `mock_codex_provider` +
+    // `provider.chat(...)` on the streaming-mandatory (default) endpoint, the
+    // same path production hits.
+
+    #[tokio::test]
+    async fn codex_default_endpoint_payloadless_completion_is_classified_empty_completion() {
+        // Real production shape (spec §5): the upstream finishes normally
+        // (`response.completed`, `status: "completed"`, no `incomplete_details`)
+        // but ships zero `response.output_text.delta` events and no tool call —
+        // the whole output-token budget went to reasoning. This is the case
+        // fork-patch #37 must classify as `empty_completion` so the turn engine
+        // nudges instead of killing the turn. RED until #37 lands: today the
+        // streaming-mandatory branch (`:1627`) strips every keyword the
+        // text-based classifier looks for.
+        let sse_body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"item_reasoning\",\"output_index\":0}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"item_reasoning\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"item_id\":\"item_reasoning\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"item_reasoning\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"item_reasoning\",\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"item_msg\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"item_id\":\"item_msg\",\"output_index\":1,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"item_id\":\"item_msg\",\"output_index\":1,\"text\":\"\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"item_id\":\"item_msg\",\"output_index\":1,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"item_reasoning\",\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"item_msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"id\":\"item_reasoning\",\"type\":\"reasoning\"},{\"id\":\"item_msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}],\"usage\":{\"output_tokens\":128,\"output_tokens_details\":{\"reasoning_tokens\":122}}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let (mut provider, captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(sse_body)]).await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5.6-luna",
+                None,
+            )
+            .await
+            .expect_err("a payloadless completion must surface as an error");
+
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        assert!(
+            crate::reliable::is_empty_completion_error(&err),
+            "expected the payloadless-completion predicate to recognize this error, got: {err}"
+        );
+        assert_eq!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_not_json_frame_is_not_empty_completion() {
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(
+                "data: not-json\n\ndata: [DONE]\n",
+            )])
+            .await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("unparseable SSE data must still error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_truncated_frame_is_not_empty_completion() {
+        // Same broken-frame body as `summarize_sse_body_separates_truncated_body_from_payloadless_completion`'s
+        // `truncated` fixture: cut mid-JSON, no closing `\n\n`. This is a
+        // transport/framing defect, not a payloadless-but-complete turn.
+        let truncated = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"";
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(truncated)]).await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("a truncated frame must still error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_incomplete_utf8_is_not_empty_completion() {
+        // The body's last byte is `\xC3`, the lead byte of a 2-byte UTF-8
+        // sequence with no continuation byte following — `decode_responses_body`
+        // sees this as the stream ending mid-character (`error_len() == None`),
+        // producing "response ended with incomplete UTF-8", not a parsed turn.
+        let cut: &'static [u8] =
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"caf\xC3";
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::SseBytes(cut)]).await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("an incomplete UTF-8 sequence must still error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_incomplete_max_output_tokens_is_not_empty_completion() {
+        // Same body as `summarize_sse_body_separates_truncated_body_from_payloadless_completion`'s
+        // `payloadless` fixture (`status: "incomplete"`,
+        // `incomplete_details.reason: "max_output_tokens"`) but driven through
+        // the real provider call instead of the summary helper directly. This
+        // is output-budget exhaustion, not the payloadless-but-complete class
+        // #37 targets — nudging it would only repeat the same truncation.
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"reasoning\"}],\"usage\":{\"output_tokens\":4096}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (mut provider, _captured, server_handle, _temp_dir) =
+            mock_codex_provider(vec![MockCodexReply::Sse(body)]).await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("output-budget exhaustion must still error");
+
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_stream_api_error_is_not_empty_completion() {
+        // An explicit upstream error event must keep surfacing as
+        // `ResponsesStreamApiError`, not get folded into the payloadless
+        // classification, even on the streaming-mandatory endpoint.
+        let (mut provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+            MockCodexReply::Sse(
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n",
+            ),
+        ])
+        .await;
+        provider.streaming_mandatory_endpoint = true;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("stream API errors should not be retried");
+
+        assert!(
+            err.downcast_ref::<ResponsesStreamApiError>().is_some(),
+            "expected a ResponsesStreamApiError to survive the streaming-mandatory branch, got: {err}"
+        );
+        assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
+        assert_ne!(
+            crate::reliable::provider_error_diagnostic(&err).kind(),
+            "empty_completion",
+            "got: {err}"
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
 
         server_handle.abort();
     }

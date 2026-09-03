@@ -810,7 +810,7 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     Some(sanitized_url_endpoint(url))
 }
 
-fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
+pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
     let endpoint = typed_reqwest_error(err)
