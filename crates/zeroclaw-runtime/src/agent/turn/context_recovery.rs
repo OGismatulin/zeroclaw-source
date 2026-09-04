@@ -33,6 +33,7 @@ pub(crate) fn record_llm_failure(
         output_tokens: None,
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
         // Error path: no prompt/completion content captured.
         messages: None,
@@ -902,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn floor_exceeds_budget_single_turn_does_not_recover() {
-        // #5808 regression: the system prompt + tool definitions alone dominate
+        // the system prompt + tool definitions alone dominate
         // the budget and only one turn exists. Recovery must NOT loop — it
         // returns false (nothing left to drop) so the caller breaks instead of
         // re-running the same turn forever.

@@ -442,6 +442,8 @@ cli-sop-execution-mode = {"  "}実行モード: {$value}
 cli-sop-deterministic = {"  "}決定論的:  {$value}
 cli-sop-cooldown = {"  "}クールダウン:       {$value}秒
 cli-sop-max-concurrent = {"  "}最大同時実行数: {$value}
+cli-sop-admission-policy = {"  "}許可ポリシー:   {$value}
+cli-sop-max-pending-approvals = {"  "}最大保留承認数: {$value}
 cli-sop-location = {"  "}場所:       {$value}
 cli-sop-triggers = {"  "}トリガー:
 cli-sop-steps = {"  "}ステップ:
@@ -592,6 +594,8 @@ cli-quickstart-error-unknown-risk-preset = 不明なリスクプリセット `{$
 cli-quickstart-error-unknown-runtime-preset = 不明なランタイムプリセット `{$preset}`
 cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエージェント `{$owner}` に割り当てられています
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
+cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
+cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -794,9 +798,11 @@ cli-models-status-none = デフォルトモデルが設定されていません�
 turn-interrupted-by-user = [ユーザーによって中断されました]
 turn-cancelled-client-rpc = [クライアント経由でターンがキャンセルされました]
 turn-stream-interrupted = [ストリームが中断されました]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-reasoning-roundtrip = provider requires reasoning round-trip; dropped one plain assistant turn
+history-trim-reason-message-cap = 履歴メッセージ数の上限を超えました
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
@@ -902,6 +908,15 @@ cli-bundle-warn-archive = 警告: バンドルディレクトリのアーカイ�
 cli-bundle-deleted = skill_bundles.{$alias} を削除しました（{$count} 件のエージェントから除去しました）
 cli-bundle-warn-move = 警告: バンドルディレクトリの移動に失敗しました: {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} にリネームしました
+
+# ── Web ダッシュボードの再起動ヒント — アプリ内アップグレード後に表示される RestartInfo.hint (PR #8173) ──
+# 最初の 4 つはそのまま表示されるシェルコマンドのテンプレートのため翻訳しません。
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動してください
+
 cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
 cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
@@ -916,3 +931,13 @@ cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しま
 cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
 cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
+sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
+sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
+sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステップを解決する権限がありません。
+sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
+sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。

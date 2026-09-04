@@ -3,14 +3,6 @@
     clippy::useless_format,
     clippy::collapsible_if
 )]
-//! Axum-based HTTP gateway with proper HTTP/1.1 compliance, body limits, and timeouts.
-//!
-//! This module replaces the raw TCP implementation with axum for:
-//! - Proper HTTP/1.1 parsing and compliance
-//! - Content-Length validation (handled by hyper)
-//! - Request body size limits (64KB max)
-//! - Request timeouts (30s) to prevent slow-loris attacks
-//! - Header sanitization (handled by axum/hyper)
 
 #[cfg(feature = "a2a")]
 pub mod a2a;
@@ -49,6 +41,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
@@ -103,12 +96,6 @@ const EMFILE: i32 = 24; // too many open files (this process)
 #[cfg(unix)]
 const ENFILE: i32 = 23; // too many open files (system-wide)
 
-/// Returns `true` when an error from a stream listener's `accept()` is
-/// transient and the listener itself remains usable, so the serve loop
-/// should log and keep running rather than terminating the daemon. Covers
-/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
-/// per-connection hiccups. Mirrors the non-fatal accept handling that
-/// `axum::serve` already performs on the plain-TCP path.
 fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     if matches!(
@@ -169,13 +156,6 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 /// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-/// Default request timeout for `POST /api/cron/{id}/run` (10 minutes).
-///
-/// Manually-triggered cron jobs run synchronously inside the request handler
-/// and frequently exceed the 30s gateway-wide default — agent jobs in
-/// particular can take minutes to complete a full reasoning loop. Capping at
-/// 10 minutes keeps the route from hanging indefinitely while still allowing
-/// realistic workloads to finish.
 pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// Gateway request timeout (seconds) for routes other than the long-running
@@ -623,6 +603,9 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
+    /// LAN-local peer hints discovered by multicast. These are informational
+    /// only; they never authorize or connect a peer.
+    pub mdns_peer_registry: nodes::mdns::MdnsPeerRegistry,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
@@ -775,7 +758,8 @@ pub async fn run_gateway(
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
     // fork(v0.8.0 regressions): the webhook default path (no model/provider in
@@ -857,19 +841,6 @@ pub async fn run_gateway(
                 )
             }
         };
-    // Model resolution (1) the first-model_provider's `model`,
-    // (2) the first configured `[providers.models.<type>.<alias>]`
-    // model with a WARN naming what to set, (3) leave the model empty so
-    // the gateway boots and the dashboard can complete browser-based
-    // quickstart at /quickstart. The chat-dispatch path checks
-    // `state.model.is_empty()` and returns a structured needs_quickstart
-    // error before any model_provider call, so the original "no silent
-    // vendor-default substitution" guarantee is preserved at request-time
-    // rather than at boot. V3 has no global fallback model_provider — every
-    // gateway request that needs agent context resolves through its
-    // `?agent=` parameter; this resolution is purely the seed value the
-    // gateway uses for boot-time logging and the AppState default model
-    // string.
     let model = if boot_provider_failed {
         String::new()
     } else {
@@ -906,14 +877,6 @@ pub async fn run_gateway(
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
     let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
-    // Skip the install-wide memory backend init when zero agents are
-    // configured. Building a SQLite (or other) backend here would
-    // synthesize `<workspace_dir>/memory/brain.db` on a fresh install
-    // that has nothing to remember; per-agent memory factories under
-    // `agents/<alias>/workspace/memory/` are the only legitimate
-    // origin of memory state. AppState gets a NoneMemory
-    // stub so endpoints that read `state.mem` keep working until an
-    // agent comes online.
     let mem: Arc<dyn Memory> = if config.agents.is_empty() {
         Arc::new(zeroclaw_memory::NoneMemory::new("none"))
     } else {
@@ -970,26 +933,6 @@ pub async fn run_gateway(
         config.memory.clone(),
         config.data_dir.clone(),
     ));
-    // Gateway is infrastructure — it doesn't run as an agent. Endpoints
-    // that need an agent context (`/webhook?agent=`, `/ws/chat?agent=`,
-    // ACP `session/new`, agent-scoped tools/memory) take it from the
-    // request. The shared SecurityPolicy / risk_profile / tools_registry
-    // built here are vestiges driving the legacy single-agent
-    // `/api/tools` listing and the `run_gateway_chat_with_tools` test
-    // mock; `/webhook` honors `?agent=` per-request (validated against
-    // `config.agents`), while SSE / pairing per-request dispatch is still
-    // tracked as a follow-up.
-    //
-    // Agent count is unconstrained at boot. Zero agents is a valid
-    // state (the gateway must come up so `/admin/reload` and
-    // `/quickstart` can install one) and the legacy seed simply stays
-    // empty. With one or more enabled agents, the lexicographically
-    // smallest enabled alias seeds the default (no `?agent=`) listing.
-    // The pick is deterministic on purpose: the previous `HashMap`
-    // iteration-order pick made the WebUI Tools page surface a different
-    // agent's tools on each restart. Every other enabled agent gets its
-    // own scoped listing (`tools_registry_by_agent`, built below) so
-    // `GET /api/tools?agent=<alias>` can show any agent's real tool set.
     let canvas_store = canvas_store.unwrap_or_default();
     let agent_alias_opt = default_agent_alias(&config);
 
@@ -1002,14 +945,6 @@ pub async fn run_gateway(
         (None, None)
     };
 
-    // The seeded `risk_profile` + `SecurityPolicy` here drive the legacy
-    // single-agent `/api/tools` listing and the `run_gateway_chat_with_tools`
-    // test mock — they are not load-bearing for per-request agent dispatch.
-    // When the seed agent's `risk_profile` (or any related per-agent
-    // validation) fails to resolve, the gateway must still boot so the
-    // operator can fix the config via `/admin/reload` or `/quickstart`
-    // instead of crash-looping the daemon supervisor. Degraded boot:
-    // log a warning and fall through to the empty-tools-registry branch.
     let agent_setup: Option<(
         zeroclaw_config::schema::RiskProfileConfig,
         Arc<SecurityPolicy>,
@@ -1056,12 +991,6 @@ pub async fn run_gateway(
                 sop_audit.clone(),
                 None,
             );
-            // Mint the registry through the gated seam: the built-in
-            // allow/deny filter and MCP scope+gate (omission is not a grant)
-            // run inside `assemble`, shared with every other path routed
-            // through it. The gateway previously applied only the MCP step,
-            // so its /api/tools listings showed unfiltered built-ins the
-            // agent's policy denies.
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
@@ -1073,20 +1002,19 @@ pub async fn run_gateway(
                 runtime: Arc::clone(&runtime),
                 caller_allowed: None,
                 connect_mcp: true,
+                // Gateway tool-listing path: short-lived, no cross-turn reuse
+                // contract, so the per-call connect is correct.
+                mcp_registry: None,
                 // Listing-only registry: loading peripherals physically opens
                 // hardware (exclusive serial holds) that the live turn paths
                 // need. Never connect them for a registry no turn runs against.
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: true,
             })
             .await;
-            // Wire channel-driven tool handles so the dashboard agent can
-            // deliver messages to configured channels (same pattern as
-            // orchestrator::start_channels).
-            // reaction_handle is PerToolChannelHandle (not Option);
-            // register_channels_for_tools expects &Option for all handles.
             let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
@@ -1134,15 +1062,6 @@ pub async fn run_gateway(
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
-    // Per-agent tool listings powering the agent-aware
-    // `GET /api/tools?agent=<alias>` view, so the WebUI Tools page can show
-    // each agent's real, scoped tool set instead of one arbitrary agent's.
-    // The dashboard seed above is reused verbatim as the default agent's
-    // entry; every OTHER enabled agent is built here with its own
-    // SecurityPolicy and `mcp_bundles`-scoped MCP tools. Channel handles are
-    // intentionally NOT registered for these agents: the tools are only
-    // enumerated for their specs, never invoked. A per-agent failure is
-    // logged and skipped so one broken agent never starves the rest.
     let mut tools_registry_by_agent: HashMap<String, Arc<Vec<ToolSpec>>> = HashMap::new();
     if let Some(default_alias) = agent_alias_opt.as_ref() {
         tools_registry_by_agent.insert(default_alias.clone(), Arc::clone(&tools_registry));
@@ -1221,12 +1140,16 @@ pub async fn run_gateway(
             runtime: Arc::clone(&runtime),
             caller_allowed: None,
             connect_mcp: true,
+            // Gateway tool-listing path: short-lived, no cross-turn reuse
+            // contract, so the per-call connect is correct.
+            mcp_registry: None,
             // Same as the seed: never open hardware for a listing (and
             // `config.peripherals` is global - N per-agent opens of the same
             // boards would fail against the first holder anyway).
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: true,
         })
         .await;
@@ -1264,7 +1187,7 @@ pub async fn run_gateway(
         });
 
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
-    // alias so `/whatsapp/{alias}` webhooks reach the matching instance (#6312).
+    // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
     let whatsapp_channel: HashMap<String, Arc<WhatsAppChannel>> = config
         .channels
@@ -1397,7 +1320,21 @@ pub async fn run_gateway(
                 alias.clone(),
                 Arc::new(NextcloudTalkChannel::new(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    // Resolve the same installed-bot secret used by inbound
+                    // verification. `webhook_secret` is canonical and
+                    // `bot_token` is a deprecated alias for the same value.
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias.clone(),
                     peer_resolver,
@@ -1413,12 +1350,23 @@ pub async fn run_gateway(
         .nextcloud_talk
         .iter()
         .filter_map(|(alias, nc)| {
-            let secret = nc
-                .webhook_secret
-                .as_deref()
-                .map(str::trim)
-                .filter(|secret| !secret.is_empty())
-                .map(ToOwned::to_owned)?;
+            // Same resolver as the outbound signing path: Nextcloud installs one
+            // secret per bot, so inbound verification and outbound signing must
+            // agree. A conflict or an unresolved secret yields no entry, and the
+            // handler rejects rather than skipping verification.
+            let secret = match nc.resolve_bot_secret() {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    return None;
+                }
+            };
             Some((alias.clone(), Arc::from(secret)))
         })
         .collect();
@@ -1448,12 +1396,6 @@ pub async fn run_gateway(
             })
     };
 
-    // ── Session persistence for WS chat ─────────────────────
-    // Routes through `make_session_backend` so `[channels].session_backend`
-    // is the single source of truth for which backend stores sessions.
-    // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
-    // to SQLite while channel + tool reads went to JSONL — the original
-    // #5769 split, just on a different backend pairing.
     let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
         match zeroclaw_infra::make_session_backend(
             &config.data_dir,
@@ -1560,12 +1502,6 @@ pub async fn run_gateway(
         }
     }
 
-    // Resolve web_dist_dir: explicit config (when valid) → auto-detect.
-    // Treat the configured path as advisory — if it doesn't contain
-    // index.html on this machine (stale/leaked path from another host,
-    // typo, missing build), fall back to auto-detect rather than hard-
-    // failing every dashboard request. We log the demotion so the
-    // operator can spot a misconfigured path.
     let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
         let mut candidates = vec![
             // Relative to CWD (development: running from repo root)
@@ -1701,22 +1637,12 @@ pub async fn run_gateway(
         hooks.fire_gateway_start(host, actual_port).await;
     }
 
-    // Install the SSE broadcast hook before building any observer so that
-    // events emitted by the agent's per-call observer (built inside
-    // `process_message`) also reach `/api/events`. The state-level observer
-    // is just the configured backend — `TeeObserver` (created by
-    // `create_observer`) tees its events into the hook automatically.
     let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
         sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
     );
     let broadcast_hook_guard =
         zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
 
-    // Install the same broadcast sender as zeroclaw-log's canonical
-    // hook so that every event emitted through `record!` / `record_event`
-    // also reaches `/api/events`. The Observer-trait hook above stays
-    // wired for legacy `observer.record_event(ObserverEvent::...)`
-    // callers that haven't migrated to `record!` yet.
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
     // Bound into AppState. Not a broadcaster — the broadcaster is the
@@ -1735,6 +1661,46 @@ pub async fn run_gateway(
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
+    let mdns_task = if config.nodes.mdns.enabled
+        && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
+    {
+        let mdns_config = config.nodes.mdns.clone();
+        let advertised_gateway = nodes::mdns::MdnsAdvertisedGateway::new(actual_port, path_prefix);
+        let mdns_registry = mdns_peer_registry.clone();
+        let mdns_shutdown_rx = shutdown_tx.subscribe();
+        Some(zeroclaw_spawn::spawn!(async move {
+            if let Err(err) = nodes::mdns::run_peer_discovery(
+                mdns_config,
+                advertised_gateway,
+                mdns_registry,
+                mdns_shutdown_rx,
+            )
+            .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "mDNS local peer discovery stopped"
+                );
+            }
+        }))
+    } else if config.nodes.mdns.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"bind_addr": actual_addr.to_string()})),
+            "mDNS local peer discovery skipped because the gateway is bound to a loopback-only host"
+        );
+        None
+    } else {
+        None
+    };
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -1814,6 +1780,7 @@ pub async fn run_gateway(
         shutdown_tx,
         reload_tx,
         node_registry,
+        mdns_peer_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
@@ -1877,6 +1844,12 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/version/check", get(version::handle_version_check))
+        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade/status",
+            get(version::handle_version_upgrade_status),
+        )
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",
@@ -2090,6 +2063,10 @@ pub async fn run_gateway(
             "/api/channels/bind",
             post(api_config::handle_api_channel_bind),
         )
+        .route(
+            "/api/channels/{channel}/relink",
+            post(api::handle_api_channel_relink),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
@@ -2272,7 +2249,7 @@ pub async fn run_gateway(
                                 // Transient (e.g. EMFILE under fd pressure):
                                 // the listener is still valid. Back off
                                 // briefly to avoid hot-spinning, then keep
-                                // serving rather than killing the daemon (#7042).
+                                // serving rather than killing the daemon
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
                                 tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                                 continue;
@@ -2336,34 +2313,34 @@ pub async fn run_gateway(
         .await?;
     }
 
-    drop(broadcast_hook_guard);
+    if let Some(task) = mdns_task {
+        let mut task = task;
+        tokio::select! {
+            result = &mut task => {
+                if let Err(err) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                        "LAN peer discovery task join failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                task.abort();
+            }
+        }
+    }
 
+    drop(broadcast_hook_guard);
     Ok(())
 }
 
-/// Admin paircode routes are localhost-only ([`require_localhost`]), so the
-/// recovery hint must never advertise a non-loopback `--host`: the CLI would
-/// then target an address the admin guard rejects with `403`. We omit `--host`
-/// entirely and let the CLI fall back to its loopback default. (`_host` is kept
-/// for call-site symmetry with [`format_paircode_recovery_curl`].)
 fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
     format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
-/// Startup-banner lines for the "pairing required, but no code exists because
-/// the gateway is already paired" state.
-///
-/// By design a fresh one-time code is NOT minted on restart once paired (see
-/// [`zeroclaw_config::pairing::PairingGuard::new`]) — that would reopen a
-/// standing, brute-forceable pairing window. The earlier banner ("Pairing:
-/// ACTIVE (bearer token required)") never said a code was *absent*, so an
-/// operator opening the dashboard hit a 6-digit prompt with no code printed
-/// anywhere and no in-band way out (#5266). This notice states the absence
-/// plainly and points at the commands that mint a code on demand.
-///
-/// Returned as lines (rather than printed inline in `run_gateway`) so the
-/// wording is the single, unit-tested source of truth and can be reused by any
-/// other operator-facing surface.
 fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
     vec![
         "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
@@ -2508,24 +2485,7 @@ async fn handle_pair(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "new client paired successfully"
             );
-            // `try_pair` is not just validation: by the time we land
-            // here, the pairing code is consumed and the token's
-            // SHA-256 hash is already in `PairingGuard::paired_tokens`.
-            // Every step below MUST succeed atomically — if any of them
-            // fails, we MUST roll back via `revoke_token_hash` and
-            // return 500 WITHOUT the token in the body. The previous
-            // version of this code returned the plaintext token in the
-            // 500 body, so the caller received a bearer that
-            // authenticated until restart even though there was no
-            // device row and no persisted token record. That preserves
-            // the management gap this whole PR is trying to close.
             let token_hash = PairingGuard::token_hash(&token);
-            // Register the device so a token paired via the legacy `/pair`
-            // route is listable and revocable from the management UI, exactly
-            // like `/api/pair` (`submit_pairing_enhanced`). Without this the
-            // token authenticates but has no device row, so the UI can neither
-            // see nor revoke it. The token itself is owned by `PairingGuard`
-            // and persisted below; this row is metadata keyed by its hash.
             if let Some(ref registry) = state.device_registry {
                 if let Err(e) = registry.register(
                     token_hash.clone(),
@@ -2546,15 +2506,6 @@ async fn handle_pair(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful legacy /pair; rolling back in-process token"
                     );
-                    // Compensating action: drop the just-accepted
-                    // hash so the failed pairing leaves no
-                    // authenticate-able state. The pairing code is
-                    // already consumed (one-shot), so the operator
-                    // must call `initiate_pairing` to issue a new
-                    // code. The orphaned registry row, if any, sits
-                    // until the operator removes it via the
-                    // management UI; the next `revoke_all` /
-                    // `reconcile` cycle cleans it up.
                     state.pairing.revoke_token_hash(&token_hash);
                     let body = serde_json::json!({
                         "paired": false,
@@ -2575,12 +2526,6 @@ async fn handle_pair(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                // Same compensating action: persistence failed, so a
-                // restart would resurrect the in-memory token. Drop
-                // it now and do NOT return the plaintext token in the
-                // body — the previous behavior leaked a usable
-                // bearer on a 200, which is the very gap this PR
-                // closes.
                 state.pairing.revoke_token_hash(&token_hash);
                 let body = serde_json::json!({
                     "paired": false,
@@ -2636,11 +2581,6 @@ pub(crate) async fn persist_pairing_tokens(
     // this should be removed once async mutexes are used everywhere
     let mut updated_cfg = { config.read().clone() };
     updated_cfg.gateway.paired_tokens = paired_tokens;
-    // Snake-case to match the prop-field name emitted by the `Configurable`
-    // derive. Until #7156 the string used here was `gateway.paired-tokens`
-    // (kebab); it kept working only thanks to the `-`→`_` fallback in
-    // `resolve_dirty_segments`. Aligning all references to the snake form
-    // removes that fallback dependency and keeps the codebase consistent.
     updated_cfg.mark_dirty("gateway.paired_tokens");
     updated_cfg
         .save_dirty()
@@ -2652,10 +2592,7 @@ pub(crate) async fn persist_pairing_tokens(
     Ok(())
 }
 
-/// Result of a gateway chat turn. Carries the response text plus per-turn
-/// token / cost totals collected from `TOOL_LOOP_TURN_USAGE` (when scoped)
-/// so callers can populate observer-event annotations without racing
-/// concurrent webhook traffic that shares the same `CostTracker`.
+/// Result of a gateway chat turn.
 struct GatewayChatOutcome {
     response: String,
     // Reserved for observer-event annotations (see doc comment above): callers
@@ -2728,12 +2665,6 @@ impl ::zeroclaw_api::attribution::Attributable for UnconfiguredModelProvider {
     }
 }
 
-/// Returns a structured `needs_quickstart` error when `model` is empty
-/// or whitespace-only, otherwise `None`. Empty model means the gateway
-/// booted with nothing configured (fresh install). Callers refuse the
-/// dispatch with this marker instead of calling the provider with an
-/// empty model id. Mirrors `agent::Agent::from_config` at
-/// request-time so `/quickstart` stays reachable.
 fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
     if model.trim().is_empty() {
         ::zeroclaw_log::record!(
@@ -2756,20 +2687,10 @@ fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
     e.downcast_ref::<NeedsQuickstart>().is_some()
 }
 
-/// Reply text sent over a channel SDK when chat dispatch refuses
-/// because the gateway has no model configured. Resolved through the
-/// shared Fluent catalog (`channel-needs-quickstart-reply` in
-/// `crates/zeroclaw-runtime/locales/<locale>/cli.ftl`) so non-English
-/// operators see localized text instead of a Rust-side English literal.
 fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
-/// Full-featured chat with tools for channel and webhook handlers.
-///
-/// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
-/// already validated against `config.agents` by the handler. `None` keeps the
-/// legacy default pick (migration-synthesized "default", else first enabled).
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2783,7 +2704,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
     // through handle_webhook, so dispatch to the mock model_provider directly
     // instead of bootstrapping the full agent runtime. The mock path
-    // doesn't go through the cost-tracking scope, so usage stays None.
+    // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
         let _ = (session_id, agent_override);
@@ -2806,9 +2727,10 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
-        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals
-        // so callers can read the per-turn cost without racing concurrent
-        // requests sharing the same tracker. Pricing is built from the
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
+        // the runtime-owned lifecycle guard can annotate its `AgentEnd`
+        // without racing concurrent requests sharing the same tracker.
+        // Pricing is built from the
         // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
         // wins over legacy per-alias pricing).
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
@@ -2838,22 +2760,11 @@ pub(crate) async fn run_gateway_chat_with_tools(
             ),
         ))
         .await?;
-        let usage = turn_usage
-            .map(|cell| *cell.lock())
-            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
-        let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(usage) => (
-                Some(usage.input_tokens),
-                Some(usage.output_tokens),
-                Some(usage.cost_usd),
-            ),
-            None => (None, None, None),
-        };
         Ok(GatewayChatOutcome {
             response,
-            input_tokens,
-            output_tokens,
-            cost_usd,
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
         })
     }
 }
@@ -3313,6 +3224,7 @@ async fn run_gateway_webhook_agentic(
             let result = zeroclaw_runtime::agent::loop_::scope_session_key(
                 session_key_for_scope,
                 zeroclaw_runtime::agent::loop_::agent_turn(
+                    Some(&config),
                     provider,
                     &mut history,
                     &tools_registry,
@@ -3346,6 +3258,7 @@ async fn run_gateway_webhook_agentic(
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                     None,
                     Some(&agent_alias),
+                    None, // turn_id: self-minted
                 ),
             )
             .await;
@@ -4567,6 +4480,7 @@ async fn handle_webhook(
             messages_count: 1,
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: None,
         },
     );
@@ -4623,6 +4537,7 @@ async fn handle_webhook(
                     // from upstream's LlmResponse field addition.
                     channel: None,
                     agent_alias: None,
+                    parent_agent_alias: None,
                     turn_id: None,
                     messages: None,
                 },
@@ -4765,6 +4680,7 @@ async fn handle_webhook(
                     // scope. messages: None adopted from upstream field addition.
                     channel: None,
                     agent_alias: None,
+                    parent_agent_alias: None,
                     turn_id: None,
                     messages: None,
                 },
@@ -5516,8 +5432,20 @@ async fn process_nextcloud_talk_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify Nextcloud Talk HMAC signature if secret is configured ──
-    if let Some(webhook_secret) = webhook_secret {
+    // ── Security: Nextcloud Talk webhooks MUST be signature-verified ──
+    // Fail closed: with no resolved bot secret we cannot verify the signature, so the
+    // request is rejected. Previously an unresolved secret skipped verification
+    // entirely, which left a bot_token-only configuration accepting unverified inbound
+    // webhooks while still signing outbound replies.
+    let Some(webhook_secret) = webhook_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "nextcloud_talk: no bot secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let random = headers
             .get("X-Nextcloud-Talk-Random")
             .and_then(|v| v.to_str().ok())
@@ -5570,8 +5498,8 @@ async fn process_nextcloud_talk_webhook(
     }
 
     // Spawn per-message processing so the webhook returns 200 quickly.
-    // Nextcloud Talk cancels webhook requests that don't complete within ~5s
-    // (see #6156); slow local models routinely exceed that. Each message gets
+    // Nextcloud Talk cancels webhook requests that don't complete within ~5s;
+    // slow local models routinely exceed that. Each message gets
     // its own task — the LLM call and reply are independent of the ack.
     for msg in messages {
         let state = state.clone();
@@ -5804,12 +5732,6 @@ enum AdminReloadGate {
     ForbiddenNoPairing,
 }
 
-/// Pure gate decision for `/admin/reload`. Auth enforcement (for the
-/// `RequireAuth` case) is handled separately by the caller.
-///
-/// Remote access requires *both* `allow_remote_admin` and pairing: opting in
-/// without pairing yields `ForbiddenNoPairing`, never an unauthenticated
-/// allow.
 fn admin_reload_gate(
     is_loopback: bool,
     allow_remote_admin: bool,
@@ -5826,28 +5748,6 @@ fn admin_reload_gate(
     }
 }
 
-/// POST /admin/reload — reload the daemon in place.
-///
-/// Loopback callers (the CLI) are always allowed. Non-loopback callers are
-/// rejected unless `gateway.allow_remote_admin` is enabled *and* pairing is
-/// on, in which case the request must also pass pairing authentication
-/// (`require_auth`). Opting in with pairing disabled is rejected rather than
-/// allowing an unauthenticated remote reload.
-///
-/// Sends `true` on the reload channel the daemon owns. The daemon's main
-/// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
-/// loop in `src/main.rs` re-reads config from disk and re-runs
-/// `daemon::run` — re-instantiating every subsystem (gateway / channels /
-/// heartbeat / scheduler / mqtt) with the fresh config.
-///
-/// Same PID throughout. Brief HTTP downtime while the gateway listener
-/// rebinds — typically sub-second. Clients should poll `/health` to detect
-/// when the new instance is ready.
-///
-/// Cross-platform — works identically on Linux, macOS, and Windows because
-/// the channel is in-process tokio, not an OS signal. The gateway-only
-/// `zeroclaw gateway start` (no daemon supervisor) returns 503 with a
-/// clear message because there's nothing to signal.
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -5911,18 +5811,6 @@ async fn handle_admin_reload(
     state
         .pending_reload
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    // Trigger graceful shutdown of THIS gateway instance's axum::serve so
-    // its TcpListener releases the port before the daemon supervisor
-    // spawns the new instance. Without this, daemon::run aborts the
-    // gateway tokio task at the next await point — but the OLD listener
-    // can stay bound briefly, racing the NEW gateway's bind. The new
-    // bind then fails and spawn_component_supervisor backs off; in the
-    // meantime the OLD gateway keeps serving requests with stale
-    // in-memory config, and `/api/config/drift` reports drift against
-    // disk because in-memory hasn't been replaced yet. Cold restart
-    // (process exit + start) hits this path differently because the OS
-    // fully releases the listener — that's why the user observes "shut
-    // down + bring up = correct" but "/admin/reload = stale".
     let shutdown_tx = state.shutdown_tx.clone();
     // Brief delay so the HTTP response flushes before tear-down begins.
     zeroclaw_spawn::spawn!(async move {
@@ -5973,26 +5861,12 @@ async fn handle_admin_paircode(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// Query parameters for `POST /admin/paircode/new`.
-///
-/// `rotate` distinguishes the destructive "rotate after compromise" path from
-/// the default "add another client" path (#6984):
-/// - absent / empty → add another client; existing tokens stay valid.
-/// - `rotate=all` → revoke every paired token and clear the device registry,
-///   then issue a fresh code. The only safe action when the operator does not
-///   know which token leaked.
-/// - `rotate=<device_id>` → revoke just that device's token, then issue a code.
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
     pub rotate: Option<String>,
 }
 
-/// POST /admin/paircode/new — generate a new pairing code (localhost only).
-///
-/// With `?rotate=all` or `?rotate=<device_id>` this also revokes existing
-/// bearer tokens before issuing the code, so the CLI/admin surface can
-/// distinguish "add another client" from "rotate after compromise" (#6984).
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -6130,13 +6004,6 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
-/// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
-///
-/// This endpoint is intentionally public so that Docker and remote users can see
-/// the pairing code on the web dashboard without needing terminal access. It only
-/// returns a code when the gateway is in its initial un-paired state (no devices
-/// paired yet and a pairing code exists). Once the first device pairs, this
-/// endpoint stops returning a code.
 async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
     let require = state.pairing.require_pairing();
     let is_paired = state.pairing.is_paired();
@@ -6880,11 +6747,6 @@ mod tests {
         }
     }
 
-    /// Gateway parity with the channel path: the gateway now scopes MCP servers
-    /// by `mcp_bundles` and gates registration through the same
-    /// `register_eager_mcp_tool_if_allowed` helper, so an `excluded_tools`-denied
-    /// MCP tool must not be registered while a non-denied one is auto-admitted.
-    /// Pins the fifth-site fix from PR #8120 against silent regression.
     #[test]
     fn gateway_excluded_tools_drops_denied_mcp_tool() {
         let policy = SecurityPolicy {
@@ -6972,7 +6834,7 @@ mod tests {
 
     #[test]
     fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
-        // Regression for #6561: a gateway bound to a non-loopback interface must
+        // a gateway bound to a non-loopback interface must
         // not surface a recovery hint that the localhost-only admin guard rejects.
         let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
         assert!(
@@ -7011,7 +6873,7 @@ mod tests {
 
     #[test]
     fn already_paired_notice_states_no_code_was_generated() {
-        // Regression for #5266: the banner must say plainly that NO code exists
+        // the banner must say plainly that NO code exists
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
         // hits the dashboard's 6-digit prompt with no code printed anywhere.
         let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
@@ -7030,7 +6892,7 @@ mod tests {
     fn already_paired_notice_includes_recovery_command_and_curl() {
         // The notice is the single source of truth for the on-demand recovery
         // commands; it must reuse the loopback-safe builders so the banner and
-        // any future surface never drift from #6561's no-`--host` rule.
+        // any future surface never drift from's no-`--host` rule.
         let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
         let joined = lines.join("\n");
         assert!(
@@ -7041,7 +6903,7 @@ mod tests {
             joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
             "notice must surface the curl fallback (honoring the path prefix): {joined}"
         );
-        // #6561: never advertise the non-loopback bound host in the hint.
+        // never advertise the non-loopback bound host in the hint.
         assert!(
             !joined.contains("192.168.1.20"),
             "notice must not advertise the non-loopback bound host: {joined}"
@@ -7139,6 +7001,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -7227,7 +7090,6 @@ mod tests {
         (status, json)
     }
 
-    /// Default `?` absent path still just adds a client; existing tokens live.
     #[tokio::test]
     async fn admin_paircode_new_without_rotate_keeps_existing_tokens() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7252,8 +7114,6 @@ mod tests {
         );
     }
 
-    /// `?rotate=all` revokes every token, clears the registry, persists, and
-    /// still issues a fresh code.
     #[tokio::test]
     async fn admin_paircode_new_rotate_all_revokes_everything() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7293,7 +7153,6 @@ mod tests {
         );
     }
 
-    /// `?rotate=<id>` revokes only that device and leaves the rest valid.
     #[tokio::test]
     async fn admin_paircode_new_rotate_device_revokes_one() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7331,7 +7190,6 @@ mod tests {
         );
     }
 
-    /// Unknown device id returns 404 and revokes nothing.
     #[tokio::test]
     async fn admin_paircode_new_rotate_unknown_device_is_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7357,7 +7215,6 @@ mod tests {
         );
     }
 
-    /// Pairing disabled returns 400 regardless of rotate intent.
     #[tokio::test]
     async fn admin_paircode_new_pairing_disabled_is_bad_request() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7379,12 +7236,6 @@ mod tests {
         assert_eq!(json["success"], false);
     }
 
-    /// The on-demand mint endpoint is the recovery path advertised to operators
-    /// (banner + dashboard "Generate pairing code" button) for the already-paired
-    /// state in #5266. It MUST stay localhost-only: a remote peer minting a code
-    /// would reopen the brute-forceable pairing window the design deliberately
-    /// closes once paired. The dashboard relies on this 403 to fall back to the
-    /// CLI hint for non-loopback origins.
     #[tokio::test]
     async fn admin_paircode_new_rejects_remote_peer() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7773,7 +7624,7 @@ mod tests {
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
 
         // Isolate data_dir so parallel nextest runs don't race on the
-        // real ~/.zeroclaw/data (see #7054).
+        // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -7789,11 +7640,6 @@ mod tests {
             "regression assumes default Config has no agents",
         );
 
-        // Bind to an ephemeral port on loopback. If the boot path
-        // erred on the agents-required check, the join would resolve
-        // immediately with that Err. We race a short delay against
-        // the spawn: a still-running task at the deadline means boot
-        // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
             run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
@@ -7843,7 +7689,7 @@ mod tests {
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
-        // real ~/.zeroclaw/data (see #7054).
+        // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -8044,6 +7890,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -8136,6 +7983,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -8766,6 +8614,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -8880,6 +8729,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -8993,6 +8843,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9121,6 +8972,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9213,6 +9065,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9310,6 +9163,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9414,6 +9268,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9458,7 +9313,7 @@ mod tests {
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            None,
             String::new(),
             alias,
             peer_resolver,
@@ -9512,6 +9367,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9555,7 +9411,7 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
-    // Regression for #6156: handler must return 200 OK before the (potentially
+    // handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
     // request at its ~5s timeout.
     #[cfg(feature = "channel-nextcloud")]
@@ -9608,15 +9464,23 @@ mod tests {
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+
+        // The same secret governs both directions now, so the channel is built
+        // with that resolved secret as its bot token rather than the `None` this
+        // test used to pass.
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
-            "app-token".into(),
+            Some(secret.to_string()),
             String::new(),
             "default",
             Arc::new(|| vec!["*".to_string()]),
         ));
 
         let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state = AppState {
             config: Arc::new(RwLock::new(test_config())),
@@ -9645,7 +9509,16 @@ mod tests {
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
-            nextcloud_talk_webhook_secret: HashMap::new(),
+            // A resolved secret, not an empty map. Inbound verification is now
+            // mandatory and fail-closed, so an unsigned request is rejected with
+            // 401 before the handler ever spawns the LLM task — which would make
+            // this test pass for the wrong reason (no provider call because the
+            // request was refused, not because the ack raced ahead of a slow
+            // provider). Signing the request keeps it on the fast-ack path.
+            nextcloud_talk_webhook_secret: HashMap::from([(
+                "default".to_string(),
+                std::sync::Arc::<str>::from(secret),
+            )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             #[cfg(feature = "channel-wati")]
@@ -9661,6 +9534,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -9682,12 +9556,22 @@ mod tests {
             hooks: None,
         };
 
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
         let start = std::time::Instant::now();
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             Box::pin(handle_nextcloud_talk_webhook(
                 State(state),
-                HeaderMap::new(),
+                headers,
                 Bytes::from(body),
             )),
         )
@@ -10717,12 +10601,6 @@ mod tests {
         assert!(!zeroclaw_config::schema::GatewayConfig::default().allow_remote_admin);
     }
 
-    // ── handle_admin_reload route-level tests ─────────────────────
-    // Beyond the pure `admin_reload_gate` policy tests, these exercise the
-    // real handler path (ConnectInfo + HeaderMap + PairingGuard + config),
-    // proving `allow_remote_admin` cannot expose an unauthenticated remote
-    // reload and that a valid paired token is required and sufficient.
-
     /// Build an `AppState` for `handle_admin_reload`: controls
     /// `gateway.allow_remote_admin`, pairing (and its tokens), and wires a
     /// live reload channel so the allowed path reaches `200` rather than the
@@ -10945,12 +10823,6 @@ mod tests {
 
     #[test]
     fn needs_quickstart_channel_reply_resolves_via_fluent() {
-        // The Fluent key channel-needs-quickstart-reply must resolve
-        // to real text from the embedded en/cli.ftl, not the missing-
-        // key fallback `{channel-needs-quickstart-reply}` that
-        // `missing_cli_string` produces. Guarding this in a test
-        // keeps the i18n contract from quietly drifting if the key
-        // gets renamed in lib.rs without a matching ftl edit.
         let reply = needs_quickstart_channel_reply();
         assert!(
             !reply.starts_with('{') && !reply.ends_with('}'),
@@ -11063,6 +10935,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -11154,6 +11027,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -11268,7 +11142,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // ── Per-alias webhook routing (#6312) ───────────────────────────────────
+    // ── Per-alias webhook routing───────────────────────────────────
 
     /// Baseline `AppState` with no channels configured, for the per-alias
     /// routing tests. Tests insert the WhatsApp instances they exercise.
@@ -11319,6 +11193,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -11374,8 +11249,6 @@ mod tests {
         }
     }
 
-    /// `/whatsapp/<alias>` reaches the addressed instance — proven by each
-    /// instance only verifying against its own token.
     #[cfg(feature = "channel-whatsapp-cloud")]
     #[tokio::test]
     async fn webhook_alias_routes_to_the_matching_instance() {
@@ -11420,7 +11293,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Unknown alias → 404 (not a 500).
     #[cfg(feature = "channel-whatsapp-cloud")]
     #[tokio::test]
     async fn webhook_unknown_alias_is_404_not_500() {
@@ -11436,8 +11308,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Bare path stays back-compatible for single-instance configs and flags the
-    /// deprecation header.
     #[cfg(feature = "channel-whatsapp-cloud")]
     #[tokio::test]
     async fn webhook_bare_path_is_back_compat_and_flags_deprecation() {
@@ -11458,7 +11328,6 @@ mod tests {
         );
     }
 
-    /// The alias path preserves per-instance signature auth.
     #[cfg(feature = "channel-whatsapp-cloud")]
     #[tokio::test]
     async fn webhook_alias_path_preserves_signature_auth() {
@@ -11504,26 +11373,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // ───────────────────────────────────────────────────────────────────────
-    // Regression tests for atomic /pair path (review feedback on #8466).
-    //
-    // `handle_pair` (`/pair`) and `submit_pairing_enhanced` (`/api/pair`)
-    // share the same atomicity invariant: once `try_pair` accepts the
-    // code, every subsequent step (device registry write, token
-    // persistence) MUST succeed atomically. If any step fails, the
-    // handler must roll back the in-process token via
-    // `revoke_token_hash` and return 5xx WITHOUT the plaintext bearer
-    // in the body. Otherwise the calling client receives a usable
-    // bearer token that authenticates until restart even though there
-    // is no device row and no persisted token record — exactly the
-    // management gap the PR is closing.
-    //
-    // The api_pairing.rs side of this guarantee is exercised by
-    // `submit_pairing_enhanced_rolls_back_*`. These two tests cover the
-    // legacy `/pair` path that previously leaked the bearer in its
-    // 500 body.
-    // ───────────────────────────────────────────────────────────────────────
-
     /// Build an `AppState` whose device registry points at a non-existent
     /// path so every SQLite write fails. Mirrors `unwriteable_registry_state`
     /// in `api_pairing::tests` so the regression set stays side-by-side.
@@ -11551,12 +11400,6 @@ mod tests {
         (status, body)
     }
 
-    /// If `registry.register(...)` fails after `try_pair` already
-    /// accepted the code, `handle_pair` must roll back the in-process
-    /// token (no accepted credential left behind) and must NOT return
-    /// the plaintext bearer in the 500 body — the previous behavior
-    /// did, so the calling client received a usable token that
-    /// authenticated until restart.
     #[tokio::test]
     async fn legacy_pair_rolls_back_in_process_token_when_registry_register_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11593,26 +11436,10 @@ mod tests {
         );
     }
 
-    /// If token persistence to `config.toml` fails after `try_pair`
-    /// already accepted the code, `handle_pair` must roll back the
-    /// in-process token and return 500 WITHOUT the bearer in the body.
-    /// The previous behavior leaked a usable bearer on a 200, which is
-    /// exactly the gap this whole PR closes.
     #[tokio::test]
     async fn legacy_pair_rolls_back_in_process_token_when_persist_fails() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, true, false);
-        // No registry → registry branch is skipped, so persistence is the
-        // only failing step.
-        //
-        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
-        // to fail deterministically by planting an ordinary file at the
-        // parent segment of `config_path`. `create_dir_all` then hits
-        // ENOTDIR at the kernel level, which root cannot bypass — unlike
-        // the previous `/no/such/dir/config.toml` path, where a uid-0 CI
-        // runner is allowed to create `/no/…` from `/` and the save
-        // silently succeeds, letting the whole rollback path go untested
-        // (and leaking a 200 + token if it ever regresses).
         let blocker = tmp.path().join("legacy-pair-blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
         state.config.write().config_path = blocker.join("config.toml");
@@ -11657,7 +11484,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }

@@ -97,7 +97,6 @@ pub async fn judge_conflicts(
 }
 
 /// Check for conflicting memories and mark old ones as superseded.
-///
 /// Returns the list of entry IDs that were superseded.
 // NOTE: superseded by judge_conflicts on the consolidation path (#18); retained for any other/no callers.
 pub async fn check_and_resolve_conflicts(
@@ -155,7 +154,6 @@ pub fn mark_superseded(
 }
 
 /// Simple text-based conflict detection without embeddings.
-///
 /// Uses token overlap (Jaccard similarity) as a fast approximation
 /// when vector embeddings are unavailable.
 pub fn jaccard_similarity(a: &str, b: &str) -> f64 {

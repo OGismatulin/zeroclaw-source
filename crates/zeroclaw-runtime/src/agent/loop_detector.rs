@@ -131,11 +131,6 @@ impl LoopDetector {
         }
     }
 
-    /// Record a completed tool call and check for loop patterns.
-    ///
-    /// * `name` — tool name (e.g. `"shell"`, `"file_read"`).
-    /// * `args` — the arguments JSON value sent to the tool.
-    /// * `result` — the tool's textual output.
     pub fn record(
         &mut self,
         name: &str,
@@ -172,12 +167,6 @@ impl LoopDetector {
         LoopDetectionResult::Ok
     }
 
-    /// Pattern 1: Same tool + same args called N+ times consecutively.
-    ///
-    /// Escalation:
-    /// - N == max_repeats     -> Warning
-    /// - N == max_repeats + 1 -> Block
-    /// - N >= max_repeats + 2 -> Break (circuit breaker)
     fn detect_exact_repeat(&self) -> Option<LoopDetectionResult> {
         let max = self.config.max_repeats;
         if self.window.len() < max {
@@ -297,7 +286,7 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
-        // #7143: the stuck agent ran 43 near-duplicate shell calls returning
+        // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
         let same_tool_same_result: Vec<&ToolCallRecord> = self
@@ -565,7 +554,7 @@ mod tests {
 
     #[test]
     fn no_progress_triggered_when_interleaved_with_other_calls() {
-        // #7143: same tool + same result repeated non-consecutively, with
+        // same tool + same result repeated non-consecutively, with
         // varied unrelated calls interleaved, must still be detected. The old
         // take_while logic reset the streak on any interleaved call.
         let mut det = LoopDetector::new(config_with_thresholds(5, 4));

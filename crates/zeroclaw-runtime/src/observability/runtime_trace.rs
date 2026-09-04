@@ -32,14 +32,6 @@ use zeroclaw_log::LogEvent;
 
 pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 
-/// Snapshot the observability config into the decoupled
-/// [`zeroclaw_log::LogConfig`] (the boundary that breaks the `zeroclaw-config`
-/// dependency cycle; see `docs/book/src/architecture/logging.md`).
-///
-/// This copies values at startup and every daemon config reload. The
-/// `zeroclaw-log` writer holds the resulting policy snapshot until the next
-/// explicit re-init, so reload handling must call [`init_from_config`] after a
-/// fresh `Config::load_or_init()` for `log_persistence*` changes to take effect.
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
         log_persistence: config.log_persistence.as_wire().to_string(),

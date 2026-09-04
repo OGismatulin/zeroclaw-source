@@ -17,20 +17,6 @@ use zeroclaw_providers::{
     ensure_terminal_provider_failure, runtime_step_timeout_failure,
 };
 
-/// Result of one provider call.
-///
-/// CANCEL ASYMMETRY — preserved verbatim from the pre-extraction loop body
-/// (RUN_SHEET `turn.provider_call`, plan flag §8.7):
-/// - The non-streaming cancel paths (and the step-timeout bails) return the
-///   OUTER `Err` from [`call_provider`] — the loop propagates it directly,
-///   skipping observer-failure recording and context-overflow recovery.
-/// - The streaming-fallback cancel yields `Err` as the `chat_result` VALUE —
-///   it flows through the loop's `match chat_result` Err arm (observer
-///   failure + recovery) exactly as before.
-/// - A cancel that fires while consuming the stream is also an inner `Err`
-///   (and skips the non-streaming fallback entirely): the loop records the
-///   observer failure with the fixed cancellation message, matching the
-///   pre-consolidation streaming engine.
 pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
     pub(crate) streamed_live_deltas: bool,
@@ -38,12 +24,6 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_visible_text: String,
 }
 
-/// Announce the upcoming LLM request: progress Status, observer `LlmRequest`,
-/// `llm_request` log line, and the `fire_llm_input` hook.
-///
-/// Returns `llm_started_at`, taken between the log line and the hook so the
-/// measured LLM duration includes the hook await — identical to the
-/// pre-extraction ordering.
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     history: &[ChatMessage],
@@ -68,6 +48,7 @@ pub(crate) async fn announce_llm_request(
         messages_count: history.len(),
         channel: Some(ctx.channel_name.to_string()),
         agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
         turn_id: Some(ctx.turn_id.to_string()),
     });
     {
@@ -215,12 +196,6 @@ pub(crate) async fn call_provider(
                         .downcast_ref::<StreamInterruptedAfterOutput>()
                         .is_some() =>
             {
-                // No fallback: the consumer either cancelled the turn (a
-                // retry is a doomed request) or already saw streamed output
-                // (a retry duplicates visible text on append-only
-                // consumers). Surfaced as the inner chat_result so the
-                // loop's Err arm records the observer failure, exactly as
-                // the pre-consolidation streaming engine did.
                 Err(stream_err)
             }
             Err(stream_err) => {
@@ -512,6 +487,7 @@ mod payload_capture_tests {
 
     fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
         TurnCtx {
+            parent_agent_alias: None,
             observer,
             provider_name: "stub",
             model: "stub-model",
