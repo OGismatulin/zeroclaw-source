@@ -2587,10 +2587,10 @@ mod tests {
             url: Some(server.uri()),
             ..Default::default()
         };
-        let mut transport = HttpTransport::new(&config).expect("build transport");
-        transport.session_id = Some("sess-42".into());
+        let transport = HttpTransport::new(&config).expect("build transport");
+        *transport.session_id.lock() = Some("sess-42".into());
         transport.reset().await.expect("reset");
-        assert!(transport.session_id.is_none());
+        assert!(transport.session_id.lock().is_none());
         // Teardown is detached (fire-and-forget); give the spawned task a moment.
         for _ in 0..50 {
             if server.received_requests().await.unwrap_or_default().len() == 1 {
@@ -2621,8 +2621,8 @@ mod tests {
             url: Some(server.uri()),
             ..Default::default()
         };
-        let mut transport = HttpTransport::new(&config).expect("build transport");
-        assert!(transport.session_id.is_none());
+        let transport = HttpTransport::new(&config).expect("build transport");
+        assert!(transport.session_id.lock().is_none());
         transport.reset().await.expect("reset");
         tokio::time::sleep(Duration::from_millis(100)).await;
         // `expect(0)` verified on drop.

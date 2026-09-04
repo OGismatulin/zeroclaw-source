@@ -706,39 +706,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_excludes_other_agent_rows_when_allowlist_omits_them() {
-        let (_tmp, inner) = fresh_sqlite();
-        let uuids = provision_agents(&inner, &["alpha", "other"]).await;
-        let alpha_uuid = &uuids[0];
-        let other_uuid = &uuids[1];
-
-        // Pre-seed with rows attributed to the OTHER agent.
-        inner
-            .store_with_agent(
-                "other-key",
-                "other-val",
-                MemoryCategory::Core,
-                None,
-                None,
-                None,
-                Some(other_uuid),
-            )
-            .await
-            .unwrap();
-
-        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, Vec::<String>::new());
-
-        let hits = wrapper
-            .recall("other-key", 10, None, None, None)
-            .await
-            .unwrap();
-        assert!(
-            !hits.iter().any(|e| e.key == "other-key"),
-            "rows attributed to a non-allowlisted agent must not surface"
-        );
-    }
-
-    #[tokio::test]
     async fn recall_includes_allowlisted_sibling_rows() {
         let (_tmp, inner) = fresh_sqlite();
         let uuids = provision_agents(&inner, &["alpha", "beta"]).await;

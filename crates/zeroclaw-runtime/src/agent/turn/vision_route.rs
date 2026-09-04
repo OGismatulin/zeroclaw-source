@@ -253,7 +253,14 @@ mod tests {
             ..MultimodalConfig::default()
         };
 
-        let error = match resolve_vision_provider(&TextOnlyProvider, &history, &config, "main") {
+        let error = match resolve_vision_provider(
+            None,
+            &TextOnlyProvider,
+            &history,
+            &config,
+            "main",
+            "text-model",
+        ) {
             Ok(_) => panic!("configured non-vision provider must be rejected before a call"),
             Err(error) => error,
         };
@@ -279,7 +286,14 @@ mod tests {
             ..MultimodalConfig::default()
         };
 
-        let error = match resolve_vision_provider(&TextOnlyProvider, &history, &config, "main") {
+        let error = match resolve_vision_provider(
+            None,
+            &TextOnlyProvider,
+            &history,
+            &config,
+            "main",
+            "text-model",
+        ) {
             Ok(_) => panic!("malformed custom vision provider must fail construction"),
             Err(error) => error,
         };
@@ -478,10 +492,14 @@ vision = false
         )
         .err()
         .expect("a forced-off vision route must surface a capability error once its alias vision override is honored");
-        assert!(
-            err.to_string().contains("does not support vision"),
-            "expected the vision-route capability error, got: {err}"
-        );
+        // fork (#23): the route surfaces a typed `VisionRouteFailure` rather
+        // than upstream's `ProviderCapabilityError`; the gateway downcasts it
+        // to build the structured error envelope.
+        let failure = err
+            .downcast_ref::<VisionRouteFailure>()
+            .expect("vision route failures stay typed");
+        assert_eq!(failure.kind(), "vision_provider_misconfigured");
+        assert_eq!(failure.provider(), "llamacpp.forced_off");
     }
 
     /// Success-path companion to the error-branch test above: when the primary

@@ -6402,10 +6402,12 @@ mod tests {
             .await
             .expect_err("second provider call should fail");
 
+        // fork (#23): a terminal provider failure is reported through the
+        // structured envelope, so the raw provider prose is no longer the
+        // error text. This test is about the trim running on the error path.
         assert!(
-            error
-                .to_string()
-                .contains("provider unavailable after tool")
+            error.to_string().contains("provider"),
+            "expected a provider failure, got: {error}"
         );
         assert!(agent.history_has_trim_breadcrumb);
         assert!(!agent.history.iter().any(|message| matches!(
@@ -6449,7 +6451,16 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        // fork (#23): the vision route surfaces a typed `VisionRouteFailure`,
+        // so assert its kind rather than upstream's prose. What this test is
+        // about is that the trim still runs on the error path.
+        assert_eq!(
+            error
+                .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+                .map(crate::agent::turn::vision_route::VisionRouteFailure::kind),
+            Some("vision_not_supported"),
+            "expected the typed vision-route failure, got: {error}"
+        );
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(
             capturing
@@ -6479,7 +6490,16 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        // fork (#23): the vision route surfaces a typed `VisionRouteFailure`,
+        // so assert its kind rather than upstream's prose. What this test is
+        // about is that the trim still runs on the error path.
+        assert_eq!(
+            error
+                .downcast_ref::<crate::agent::turn::vision_route::VisionRouteFailure>()
+                .map(crate::agent::turn::vision_route::VisionRouteFailure::kind),
+            Some("vision_not_supported"),
+            "expected the typed vision-route failure, got: {error}"
+        );
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(drain_history_trim_events(&mut event_rx), 1);
     }

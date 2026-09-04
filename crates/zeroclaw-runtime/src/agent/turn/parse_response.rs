@@ -642,6 +642,7 @@ mod reasoning_only_history_tests {
             strict_tool_parsing: false,
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: "turn-reasoning-roundtrip",
         };
         let specs = IterationToolSpecs {

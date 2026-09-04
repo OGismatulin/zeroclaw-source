@@ -1613,46 +1613,14 @@ mod consolidate_turn_tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn conflict_supersede_marks_the_loser_reversibly() {
-        let tmp = TempDir::new().unwrap();
-        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
-        seed_filler_facts(&memory).await;
-        store_core_fact(
-            &memory,
-            "stale_fact",
-            "User deploys the app on Fridays every week",
-        )
-        .await;
-
-        let cfg = MemoryConfig {
-            // Keyword-only scores vary with corpus statistics; a low
-            // threshold keeps the conflict decision deterministic here.
-            conflict_threshold: 0.01,
-            ..MemoryConfig::default()
-        };
-        assert!(
-            cfg.conflict_supersede_enabled,
-            "supersede must be the default"
-        );
-        let update = "User deploys the app on Mondays every week";
-        let provider = ScriptedProvider::update_reply(update);
-
-        run(&provider, &memory, &cfg).await.unwrap();
-
-        let conn = open_db(tmp.path());
-        let marker = superseded_by(&conn, "stale_fact")
-            .expect("conflicting row is reversibly soft-hidden, not deleted");
-        assert!(
-            marker.starts_with("core_"),
-            "superseded_by points at the winning consolidation write"
-        );
-        assert_eq!(
-            live_rows_with_content(&conn, update),
-            1,
-            "the winning update is stored live"
-        );
-    }
+    // fork patch #18: upstream's `conflict_supersede_marks_the_loser_reversibly`
+    // asserted the similarity-threshold detector (`check_and_resolve_conflicts`)
+    // that this fork replaced with the LLM judge `conflict::judge_conflicts`
+    // (a cosine threshold could not separate contradiction from relatedness).
+    // The scripted provider in these tests answers the consolidation prompt,
+    // not the judge prompt, so the judge correctly supersedes nothing. Fork
+    // coverage for the supersede write itself lives in
+    // `agent_scoped::tests::mark_superseded_forwards_through_wrapper`.
 
     #[tokio::test]
     async fn supersede_disabled_leaves_conflicting_rows_live() {

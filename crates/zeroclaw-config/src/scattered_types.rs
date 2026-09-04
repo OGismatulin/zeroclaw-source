@@ -241,8 +241,13 @@ impl Default for EvalHarnessConfig {
     }
 }
 
+// fork: upstream flipped this default to `false` because upstream deleted its
+// runtime context compressor. This fork KEPT it — `compress_if_needed` runs on
+// the live gateway webhook path (post-turn compaction plus the operator
+// context watchdog), so the flag must stay on by default or per-user configs
+// without an explicit value silently lose compaction.
 fn default_cc_enabled() -> bool {
-    false
+    true
 }
 fn default_threshold_ratio() -> f64 {
     0.50
@@ -279,11 +284,10 @@ fn default_emergency_protect_last_n() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// fork: the runtime context compressor is retained here (upstream removed
+    /// theirs), so this flag IS consumed — `compress_if_needed` on the gateway
+    /// webhook path reads it. Defaults to `true`. Upstream's
+    /// `context_compression_unsupported` warning does not apply to this build.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
@@ -930,14 +934,14 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so the default must be
-    // `false` (a `true` default would mislead users into thinking the
-    // knob does something). See `context_compression_unsupported` in
-    // `schema.rs` for the companion validation warning.
     #[test]
-    fn context_compression_config_defaults_to_disabled() {
-        assert!(!ContextCompressionConfig::default().enabled);
+    fn context_compression_config_defaults_to_enabled() {
+        // fork: the compressor is live on the gateway webhook path, so the
+        // default must stay ON — a per-user config without an explicit value
+        // would otherwise silently lose post-turn compaction.
+        assert!(ContextCompressionConfig::default().enabled);
+        let from_empty: ContextCompressionConfig = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.enabled);
     }
 
     #[test]

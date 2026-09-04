@@ -895,6 +895,7 @@ mod tests {
             messages_count: 3,
             channel: Some("webhook".into()),
             agent_alias: Some("default".into()),
+            parent_agent_alias: None,
             turn_id: Some("turn-1".into()),
         });
 
@@ -918,6 +919,7 @@ mod tests {
             messages: Some(snapshot),
             channel: Some("webhook".into()),
             agent_alias: Some("default".into()),
+            parent_agent_alias: None,
             turn_id: Some("turn-1".into()),
         });
 

@@ -3287,12 +3287,15 @@ mod tests {
         (tmp, mem)
     }
 
-    /// Repro shape from the 2026-07-09 injection-scope finding: with
-    /// embeddings live, a session-scoped recall (what per-turn injection
-    /// issues) must surface a global core fact written outside the session,
-    /// while other sessions' bound rows stay excluded.
+    /// Fork (Core-global recall): with embeddings live, a session-scoped
+    /// recall (what per-turn injection issues) must surface EVERY `core` row —
+    /// including one bound to another session, because consolidation keeps a
+    /// survivor's session_id — while every non-core row from another session
+    /// stays excluded. Upstream instead gates its carve-out on
+    /// `session_id IS NULL` and includes `daily`; our core rows carry a
+    /// session_id, so that shape would hide them.
     #[tokio::test]
-    async fn session_scoped_recall_includes_durable_global_rows_when_vector_live() {
+    async fn session_scoped_recall_includes_core_rows_when_vector_live() {
         let (_tmp, mem) = temp_sqlite_keyed();
         mem.store(
             "vault_fact",
@@ -3353,8 +3356,8 @@ mod tests {
             "global core row must reach session-scoped vector recall, got {keys:?}"
         );
         assert!(
-            keys.contains(&"daily_note"),
-            "global daily row must reach session-scoped vector recall, got {keys:?}"
+            !keys.contains(&"daily_note"),
+            "daily rows stay session-scoped in the fork carve-out, got {keys:?}"
         );
         assert!(
             keys.contains(&"this_chat"),
@@ -3365,19 +3368,20 @@ mod tests {
             "other sessions' conversation rows must stay excluded, got {keys:?}"
         );
         assert!(
-            !keys.contains(&"bound_core"),
-            "session-bound core rows must stay session-scoped, got {keys:?}"
+            keys.contains(&"bound_core"),
+            "core rows reach recall from any session, bound or not, got {keys:?}"
         );
         assert!(
             !keys.contains(&"custom_global"),
-            "custom categories are outside the durable-global carve-out, got {keys:?}"
+            "custom categories are outside the core carve-out, got {keys:?}"
         );
     }
 
     /// The vector stage's SQL predicate itself: a session filter admits
-    /// session-NULL core/daily rows and nothing else beyond the session.
+    /// `core` rows (fork Core-global recall) and nothing else beyond the
+    /// session's own rows.
     #[tokio::test]
-    async fn vector_search_session_filter_admits_durable_global_rows_only() {
+    async fn vector_search_session_filter_admits_core_rows() {
         let (_tmp, mem) = temp_sqlite_keyed();
         for (key, category, session) in [
             ("global_core", MemoryCategory::Core, None),
@@ -3421,17 +3425,17 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["global_core", "global_daily", "session_row"],
-            "session filter must admit exactly the session's rows plus session-NULL core/daily"
+            vec!["bound_core", "global_core", "session_row"],
+            "session filter must admit exactly the session's rows plus every core row"
         );
     }
 
-    /// With the stock Noop embedder (vector stage never runs), session-scoped
-    /// recall keeps the strict legacy filter (global core rows stay out) and
-    /// batch-max normalizes keyword scores onto [0, 1] so downstream relevance
+    /// With the stock Noop embedder (vector stage never runs), the fork's
+    /// Core-global carve-out still holds on the BM25-only path, and batch-max
+    /// normalizes keyword scores onto [0, 1] so downstream relevance
     /// thresholding and the injection rerank stage see one calibrated scale.
     #[tokio::test]
-    async fn noop_embedder_session_recall_keeps_strict_filter_and_normalizes_scores() {
+    async fn noop_embedder_session_recall_admits_core_and_normalizes_scores() {
         let (_tmp, mem) = temp_sqlite();
         mem.store(
             "vault_fact",
@@ -3464,12 +3468,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             hits.len(),
-            2,
-            "strict session filter must hold on the BM25-only path"
+            3,
+            "the core carve-out holds on the BM25-only path too"
         );
         let mut keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["this_chat", "this_chat_2"]);
+        assert_eq!(keys, vec!["this_chat", "this_chat_2", "vault_fact"]);
 
         // Multi-entry normalization: BM25-only scores are batch-max normalized
         // onto [0, 1] (dividing each raw negated BM25 by the batch maximum) so

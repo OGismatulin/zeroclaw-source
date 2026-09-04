@@ -1269,6 +1269,32 @@ impl ReliableModelProviderEntry {
         }
     }
 
+    /// Build an entry that serves `pinned_model` regardless of the requested
+    /// model. Fork: the pin lives in the candidate descriptor, which is also
+    /// what terminal-failure envelopes report (patch #23).
+    #[cfg(test)]
+    pub(crate) fn new_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        alias: &str,
+        pinned_model: &str,
+        inner: Box<dyn ModelProvider>,
+    ) -> Self {
+        // The reported identity is the display name: these entries are built by
+        // the cooldown/fallback tests, which assert on the family label, and the
+        // production fallback wiring uses `with_descriptor` directly.
+        let _ = alias;
+        let display_name = display_name.into();
+        let descriptor = ProviderCandidateDescriptor::pinned(&display_name, None, pinned_model);
+        Self::with_descriptor(
+            descriptor.clone(),
+            cooldown_key,
+            Box::new(crate::model_pin::ModelPinnedProvider::new(
+                descriptor, inner,
+            )),
+        )
+    }
+
     /// Model this entry serves for `requested_model`: the descriptor's pinned
     /// model when the candidate is model-pinned, otherwise the requested model
     /// unchanged (fork: the descriptor is the single pin source, patch #23).

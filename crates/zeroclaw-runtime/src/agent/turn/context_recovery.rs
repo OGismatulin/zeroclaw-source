@@ -587,6 +587,7 @@ mod tests {
             channel: None,
             turn_id: "turn-roundtrip-test",
             agent_alias: Some("analyst_deepseek_pro"),
+            parent_agent_alias: None,
         }
     }
 

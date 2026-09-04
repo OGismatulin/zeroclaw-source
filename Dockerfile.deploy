@@ -41,6 +41,7 @@ COPY crates/zeroclaw-eval/Cargo.toml crates/zeroclaw-eval/Cargo.toml
 COPY crates/zeroclaw-log/Cargo.toml crates/zeroclaw-log/Cargo.toml
 COPY crates/zeroclaw-spawn/Cargo.toml crates/zeroclaw-spawn/Cargo.toml
 COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
+COPY crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml
 COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
 COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
 COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
@@ -71,6 +72,8 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
        mkdir -p "crates/$crate_dir/src" && \
        echo "pub fn placeholder() {}" > "crates/$crate_dir/src/lib.rs"; \
     done \
+    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
+    && echo "pub fn placeholder() {}" > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs \
     && mkdir -p crates/zeroclaw-macros/src \
     && echo "" > crates/zeroclaw-macros/src/lib.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \

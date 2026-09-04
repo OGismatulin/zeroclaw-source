@@ -3338,10 +3338,10 @@ done
             .mount(&server)
             .await;
 
-        let mut transport =
-            create_transport(&http_server_config(server.uri())).expect("build transport");
+        let transport =
+            create_shared_transport(&http_server_config(server.uri())).expect("build transport");
         let started = Instant::now();
-        let err = handshake(transport.as_ref(), "remote", 1, RECV_TIMEOUT_SECS)
+        let err = handshake(transport.as_ref(), "remote", 0, 1)
             .await
             .expect_err("handshake must time out at the 1s budget");
         let elapsed = started.elapsed();

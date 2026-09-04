@@ -10037,6 +10037,7 @@ mod tests {
     ) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(test_config())),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             model_provider,
             provider_name: provider_label.to_string(),
             model: model_label.to_string(),

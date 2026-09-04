@@ -5365,6 +5365,7 @@ mod tests {
                     silent: true,
                     approval: None,
                     multimodal_config: multimodal,
+                    config: None,
                     hooks: None,
                     activated_tools: None,
                     model_switch_callback: None,
@@ -5397,7 +5398,9 @@ mod tests {
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: &turn_id,
+            sop_reassembly: None,
         })
         .await
     }
@@ -16364,6 +16367,8 @@ Let me check the result."#;
             0,     // max_tool_result_chars: disabled for test
             0,     // context_token_budget: disabled for test
             None,  // channel
+            None,  // cancellation_token
+            None,  // hooks
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
@@ -16434,6 +16439,8 @@ Let me check the result."#;
             0,     // max_tool_result_chars: disabled for test
             0,     // context_token_budget: disabled for test
             None,  // channel
+            None,  // cancellation_token
+            None,  // hooks
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
