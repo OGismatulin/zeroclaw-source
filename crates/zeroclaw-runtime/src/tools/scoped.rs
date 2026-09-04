@@ -992,6 +992,10 @@ mod tests {
     }
 
     fn mcp_connect_failure_events(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        // The trace writer hands rows to a worker thread, so a read straight
+        // after the emit can see an empty file — which under load looked like
+        // "no event was emitted". Flush first, then read.
+        let _ = zeroclaw_log::flush_for_test();
         let raw = std::fs::read_to_string(dir.join("trace.jsonl")).unwrap_or_default();
         raw.lines()
             .filter(|l| !l.trim().is_empty())
