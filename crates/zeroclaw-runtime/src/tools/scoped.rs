@@ -1012,7 +1012,9 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_one_mcp_connect_failure_per_failed_boot_connect() {
         let tmp = tempfile::tempdir().unwrap();
-        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK.lock();
+        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
+            .lock()
+            .await;
         init_trace_to(tmp.path());
 
         // "remote" rejects (fails), "remote2" is healthy (succeeds).
@@ -1045,7 +1047,9 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_no_mcp_connect_failure_on_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK.lock();
+        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
+            .lock()
+            .await;
         init_trace_to(tmp.path());
 
         let s1 = mock_mcp_http_server().await;

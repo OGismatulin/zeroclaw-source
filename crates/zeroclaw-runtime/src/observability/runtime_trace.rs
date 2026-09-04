@@ -359,7 +359,7 @@ pub fn record_turn_cancelled(
 /// this lock (CI's parallel gate runs `cargo test --test-threads=16` in ONE
 /// process, so nextest's process-per-test isolation does not apply there).
 #[cfg(test)]
-pub(crate) static TRACE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub(crate) static TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn legacy_record_event_writes_legacy_shape_and_rolls() {
-        let _guard = TRACE_TEST_LOCK.lock();
+        let _guard = TRACE_TEST_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_observability_config(tmp.path());
         init_from_config(&cfg, tmp.path());

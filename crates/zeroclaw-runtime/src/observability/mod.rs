@@ -871,6 +871,10 @@ mod tests {
     /// inner observer untouched, alongside a sanity check that a *handled*
     /// variant (`LlmRequest`) keeps producing its legacy `event_type` +
     /// `payload` row exactly as before.
+    /// Discriminator so this test can count its OWN legacy rows in the
+    /// process-global trace file (see the filter below).
+    const LEGACY_ROW_PROBE_MODEL: &str = "v084-legacy-row-probe-model";
+
     #[test]
     fn legacy_trace_observer_ignores_llm_response_messages_field() {
         let tmp = tempfile::tempdir().unwrap();
@@ -884,7 +888,7 @@ mod tests {
             log_persistence_max_entries: 50,
             ..ObservabilityConfig::default()
         };
-        let _trace_guard = runtime_trace::TRACE_TEST_LOCK.lock();
+        let _trace_guard = runtime_trace::TRACE_TEST_LOCK.blocking_lock();
         runtime_trace::init_from_config(&cfg, tmp.path());
 
         let inner = Arc::new(CountingObserver::default());
@@ -892,7 +896,7 @@ mod tests {
 
         observer.record_event(&ObserverEvent::LlmRequest {
             model_provider: "opencode-go".into(),
-            model: "deepseek-v4-flash".into(),
+            model: LEGACY_ROW_PROBE_MODEL.into(),
             messages_count: 3,
             channel: Some("webhook".into()),
             agent_alias: Some("default".into()),
@@ -911,7 +915,7 @@ mod tests {
         };
         observer.record_event(&ObserverEvent::LlmResponse {
             model_provider: "opencode-go".into(),
-            model: "deepseek-v4-flash".into(),
+            model: LEGACY_ROW_PROBE_MODEL.into(),
             duration: std::time::Duration::from_millis(120),
             success: true,
             error_message: None,
@@ -927,8 +931,17 @@ mod tests {
         // Both events still reach the wrapped inner observer unchanged.
         assert_eq!(inner.events.load(Ordering::SeqCst), 2);
 
+        // The trace writer is process-global: when the whole crate's tests share
+        // one process (CI's parallel gate runs `--test-threads=16`), another
+        // test's event can land in this file too. Count only the rows this test
+        // produced, keyed by its own probe model, so the assertion still says
+        // exactly what it means: LlmResponse adds no legacy row of its own.
         let raw = std::fs::read_to_string(tmp.path().join("trace.jsonl")).unwrap();
-        let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        let lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| l.contains(LEGACY_ROW_PROBE_MODEL))
+            .collect();
         assert_eq!(
             lines.len(),
             1,

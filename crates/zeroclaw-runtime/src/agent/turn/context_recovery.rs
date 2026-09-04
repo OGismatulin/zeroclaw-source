@@ -528,7 +528,11 @@ mod tests {
         assert!(try_recover_empty_completion(&mut history, &err, 2, &mut nudges, &ctx).await);
 
         let mut record: Option<serde_json::Value> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 10s, not 2s: the broadcast reader competes with the whole crate's
+        // tests when CI runs them 16-threads-in-one-process, and the loop exits
+        // as soon as the record arrives, so a longer ceiling costs nothing on a
+        // healthy run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while record.is_none() && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let step = remaining.min(std::time::Duration::from_millis(50));
@@ -773,7 +777,11 @@ mod tests {
         );
 
         let mut record: Option<serde_json::Value> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 10s, not 2s: the broadcast reader competes with the whole crate's
+        // tests when CI runs them 16-threads-in-one-process, and the loop exits
+        // as soon as the record arrives, so a longer ceiling costs nothing on a
+        // healthy run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while record.is_none() && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let step = remaining.min(std::time::Duration::from_millis(50));
@@ -1022,7 +1030,11 @@ mod tests {
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
         // deadline, tolerating `Lagged` from parallel broadcast traffic.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 10s, not 2s: the broadcast reader competes with the whole crate's
+        // tests when CI runs them 16-threads-in-one-process, and the loop exits
+        // as soon as the record arrives, so a longer ceiling costs nothing on a
+        // healthy run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let record = loop {
             if std::time::Instant::now() >= deadline {
                 panic!("did not observe the context_floor_exceeds_budget record in time");
