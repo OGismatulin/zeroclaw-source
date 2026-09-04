@@ -935,6 +935,12 @@ pub async fn agent_turn(
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     // fork: cancellation_token + hooks threaded from the webhook caller.
+    //
+    // EVERY WRAPPER AROUND THIS FUNCTION MUST FORWARD BOTH. An upstream wrapper
+    // that omits them compiles fine and silently drops webhook latest-message-
+    // wins cancellation and the prompt-trace hook — no error, no failing test.
+    // v0.8.4 added `agent_turn_with_sop_reassembly` around this and would have
+    // done exactly that; the patch census now asserts the site count.
     cancellation_token: Option<CancellationToken>,
     hooks: Option<&crate::hooks::HookRunner>,
     origin: TurnOrigin,

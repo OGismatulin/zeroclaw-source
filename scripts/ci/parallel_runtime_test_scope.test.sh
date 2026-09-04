@@ -102,7 +102,7 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "channels scope" \
-    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls'
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls --skip observability::tests::legacy_trace_observer_ignores_llm_response_messages_field --skip tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect --skip tools::scoped::tests::assemble_emits_no_mcp_connect_failure_on_success --skip agent::turn::context_recovery::tests::diagnostic_record_carries_attribution_and_no_message_content'
 
 : > "$cargo_log"
 PATH="${mock_dir}:$PATH" \
@@ -111,8 +111,8 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "default scope" \
-    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls' \
-    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls'
+    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls --skip observability::tests::legacy_trace_observer_ignores_llm_response_messages_field --skip tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect --skip tools::scoped::tests::assemble_emits_no_mcp_connect_failure_on_success --skip agent::turn::context_recovery::tests::diagnostic_record_carries_attribution_and_no_message_content' \
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls --skip observability::tests::legacy_trace_observer_ignores_llm_response_messages_field --skip tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect --skip tools::scoped::tests::assemble_emits_no_mcp_connect_failure_on_success --skip agent::turn::context_recovery::tests::diagnostic_record_carries_attribution_and_no_message_content'
 
 : > "$cargo_log"
 PATH="${mock_dir}:$PATH" \
@@ -122,8 +122,8 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "empty scope" \
-    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls' \
-    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls'
+    'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls --skip observability::tests::legacy_trace_observer_ignores_llm_response_messages_field --skip tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect --skip tools::scoped::tests::assemble_emits_no_mcp_connect_failure_on_success --skip agent::turn::context_recovery::tests::diagnostic_record_carries_attribution_and_no_message_content' \
+    'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16 --skip observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls --skip observability::tests::legacy_trace_observer_ignores_llm_response_messages_field --skip tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect --skip tools::scoped::tests::assemble_emits_no_mcp_connect_failure_on_success --skip agent::turn::context_recovery::tests::diagnostic_record_carries_attribution_and_no_message_content'
 
 : > "$cargo_log"
 set +e

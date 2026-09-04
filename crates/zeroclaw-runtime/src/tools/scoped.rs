@@ -838,21 +838,39 @@ mod tests {
     }
 
     fn config_with_bundled_mcp(server_uri: String, server2_uri: String) -> Config {
+        config_with_bundled_mcp_named("remote", server_uri, server2_uri)
+    }
+
+    /// Same config, but with caller-chosen server names.
+    ///
+    /// Tests that read the PROCESS-GLOBAL trace writer need a discriminator of
+    /// their own: two tests emitting `mcp_connect_failure` under the same server
+    /// names cannot tell their rows apart, and the writer flushes on a worker
+    /// thread, so a sibling's row can land in this test's file after the
+    /// sibling released the lock. Naming the servers per test is that
+    /// discriminator (engineering-invariants I62).
+    fn config_with_bundled_mcp_named(
+        prefix: &str,
+        server_uri: String,
+        server2_uri: String,
+    ) -> Config {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
         };
 
+        let first = prefix.to_string();
+        let second = format!("{prefix}2");
         let mut config = Config::default();
         config.mcp.enabled = true;
         config.mcp.servers = vec![
             McpServerConfig {
-                name: "remote".into(),
+                name: first.clone(),
                 transport: McpTransport::Http,
                 url: Some(server_uri),
                 ..Default::default()
             },
             McpServerConfig {
-                name: "remote2".into(),
+                name: second.clone(),
                 transport: McpTransport::Http,
                 url: Some(server2_uri),
                 ..Default::default()
@@ -861,7 +879,7 @@ mod tests {
         config.mcp_bundles.insert(
             "mockbundle".into(),
             McpBundleConfig {
-                servers: vec!["remote".into(), "remote2".into()],
+                servers: vec![first, second],
                 exclude: Vec::new(),
             },
         );
@@ -991,6 +1009,16 @@ mod tests {
         crate::observability::runtime_trace::init_from_config(&cfg, dir);
     }
 
+    fn mcp_connect_failure_events_for(
+        dir: &std::path::Path,
+        server: &str,
+    ) -> Vec<serde_json::Value> {
+        mcp_connect_failure_events(dir)
+            .into_iter()
+            .filter(|ev| ev["payload"]["server"] == server)
+            .collect()
+    }
+
     fn mcp_connect_failure_events(dir: &std::path::Path) -> Vec<serde_json::Value> {
         // The trace writer hands rows to a worker thread, so a read straight
         // after the emit can see an empty file — which under load looked like
@@ -1013,27 +1041,31 @@ mod tests {
     /// per server that fails its boot connect, while staying non-fatal (the
     /// healthy server is still registered). This is the #30 warmup-saturation
     /// scenario: a boot connect that fails before the first webhook turn.
+    // Held across awaits on purpose: the guard must cover the whole assemble,
+    // because the writer it protects is process-global (same pattern and same
+    // lock as provider_call.rs's payload test).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn assemble_emits_one_mcp_connect_failure_per_failed_boot_connect() {
         let tmp = tempfile::tempdir().unwrap();
-        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
-            .lock()
-            .await;
+        let _trace_guard = zeroclaw_log::__private_test_writer_lock();
         init_trace_to(tmp.path());
 
-        // "remote" rejects (fails), "remote2" is healthy (succeeds).
+        // "bootfail" rejects (fails), "bootfail2" is healthy (succeeds). The
+        // names are unique to this test so its rows stay distinguishable from a
+        // sibling's in the process-global trace file (I62).
         let rejecting = mock_mcp_http_server_rejecting().await;
         let healthy = mock_mcp_http_server().await;
-        let config = config_with_bundled_mcp(rejecting.uri(), healthy.uri());
+        let config = config_with_bundled_mcp_named("bootfail", rejecting.uri(), healthy.uri());
 
         let names = assemble_listing_for(&config).await;
         // Non-fatal: the healthy server's tools are still present.
         assert!(
-            names.iter().any(|n| n == "remote2__echo"),
+            names.iter().any(|n| n == "bootfail2__echo"),
             "assemble must still register the healthy server (non-fatal): {names:?}"
         );
 
-        let events = mcp_connect_failure_events(tmp.path());
+        let events = mcp_connect_failure_events_for(tmp.path(), "bootfail");
         assert_eq!(
             events.len(),
             1,
@@ -1042,27 +1074,30 @@ mod tests {
         let ev = &events[0];
         assert_eq!(ev["event_type"], "mcp_connect_failure");
         assert_eq!(ev["channel"], "assemble");
-        assert_eq!(ev["payload"]["server"], "remote");
+        assert_eq!(ev["payload"]["server"], "bootfail");
         assert_eq!(ev["payload"]["stage"], "boot_connect_error");
         assert!(ev["payload"]["timeout_secs"].is_number());
         assert!(ev["payload"].get("session_id").is_some());
     }
 
+    // Held across awaits on purpose: the guard must cover the whole assemble,
+    // because the writer it protects is process-global (same pattern and same
+    // lock as provider_call.rs's payload test).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn assemble_emits_no_mcp_connect_failure_on_success() {
         let tmp = tempfile::tempdir().unwrap();
-        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
-            .lock()
-            .await;
+        let _trace_guard = zeroclaw_log::__private_test_writer_lock();
         init_trace_to(tmp.path());
 
         let s1 = mock_mcp_http_server().await;
         let s2 = mock_mcp_http_server().await;
-        let config = config_with_bundled_mcp(s1.uri(), s2.uri());
+        // Own server names, same reason as the sibling test above (I62).
+        let config = config_with_bundled_mcp_named("bootok", s1.uri(), s2.uri());
 
         let _ = assemble_listing_for(&config).await;
         assert!(
-            mcp_connect_failure_events(tmp.path()).is_empty(),
+            mcp_connect_failure_events_for(tmp.path(), "bootok").is_empty(),
             "a successful boot connect must emit no mcp_connect_failure event"
         );
     }

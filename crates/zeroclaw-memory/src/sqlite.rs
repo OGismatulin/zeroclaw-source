@@ -721,6 +721,9 @@ impl SqliteMemory {
             // (and survive `/new`), whichever stage found them. Upstream gates
             // its durable-global rows on `session_id IS NULL`; our Core rows
             // carry a session_id, so that gate would hide them.
+            //
+            // ONE OF THREE SITES — see the vector stage in `vector_search` and
+            // the hybrid post-filter. All three or none.
             let _ = write!(
                 sql,
                 " AND (m.session_id = ?{param_idx} OR m.category = 'core')"
@@ -871,6 +874,13 @@ impl SqliteMemory {
             // "soul" facts and must surface regardless of the session filter
             // (and survive `/new`). Safe alongside a category filter: a row
             // cannot satisfy both `category = ?cat` and `category = 'core'`.
+            //
+            // ONE OF THREE SITES — vector stage here, keyword/FTS and the
+            // hybrid post-filter below. All three or none: half of this reads
+            // as flaky recall, not as a regression, so it survives review.
+            // A v0.8.4 auto-merge took upstream's version on the keyword stage
+            // while this one stayed forked and the patch census still said
+            // ALL PRESENT; it now asserts three sites (min_count).
             let _ = write!(sql, " AND (session_id = ?{idx} OR category = 'core')");
             param_values.push(Box::new(sid.to_string()));
             idx += 1;
@@ -1246,6 +1256,9 @@ impl SqliteMemory {
                         };
                         // Fork patch (Core-global recall): Core entries are
                         // cross-session and bypass the session filter.
+                        //
+                        // ONE OF THREE SITES — the two SQL predicates are in
+                        // `vector_search` and the FTS stage. All three or none.
                         if let Some(filter_sid) = session_ref
                             && entry.category != MemoryCategory::Core
                             && entry.session_id.as_deref() != Some(filter_sid) {
