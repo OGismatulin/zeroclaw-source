@@ -995,7 +995,12 @@ mod tests {
         let raw = std::fs::read_to_string(dir.join("trace.jsonl")).unwrap_or_default();
         raw.lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            // The trace writer is process-global, so a foreign or half-written
+            // line can land in this file when the whole crate's tests share one
+            // process (CI's parallel gate runs `--test-threads=16`). Skip what
+            // does not parse instead of failing the assertion on someone else's
+            // write; the events under test are matched by `event_type` below.
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|ev| ev["event_type"] == "mcp_connect_failure")
             .collect()
     }
@@ -1007,6 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_one_mcp_connect_failure_per_failed_boot_connect() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK.lock();
         init_trace_to(tmp.path());
 
         // "remote" rejects (fails), "remote2" is healthy (succeeds).
@@ -1039,6 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_no_mcp_connect_failure_on_success() {
         let tmp = tempfile::tempdir().unwrap();
+        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK.lock();
         init_trace_to(tmp.path());
 
         let s1 = mock_mcp_http_server().await;

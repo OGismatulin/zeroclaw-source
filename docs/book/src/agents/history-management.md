@@ -72,8 +72,8 @@ model name resolves it through `ResolvedRuntime::effective_context_budget_for_mo
 
 The raw window itself (`context_window_for_model(model)`, without the trim
 headroom) is what the overflow-recovery target (× 0.9) and the CLI context-meter
-denominator use. The older model-agnostic `effective_context_budget()` — which
-returned a flat `max_context_tokens` — is retained only for callers with no
+denominator use. The older model-agnostic `effective_context_budget()`, which
+returned a flat `max_context_tokens`, is retained only for callers with no
 model in scope.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four

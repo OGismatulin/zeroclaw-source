@@ -155,6 +155,13 @@ fn run_cli_patch_output_human(config_dir: &std::path::Path, patch_doc: &[u8]) ->
     Command::new(bin)
         .env("ZEROCLAW_CONFIG_DIR", config_dir)
         .env("RUST_LOG", "off")
+        // Fork: same reason as the `--json` spawner above — the stderr fmt
+        // layer floors at WARN regardless of RUST_LOG when `--verbose` is
+        // absent, and validating a default `Config` always emits the benign
+        // `memory_semantic_search_without_embedder` WARN. Its structured
+        // `zc_attrs={...}` payload would trip this test's
+        // "no JSON envelope fields in human stderr" assertion.
+        .env("ZEROCLAW_STDERR_FLOOR", "off")
         .args(["config", "patch", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -884,6 +884,7 @@ mod tests {
             log_persistence_max_entries: 50,
             ..ObservabilityConfig::default()
         };
+        let _trace_guard = runtime_trace::TRACE_TEST_LOCK.lock();
         runtime_trace::init_from_config(&cfg, tmp.path());
 
         let inner = Arc::new(CountingObserver::default());

@@ -31,6 +31,11 @@ ignore = [
     # LruCache in this tree is keyed by String/integer ids, whose Drop cannot panic.
     # Removing it for real means bumping nostr-sdk; tracked separately.
     { id = "RUSTSEC-2026-0253", reason = "lru LruCache::pop() panic-safety unsoundness; affected 0.16.4 copy is transitive via nostr-database 0.44 which excludes the patched 0.18.2; unreachable without catch_unwind plus a panicking key Drop, and all keys here are String/integer" },
+    # bitmaps -- unmaintained advisory (no CVE). Transitive only, via
+    # imbl/imbl-sized-chunks; 3.2.1 is the latest published version, so there is
+    # nothing to bump to. Removing it means dropping imbl, which is not ours to
+    # drop. Published 2026-09-04, after the v0.8.4 tag.
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained (no CVE); transitive via imbl/imbl-sized-chunks with no patched release; awaiting an upstream imbl migration" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
