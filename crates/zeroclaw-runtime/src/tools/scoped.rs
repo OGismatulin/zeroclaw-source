@@ -843,12 +843,14 @@ mod tests {
 
     /// Same config, but with caller-chosen server names.
     ///
-    /// Tests that read the PROCESS-GLOBAL trace writer need a discriminator of
-    /// their own: two tests emitting `mcp_connect_failure` under the same server
-    /// names cannot tell their rows apart, and the writer flushes on a worker
-    /// thread, so a sibling's row can land in this test's file after the
-    /// sibling released the lock. Naming the servers per test is that
-    /// discriminator (engineering-invariants I62).
+    /// Honest accounting of what this buys, now that these tests are excluded
+    /// from the in-process parallel run (fork patch #40): under `nextest` each
+    /// test owns its process, so per-test server names are NOT load-bearing —
+    /// they are kept because naming what a test exercises reads better than
+    /// four tests sharing "remote"/"remote2". The load-bearing part of that
+    /// change was the `flush_for_test()` before reading: the writer hands rows
+    /// to a worker thread, so a read straight after the emit can see an empty
+    /// file even in perfect isolation. See engineering-invariants I62.
     fn config_with_bundled_mcp_named(
         prefix: &str,
         server_uri: String,
