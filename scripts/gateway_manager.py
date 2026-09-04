@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from typing import Callable, TextIO, TypedDict
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
@@ -2111,10 +2112,10 @@ class GatewayManagerServer:
         )
 
     def handle_internal_error(
-        self, path: str, _exc: Exception
+        self, path: str, exc: Exception
     ) -> tuple[int, dict[str, object]]:
         if path.startswith("/upload"):
-            return self._manager_error(
+            status_code, payload = self._manager_error(
                 status_code=500,
                 code="upload_failed",
                 component="manager",
@@ -2122,13 +2123,50 @@ class GatewayManagerServer:
                 error_message="Upload failed",
                 hint="Retry the upload or contact support with the incident ID",
             )
-        return self._manager_error(
-            status_code=500,
-            code="manager_internal_error",
-            component="manager",
-            retryable=False,
-            error_message="Gateway Manager failed",
-            hint="Contact support with the incident ID",
+        else:
+            status_code, payload = self._manager_error(
+                status_code=500,
+                code="manager_internal_error",
+                component="manager",
+                retryable=False,
+                error_message="Gateway Manager failed",
+                hint="Contact support with the incident ID",
+            )
+        self._log_internal_error_diagnostic(payload, exc)
+        return status_code, payload
+
+    @staticmethod
+    def _log_internal_error_diagnostic(
+        payload: dict[str, object], exc: Exception
+    ) -> None:
+        """Log the exception behind a manager 500, keyed by its incident id.
+
+        Without this the public envelope is all that survives: an incident id
+        with nothing behind it. `finalize_error` logs only the classification
+        (role/code/component/user), and the Fly log window holds roughly ten
+        minutes, so a manager-internal 500 used to be unattributable the moment
+        it rotated out.
+
+        The traceback is folded onto one line so the aggregator keeps it as a
+        single record next to the id. Frames carry file/line/function only, not
+        variable values; the exception message is bounded because it is the one
+        part that can quote arbitrary upstream text.
+        """
+        incident_id = _bounded_string(payload.get("incident_id"), limit=64) or ""
+        error_code = _bounded_string(payload.get("error_code"), limit=64) or ""
+        message = _bounded_string(str(exc), limit=300) or ""
+        frames = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        folded = " | ".join(line.strip() for line in frames.splitlines() if line.strip())
+        print(
+            "[gateway-manager] internal error diagnostic "
+            f"incident_id={incident_id} "
+            f"error_code={error_code} "
+            f"error_class={exc.__class__.__name__} "
+            f"error_message={message} "
+            f"traceback={folded[:4000]}",
+            flush=True,
         )
 
     def handle_health(self) -> tuple[int, dict[str, object]]:
