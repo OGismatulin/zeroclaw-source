@@ -69,7 +69,7 @@ swap_size_mb = 512
   # reachable only by the Fly metrics agent and from inside the Machine.
   ZEROCLAW_EXPORTER_ENABLED = '1'
   ZEROCLAW_EXPORTER_PORT = '2999'
-  ZEROCLAW_ERROR_REPORT_ENABLED = '0'
+  ZEROCLAW_ERROR_REPORT_ENABLED = '1'
   ZEROCLAW_REPORT_TIMEZONE = 'Asia/Bishkek'
 
   # Public URLs — plain env, not secrets. Values are non-sensitive (own app domain + CRM base URL).
