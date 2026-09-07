@@ -94,4 +94,6 @@ scripts/
 !scripts/bootstrap_default_cron_jobs.py
 !scripts/backfill_cron_agent_alias.py
 !scripts/volume_janitor.py
+!scripts/zeroclaw_metrics.py
+!scripts/zeroclaw_error_report.py
 !scripts/agent_browser_wrapper.sh

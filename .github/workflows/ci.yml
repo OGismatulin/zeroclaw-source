@@ -457,6 +457,26 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+  python-runtime:
+    name: Python Runtime Contract
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Exact pin, equal to uv.lock in the integration repository and to the
+      # version both Dockerfiles install.
+      - name: Install exporter dependency
+        run: python3 -m pip install --no-cache-dir "prometheus-client==0.26.0"
+      # The Fly image is built from THIS repo, so these mirrored scripts are the
+      # ones that reach production. A red assertion here blocks zc-fly-deploy.yml,
+      # which triggers on this workflow's success.
+      - name: ZeroClaw Python runtime contract
+        run: python3 scripts/ci/zc_python_runtime_gate.py
+
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
     needs: [fmt]

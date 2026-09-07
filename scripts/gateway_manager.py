@@ -32,6 +32,11 @@ try:  # image layout: both scripts live side by side in /usr/local/bin
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
     from scripts import volume_janitor
 
+try:  # image layout: both scripts live side by side in /usr/local/bin
+    import zeroclaw_metrics
+except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
+    from scripts import zeroclaw_metrics
+
 
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
 INCIDENT_ID_PATTERN = re.compile(r"^zc-[0-9a-f]{16}$")
@@ -1453,7 +1458,8 @@ class GatewayRegistry:
                         last_used_at=now,
                         process=None,
                     )
-                    self._instances[user_key] = instance
+                    with self._global_lock:
+                        self._instances[user_key] = instance
                     return instance
         else:
             port = self._allocate_port()
@@ -1530,7 +1536,8 @@ class GatewayRegistry:
             last_used_at=now,
             process=process,
         )
-        self._instances[user_key] = instance
+        with self._global_lock:
+            self._instances[user_key] = instance
         return instance
 
     def _scan_boot_mcp_failures(self, workspace_root: Path) -> None:
@@ -1602,7 +1609,34 @@ class GatewayRegistry:
         return self._instances.get(user_key)
 
     def list_instances(self) -> list[DaemonInstance]:
-        return list(self._instances.values())
+        with self._global_lock:
+            return list(self._instances.values())
+
+    def snapshot_targets(self) -> list[zeroclaw_metrics.DaemonTarget]:
+        """Detached, value-only view of the pool for the metrics exporter.
+
+        Structural reads of `_instances` share the existing global lock with the
+        structural writes, so a concurrent spawn/stop cannot be observed
+        half-applied. Live `DaemonInstance` objects never leave: the exporter
+        does network I/O, and nothing that blocks on a socket or a process may
+        run while this lock is held.
+        """
+        with self._global_lock:
+            instances = list(self._instances.values())
+        targets: list[zeroclaw_metrics.DaemonTarget] = []
+        for instance in instances:
+            process = instance.process
+            running = True if process is None else process.poll() is None
+            targets.append(
+                zeroclaw_metrics.DaemonTarget(
+                    user_key=instance.user_key,
+                    port=instance.port,
+                    pid=instance.pid,
+                    started_at=instance.started_at,
+                    process_running=running,
+                )
+            )
+        return targets
 
     def stop_instance(self, user_key: str) -> None:
         lock = self._get_user_lock(user_key)
@@ -1611,7 +1645,8 @@ class GatewayRegistry:
 
     def _stop_instance_unlocked(self, user_key: str) -> None:
         """Internal — caller must hold per-user lock."""
-        instance = self._instances.pop(user_key, None)
+        with self._global_lock:
+            instance = self._instances.pop(user_key, None)
         if instance is None:
             return
         self._terminate_process(instance)
@@ -1882,10 +1917,16 @@ class GatewayRegistry:
         # - ZEROCLAW_GATEWAY_PORT: would override config port, causing bind conflict with manager
         # - ZEROCLAW_GATEWAY_HOST: child must bind to localhost, not 0.0.0.0
         # - ZEROCLAW_ALLOW_PUBLIC_BIND: child is behind manager, no public binding
+        # - ZEROCLAW_METRICS_QUERY_TOKEN / ZEROCLAW_REPORT_OWNER_MACHINE_ID:
+        #   reporter-only credentials. `os.environ.copy()` above would otherwise
+        #   hand every per-user daemon (and therefore every shell tool the agent
+        #   can reach) a read token for the whole org's metrics.
         for key in (
             "ZEROCLAW_GATEWAY_PORT",
             "ZEROCLAW_GATEWAY_HOST",
             "ZEROCLAW_ALLOW_PUBLIC_BIND",
+            "ZEROCLAW_METRICS_QUERY_TOKEN",
+            "ZEROCLAW_REPORT_OWNER_MACHINE_ID",
         ):
             env.pop(key, None)
         # Prompt-trace is opt-in per user. ZEROCLAW_PROMPT_TRACE_USERS is a
@@ -1986,6 +2027,7 @@ class GatewayManagerServer:
         self.forward_webhook = forward_webhook
         self.operator_error_notifier = operator_error_notifier
         self.volume_janitor = volume_janitor
+        self.metrics_exporter: zeroclaw_metrics.MetricsExporter | None = None
 
     def finalize_error(
         self,
@@ -3794,7 +3836,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     else:
         print("[gateway-manager] janitor: disabled by env", flush=True)
 
-    return GatewayManagerServer(
+    server = GatewayManagerServer(
         settings=settings,
         pairing_state=pairing_state,
         registry=registry,
@@ -3802,6 +3844,47 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         operator_error_notifier=operator_error_notifier,
         volume_janitor=janitor,
     )
+    server.metrics_exporter = _start_metrics_exporter(settings, registry)
+    return server
+
+
+def _start_metrics_exporter(
+    settings: ManagerSettings, registry: GatewayRegistry
+) -> zeroclaw_metrics.MetricsExporter | None:
+    """Build, validate and start the private metrics listener.
+
+    Off by default. A misconfigured port is fatal rather than silently ignored:
+    an exporter that quietly failed to bind is indistinguishable downstream from
+    an app with no errors.
+    """
+    if not _env_bool("ZEROCLAW_EXPORTER_ENABLED", False):
+        print("[gateway-manager] metrics exporter: disabled by env", flush=True)
+        return None
+    exporter_port = int(
+        os.getenv("ZEROCLAW_EXPORTER_PORT", str(zeroclaw_metrics.DEFAULT_EXPORTER_PORT))
+    )
+    zeroclaw_metrics.validate_exporter_port(
+        exporter_port=exporter_port,
+        manager_base_port=settings.manager_base_port,
+    )
+    exporter = zeroclaw_metrics.MetricsExporter(
+        targets_provider=registry.snapshot_targets,
+        max_instances=settings.max_instances,
+        child_host=settings.child_host,
+        state_path=settings.data_root / "observability" / "exporter-state.json",
+        poll_interval_secs=_env_float(
+            "ZEROCLAW_EXPORTER_POLL_SECS",
+            zeroclaw_metrics.DEFAULT_POLL_INTERVAL_SECS,
+        ),
+    )
+    exporter_host = os.getenv("ZEROCLAW_EXPORTER_HOST", "0.0.0.0")  # noqa: S104
+    bound = exporter.start_listener(exporter_host, exporter_port)
+    exporter.start_worker()
+    print(
+        f"[gateway-manager] metrics exporter listening on {exporter_host}:{bound}",
+        flush=True,
+    )
+    return exporter
 
 
 class _RuntimeHTTPServer(ThreadingHTTPServer):
@@ -3824,6 +3907,7 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             status_code, payload = self.server.app.handle_internal_error(
                 self.path, exc
             )
+        self._record_outcome(status_code, payload)
         self._write_json_safely(status_code, payload)
 
     def _dispatch_get(self) -> tuple[int, dict[str, object]]:
@@ -3845,7 +3929,30 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             status_code, payload = self.server.app.handle_internal_error(
                 self.path, exc
             )
+        self._record_outcome(status_code, payload)
         self._write_json_safely(status_code, payload)
+
+    def _record_outcome(
+        self, status_code: int, payload: dict[str, object]
+    ) -> None:
+        """The single HTTP instrumentation point.
+
+        It sits here, after dispatch and normalization, because it is the only
+        place that sees BOTH outcomes of every application request.
+        `finalize_error()` is not a second counting point: it never sees a
+        success, it never sees the early rejections that bypass it, and counting
+        there as well would double every Manager-classified error. `primary` and
+        `echo` are two mutually exclusive roles of one call, not two events.
+        """
+        exporter = getattr(self.server.app, "metrics_exporter", None)
+        if exporter is None:
+            return
+        try:
+            exporter.record_http(
+                path=self.path, status_code=status_code, payload=payload
+            )
+        except Exception:
+            return
 
     def _dispatch_post(self) -> tuple[int, dict[str, object]]:
         raw_content_length = self.headers.get("Content-Length", "0")
@@ -3912,6 +4019,12 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             self._write_json(status_code, payload)
         except Exception as exc:
             path = _safe_log_identity(self.path, limit=160) or "unknown"
+            exporter = getattr(self.server.app, "metrics_exporter", None)
+            if exporter is not None:
+                try:
+                    exporter.record_response_write_failure(path=self.path)
+                except Exception:
+                    pass
             print(
                 "[gateway-manager] response write failed "
                 f"path={path} error_class={exc.__class__.__name__}",
@@ -3945,6 +4058,9 @@ def main() -> int:
         active_janitor = getattr(app, "volume_janitor", None)
         if active_janitor is not None:
             active_janitor.stop()
+        exporter = getattr(app, "metrics_exporter", None)
+        if exporter is not None:
+            exporter.stop()
     return 0
 
 

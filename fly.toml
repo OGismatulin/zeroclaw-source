@@ -61,6 +61,17 @@ swap_size_mb = 512
   GRAYLOG_REFRESH_INTERVAL_S = '1500'
   GRAYLOG_OPERATOR_TELEGRAM_USER_ID = '83292437'
 
+  # ── Prometheus error report ────────────────────────────────────────────
+  # Both flags stay off until the ordered rollout turns them on (spec §"Окно
+  # выката"). New code + old values is the safe inert state: no listener, no
+  # scheduled send, chat unaffected. The exporter binds 0.0.0.0:2999 as Fly
+  # custom metrics requires; it is NOT published as a service, so it is
+  # reachable only by the Fly metrics agent and from inside the Machine.
+  ZEROCLAW_EXPORTER_ENABLED = '0'
+  ZEROCLAW_EXPORTER_PORT = '2999'
+  ZEROCLAW_ERROR_REPORT_ENABLED = '0'
+  ZEROCLAW_REPORT_TIMEZONE = 'Asia/Bishkek'
+
   # Public URLs — plain env, not secrets. Values are non-sensitive (own app domain + CRM base URL).
   # Kept here instead of fly secrets so the integration wiring is visible in git.
   NOTIFY_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify'
