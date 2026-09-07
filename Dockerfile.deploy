@@ -199,7 +199,7 @@ COPY scripts/fly_warmup.py /usr/local/bin/fly_warmup.py
 COPY scripts/cron_template_install.py /usr/local/bin/cron_template_install.py
 COPY scripts/bootstrap_default_cron_jobs.py /usr/local/bin/bootstrap_default_cron_jobs.py
 COPY scripts/backfill_cron_agent_alias.py /usr/local/bin/backfill_cron_agent_alias.py
-COPY scripts/volume_janitor.py /usr/local/bin/volume_janitor.py /usr/local/bin/zeroclaw_metrics.py /usr/local/bin/zeroclaw_error_report.py
+COPY scripts/volume_janitor.py /usr/local/bin/volume_janitor.py
 COPY scripts/zeroclaw_metrics.py /usr/local/bin/zeroclaw_metrics.py
 COPY scripts/zeroclaw_error_report.py /usr/local/bin/zeroclaw_error_report.py
 
