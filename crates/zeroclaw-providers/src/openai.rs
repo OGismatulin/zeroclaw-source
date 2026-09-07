@@ -2,6 +2,7 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::opencode_session::{OPENCODE_SESSION_HEADER, OPENCODE_USER_AGENT};
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -1122,7 +1123,44 @@ impl OpenAiResponsesModelProvider {
                 }
             }
         }
+        // Fork patch #41: OpenCode asks callers to identify the tool.
+        if !headers.contains_key(reqwest::header::USER_AGENT)
+            && crate::opencode_session::is_opencode_target(&self.responses_url)
+            && let Ok(value) = HeaderValue::from_str(OPENCODE_USER_AGENT)
+        {
+            headers.insert(reqwest::header::USER_AGENT, value);
+        }
         headers
+    }
+
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode (fork patch #41, ported
+    /// from upstream PR #10604).
+    ///
+    /// `responses_url` is the full endpoint rather than a base URL; the target
+    /// test parses its host, so it matches either shape. Returns `None` when
+    /// the operator already pinned a *valid* header through `extra_headers`,
+    /// which `build_default_headers` puts on every request — a second value
+    /// here would send the header twice. Reads the effective `HeaderMap`, so a
+    /// value the validator drops cannot suppress the safe default.
+    fn opencode_session_value(&self) -> Option<String> {
+        if self
+            .build_default_headers()
+            .contains_key(OPENCODE_SESSION_HEADER)
+        {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.responses_url)
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task. The streaming path resolves the value before its spawn
+    /// and applies it with [`apply_opencode_session_value`].
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        apply_opencode_session_value(req, self.opencode_session_value().as_deref())
     }
 
     fn http_client(&self) -> Client {
@@ -1145,6 +1183,19 @@ impl OpenAiResponsesModelProvider {
             builder = builder.default_headers(default_headers);
         }
         builder.build().unwrap_or_else(|_| Client::new())
+    }
+}
+
+/// Attach a pre-resolved OpenCode affinity token (see
+/// `OpenAiResponsesModelProvider::opencode_session_value`). `None` leaves the
+/// request untouched — non-OpenCode hosts and operator-pinned headers.
+fn apply_opencode_session_value(
+    req: reqwest::RequestBuilder,
+    session: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match session {
+        Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+        None => req,
     }
 }
 
@@ -1205,9 +1256,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1255,9 +1308,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1296,6 +1351,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
         let responses_url = self.responses_url.clone();
+        // Resolved before the spawn: `spawn!` propagates the tracing span but
+        // not task-locals, so the conversation scope is unreadable inside.
+        let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
@@ -1348,11 +1406,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
-            let request_builder = client
-                .post(&responses_url)
-                .header("Authorization", format!("Bearer {credential}"))
-                .header("Accept", "text/event-stream")
-                .json(&req);
+            let request_builder = apply_opencode_session_value(
+                client
+                    .post(&responses_url)
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("Accept", "text/event-stream"),
+                opencode_session.as_deref(),
+            )
+            .json(&req);
 
             run_responses_sse(request_builder, &tx, count_tokens).await;
         });
@@ -1457,6 +1518,180 @@ mod tests {
             .credential(None)
             .build();
         assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
+    }
+
+    // ---- OpenCode session / User-Agent wire tests (fork patch #41) ----
+    // Same method as compatible.rs: build the request through the production
+    // helpers and reproduce reqwest's execute-time default-header merge.
+
+    const OPENCODE_GO_URL: &str = "https://opencode.ai/zen/go/v1";
+
+    fn opencode_responses_provider(base_url: &str) -> OpenAiResponsesModelProvider {
+        OpenAiResponsesModelProvider::builder("opencode")
+            .api_url(base_url)
+            .credential(Some("test-key"))
+            .build()
+    }
+
+    fn wire_headers(
+        provider: &OpenAiResponsesModelProvider,
+        request: &reqwest::Request,
+    ) -> HeaderMap {
+        let mut headers = request.headers().clone();
+        for (name, value) in provider.build_default_headers().iter() {
+            if let reqwest::header::Entry::Vacant(entry) = headers.entry(name) {
+                entry.insert(value.clone());
+            }
+        }
+        headers
+    }
+
+    /// Non-streaming request exactly as the two in-task sites build it.
+    fn built_responses_headers(provider: &OpenAiResponsesModelProvider) -> HeaderMap {
+        let request = provider
+            .apply_opencode_session_header(
+                provider
+                    .http_client()
+                    .post(&provider.responses_url)
+                    .header("Authorization", "Bearer test-key"),
+            )
+            .json(&serde_json::json!({}))
+            .build()
+            .expect("request must build");
+        wire_headers(provider, &request)
+    }
+
+    fn header_values(headers: &HeaderMap, name: &str) -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().expect("header must be ASCII").to_string())
+            .collect()
+    }
+
+    fn assert_is_session_token(value: &str) {
+        assert_eq!(
+            value.len(),
+            32,
+            "expected a 128-bit hex token, got {value:?}"
+        );
+        assert!(
+            value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
+
+    #[test]
+    fn opencode_responses_request_carries_session_and_user_agent() {
+        let headers = built_responses_headers(&opencode_responses_provider(OPENCODE_GO_URL));
+        let session = header_values(&headers, OPENCODE_SESSION_HEADER);
+        assert_eq!(session.len(), 1);
+        assert_is_session_token(&session[0]);
+        assert_eq!(
+            header_values(&headers, "user-agent"),
+            vec![OPENCODE_USER_AGENT.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_responses_streaming_request_carries_session_and_user_agent() {
+        let provider = opencode_responses_provider(OPENCODE_GO_URL);
+        let scope = "telegram_1001_alice".to_string();
+        let expected = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(scope.clone()), async {
+                crate::opencode_session::session_token(&provider.responses_url).expect("token")
+            })
+            .await;
+
+        let request = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(scope), async {
+                // Mirror stream_chat: capture before spawn, build inside.
+                let opencode_session = provider.opencode_session_value();
+                let client = provider.streaming_client();
+                let responses_url = provider.responses_url.clone();
+                ::zeroclaw_spawn::spawn!(async move {
+                    let request_builder = client
+                        .post(&responses_url)
+                        .header("Authorization", "Bearer test-key")
+                        .header("Accept", "text/event-stream");
+                    apply_opencode_session_value(request_builder, opencode_session.as_deref())
+                        .build()
+                        .expect("request must build")
+                })
+                .await
+                .expect("join")
+            })
+            .await;
+        let headers = wire_headers(&provider, &request);
+
+        assert_eq!(
+            header_values(&headers, OPENCODE_SESSION_HEADER),
+            vec![expected],
+            "streaming token must be the conversation token captured before spawn"
+        );
+        assert_eq!(
+            header_values(&headers, "user-agent"),
+            vec![OPENCODE_USER_AGENT.to_string()]
+        );
+    }
+
+    #[test]
+    fn opencode_responses_headers_absent_on_other_hosts() {
+        for base_url in ["https://api.openai.com/v1", "http://127.0.0.1:1/v1"] {
+            let headers = built_responses_headers(&opencode_responses_provider(base_url));
+            assert!(
+                header_values(&headers, OPENCODE_SESSION_HEADER).is_empty(),
+                "{base_url}"
+            );
+            assert!(
+                header_values(&headers, "user-agent").is_empty(),
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_responses_operator_overrides_win_when_valid_only() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "X-Opencode-Session".to_string(),
+            "pinned-by-operator".to_string(),
+        );
+        extra.insert("User-Agent".to_string(), "operator-ua/1".to_string());
+        let provider = OpenAiResponsesModelProvider::builder("opencode")
+            .api_url(OPENCODE_GO_URL)
+            .credential(Some("test-key"))
+            .extra_headers(extra)
+            .build();
+        let headers = built_responses_headers(&provider);
+        assert_eq!(
+            header_values(&headers, OPENCODE_SESSION_HEADER),
+            vec!["pinned-by-operator".to_string()]
+        );
+        assert_eq!(
+            header_values(&headers, "user-agent"),
+            vec!["operator-ua/1".to_string()]
+        );
+
+        // Invalid values are dropped by the validator and must not suppress
+        // the safe defaults.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("x-opencode-session".to_string(), "bad\nvalue".to_string());
+        extra.insert("User-Agent".to_string(), "bad\0ua".to_string());
+        let provider = OpenAiResponsesModelProvider::builder("opencode")
+            .api_url(OPENCODE_GO_URL)
+            .credential(Some("test-key"))
+            .extra_headers(extra)
+            .build();
+        let headers = built_responses_headers(&provider);
+        let session = header_values(&headers, OPENCODE_SESSION_HEADER);
+        assert_eq!(session.len(), 1);
+        assert_is_session_token(&session[0]);
+        assert_eq!(
+            header_values(&headers, "user-agent"),
+            vec![OPENCODE_USER_AGENT.to_string()]
+        );
     }
 
     #[test]
