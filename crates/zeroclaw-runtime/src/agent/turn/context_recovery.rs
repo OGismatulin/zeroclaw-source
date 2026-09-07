@@ -758,6 +758,12 @@ mod tests {
         let secret_prose = "SENSITIVE-ASSISTANT-PROSE-42";
         let mut history = vec![ChatMessage::user("u"), ChatMessage::assistant(secret_prose)];
         let mut repaired = false;
+        // Own trace_id: every other test in this module emits the same record
+        // through `repair_ctx`'s shared "turn-roundtrip-test", and the log
+        // broadcast is process-global, so under the 16-thread in-process CI run
+        // a sibling's record (iteration 4) could win a first-message scan.
+        let mut ctx = repair_ctx(&pacing, &dedup_exempt_tools, None);
+        ctx.turn_id = "turn-roundtrip-diagnostic";
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -771,7 +777,7 @@ mod tests {
                 &roundtrip_error(),
                 7,
                 &mut repaired,
-                &repair_ctx(&pacing, &dedup_exempt_tools, None),
+                &ctx,
             )
             .await
         );
@@ -789,6 +795,11 @@ mod tests {
                 Ok(Ok(value)) => {
                     if value.get("message").and_then(|v| v.as_str())
                         == Some("reasoning_roundtrip_rejected")
+                        && value
+                            .get("attributes")
+                            .and_then(|a| a.get("trace_id"))
+                            .and_then(|v| v.as_str())
+                            == Some("turn-roundtrip-diagnostic")
                     {
                         record = Some(value);
                     }
@@ -808,7 +819,7 @@ mod tests {
         );
         assert_eq!(
             attrs.get("trace_id").and_then(|v| v.as_str()),
-            Some("turn-roundtrip-test")
+            Some("turn-roundtrip-diagnostic")
         );
         assert_eq!(
             attrs.get("agent_alias").and_then(|v| v.as_str()),
