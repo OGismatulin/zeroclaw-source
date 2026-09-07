@@ -136,8 +136,24 @@ class MetricsClient:
     def _remaining(self) -> float:
         return self._budget - (self._clock() - self._started)
 
+    @staticmethod
+    def _authorization(token: str) -> str:
+        """Fly org and read-only tokens carry their own scheme.
+
+        `fly tokens create readonly` returns a macaroon that already starts with
+        `FlyV1 `, and wrapping it in `Bearer` produces `Bearer FlyV1 ...`, which
+        the metrics API rejects with 401. Measured against the live API on
+        2026-09-07: `Bearer <macaroon>` -> 401, the macaroon verbatim -> 200.
+        A full-access token (`fo1_...`) has no scheme and still needs `Bearer`.
+        """
+        candidate = token.strip()
+        for scheme in ("FlyV1 ", "Bearer ", "FlyV1fm2_"):
+            if candidate.startswith(scheme):
+                return candidate
+        return f"Bearer {candidate}"
+
     def _call(self, endpoint: str, params: dict[str, str]) -> dict:
-        headers = {"Authorization": f"Bearer {self._token}"}
+        headers = {"Authorization": self._authorization(self._token)}
         attempt = 0
         while True:
             if self._remaining() <= 0:
@@ -300,9 +316,21 @@ def assess_completeness(
         if points[-1][0] < window.end_utc.timestamp() - 3 * cadence:
             result.note("нет данных на правом крае окна")
             http_ok = False
-        for (timestamp, value), (_, _) in zip(points, points[1:]):
+        # Two different holes, and only the first one used to be detected.
+        # (a) The exporter is alive but its snapshot stopped advancing.
+        for timestamp, value in points:
             if timestamp - value > 3 * cadence:
                 result.note("разрыв наблюдения exporter'а")
+                http_ok = False
+                break
+        # (b) The samples themselves stop: the app died, the scrape failed, the
+        # series vanished. Prometheus simply has fewer points, the edges still
+        # match, and the window reads "complete" — the exact false green this
+        # report exists to prevent.
+        for previous, current in zip(points, points[1:]):
+            if current[0] - previous[0] > 3 * cadence:
+                gap = int(current[0] - previous[0])
+                result.note(f"пропуск samples {gap} с")
                 http_ok = False
                 break
 
@@ -332,12 +360,22 @@ def assess_completeness(
         _slot_of(series): _series_points(series) for series in daemon_last_success
     }
     stale_limit = max(STALE_FLOOR_SECS, 3 * result.cadence_secs)
+    if expected_slots and not daemon_start:
+        # Without daemon start times a restart is undetectable, so native
+        # reconciliation has no baseline. Absent input is "not measured", never
+        # a pass.
+        result.note("нет времени старта daemon — база сверки неизвестна")
+        native_ok = False
     for slot in sorted(expected_slots):
         up_points = up_by_slot.get(slot, [])
         if not up_points or any(value < 1 for _ts, value in up_points):
             result.note(f"слот {slot}: наблюдение daemon прерывалось")
             native_ok = False
-        for timestamp, value in last_success_by_slot.get(slot, []):
+        success_points = last_success_by_slot.get(slot, [])
+        if not success_points:
+            result.note(f"слот {slot}: нет отметок последнего успешного опроса")
+            native_ok = False
+        for timestamp, value in success_points:
             if timestamp - value > stale_limit:
                 result.note(f"слот {slot}: устаревший снимок daemon")
                 native_ok = False
@@ -881,6 +919,17 @@ def run_once(
                 return outcome
             if state == "failed":
                 outcome["state"] = "already-failed"
+                return outcome
+            if state == "sending" and not retry_unknown:
+                # A durable `sending` means a previous process reached the
+                # network and never came back. The bot may well have delivered
+                # the message before dying, so this is exactly the `unknown`
+                # case: promote it, then hold. Re-sending automatically here
+                # would duplicate the operator's report after every crash.
+                store.write(
+                    key, "unknown", detail="process died after sending"
+                )
+                outcome["state"] = "unknown-held"
                 return outcome
             if state == "unknown" and not retry_unknown:
                 # An unknown send may already have reached Telegram. Retrying is

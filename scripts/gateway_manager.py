@@ -53,6 +53,19 @@ except ImportError as exc:  # prometheus_client absent from the image
 else:
     _METRICS_IMPORT_ERROR = None
 
+# The reporter is stdlib-only, but it lives next to the exporter in the image;
+# guard it the same way so a missing file degrades to "no report", not "no chat".
+zeroclaw_error_report: object | None
+try:
+    import zeroclaw_error_report  # type: ignore[no-redef]
+except ModuleNotFoundError:
+    try:
+        from scripts import zeroclaw_error_report  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        zeroclaw_error_report = None
+except ImportError:
+    zeroclaw_error_report = None
+
 
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
 INCIDENT_ID_PATTERN = re.compile(r"^zc-[0-9a-f]{16}$")
@@ -2046,6 +2059,7 @@ class GatewayManagerServer:
         self.operator_error_notifier = operator_error_notifier
         self.volume_janitor = volume_janitor
         self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
+        self.error_report_worker: threading.Thread | None = None
 
     def finalize_error(
         self,
@@ -3863,7 +3877,64 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         volume_janitor=janitor,
     )
     server.metrics_exporter = _start_metrics_exporter(settings, registry)
+    server.error_report_worker = _start_error_report_worker(
+        settings, server.metrics_exporter
+    )
     return server
+
+
+def _start_error_report_worker(
+    settings: ManagerSettings, exporter: object | None
+) -> threading.Thread | None:
+    """Start the daily report worker, or explain in one line why it did not.
+
+    Gated three ways, and every refusal is printed: the flag, the module, and
+    the owner-Machine identity. A flag that silently does nothing is worse than
+    no flag — it reads as "the report is on, so there were no errors".
+    """
+    if not _env_bool("ZEROCLAW_ERROR_REPORT_ENABLED", False):
+        print("[gateway-manager] error report: disabled by env", flush=True)
+        return None
+    if zeroclaw_error_report is None:
+        print(
+            "[gateway-manager] error report: ENABLED but module unavailable",
+            flush=True,
+        )
+        return None
+    allowed, reason = zeroclaw_error_report.owner_check(dict(os.environ))
+    if not allowed:
+        # Not an error on a non-owner Machine — it is the design. Still logged,
+        # because "no report arrived" must always have a findable reason.
+        print(f"[gateway-manager] error report: not sending — {reason}", flush=True)
+        return None
+    config = zeroclaw_error_report.ReportConfig.from_env()
+    if not config.recipient or not config.notify_url:
+        print(
+            "[gateway-manager] error report: ENABLED but recipient/notify_url "
+            "are not configured",
+            flush=True,
+        )
+        return None
+    stop = threading.Event()
+
+    def _run() -> None:
+        zeroclaw_error_report.run_worker(
+            config=config,
+            stop=stop.is_set,
+            send=True,
+            exporter=exporter,
+        )
+
+    thread = threading.Thread(target=_run, name="zc-error-report", daemon=True)
+    thread.stop_event = stop  # type: ignore[attr-defined]
+    thread.start()
+    print(
+        "[gateway-manager] error report: worker started "
+        f"(daily {zeroclaw_error_report.DEFAULT_SEND_HOUR}:00 {config.timezone}, "
+        f"recipient={config.recipient})",
+        flush=True,
+    )
+    return thread
 
 
 def _start_metrics_exporter(
@@ -4088,6 +4159,11 @@ def main() -> int:
         exporter = getattr(app, "metrics_exporter", None)
         if exporter is not None:
             exporter.stop()
+        report_worker = getattr(app, "error_report_worker", None)
+        if report_worker is not None:
+            stop_event = getattr(report_worker, "stop_event", None)
+            if stop_event is not None:
+                stop_event.set()
     return 0
 
 

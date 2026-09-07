@@ -173,12 +173,59 @@ def check_report_window_and_contract() -> None:
             state == expected,
             f"bot response {status}/{content_type} classified {state}, want {expected}",
         )
+    # A Fly org/readonly macaroon carries its own scheme; wrapping it in Bearer
+    # is a 401 against the live API (measured 2026-09-07).
+    check(
+        rep.MetricsClient._authorization("FlyV1 fm2_x") == "FlyV1 fm2_x",
+        "a Fly macaroon was wrapped in Bearer",
+    )
+    check(
+        rep.MetricsClient._authorization("fo1_x") == "Bearer fo1_x",
+        "a scheme-less token lost its Bearer prefix",
+    )
     allowed, _ = rep.owner_check({"FLY_MACHINE_ID": "a"})
     check(not allowed, "a missing owner Machine ID did not disable sending")
     allowed, _ = rep.owner_check(
         {"ZEROCLAW_REPORT_OWNER_MACHINE_ID": "a", "FLY_MACHINE_ID": "b"}
     )
     check(not allowed, "a non-owner Machine was allowed to send")
+
+
+def check_report_flag_is_read() -> None:
+    """A declared flag nothing reads is worse than no flag: the operator turns
+    the report on, nothing happens, and silence reads as "no errors"."""
+    source = (ROOT / "scripts" / "gateway_manager.py").read_text(encoding="utf-8")
+    for flag in ("ZEROCLAW_ERROR_REPORT_ENABLED", "ZEROCLAW_EXPORTER_ENABLED"):
+        check(
+            f'_env_bool("{flag}"' in source,
+            f"{flag} is declared in fly.toml but never read by the manager",
+        )
+
+
+def check_completeness_rejects_absent_inputs() -> None:
+    import datetime as dt
+
+    window = rep.window_for_date(dt.date(2026, 9, 6), ZoneInfo("Asia/Bishkek"))
+    start, end = window.start_utc.timestamp(), window.end_utc.timestamp()
+    holed = [
+        [start, str(start)],
+        [start + 15, str(start + 15)],
+        [end - 15, str(end - 15)],
+        [end, str(end)],
+    ]
+    result = rep.assess_completeness(
+        snapshot_series=[{"metric": {"instance": "a"}, "values": holed}],
+        manager_start_series=[{"metric": {"instance": "a"}, "values": [[start, "1"], [end, "1"]]}],
+        daemon_expected=[],
+        daemon_up=[],
+        daemon_last_success=[],
+        daemon_start=[],
+        window=window,
+    )
+    check(
+        result.http == rep.INCOMPLETE,
+        "a day-long hole in the samples was reported as complete coverage",
+    )
 
 
 def check_child_secret_denylist() -> None:
@@ -198,6 +245,8 @@ def main() -> int:
         check_native_filter,
         check_exporter_port_floor,
         check_report_window_and_contract,
+        check_report_flag_is_read,
+        check_completeness_rejects_absent_inputs,
         check_child_secret_denylist,
     ):
         try:
