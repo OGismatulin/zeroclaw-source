@@ -293,8 +293,11 @@ prompt_injection_mode = "compact"
 # MANDATORY (Spike 0): without it runtime-trace.jsonl stops writing and later
 # gates fail. V3 field names log_persistence* are aliases of the old
 # runtime_trace_* keys.
+# Prometheus is ON so the Manager exporter has native counters to reconcile
+# against. The exporter and the daily report are separate switches in
+# fly.toml [env]; this line only makes the child expose its own /metrics.
 [observability]
-backend = "none"
+backend = "prometheus"
 log_persistence = "rolling"
 log_persistence_path = "logs/runtime-trace.jsonl"
 log_persistence_max_entries = 5000

@@ -67,7 +67,7 @@ swap_size_mb = 512
   # scheduled send, chat unaffected. The exporter binds 0.0.0.0:2999 as Fly
   # custom metrics requires; it is NOT published as a service, so it is
   # reachable only by the Fly metrics agent and from inside the Machine.
-  ZEROCLAW_EXPORTER_ENABLED = '0'
+  ZEROCLAW_EXPORTER_ENABLED = '1'
   ZEROCLAW_EXPORTER_PORT = '2999'
   ZEROCLAW_ERROR_REPORT_ENABLED = '0'
   ZEROCLAW_REPORT_TIMEZONE = 'Asia/Bishkek'
@@ -77,6 +77,15 @@ swap_size_mb = 512
   NOTIFY_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify'
   NOTIFY_FILE_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify/file'
   CREATIO_BASE_URL = 'https://lalafo.creatio.com'
+
+# Fly scrapes this port directly. It is deliberately NOT published as a
+# service, so the exporter stays unreachable from the public internet;
+# the port also sits below ZEROCLAW_MANAGER_BASE_PORT, which the child
+# allocator can never reach (startup validates that).
+[[metrics]]
+  port = 2999
+  path = "/metrics"
+  processes = ["app"]
 
 [mounts]
   source = 'zeroclaw_data'
