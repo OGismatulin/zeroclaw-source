@@ -84,6 +84,34 @@ wire_api = "responses"
 
 The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
 
+### OpenCode session affinity and User-Agent
+
+Every inference request to an `opencode.ai` host carries two identification headers on both wires, streaming and non-streaming:
+
+```text
+x-opencode-session: <opaque 32-hex token>
+User-Agent: zeroclaw/<version>
+```
+
+OpenCode uses `x-opencode-session` to pin one conversation's turns to the same upstream backend, which keeps that backend's prompt cache warm across turns; the Go endpoint rejects header-less inference with HTTP 400 `MissingSessionID`. Upstream also asks callers to identify the tool through `User-Agent`.
+
+The session value is a domain-separated SHA-256 digest of the active conversation scope (the runtime's `TOOL_LOOP_SESSION_KEY`), truncated to 128 bits. Each conversation pins to its own backend and keeps it across a daemon restart. The conversation's session key is **hashed, never sent**: session keys embed channel and user identifiers, and forwarding one verbatim would hand a third-party relay a per-user identifier. Streaming paths resolve the token before spawning the SSE task, because task-locals do not cross a spawn.
+
+Requests made outside any conversation scope (cron runs, CLI invocations, warmup-style probes) share one process-stable random token. They are never header-less, but they do not get per-conversation affinity.
+
+Nothing needs configuring. A valid operator-pinned header wins and is sent exactly once; a value that fails HTTP header validation is dropped and the safe default is sent instead. To pin the session yourself, for instance to share one affinity scope across replicas:
+
+```toml
+[providers.models.opencode.default]
+model = "big-pickle"
+
+[providers.models.opencode.default.extra_headers]
+x-opencode-session = "my-fixed-scope"
+User-Agent = "my-tool/1.0"
+```
+
+Hosts other than `opencode.ai` and its subdomains receive neither header; their requests are byte-identical to before.
+
 ## Validation
 
 Regardless of approach:
