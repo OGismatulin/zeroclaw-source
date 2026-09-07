@@ -1016,6 +1016,8 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_one_mcp_connect_failure_per_failed_boot_connect() {
         let tmp = tempfile::tempdir().unwrap();
+        // Writer lock first, then the legacy-logger lock (see TRACE_TEST_LOCK docs).
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
             .lock()
             .await;
@@ -1051,6 +1053,8 @@ mod tests {
     #[tokio::test]
     async fn assemble_emits_no_mcp_connect_failure_on_success() {
         let tmp = tempfile::tempdir().unwrap();
+        // Writer lock first, then the legacy-logger lock (see TRACE_TEST_LOCK docs).
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
             .lock()
             .await;

@@ -358,6 +358,13 @@ pub fn record_turn_cancelled(
 /// events. Every test that installs the writer or asserts on its output takes
 /// this lock (CI's parallel gate runs `cargo test --test-threads=16` in ONE
 /// process, so nextest's process-per-test isolation does not apply there).
+///
+/// This lock guards the LEGACY logger half only. The writer itself lives in
+/// `zeroclaw_log` and has its own test lock, `zeroclaw_log::__private_test_writer_lock()`,
+/// taken by tests in other modules (`agent/turn/provider_call.rs`,
+/// `context_recovery.rs`, …). Two locks on one singleton protect nothing
+/// (engineering-invariants I62 §3): take the writer lock FIRST, then this one,
+/// and keep that order everywhere.
 #[cfg(test)]
 pub(crate) static TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -377,6 +384,7 @@ mod tests {
 
     #[test]
     fn legacy_record_event_writes_legacy_shape_and_rolls() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _guard = TRACE_TEST_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_observability_config(tmp.path());

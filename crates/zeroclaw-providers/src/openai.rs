@@ -1123,7 +1123,7 @@ impl OpenAiResponsesModelProvider {
                 }
             }
         }
-        // Fork patch #41: OpenCode asks callers to identify the tool.
+        // fork(#41): OpenCode asks callers to identify the tool.
         if !headers.contains_key(reqwest::header::USER_AGENT)
             && crate::opencode_session::is_opencode_target(&self.responses_url)
             && let Ok(value) = HeaderValue::from_str(OPENCODE_USER_AGENT)
@@ -1256,6 +1256,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(
                 self.http_client()
                     .post(&self.responses_url)
@@ -1308,6 +1309,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(
                 self.http_client()
                     .post(&self.responses_url)
@@ -1406,6 +1408,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
+            // fork(#41): token captured before spawn, applied here.
             let request_builder = apply_opencode_session_value(
                 client
                     .post(&responses_url)
