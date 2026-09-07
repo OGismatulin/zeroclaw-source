@@ -32,10 +32,26 @@ try:  # image layout: both scripts live side by side in /usr/local/bin
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
     from scripts import volume_janitor
 
+# The metrics exporter is the ONLY thing here that needs a third-party package
+# (prometheus-client). It ships disabled, so a missing dependency must degrade to
+# "no metrics", never to "no chat": an ImportError at module scope would take the
+# whole public edge down for a feature nobody turned on.
+zeroclaw_metrics: object | None
 try:  # image layout: both scripts live side by side in /usr/local/bin
-    import zeroclaw_metrics
+    import zeroclaw_metrics  # type: ignore[no-redef]
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
-    from scripts import zeroclaw_metrics
+    try:
+        from scripts import zeroclaw_metrics  # type: ignore[no-redef]
+    except ModuleNotFoundError as exc:
+        zeroclaw_metrics = None
+        _METRICS_IMPORT_ERROR: str | None = exc.name or "unknown"
+    else:
+        _METRICS_IMPORT_ERROR = None
+except ImportError as exc:  # prometheus_client absent from the image
+    zeroclaw_metrics = None
+    _METRICS_IMPORT_ERROR = exc.name or "unknown"
+else:
+    _METRICS_IMPORT_ERROR = None
 
 
 PAIRING_CODE_PATTERN = re.compile(r"^\d{6}$")
@@ -1612,7 +1628,7 @@ class GatewayRegistry:
         with self._global_lock:
             return list(self._instances.values())
 
-    def snapshot_targets(self) -> list[zeroclaw_metrics.DaemonTarget]:
+    def snapshot_targets(self) -> list["zeroclaw_metrics.DaemonTarget"]:
         """Detached, value-only view of the pool for the metrics exporter.
 
         Structural reads of `_instances` share the existing global lock with the
@@ -1621,6 +1637,8 @@ class GatewayRegistry:
         does network I/O, and nothing that blocks on a socket or a process may
         run while this lock is held.
         """
+        if zeroclaw_metrics is None:  # pragma: no cover - exporter cannot run
+            raise RuntimeError("metrics exporter module is unavailable")
         with self._global_lock:
             instances = list(self._instances.values())
         targets: list[zeroclaw_metrics.DaemonTarget] = []
@@ -2027,7 +2045,7 @@ class GatewayManagerServer:
         self.forward_webhook = forward_webhook
         self.operator_error_notifier = operator_error_notifier
         self.volume_janitor = volume_janitor
-        self.metrics_exporter: zeroclaw_metrics.MetricsExporter | None = None
+        self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
 
     def finalize_error(
         self,
@@ -3850,7 +3868,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
 
 def _start_metrics_exporter(
     settings: ManagerSettings, registry: GatewayRegistry
-) -> zeroclaw_metrics.MetricsExporter | None:
+) -> "zeroclaw_metrics.MetricsExporter | None":
     """Build, validate and start the private metrics listener.
 
     Off by default. A misconfigured port is fatal rather than silently ignored:
@@ -3859,6 +3877,15 @@ def _start_metrics_exporter(
     """
     if not _env_bool("ZEROCLAW_EXPORTER_ENABLED", False):
         print("[gateway-manager] metrics exporter: disabled by env", flush=True)
+        return None
+    if zeroclaw_metrics is None:
+        # Loud, because the operator asked for the exporter and is not getting
+        # it — but still not fatal: silence here would read as "no errors".
+        print(
+            "[gateway-manager] metrics exporter: ENABLED but unavailable, "
+            f"missing module={_METRICS_IMPORT_ERROR}",
+            flush=True,
+        )
         return None
     exporter_port = int(
         os.getenv("ZEROCLAW_EXPORTER_PORT", str(zeroclaw_metrics.DEFAULT_EXPORTER_PORT))
