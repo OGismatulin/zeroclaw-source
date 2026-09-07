@@ -41,6 +41,13 @@ esac
 # under nextest (process per test); only this redundant in-process rerun skips it.
 skips=(
     observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls
+    # Same singleton, second victim (2026-09-07): this test re-points the global
+    # writer to a temp file with a 50-row rolling cap and asserts exactly one
+    # mcp_connect_failure row. In-process neighbours both evict rows through
+    # that cap and re-point the writer under a DIFFERENT test lock
+    # (`zeroclaw_log::__private_test_writer_lock` vs `TRACE_TEST_LOCK`), so the
+    # row lands elsewhere and the count reads 0. Covered by the nextest `Test` job.
+    tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect
 )
 skip_args=()
 for skip in "${skips[@]}"; do
