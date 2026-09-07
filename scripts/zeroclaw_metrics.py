@@ -414,6 +414,17 @@ class MetricsExporter:
         ).inc()
         if not is_error:
             return
+        if route not in REPORTED_ROUTES:
+            # Routes outside the report only ever carry `unknown`. Resolving the
+            # catalog here would mint a new series on first use, so the live
+            # exposition would drift above the pre-initialised set — exactly the
+            # silent growth Fly may drop. Measured on 2026-09-07: a stray request
+            # to an unknown path created ("other", "invalid_request", "request")
+            # in production and pushed the count from 69 to 70.
+            self.http_errors.labels(
+                route=route, error_code=UNKNOWN, component=UNKNOWN
+            ).inc()
+            return
         catalog_component = ERROR_CATALOG.get(code or "")
         if catalog_component is None:
             label_code, label_component = UNKNOWN, UNKNOWN
