@@ -718,7 +718,7 @@ impl OpenAiCompatibleModelProvider {
                 }
             }
         }
-        // Fork patch #41: OpenCode asks callers to identify the tool.
+        // fork(#41): OpenCode asks callers to identify the tool.
         if !headers.contains_key(USER_AGENT)
             && crate::opencode_session::is_opencode_target(&self.base_url)
             && let Ok(value) = HeaderValue::from_str(OPENCODE_USER_AGENT)
@@ -2759,6 +2759,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
 
         let response = match self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
@@ -2844,6 +2845,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
@@ -2923,6 +2925,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
@@ -3044,6 +3047,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
+            // fork(#41): OpenCode session header (opencode_session.rs).
             .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&native_request),
                 credential.as_deref(),
@@ -3266,6 +3270,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let mut req_builder = client.post(&url).json(&payload);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
+            // fork(#41): token captured before spawn, applied here.
             req_builder = apply_opencode_session_value(req_builder, opencode_session.as_deref());
 
             let response = match req_builder.send().await {
@@ -3415,6 +3420,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
+            // fork(#41): token captured before spawn, applied here.
             req_builder = apply_opencode_session_value(req_builder, opencode_session.as_deref());
 
             // Send request
@@ -3531,6 +3537,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let mut req_builder = client.post(&url).json(&request);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
+            // fork(#41): token captured before spawn, applied here.
             req_builder = apply_opencode_session_value(req_builder, opencode_session.as_deref());
 
             let response = match req_builder.send().await {

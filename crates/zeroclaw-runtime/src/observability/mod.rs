@@ -888,6 +888,7 @@ mod tests {
             log_persistence_max_entries: 50,
             ..ObservabilityConfig::default()
         };
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _trace_guard = runtime_trace::TRACE_TEST_LOCK.blocking_lock();
         runtime_trace::init_from_config(&cfg, tmp.path());
 

@@ -589,6 +589,11 @@ mod tests {
             pacing,
             strict_tool_parsing: false,
             channel: None,
+            // Shared by every test in this module. A test that scans the
+            // process-global log broadcast MUST override it with its own id
+            // (see `diagnostic_record_carries_attribution_and_no_message_content`),
+            // or a sibling's record wins the first-message scan under
+            // `--test-threads=16`.
             turn_id: "turn-roundtrip-test",
             agent_alias: Some("analyst_deepseek_pro"),
             parent_agent_alias: None,

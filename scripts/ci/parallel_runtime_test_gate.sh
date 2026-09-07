@@ -39,6 +39,8 @@ esac
 # a parallelism bug in the code under test, and it is unfixable while the writer
 # is global. The test keeps its coverage in the required `Test` job, which runs
 # under nextest (process per test); only this redundant in-process rerun skips it.
+# Adding a skip? `parallel_runtime_test_scope.test.sh` asserts the exact cargo
+# argv this script emits — update its expected strings in the same commit.
 skips=(
     observability::runtime_trace::tests::legacy_record_event_writes_legacy_shape_and_rolls
     # Same singleton, second victim (2026-09-07): this test re-points the global
