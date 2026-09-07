@@ -355,50 +355,75 @@ def assess_completeness(
         for series in daemon_expected
         if any(value > 0 for _ts, value in _series_points(series))
     }
-    up_by_slot = {_slot_of(series): _series_points(series) for series in daemon_up}
-    last_success_by_slot = {
-        _slot_of(series): _series_points(series) for series in daemon_last_success
-    }
+    up_by_slot = _by_slot(daemon_up)
+    last_success_by_slot = _by_slot(daemon_last_success)
+    start_by_slot = _by_slot(daemon_start)
     stale_limit = max(STALE_FLOOR_SECS, 3 * result.cadence_secs)
-    if expected_slots and not daemon_start:
-        # Without daemon start times a restart is undetectable, so native
-        # reconciliation has no baseline. Absent input is "not measured", never
-        # a pass.
-        result.note("нет времени старта daemon — база сверки неизвестна")
-        native_ok = False
     for slot in sorted(expected_slots):
+        name = _slot_name(slot)
         up_points = up_by_slot.get(slot, [])
         if not up_points or any(value < 1 for _ts, value in up_points):
-            result.note(f"слот {slot}: наблюдение daemon прерывалось")
+            result.note(f"слот {name}: наблюдение daemon прерывалось")
             native_ok = False
         success_points = last_success_by_slot.get(slot, [])
         if not success_points:
-            result.note(f"слот {slot}: нет отметок последнего успешного опроса")
+            result.note(f"слот {name}: нет отметок последнего успешного опроса")
             native_ok = False
         for timestamp, value in success_points:
             if timestamp - value > stale_limit:
-                result.note(f"слот {slot}: устаревший снимок daemon")
+                result.note(f"слот {name}: устаревший снимок daemon")
                 native_ok = False
                 break
-
-    for series in daemon_start:
-        values = {
-            value for _ts, value in _series_points(series) if value > 0
-        }
-        if len(values) > 1:
-            result.note("daemon перезапускался — native-счётчики сброшены")
+        # Per slot, not "is the whole list non-empty": one slot with a start
+        # time does not vouch for the others, and without a start time a
+        # restart on that slot is undetectable.
+        start_points = [
+            (timestamp, value)
+            for timestamp, value in start_by_slot.get(slot, [])
+            if value > 0
+        ]
+        if not start_points:
+            result.note(f"слот {name}: нет времени старта — база сверки неизвестна")
+            native_ok = False
+        elif len({value for _ts, value in start_points}) > 1:
+            result.note(f"слот {name}: daemon перезапускался — счётчики сброшены")
             native_ok = False
 
     result.native = COMPLETE if native_ok else INCOMPLETE
     return result
 
 
+def _by_slot(series_list: list[dict]) -> dict[tuple[str, str], list[tuple[float, float]]]:
+    """Group range vectors by (instance, slot).
+
+    A plain dict keyed on the slot number silently keeps only the last series,
+    so a broken slot on one Machine disappears behind a healthy slot of the
+    same number on another.
+    """
+    grouped: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    for series in series_list:
+        grouped.setdefault(_slot_of(series), []).extend(_series_points(series))
+    return grouped
+
+
+def _slot_name(slot: tuple[str, str]) -> str:
+    instance, number = slot
+    return f"{instance}/{number}" if instance else number
+
+
 def _instance_of(series: dict) -> str:
     return str(series.get("metric", {}).get("instance", ""))
 
 
-def _slot_of(series: dict) -> str:
-    return str(series.get("metric", {}).get("daemon_slot", "?"))
+def _slot_of(series: dict) -> tuple[str, str]:
+    """Identity of a daemon slot is (instance, slot), never the slot alone.
+
+    Slot numbers restart at 00 on every Machine, so keying by the number alone
+    lets a healthy slot 00 on one instance overwrite a broken slot 00 on
+    another and the window reads "complete".
+    """
+    metric = series.get("metric", {})
+    return (str(metric.get("instance", "")), str(metric.get("daemon_slot", "?")))
 
 
 # ── report data ──────────────────────────────────────────────────────────────

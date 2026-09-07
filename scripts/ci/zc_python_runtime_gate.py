@@ -228,6 +228,15 @@ def check_completeness_rejects_absent_inputs() -> None:
     )
 
 
+def check_slot_identity_includes_instance() -> None:
+    """Slot numbers restart at 00 on every Machine; the number alone is not an
+    identity, and a last-one-wins lookup hides a broken daemon behind a healthy
+    one of the same number."""
+    a = rep._slot_of({"metric": {"instance": "a", "daemon_slot": "00"}})
+    b = rep._slot_of({"metric": {"instance": "b", "daemon_slot": "00"}})
+    check(a != b, "two instances share one slot identity")
+
+
 def check_child_secret_denylist() -> None:
     source = (ROOT / "scripts" / "gateway_manager.py").read_text(encoding="utf-8")
     for name in ("ZEROCLAW_METRICS_QUERY_TOKEN", "ZEROCLAW_REPORT_OWNER_MACHINE_ID"):
@@ -247,6 +256,7 @@ def main() -> int:
         check_report_window_and_contract,
         check_report_flag_is_read,
         check_completeness_rejects_absent_inputs,
+        check_slot_identity_includes_instance,
         check_child_secret_denylist,
     ):
         try:
