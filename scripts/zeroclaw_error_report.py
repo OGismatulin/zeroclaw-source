@@ -591,63 +591,85 @@ def _ru_number(value: float | None) -> str:
     return f"{value:.1f}".replace(".", ",")
 
 
+def _state_icon(state: str) -> str:
+    return {COMPLETE: "✅", INCOMPLETE: "⚠️"}.get(state, "🚫")
+
+
 def render_report(data: ReportData) -> str:
+    """Rich Markdown for the bot's `/zeroclaw/notify`.
+
+    Only constructs that survive BOTH delivery paths are used: the rich one and
+    the markdown→HTML fallback the bot falls back to when rich messages are off.
+    That fallback knows headings, bullets, bold, blockquote and inline code —
+    tables and `<details>` reach the reader as raw pipes and literal tags.
+    """
     window = data.window
     start_local = window.start_utc.astimezone(ZoneInfo(window.timezone))
     end_local = window.end_utc.astimezone(ZoneInfo(window.timezone))
     lines = [
-        f"*ZeroClaw* — окно {start_local:%d.%m} 00:00–{end_local:%d.%m} 00:00 "
+        f"# 🛡 ZeroClaw — ошибки за {start_local:%d.%m}",
+        "",
+        f"**Окно:** {start_local:%d.%m} 00:00–{end_local:%d.%m} 00:00 "
         f"({window.timezone})",
-        f"HTTP-наблюдение: {_with_reasons(data.completeness.http, data.completeness, 'http')}",
-        f"Runtime-наблюдение: {_with_reasons(data.completeness.native, data.completeness, 'native')}",
+        "",
+        "**Наблюдение**",
+        f"- {_state_icon(data.completeness.http)} HTTP-наблюдение: "
+        f"{data.completeness.http}",
+        f"- {_state_icon(data.completeness.native)} Runtime-наблюдение: "
+        f"{data.completeness.native}",
     ]
+    # One shared list: the reasons are not per-scope, and repeating the same
+    # three of them on both lines is what turned the old report into a wall.
+    if data.completeness.reasons:
+        lines.append("")
+        lines.append("**Пробелы в наблюдении**")
+        lines.extend(f"- {reason}" for reason in data.completeness.reasons[:3])
+    lines.append("")
+    lines.append("**Трафик**")
     requests = data.webhook_requests
     errors = data.webhook_errors
     if requests.measured and requests.value == 0:
-        lines.append("Запросов /webhook не было")
+        lines.append("- Запросов `/webhook` не было")
     elif requests.measured and errors.measured and requests.value:
         share = 100.0 * (errors.value or 0.0) / requests.value
+        lines.append(f"- Запросы `/webhook`: **{requests.render()}**")
         lines.append(
-            f"Запросы /webhook: {requests.render()}; неуспешные: {errors.render()} "
+            f"- Неуспешные: **{errors.render()}** "
             f"(≈{f'{share:.1f}'.replace('.', ',')}%)"
         )
     else:
-        lines.append(
-            f"Запросы /webhook: {requests.render()}; неуспешные: {errors.render()}"
-        )
-    if data.webhook_by_code:
-        causes = ", ".join(
-            f"{code} ≈{_ru_number(amount)}" for code, _component, amount in data.webhook_by_code
-        )
-        lines.append(f"Причины: {causes}")
-    elif data.completeness.http == COMPLETE:
-        lines.append("Причины: неуспешных запросов не зафиксировано")
-    else:
-        lines.append(f"Причины: {UNMEASURED}")
-    lines.append(f"Ошибки /upload: {data.upload_errors.render()} (вне error-rate)")
+        lines.append(f"- Запросы `/webhook`: {requests.render()}")
+        lines.append(f"- Неуспешные: {errors.render()}")
+    lines.append(f"- Ошибки `/upload`: {data.upload_errors.render()} — вне error-rate")
+    lines.append(f"- Перезапуски daemon: {data.daemon_restarts.render()}")
     lines.append(
-        f"Терминальные gateway failures: {data.gateway_native_errors.render()} "
-        "(сверочный native-сигнал, не суммируется с HTTP)"
+        f"- Терминальные gateway failures: {data.gateway_native_errors.render()} "
+        "— сверочный native-сигнал, не суммируется с HTTP"
     )
-    lines.append(f"Перезапуски daemon: {data.daemon_restarts.render()}")
-    lines.append("Model/tool breakdown: не измеряется в v1")
-    lines.append("Доставка ответа пользователю и bot-local ошибки: не измеряются")
+    lines.append("")
+    lines.append("**Причины**")
+    if data.webhook_by_code:
+        for code, component, amount in data.webhook_by_code:
+            lines.append(f"- {code} ≈{_ru_number(amount)} · `{component}`")
+    elif data.completeness.http == COMPLETE:
+        lines.append("- неуспешных запросов не зафиксировано")
+    else:
+        lines.append(f"- {UNMEASURED}")
+    lines.append("")
+    lines.append("> Model/tool breakdown: не измеряется в v1")
+    lines.append("> Доставка ответа пользователю и bot-local ошибки: не измеряются")
     text = "\n".join(lines)
     return text[:MAX_REPORT_CHARS]
-
-
-def _with_reasons(state: str, completeness: Completeness, scope: str) -> str:
-    if state == COMPLETE or not completeness.reasons:
-        return state
-    return f"{state} — {'; '.join(completeness.reasons[:3])}"
 
 
 def render_unavailable_notice(window: Window, kind: str) -> str:
     start_local = window.start_utc.astimezone(ZoneInfo(window.timezone))
     return (
-        f"*ZeroClaw* — отчёт за {start_local:%d.%m} не построен\n"
-        f"Причина: запрос к метрикам не удался ({kind})\n"
-        "Это НЕ означает отсутствие ошибок — наблюдение недоступно."
+        f"# ⚠️ ZeroClaw — отчёт за {start_local:%d.%m} не построен\n"
+        "\n"
+        f"**Причина:** запрос к метрикам не удался (`{kind}`)\n"
+        "\n"
+        "> Это НЕ означает отсутствие ошибок — наблюдение недоступно."
     )
 
 
