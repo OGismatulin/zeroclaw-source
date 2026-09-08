@@ -634,7 +634,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         and the delegate died with zero output. Delegates retry same-provider
 #         x3 with NO fallback (D2), so the per-request ceiling has to cover the
 #         model's worst case, not its median.
-CURRENT_CONFIG_MARKER = "v3-59"
+CURRENT_CONFIG_MARKER = "v3-60"
 
 
 def sanitize_filename(filename: str) -> str:

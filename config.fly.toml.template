@@ -511,6 +511,11 @@ allowed_commands = [
     "gh",
     "glab",
     "code_repos_sync.py",
+    "sleep",
+    "sort",
+    "uname",
+    "du",
+    "bash",
 ]
 forbidden_paths = [
     "/etc",
