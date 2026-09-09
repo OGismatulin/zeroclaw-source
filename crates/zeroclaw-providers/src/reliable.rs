@@ -1431,6 +1431,19 @@ impl ReliableModelProvider {
         {
             // Use Retry-After but cap at 30s to avoid indefinite waits
             retry_after.min(30_000).max(base)
+        } else if is_rate_limited(err) {
+            // fork(#44): a rate limit needs a cooldown, not the generic 500ms
+            // base. The failover path already waits RATE_LIMIT_COOLDOWN, but it
+            // is gated on `model_providers.len() > 1`; a delegate runs a
+            // single-provider chain by design (no fallback keeps the analyst's
+            // failure domain), so it fell through to 500ms -> 1s and burned all
+            // three attempts inside ~1.5s -- shorter than any concurrency
+            // window. Production: `analyst_glm` on the z.ai subscription
+            // (glm-5.3, 5 concurrent requests allowed) failed this way 22 times
+            // over 17 runs, so the ensemble ran with 4 sources instead of 5 and
+            // the user got an "analyst failed" notice on most runs.
+            // A server-supplied Retry-After still wins (branch above).
+            base.max(Self::RATE_LIMIT_COOLDOWN.as_millis() as u64)
         } else {
             base
         }
@@ -4509,6 +4522,50 @@ mod tests {
         let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
         let err = anyhow::Error::msg("500 Server Error");
         assert_eq!(model_provider.compute_backoff(500, &err), 500);
+    }
+
+    #[test]
+    fn compute_backoff_applies_rate_limit_cooldown_without_retry_after() {
+        // fork(#44): three attempts at 500ms/1s span ~1.5s -- shorter than any
+        // concurrency window, which is why `analyst_glm` on the z.ai
+        // subscription (5 concurrent requests allowed) burned all its attempts
+        // 22 times over 17 production runs. The failover path already cools
+        // down for RATE_LIMIT_COOLDOWN, but it is gated on having a second
+        // provider; a delegate has exactly one by design.
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("429 Too Many Requests: rate limit exceeded");
+        assert_eq!(
+            model_provider.compute_backoff(500, &err),
+            ReliableModelProvider::RATE_LIMIT_COOLDOWN.as_millis() as u64
+        );
+    }
+
+    #[test]
+    fn compute_backoff_rate_limit_keeps_a_larger_base() {
+        // The cooldown is a floor, not a cap: exponential growth still applies.
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("429 Too Many Requests");
+        assert_eq!(model_provider.compute_backoff(25_000, &err), 25_000);
+    }
+
+    #[test]
+    fn compute_backoff_rate_limit_still_obeys_server_retry_after() {
+        // The server knows better than our floor: an explicit "retry in 3s"
+        // wins, so a provider that answers fast is not slowed to 10s.
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("429 Retry-After: 3");
+        assert_eq!(model_provider.compute_backoff(500, &err), 3_000);
+    }
+
+    #[test]
+    fn compute_backoff_leaves_non_rate_limit_errors_fast() {
+        // Timeouts and 5xx must keep retrying quickly -- the cooldown is scoped
+        // to rate limits only.
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        for text in ["500 Server Error", "operation timed out", "503 unavailable"] {
+            let err = anyhow::Error::msg(text);
+            assert_eq!(model_provider.compute_backoff(500, &err), 500, "{text}");
+        }
     }
 
     // ── §2.1 API auth error (401/403) tests ──────────────────
