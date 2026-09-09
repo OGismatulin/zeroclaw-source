@@ -5599,6 +5599,32 @@ mod tests {
     }
 
     #[test]
+    fn process_substitution_guard_is_quote_blind_and_hits_js_arrow_functions() {
+        // Documented consequence, not a wish: the `>(` / `<(` guard is a raw
+        // substring check, so it fires inside quotes too. A JS arrow function
+        // returning an object literal (`e=>({...})`) contains `>(` and is
+        // rejected before the browser is ever reached -- that is what killed
+        // the mandated `agent-browser eval` measurement pass of the Jira HTML
+        // worker on 2026-09-08 (two rejected calls, then the loop detector).
+        // The guard stays as-is (loosening it re-opens process substitution);
+        // callers must write `=> (` or a plain `function`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["agent-browser".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed(
+            "agent-browser eval 'JSON.stringify([...document.querySelectorAll(\".x\")].map(e=>({w:e.scrollWidth})))'"
+        ));
+        assert!(p.is_command_allowed(
+            "agent-browser eval 'JSON.stringify([...document.querySelectorAll(\".x\")].map(e => ({w:e.scrollWidth})))'"
+        ));
+        assert!(p.is_command_allowed(
+            "agent-browser eval 'document.documentElement.scrollWidth > innerWidth'"
+        ));
+    }
+
+    #[test]
     fn specific_allowlist_with_block_true_still_runs_shell_guard() {
         let p = SecurityPolicy {
             allowed_commands: vec!["echo".into(), "ls".into()],

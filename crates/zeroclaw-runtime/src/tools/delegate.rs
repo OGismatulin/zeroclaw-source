@@ -2552,7 +2552,21 @@ impl DelegateTool {
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            // fork(#43): the delegate prompt honours the SAME effective mode
+            // that gates `read_skill` registration (`tools/mod.rs`
+            // effective_skills_prompt_mode). Upstream hardcodes Full here
+            // (v0.8.3/v0.8.4), so a `[skills] prompt_injection_mode =
+            // "compact"` config gave every delegate BOTH the on-demand loader
+            // and the full inlined corpus: 60 x SKILL.md = 1_002_384 bytes
+            // ~= 250_600 tokens of system floor, above the compaction budget of
+            // every model in the jira roster (247_099 codex / 140_000 glm).
+            // `None` (legacy unit-test constructors without a root config)
+            // keeps the previous Full default.
+            skills_prompt_mode: self
+                .root_config
+                .as_ref()
+                .map(|config| config.effective_skills_prompt_mode(agent_alias))
+                .unwrap_or(zeroclaw_config::schema::SkillsPromptInjectionMode::Full),
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
@@ -4933,6 +4947,80 @@ mod tests {
             "{bg_result:?}"
         );
         assert!(bg_result.error.is_none(), "{bg_result:?}");
+    }
+
+    fn prompt_probe_skill() -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["FORK43_INLINED_INSTRUCTION_BODY".into()],
+            slash_options: Vec::new(),
+            location: Some(PathBuf::from("/tmp/workspace/skills/deploy/SKILL.md")),
+        }
+    }
+
+    fn delegate_prompt_with_skills_mode(
+        mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    ) -> String {
+        // fork(#43): the delegate system prompt must follow the configured
+        // effective mode, not a hardcoded Full. Upstream inlined the whole
+        // skill corpus into every delegate prompt regardless of config.
+        let mut root = Config::default();
+        root.skills.prompt_injection_mode = mode;
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![]))
+            .with_root_config(Arc::new(root));
+        let mut prompt_config = config.clone();
+        prompt_config.resolved = tool.resolve_loop_runtime("agentic", &config);
+        let skills = vec![prompt_probe_skill()];
+        let prompt_tools: Vec<Box<dyn Tool>> = vec![];
+        tool.build_enriched_system_prompt(
+            "agentic",
+            &prompt_config,
+            "model-test",
+            &prompt_tools,
+            Path::new("/tmp/workspace"),
+            false,
+            Some(&skills),
+        )
+        .expect("prompt should render")
+    }
+
+    #[test]
+    fn delegate_prompt_compact_mode_omits_inlined_skill_instructions() {
+        let prompt = delegate_prompt_with_skills_mode(
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+        assert!(
+            prompt.contains("<name>deploy</name>"),
+            "compact delegate prompt still advertises the skill roster: {prompt}"
+        );
+        assert!(
+            !prompt.contains("FORK43_INLINED_INSTRUCTION_BODY"),
+            "compact delegate prompt must NOT inline skill instructions: {prompt}"
+        );
+        assert!(
+            prompt.contains("read_skill"),
+            "compact delegate prompt must point at the on-demand loader: {prompt}"
+        );
+    }
+
+    #[test]
+    fn delegate_prompt_full_mode_still_inlines_skill_instructions() {
+        let prompt = delegate_prompt_with_skills_mode(
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+        assert!(
+            prompt.contains("FORK43_INLINED_INSTRUCTION_BODY"),
+            "full delegate prompt must keep inlining instructions: {prompt}"
+        );
     }
 
     #[tokio::test]
