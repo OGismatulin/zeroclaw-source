@@ -68,6 +68,20 @@ pub enum LoopDetectionResult {
 
 // ── Internal types ───────────────────────────────────────────────
 
+/// fork(#42): a wait is a separator, not a call. It must sit in the window so
+/// `detect_exact_repeat`'s `take_while` stops at the pause (incident
+/// zc-fa70026b339e4e57, 2026-09-08), and it must stay invisible to the other two
+/// patterns, which is the invariant the wait exemption shipped with on
+/// 2026-07-11: "must not count toward loop detection (no_progress /
+/// exact_repeat / ping_pong)". Recording a wait as an ordinary call instead
+/// resurrects DV-34269: nine varying sleeps plus one silent shell call hash to
+/// "no progress x10".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordKind {
+    Call,
+    Wait,
+}
+
 /// A single recorded tool invocation inside the sliding window.
 #[derive(Debug, Clone)]
 struct ToolCallRecord {
@@ -77,6 +91,8 @@ struct ToolCallRecord {
     args_hash: u64,
     /// Hash of the tool's output/result.
     result_hash: u64,
+    /// fork(#42): whether this entry is a real call or a wait separator.
+    kind: RecordKind,
 }
 
 /// Produce a deterministic hash for a JSON value by recursively sorting
@@ -137,6 +153,28 @@ impl LoopDetector {
         args: &serde_json::Value,
         result: &str,
     ) -> LoopDetectionResult {
+        self.record_kind(name, args, result, RecordKind::Call)
+    }
+
+    /// fork(#42): record a wait/poll as a streak separator. The verdict is
+    /// always `Ok`: a wait may break someone else's streak, never start its own.
+    pub fn record_wait(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        result: &str,
+    ) -> LoopDetectionResult {
+        self.record_kind(name, args, result, RecordKind::Wait);
+        LoopDetectionResult::Ok
+    }
+
+    fn record_kind(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        result: &str,
+        kind: RecordKind,
+    ) -> LoopDetectionResult {
         if !self.config.enabled {
             return LoopDetectionResult::Ok;
         }
@@ -145,6 +183,7 @@ impl LoopDetector {
             name: name.to_string(),
             args_hash: hash_value(args),
             result_hash: hash_str(result),
+            kind,
         };
 
         // Maintain sliding window.
@@ -212,11 +251,22 @@ impl LoopDetector {
         }
         let needed = min_cycles.saturating_mul(2); // each cycle = 2 calls
 
-        if self.window.len() < needed {
+        // fork(#42): wait separators are not turns of an alternation. Filtering
+        // BEFORE the length check matters: counting them would measure the
+        // threshold against a window padded with waits, so a delegate poll
+        // burst (`check_result` <-> sleep) would read as a live ping-pong the
+        // moment the next real call anchored the tail (DV-34269 class).
+        let calls: Vec<&ToolCallRecord> = self
+            .window
+            .iter()
+            .filter(|r| r.kind == RecordKind::Call)
+            .collect();
+
+        if calls.len() < needed {
             return None;
         }
 
-        let tail: Vec<&ToolCallRecord> = self.window.iter().rev().take(needed).collect();
+        let tail: Vec<&ToolCallRecord> = calls.iter().rev().take(needed).copied().collect();
         // tail[0] is most recent; pattern: A, B, A, B, ...
         let a_name = &tail[0].name;
         let b_name = &tail[1].name;
@@ -239,7 +289,7 @@ impl LoopDetector {
 
         // Count total alternating length for escalation.
         let mut cycles = min_cycles;
-        let extended: Vec<&ToolCallRecord> = self.window.iter().rev().collect();
+        let extended: Vec<&ToolCallRecord> = calls.iter().rev().copied().collect();
         for extra_pair in extended.chunks(2).skip(min_cycles) {
             if extra_pair.len() == 2
                 && &extra_pair[0].name == a_name
@@ -281,18 +331,37 @@ impl LoopDetector {
             return None; // detector disabled
         }
 
-        if self.window.len() < min_calls {
+        // fork(#42): same reason as in detect_ping_pong — the population is
+        // real calls. Sleeps return "(no output)" and the agent varies their
+        // duration, which is exactly the "different args, identical result"
+        // shape this pattern hunts for; counting them made a healthy wait
+        // protocol look like DV-34269.
+        if self
+            .window
+            .iter()
+            .filter(|r| r.kind == RecordKind::Call)
+            .count()
+            < min_calls
+        {
             return None;
         }
 
-        let last = self.window.back()?;
+        let last = self
+            .window
+            .iter()
+            .rev()
+            .find(|r| r.kind == RecordKind::Call)?;
         // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
         let same_tool_same_result: Vec<&ToolCallRecord> = self
             .window
             .iter()
-            .filter(|r| r.name == last.name && r.result_hash == last.result_hash)
+            .filter(|r| {
+                r.kind == RecordKind::Call
+                    && r.name == last.name
+                    && r.result_hash == last.result_hash
+            })
             .collect();
 
         let count = same_tool_same_result.len();

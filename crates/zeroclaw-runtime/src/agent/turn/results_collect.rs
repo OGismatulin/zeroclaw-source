@@ -37,9 +37,12 @@ fn is_pure_sleep_command(cmd: &str) -> bool {
 }
 
 /// A tool call that is *waiting for* async work rather than *doing* work.
-/// Polling a background delegate legitimately repeats these; feeding them to
-/// the loop detector would trip the circuit breaker on a healthy wait. Narrow
-/// by design — real work (`delegate` action, arbitrary `shell`) still counts.
+/// Polling a background delegate legitimately repeats these. fork(#42): such a
+/// call is fed to the detector as a separator only (`record_wait`) — it never
+/// escalates and stays invisible to ping-pong and no-progress, so the
+/// 2026-07-11 invariant holds while a wait still breaks someone else's
+/// exact-repeat streak. Narrow by design — real work (`delegate` action,
+/// arbitrary `shell`) still counts.
 fn is_wait_poll_call(tool: &str, args: &serde_json::Value) -> bool {
     match tool {
         "delegate" => matches!(
@@ -182,6 +185,22 @@ pub(crate) fn collect_tool_results(
                 }
             }
         }
+        // fork(#42): a wait/poll is not a repetition, but it IS a separator.
+        // Without this a `query -> sleep -> same query` poll keeps the
+        // exact-repeat streak alive across the wait and dies on the fifth poll:
+        // incident zc-fa70026b339e4e57 (2026-09-08) killed a chat turn that was
+        // waiting for ads to activate. `record_wait` can never escalate and is
+        // invisible to ping-pong and no-progress, so the #25 invariant survives;
+        // `loop_ignore_tools` entries stay fully invisible, which is what the
+        // operator asked for by listing them; only successful calls are fed, for
+        // the same reason the branch above is gated on `outcome.success`.
+        if !loop_ignore_tools.contains(tool_name.as_str())
+            && is_wait_poll_call(&tool_name, args)
+            && outcome.success
+        {
+            loop_detector.record_wait(&tool_name, args, &outcome.output);
+        }
+
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
         let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
@@ -408,6 +427,119 @@ mod tests {
                 "(no output)",
             )
             .expect("sleep must never bail");
+        }
+    }
+
+    // fork(#42): a wait is a separator, not a repetition. Only exact-repeat is
+    // under test here, so the other two patterns are disabled.
+    #[test]
+    fn a_wait_separates_an_identical_argument_streak() {
+        let mut det = LoopDetector::new(LoopDetectorConfig {
+            enabled: true,
+            window_size: 20,
+            max_repeats: 3,
+            no_progress_min_calls: 0,
+            ping_pong_min_cycles: 0,
+        });
+        for round in 1..=8 {
+            run_round(
+                &mut det,
+                "lalafo-db__query",
+                serde_json::json!({"sql": "SELECT count(*) FROM ad WHERE user_id = 1"}),
+                "rows: 215",
+            )
+            .unwrap_or_else(|e| panic!("round {round}: poll must survive the wait, got: {e}"));
+            run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": r#"python3 -c "import time; time.sleep(90)""#}),
+                "(no output)",
+            )
+            .unwrap_or_else(|e| panic!("round {round}: the wait itself must never bail, got: {e}"));
+        }
+    }
+
+    // fork(#42) regression: the exempt burst must not become evidence against
+    // the first NON-exempt call that follows it. `delegate cancel_task` is the
+    // documented end of the wait protocol (ensemble-analysis skill), and with
+    // waits recorded as ordinary calls it used to see `delegate` <-> `shell`
+    // alternating and bail.
+    #[test]
+    fn a_delegate_poll_burst_does_not_ping_pong_a_later_real_delegate_call() {
+        let mut det = detector(); // ping_pong_min_cycles = 4
+        for _ in 0..10 {
+            run_round(
+                &mut det,
+                "delegate",
+                serde_json::json!({"action": "check_result", "task_id": "t1"}),
+                "(no output)",
+            )
+            .expect("poll must never bail");
+            run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": r#"python3 -c "import time; time.sleep(180)""#}),
+                "(no output)",
+            )
+            .expect("sleep must never bail");
+        }
+        run_round(
+            &mut det,
+            "delegate",
+            serde_json::json!({"action": "cancel_task", "task_id": "t1"}),
+            "cancelled",
+        )
+        .expect("ending the wait protocol must not trip the ping-pong breaker");
+    }
+
+    // fork(#42) regression for DV-34269: sleeps return "(no output)" and the
+    // agent varies their duration, so as ordinary records they are exactly the
+    // "different args, identical result" shape no-progress hunts for.
+    #[test]
+    fn sleeps_do_not_count_as_no_progress_for_a_later_silent_shell() {
+        let mut det = detector(); // no_progress_min_calls = 5
+        for secs in [120, 60, 30, 90, 45, 15, 75, 20, 150] {
+            run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": format!(r#"python3 -c "import time; time.sleep({secs})""#)}),
+                "(no output)",
+            )
+            .expect("sleep must never bail");
+        }
+        run_round(
+            &mut det,
+            "shell",
+            serde_json::json!({"command": "ls artifacts"}),
+            "(no output)",
+        )
+        .expect("a silent real shell call after waits must not be no-progress");
+    }
+
+    // fork(#42): a wait-separated poll is bounded by max_tool_iterations and the
+    // turn timeout, NOT by the loop detector — the same place the delegate wait
+    // protocol has been since 2026-07-11. This test pins that as a decision: it
+    // goes red the moment someone lets waits back into ping-pong.
+    #[test]
+    fn an_endless_wait_separated_poll_is_bounded_only_by_the_iteration_budget() {
+        let mut det = LoopDetector::new(LoopDetectorConfig::default());
+        for round in 1..=20 {
+            run_round(
+                &mut det,
+                "lalafo-db__query",
+                serde_json::json!({"sql": "SELECT 1"}),
+                "rows: 1",
+            )
+            .unwrap_or_else(|e| {
+                panic!("round {round}: the detector must not bound this, got: {e}")
+            });
+            run_round(
+                &mut det,
+                "shell",
+                serde_json::json!({"command": "sleep 30"}),
+                "(no output)",
+            )
+            .unwrap_or_else(|e| panic!("round {round}: the wait itself must never bail, got: {e}"));
         }
     }
 
