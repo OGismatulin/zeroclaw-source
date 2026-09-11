@@ -32,14 +32,14 @@ schema_version = 3
 #     an SQL count, a Creatio report), same answers (Creatio 59/840 identical), 181 s
 #     total vs 220 s. Bench doc: docs/analysis/2026-08-25-chat-default-model-bench.md.
 #   * Delegates keep their own slots and have NO fallback by design (invariant D2), so
-#     they stay on proven models: [providers.models.opencode.flash] = deepseek-v4-flash.
+#     they stay on proven models: [providers.models.opencode.flash] = deepseek-v4.1-flash.
 # Watch: grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
 #          | grep -oE "model=[a-z0-9.-]+" | sort | uniq -c
 # Go rollback slot: no longer the chat default (see the header), kept on a proven
-# model so flipping ZEROCLAW_PROVIDER back to opencode-go lands on deepseek-v4-flash,
+# model so flipping ZEROCLAW_PROVIDER back to opencode-go lands on deepseek-v4.1-flash,
 # not on a flaky slot (ox-alpha-free had 54 x 503 and is now off the router entirely).
 [providers.models.opencode.go]
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 # Go-router accepts reasoning_effort in the request body; deepseek gates the
@@ -48,11 +48,11 @@ api_key = ""
 # stays unset (codex default xhigh). Only low/medium/high/xhigh/max — NOT minimal (400).
 provider_extra = { reasoning_effort = "high" }
 
-# Background/delegate alias: deepseek-v4-flash, the model with zero 503s over the
+# Background/delegate alias: deepseek-v4.1-flash, the model with zero 503s over the
 # observation window. [agents.worker] and [agents.jira_worker] point here because
 # delegate turns have no fallback (D2) -- see the boot-slot note above.
 [providers.models.opencode.flash]
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "high" }
@@ -63,7 +63,7 @@ provider_extra = { reasoning_effort = "high" }
 # a marker bump is the whole rollback. Spec:
 # 2026-07-24-jira-judge-ensemble-input-integrity §5.3.
 [providers.models.opencode.go_coordinator]
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
@@ -168,7 +168,7 @@ provider_extra = { reasoning_effort = "max" }
 model = "deepseek-v4-flash"
 api_key = ""
 
-# Ensemble analyst alias on the Go router (2026-08-26): deepseek-v4-flash instead
+# Ensemble analyst alias on the Go router (2026-08-26): deepseek-v4.1-flash instead
 # of deepseek-v4-pro on api.deepseek.com — the analyst now rides the opencode-go
 # subscription key (OPENCODE_GO_API_KEY) instead of DEEPSEEK_API_KEY. Same
 # reasoning_effort = "max" as the other analysts (Go-router valid on this model —
@@ -178,7 +178,7 @@ api_key = ""
 # (jira-analysis-pipeline D2: same-provider retry x3, no fallback).
 # Rollback = repoint [agents.analyst_deepseek_pro] back to deepseek.pro + marker bump.
 [providers.models.opencode.deepseek]
-model = "deepseek-v4-flash"
+model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "max" }
@@ -241,31 +241,31 @@ fallback_providers = ["opencode-go"]
 # gpt-5.5, gpt-5.4*, glm-5-turbo, glm-5.1, glm-5.2, minimax-m2.7, mimo-v2.5,
 # kimi-k2.7-code, ox-alpha-free, muse-spark-1.2-contributor) dropped;
 # glm-5.3-flash + longcat-2.0 added (single + multi-turn tool loop PASS, 2 probes
-# each). deepseek-v4-flash is the fallback target, so it is never a key.
+# each). deepseek-v4.1-flash is the fallback target, so it is never a key.
 # Codex family
-"gpt-5.6-sol"        = ["deepseek-v4-flash"]
-"gpt-5.6-terra"      = ["deepseek-v4-flash"]
-"gpt-5.6-luna"       = ["deepseek-v4-flash"]
+"gpt-5.6-sol"        = ["deepseek-v4.1-flash"]
+"gpt-5.6-terra"      = ["deepseek-v4.1-flash"]
+"gpt-5.6-luna"       = ["deepseek-v4.1-flash"]
 # Go-plan native opencode-go
-"glm-5.3"            = ["deepseek-v4-flash"]
-"kimi-k3"            = ["deepseek-v4-flash"]
-"minimax-m3"         = ["deepseek-v4-flash"]
-"mimo-v2.5-pro"      = ["deepseek-v4-flash"]
-"qwen3.7-plus"       = ["deepseek-v4-flash"]
-"qwen3.8-max"        = ["deepseek-v4-flash"]
-"hy3"                = ["deepseek-v4-flash"]
-"deepseek-v4-pro"    = ["deepseek-v4-flash"]
-"glm-5.3-flash"      = ["deepseek-v4-flash"]
-"longcat-2.0"        = ["deepseek-v4-flash"]
+"glm-5.3"            = ["deepseek-v4.1-flash"]
+"kimi-k3"            = ["deepseek-v4.1-flash"]
+"minimax-m3"         = ["deepseek-v4.1-flash"]
+"mimo-v2.5-pro"      = ["deepseek-v4.1-flash"]
+"qwen3.7-plus"       = ["deepseek-v4.1-flash"]
+"qwen3.8-max"        = ["deepseek-v4.1-flash"]
+"hy3"                = ["deepseek-v4.1-flash"]
+"deepseek-v4-pro"    = ["deepseek-v4.1-flash"]
+"glm-5.3-flash"      = ["deepseek-v4.1-flash"]
+"longcat-2.0"        = ["deepseek-v4.1-flash"]
 # Catalog v7 (2026-08-31): new on the Go router, single + multi-turn tool
 # loop PASS x2 each on a healthy key.
-"qwen3.8-flash"      = ["deepseek-v4-flash"]
-"hy4-preview"        = ["deepseek-v4-flash"]
+"qwen3.8-flash"      = ["deepseek-v4.1-flash"]
+"hy4-preview"        = ["deepseek-v4.1-flash"]
 # Catalog v8 (2026-09-11): new on the Go router, single + multi-turn tool
 # loop PASS on healthy key, 256k+ token capacity.
-"deepseek-flash"     = ["deepseek-v4-flash"]
-"deepseek-v4.1-flash"= ["deepseek-v4-flash"]
-"omen-alpha"         = ["deepseek-v4-flash"]
+"deepseek-flash"     = ["deepseek-v4.1-flash"]
+"deepseek-v4-flash"  = ["deepseek-v4.1-flash"]
+"omen-alpha"         = ["deepseek-v4.1-flash"]
 
 # ── Memory ──────────────────────────────────────────────────────────────────
 [memory]
