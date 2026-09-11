@@ -868,6 +868,46 @@ mcp_bundles = ["all"]
 [agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
+# Research specialists (design 2026-09-11-jira-research-specialists, owner
+# decisions D1/D3): the map, the cross-service contracts and the acceptance
+# study, plus the single gap pass of the B contract. All four sit on the
+# existing openai.codex_luna alias (gpt-5.6-luna at reasoning_effort = max) and
+# on the existing jira_analysis runtime profile -- D1: an hour per role is
+# enough and a fourth profile would only add a fourth copy of
+# context_compression.model_windows to keep in sync. They are aux workers, NOT
+# members of ANALYST_ROSTER, and deliberately absent from FAILURE_DOMAINS.
+[agents.jira_topology_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_topology_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.jira_contract_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_contract_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.jira_acceptance_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_acceptance_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.jira_gap_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_gap_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
 [image_gen]
 enabled = true
 default_backend = "fast"

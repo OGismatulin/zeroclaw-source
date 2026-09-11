@@ -634,7 +634,15 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         and the delegate died with zero output. Delegates retry same-provider
 #         x3 with NO fallback (D2), so the per-request ceiling has to cover the
 #         model's worst case, not its median.
-CURRENT_CONFIG_MARKER = "v3-62"
+# v3-63 = four research aliases for the Jira analysis route
+#         (jira_topology_researcher / jira_contract_researcher /
+#         jira_acceptance_researcher / jira_gap_researcher), all on the existing
+#         openai.codex_luna provider alias and the existing jira_analysis
+#         runtime profile (owner decisions D1/D3, design 2026-09-11). Aux
+#         workers only: they are NOT in ANALYST_ROSTER and NOT in
+#         FAILURE_DOMAINS, so a research slot can never register as a core
+#         analyst and block the ensemble barrier.
+CURRENT_CONFIG_MARKER = "v3-63"
 
 
 def sanitize_filename(filename: str) -> str:
