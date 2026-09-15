@@ -326,6 +326,11 @@ pub(crate) fn fallback_auth_ready_for_alias(
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
 
+    // fork(#45): ask the same credential resolver as the build path
+    if crate::fallback_credential_present(provider_kind, key) {
+        return true;
+    }
+
     // openai missing-entry fallback: keep construction symmetric with
     // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
     // but constructing the same chat-anchored fallback avoids any future

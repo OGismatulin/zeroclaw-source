@@ -1097,6 +1097,38 @@ fn resolve_model_provider_credential(
         .filter(|v| !v.is_empty())
 }
 
+/// fork(#45): does a credential EXIST for this provider kind, by the same rules
+/// the build path uses (`resolve_model_provider_credential`) minus the generic
+/// `ZEROCLAW_API_KEY` tail.
+///
+/// The generic tail is excluded on purpose: on Fly it is always set (neuralwatt),
+/// so including it would make every fallback ref pass the gate and turn a loud
+/// boot failure into a 401 at call time. `custom` is the one kind that legitimately
+/// resolves through it, so it keeps the tail.
+pub(crate) fn fallback_credential_present(provider_kind: &str, key: Option<&str>) -> bool {
+    if key.map(str::trim).is_some_and(|value| !value.is_empty()) {
+        return true;
+    }
+    for env_var in provider_env_candidates(provider_kind) {
+        if credential_from_file_env(&format!("{env_var}_FILE")).is_some() {
+            return true;
+        }
+        if let Ok(value) = std::env::var(env_var) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return true;
+            }
+        }
+    }
+    if provider_kind == "custom" {
+        return std::env::var("ZEROCLAW_API_KEY")
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+    }
+    false
+}
+
 /// Single source of truth for `(key_prefix, canonical_model_provider_family)`
 /// pairs used by `check_api_key_prefix`. Order matters: longer prefixes
 /// must come before shorter ones that share a head (`sk-ant-` and `sk-or-`
@@ -4649,8 +4681,158 @@ mod tests {
     }
 
     #[test]
+    fn g1_1_fallback_credential_present_resolves_env_and_file() {
+        use super::test_util::{EnvGuard, env_lock};
+        let _guard = env_lock();
+
+        // 1. OPENCODE_GO_API_KEY set in env
+        {
+            let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+            let _key = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-test-key"));
+            let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+            let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
+            assert!(fallback_credential_present("opencode", Some("")));
+            assert!(fallback_credential_present("opencode", None));
+        }
+
+        // 2. OPENCODE_GO_API_KEY_FILE set to a non-empty file
+        {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let key_file = temp_dir.path().join("opencode.key");
+            std::fs::write(&key_file, "sk-file-key\n").unwrap();
+
+            let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", Some(key_file.to_str().unwrap()));
+            let _key = EnvGuard::set("OPENCODE_GO_API_KEY", None);
+            let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+            let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
+            assert!(fallback_credential_present("opencode", Some("")));
+        }
+
+        // 3. Both unset -> false
+        {
+            let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+            let _key = EnvGuard::set("OPENCODE_GO_API_KEY", None);
+            let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+            let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
+            assert!(!fallback_credential_present("opencode", Some("")));
+            assert!(!fallback_credential_present("opencode", None));
+        }
+    }
+
+    #[test]
+    fn g1_2_fallback_credential_present_excludes_generic_tail_except_for_custom() {
+        use super::test_util::{EnvGuard, env_lock};
+        let _guard = env_lock();
+
+        let _zc = EnvGuard::set("ZEROCLAW_API_KEY", Some("generic-neuralwatt-key"));
+        let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+        let _key = EnvGuard::set("OPENCODE_GO_API_KEY", None);
+        let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+
+        // Generic ZEROCLAW_API_KEY must NOT satisfy opencode
+        assert!(!fallback_credential_present("opencode", Some("")));
+        assert!(!fallback_credential_present("opencode", None));
+
+        // Generic ZEROCLAW_API_KEY MUST satisfy custom
+        assert!(fallback_credential_present("custom", Some("")));
+        assert!(fallback_credential_present("custom", None));
+    }
+
+    #[test]
+    fn g1_3_resilient_alias_builds_with_opencode_fallback_chain() {
+        use super::test_util::{EnvGuard, env_lock};
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, OpencodeModelProviderConfig,
+        };
+
+        let _guard = env_lock();
+        let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+        let _provider = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-test-opencode-key"));
+        let _opencode = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _zeroclaw = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5.6-luna".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "opencode.flash",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.opencode.insert(
+            "flash".to_string(),
+            OpencodeModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("deepseek-v4.1-flash".to_string()),
+                    api_key: Some("".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "codex",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "resilient alias with opencode fallback resolved via env must succeed: {:?}",
+            result.err()
+        );
+
+        // Also verify candidate count directly via push_pinned_entries + append_fallback_chain
+        let primary = create_model_provider_inner(
+            Some(&config),
+            "openai",
+            "codex",
+            Some("primary-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .unwrap();
+        let mut model_providers = Vec::new();
+        push_pinned_entries(
+            &mut model_providers,
+            &config,
+            "openai",
+            "codex",
+            primary,
+            None,
+        );
+        let mut visited = vec!["openai.codex".to_string()];
+        append_fallback_chain(
+            &mut model_providers,
+            &config,
+            &config.providers.models.openai["codex"].base.fallback,
+            &mut visited,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            model_providers.len(),
+            2,
+            "chain must contain primary and fallback candidates"
+        );
+    }
+
+    #[test]
     fn resilient_alias_fails_when_resolved_fallback_lacks_profile_credential() {
+        use super::test_util::{EnvGuard, env_lock};
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let _guard = env_lock();
+        let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
         let mut config = Config::default();
         config.providers.models.openai.insert(
@@ -4707,7 +4889,11 @@ mod tests {
 
     #[test]
     fn resilient_alias_fails_when_resolved_fallback_uri_lacks_profile_credential() {
+        use super::test_util::{EnvGuard, env_lock};
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let _guard = env_lock();
+        let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
         let mut config = Config::default();
         config.providers.models.openai.insert(
@@ -4765,9 +4951,15 @@ mod tests {
 
     #[test]
     fn resilient_alias_fails_when_minimax_fallback_lacks_auth_source() {
+        use super::test_util::{EnvGuard, env_lock};
         use zeroclaw_config::schema::{
             Config, MinimaxModelProviderConfig, ModelProviderConfig, OpenAIModelProviderConfig,
         };
+
+        let _guard = env_lock();
+        let _mm = EnvGuard::set("MINIMAX_API_KEY", None);
+        let _mm_file = EnvGuard::set("MINIMAX_API_KEY_FILE", None);
+        let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
 
         let mut config = Config::default();
         config.providers.models.openai.insert(

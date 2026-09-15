@@ -801,6 +801,7 @@ turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }�
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-reasoning-roundtrip = provider requires reasoning round-trip; dropped one plain assistant turn
+history-trim-reason-reasoning-roundtrip-placeholder = provider requires reasoning round-trip; injected placeholder reasoning into assistant turn
 history-trim-reason-message-cap = 已超出历史消息数量限制
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }

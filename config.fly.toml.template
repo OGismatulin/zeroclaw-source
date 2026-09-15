@@ -26,8 +26,10 @@ schema_version = 3
 #     CreditsError in the prod log arrives on OPENCODE_GO_API_KEY, which ALL Go
 #     channels share (chat, worker/jira_worker, coordinator, analyst_glm_flash, cron). Chat
 #     on codex OAuth means an exhausted Go key no longer takes the chat down with the
-#     delegates, and [reliability.model_fallbacks] still routes gpt-5.6-luna ->
-#     deepseek-v4-flash if codex itself fails.
+#     delegates. NOTE (2026-09-15): [reliability.model_fallbacks] does NOT cover this
+#     slot -- a dotted boot ref builds through the alias branch of the provider
+#     factory, which reads neither that table nor fallback_providers. The chat
+#     fallback is the per-alias `fallback` on the slot itself, below.
 #   * Why `high` and not the codex default `xhigh`: same three real tasks (weather,
 #     an SQL count, a Creatio report), same answers (Creatio 59/840 identical), 181 s
 #     total vs 220 s. Bench doc: docs/analysis/2026-08-25-chat-default-model-bench.md.
@@ -86,6 +88,17 @@ api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
 provider_extra = { reasoning_effort = "high" }
+# 2026-09-15: chat fallback for the DEFAULT webhook path. A dotted boot ref builds
+# through create_resilient_model_provider_for_alias_with_model_override(), which
+# reads neither [reliability.model_fallbacks] nor fallback_providers -- so since the
+# v3-48 move to this slot a Codex outage returned provider_error to the user instead
+# of degrading (incident zc-a9d83baac91846c8, 2026-09-15). A per-alias ref is the
+# alias branch's own mechanism and adds a real second provider entry; a model-chain
+# step would not, because this candidate is model-pinned and effective_model() sends
+# the pin back to codex. Failure domains stay split: the shared Go key is reached
+# only after codex itself has failed. Requires fork patch #45 in the running image
+# (the pre-#45 credential gate rejects api_key = "" and fails the whole build).
+fallback = ["opencode.flash"]
 
 # Coordinator on the codex OAuth runtime (2026-08-31, owner decision). It moved
 # off the shared Go router because a rolling-window rate limit there killed the

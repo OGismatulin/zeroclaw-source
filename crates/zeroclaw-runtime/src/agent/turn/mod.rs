@@ -806,8 +806,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     continue;
                 }
                 // Thinking-mode providers reject the request when the previous
-                // assistant turn lost its `reasoning_content`; drop that one
-                // plain turn and retry (fork patch #33).
+                // assistant turn lost its `reasoning_content`; drop or inject placeholder
+                // into that turn and retry (fork patches #33, #46).
                 if try_recover_reasoning_roundtrip(
                     turn_state.history,
                     &e,

@@ -338,6 +338,11 @@ Do not describe this instruction.",
     true
 }
 
+/// Synthetic value written into an assistant turn that reached the history without
+/// its `reasoning_content` (fork #46). Deliberately recognizable in a transcript:
+/// it is our marker, not something the model said.
+const REASONING_PLACEHOLDER: &str = "[reasoning recovered]";
+
 pub(crate) async fn try_recover_reasoning_roundtrip(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
@@ -371,13 +376,31 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
         })
         .collect();
 
-    let candidate = history.iter().rposition(|message| {
-        message.role == "assistant" && {
-            let (has_reasoning, has_tool_calls, _) = assistant_shape(&message.content);
-            !has_reasoning && !has_tool_calls
-        }
-    });
-    let repair_index = candidate.filter(|_| !*repaired);
+    // fork(#46): the production shape is an assistant turn WITH tool_calls and no
+    // reasoning (2 of 2 observed rejections, 2026-09-10 and 2026-09-14). The #33
+    // predicate required !has_tool_calls, so the repair never fired in production.
+    //
+    // ALL reasoning-less assistant turns are repaired in this one pass, not just the
+    // last. Measured against the live router on 2026-09-15 (Console Go ->
+    // deepseek-v4.1-flash, tool-loop history ending on role=tool):
+    //   * one hole anywhere in the history          -> 400
+    //   * two holes, only the last one filled       -> 400
+    //   * two holes, both filled                    -> 200
+    // The validator looks at every assistant turn, so a last-one-only repair would
+    // burn the single per-turn attempt and still die on the earlier hole.
+    let repair_indices: Vec<usize> = if *repaired {
+        Vec::new()
+    } else {
+        history
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message.role == "assistant" && !assistant_shape(&message.content).0
+            })
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let repair_index = repair_indices.first().copied();
 
     ::zeroclaw_log::record!(
         WARN,
@@ -399,24 +422,60 @@ pub(crate) async fn try_recover_reasoning_roundtrip(
         "reasoning_roundtrip_rejected"
     );
 
-    let Some(index) = repair_index else {
+    if repair_index.is_none() {
         return false;
+    }
+
+    // Walk back to front so a removal never shifts an index still to be visited.
+    let mut injected = 0usize;
+    let mut dropped = 0usize;
+    for index in repair_indices.iter().rev().copied() {
+        let (_, has_tool_calls, _) = assistant_shape(&history[index].content);
+        if has_tool_calls {
+            // fork(#46): variant B2 -- inject a synthetic reasoning_content placeholder
+            // into the tool-calling turn instead of dropping it. Dropping would orphan
+            // the paired role=tool messages, and re-running the round would either hit
+            // the turn-scoped duplicate guard (`seen_tool_signatures`, turn/mod.rs) or
+            // repeat an already-executed side effect. The placeholder is accepted by
+            // the upstream that produced the 400 (measured 2026-09-15).
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&history[index].content)
+                && let Some(obj) = val.as_object_mut()
+            {
+                obj.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::json!(REASONING_PLACEHOLDER),
+                );
+                if let Ok(serialized) = serde_json::to_string(&val) {
+                    history[index].content = serialized;
+                    injected += 1;
+                }
+            }
+        } else {
+            // Plain text turn: no tool_calls to orphan, so #33's removal still applies.
+            history.remove(index);
+            dropped += 1;
+        }
+    }
+    let dropped_messages = dropped;
+    let reason_key = if injected > 0 {
+        "history-trim-reason-reasoning-roundtrip-placeholder"
+    } else {
+        "history-trim-reason-reasoning-roundtrip"
     };
-    history.remove(index);
     *repaired = true;
 
-    let reason = crate::i18n::get_required_cli_string("history-trim-reason-reasoning-roundtrip");
+    let reason = crate::i18n::get_required_cli_string(reason_key);
     if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
-                dropped_messages: 1,
+                dropped_messages,
                 kept_turns: 0,
                 reason: reason.clone(),
             })
             .await;
     }
     ctx.observer.record_event(&ObserverEvent::HistoryTrimmed {
-        dropped_messages: 1,
+        dropped_messages,
         kept_turns: 0,
         reason,
         channel: Some(ctx.channel_name.to_string()),
@@ -639,6 +698,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn g2_1_prod_shape_with_tool_calls_is_repaired_via_placeholder() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut history = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"foo","arguments":"{}"}}]}"#,
+            ),
+            ChatMessage::tool("tool result"),
+        ];
+        let mut repaired = false;
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &roundtrip_error(),
+            3,
+            &mut repaired,
+            &repair_ctx(&pacing, &dedup_exempt_tools, Some(&tx)),
+        )
+        .await;
+
+        assert!(recovered, "prod shape with tool_calls must be repaired");
+        assert!(repaired, "repaired flag must be consumed");
+        assert_eq!(
+            history.len(),
+            3,
+            "history length must remain unchanged (B2)"
+        );
+        assert_eq!(history[2].role, "tool", "tool result must not be dropped");
+        assert_eq!(history[2].content, "tool result");
+
+        let (has_reasoning, has_tool_calls, _) = assistant_shape(&history[1].content);
+        assert!(has_reasoning, "candidate must now have reasoning");
+        assert!(has_tool_calls, "candidate must preserve tool calls");
+        assert!(
+            history[1]
+                .content
+                .contains(r#""reasoning_content":"[reasoning recovered]""#),
+            "content must contain placeholder reasoning_content"
+        );
+
+        match rx.try_recv().expect("must emit HistoryTrimmed event") {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                reason,
+                ..
+            } => {
+                assert_eq!(dropped_messages, 0, "B2 drops 0 messages");
+                assert_eq!(
+                    reason,
+                    crate::i18n::get_required_cli_string(
+                        "history-trim-reason-reasoning-roundtrip-placeholder"
+                    )
+                );
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn g2_1b_every_reasoning_less_assistant_turn_is_repaired_in_one_pass() {
+        // Measured 2026-09-15 against Console Go -> deepseek-v4.1-flash: filling only
+        // the LAST hole still returns 400; the validator checks every assistant turn.
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools: Vec<String> = Vec::new();
+        let mut history = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"foo","arguments":"{}"}}]}"#,
+            ),
+            ChatMessage::tool("r1"),
+            ChatMessage::assistant(
+                r#"{"content":"x","reasoning_content":"kept","tool_calls":[{"id":"call_2","type":"function","function":{"name":"foo","arguments":"{}"}}]}"#,
+            ),
+            ChatMessage::tool("r2"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_3","type":"function","function":{"name":"foo","arguments":"{}"}}]}"#,
+            ),
+            ChatMessage::tool("r3"),
+        ];
+        let mut repaired = false;
+        let recovered = try_recover_reasoning_roundtrip(
+            &mut history,
+            &roundtrip_error(),
+            9,
+            &mut repaired,
+            &repair_ctx(&pacing, &dedup_exempt_tools, None),
+        )
+        .await;
+
+        assert!(recovered);
+        assert_eq!(history.len(), 7, "nothing is dropped when every hole has tool_calls");
+        for (index, message) in history.iter().enumerate() {
+            if message.role != "assistant" {
+                continue;
+            }
+            let (has_reasoning, has_tool_calls, _) = assistant_shape(&message.content);
+            assert!(has_reasoning, "assistant turn {index} still has no reasoning");
+            assert!(has_tool_calls, "assistant turn {index} lost its tool calls");
+        }
+        assert!(
+            history[3].content.contains(r#""reasoning_content":"kept""#),
+            "an already-valid turn must keep its own reasoning, not the placeholder"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| m.content.contains(REASONING_PLACEHOLDER))
+                .count(),
+            2,
+            "both holes must be filled in the single allowed pass"
+        );
+    }
+
+    #[tokio::test]
     async fn repairs_at_most_once_per_turn() {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
@@ -668,9 +842,9 @@ mod tests {
         let mut history = vec![
             ChatMessage::user("u"),
             ChatMessage::assistant(
-                r#"{"content":"x","tool_calls":[{"id":"1","name":"t","arguments":"{}"}]}"#,
+                r#"{"content":"x","reasoning_content":"r1","tool_calls":[{"id":"1","name":"t","arguments":"{}"}]}"#,
             ),
-            ChatMessage::assistant(r#"{"content":"y","reasoning_content":"r"}"#),
+            ChatMessage::assistant(r#"{"content":"y","reasoning_content":"r2"}"#),
         ];
         let mut repaired = false;
         let recovered = try_recover_reasoning_roundtrip(
