@@ -789,13 +789,20 @@ mod tests {
         .await;
 
         assert!(recovered);
-        assert_eq!(history.len(), 7, "nothing is dropped when every hole has tool_calls");
+        assert_eq!(
+            history.len(),
+            7,
+            "nothing is dropped when every hole has tool_calls"
+        );
         for (index, message) in history.iter().enumerate() {
             if message.role != "assistant" {
                 continue;
             }
             let (has_reasoning, has_tool_calls, _) = assistant_shape(&message.content);
-            assert!(has_reasoning, "assistant turn {index} still has no reasoning");
+            assert!(
+                has_reasoning,
+                "assistant turn {index} still has no reasoning"
+            );
             assert!(has_tool_calls, "assistant turn {index} lost its tool calls");
         }
         assert!(
