@@ -326,7 +326,15 @@ pub(crate) fn fallback_auth_ready_for_alias(
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
 
-    // fork(#45): ask the same credential resolver as the build path
+    // fork(#45): ask the same credential resolver as the build path.
+    //
+    // I93 -- two answers to one question drift apart. This gate and
+    // `resolve_model_provider_credential` (the one the BUILD path uses) must agree:
+    // upstream's gate only knew about the literal `api_key`, the fork's resolver also
+    // reads `<CAND>_FILE` and the family env candidates, and under the project's
+    // `api_key = ""` policy the disagreement made every per-alias `fallback` abort the
+    // whole provider build. Adding a resolution source below means adding it there too;
+    // `gate_agrees_with_build_path_resolver_for_every_env_family` pins the agreement.
     if crate::fallback_credential_present(provider_kind, key) {
         return true;
     }

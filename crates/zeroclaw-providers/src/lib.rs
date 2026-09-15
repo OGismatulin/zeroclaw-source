@@ -1503,6 +1503,16 @@ fn create_model_provider_inner(
         .map(|provider| apply_vision_override(provider, options.vision))
 }
 
+/// Build a resilient provider from a BARE family name.
+///
+/// fork(#47): this is the branch that reads the GLOBAL resilience tables --
+/// `reliability.fallback_providers` (cross-provider) and, via
+/// `with_model_fallbacks`, `[reliability.model_fallbacks]` (per-model chains).
+/// Its sibling for dotted `<family>.<alias>` refs,
+/// `create_resilient_model_provider_for_alias_with_model_override`, reads
+/// NEITHER and honours only the alias's own `fallback` / `fallback_models`.
+/// The names do not say this; the map lives in the `zeroclaw-provider-factory`
+/// skill and in docs/architecture/reliability.md.
 pub fn create_resilient_model_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1610,6 +1620,14 @@ pub fn create_resilient_model_provider_for_alias(
     )
 }
 
+/// Build a resilient provider from a DOTTED `<family>.<alias>` ref.
+///
+/// fork(#47): reads NO global resilience table -- not
+/// `reliability.fallback_providers`, not `[reliability.model_fallbacks]`. The
+/// only spare candidates are this alias's `fallback` and `fallback_models`.
+/// A model-chain step could not help anyway: the candidate is model-pinned and
+/// `ProviderCandidateDescriptor::effective_model` returns the pin, so the chain
+/// would come straight back to the same provider.
 fn create_resilient_model_provider_for_alias_with_model_override(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1634,6 +1652,11 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
+    let has_declared_fallback = config
+        .providers
+        .models
+        .find(family, alias)
+        .is_some_and(|entry| !entry.fallback.is_empty() || !entry.fallback_models.is_empty());
     if let Some(entry) = config.providers.models.find(family, alias) {
         append_fallback_chain(
             &mut model_providers,
@@ -1642,6 +1665,27 @@ fn create_resilient_model_provider_for_alias_with_model_override(
             &mut visited,
             1,
         )?;
+    }
+
+    // fork(#47): this branch reads NEITHER `reliability.fallback_providers` NOR
+    // `[reliability.model_fallbacks]` -- only the alias's own `fallback` /
+    // `fallback_models`. That asymmetry with the bare-family branch is invisible
+    // in the function names and cost production three weeks without a chat
+    // fallback (incident zc-a9d83baac91846c8, 2026-09-15). Say it out loud when a
+    // global table is configured but unreachable from here, so the next operator
+    // reads a log line instead of re-deriving the branch split.
+    if !reliability.model_fallbacks.is_empty() && !has_declared_fallback {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "alias": format!("{family}.{alias}"),
+                    "configured_model_fallbacks": reliability.model_fallbacks.len(),
+                })),
+            "alias-built provider ignores [reliability.model_fallbacks]; declare a per-alias \
+             `fallback` on this entry if this candidate needs one"
+        );
     }
 
     let reliable = ReliableModelProvider::new_with_entries(
@@ -4716,6 +4760,58 @@ mod tests {
             let _zc = EnvGuard::set("ZEROCLAW_API_KEY", None);
             assert!(!fallback_credential_present("opencode", Some("")));
             assert!(!fallback_credential_present("opencode", None));
+        }
+    }
+
+    /// fork(#47), I93+I72: the readiness gate must agree with the resolver the build
+    /// path uses, for EVERY family that has env candidates -- and the family list is
+    /// read out of the source of truth (`provider_env_candidates`) instead of being
+    /// retyped here, so a new family cannot be added without this test covering it.
+    #[test]
+    fn gate_agrees_with_build_path_resolver_for_every_env_family() {
+        use super::test_util::{EnvGuard, env_lock};
+        let _guard = env_lock();
+        let _generic = EnvGuard::set("ZEROCLAW_API_KEY", None);
+
+        // The families the fork actually resolves from the environment. Kept in sync by
+        // construction: every name here is asserted to HAVE candidates, so dropping one
+        // from `provider_env_candidates` fails this test instead of silently shrinking it.
+        for family in [
+            "opencode",
+            "openrouter",
+            "zai",
+            "glm",
+            "minimax",
+            "deepseek",
+        ] {
+            let candidates = provider_env_candidates(family);
+            assert!(
+                !candidates.is_empty(),
+                "{family} lost its env candidates; the gate would stop agreeing silently"
+            );
+            let primary = candidates[0];
+            let guards: Vec<EnvGuard> = candidates.iter().map(|c| EnvGuard::set(c, None)).collect();
+
+            assert!(
+                !fallback_credential_present(family, Some("")),
+                "{family}: no credential anywhere, gate must refuse"
+            );
+            assert!(
+                resolve_model_provider_credential(family, Some("")).is_none(),
+                "{family}: build path must agree there is no credential"
+            );
+            drop(guards);
+
+            let _set = EnvGuard::set(primary, Some("probe-key"));
+            assert!(
+                fallback_credential_present(family, Some("")),
+                "{family}: {primary} is set, gate must accept"
+            );
+            assert_eq!(
+                resolve_model_provider_credential(family, Some("")).as_deref(),
+                Some("probe-key"),
+                "{family}: build path must resolve the same credential the gate accepted"
+            );
         }
     }
 
