@@ -2327,7 +2327,14 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
-                        name: tool_name,
+                        // fork(#47): the OpenCode relay's strict backends
+                        // reject this non-standard field outright; see
+                        // rejects_tool_result_name.
+                        name: if self.rejects_tool_result_name() {
+                            None
+                        } else {
+                            tool_name
+                        },
                     };
                 }
 
@@ -2438,6 +2445,25 @@ impl OpenAiCompatibleModelProvider {
                     || host == "gateway.ai.cloudflare.com"
                     || host.ends_with(".cloudflare.com")
             })
+    }
+
+    /// Whether this backend rejects the non-standard `name` field on
+    /// `role: "tool"` messages.
+    ///
+    /// The OpenAI schema for a tool result carries only `role`, `content` and
+    /// `tool_call_id`; `name` is an extension we send because Groq rejects a
+    /// tool result without it (`400 Tools should have a name!`, upstream
+    /// #7909). Several backends behind the OpenCode relay validate strictly
+    /// and reject the whole request with `messages[N]: "name" is not
+    /// supported by this endpoint`. Measured 2026-09-17 on the Go endpoint:
+    /// `glm-5.3-flash` and `omen-alpha` fail 8/8 with the field and pass 5/5
+    /// without it, while every other catalog model accepts both. Since fork
+    /// patch #41 pins a conversation to one backend, an unlucky session hits
+    /// this on every tool result of its life rather than intermittently.
+    ///
+    /// fork(#47)
+    fn rejects_tool_result_name(&self) -> bool {
+        crate::opencode_session::is_opencode_target(&self.base_url)
     }
 
     fn targets_mistral_tool_call_contract(&self) -> bool {
@@ -4922,6 +4948,85 @@ mod tests {
             tool_msg.name.as_deref(),
             Some("shell"),
             "tool name should resolve from paired assistant tool-call"
+        );
+    }
+
+    /// History with one assistant tool-call and its tool result — the exact
+    /// shape every tool loop produces from its second iteration on.
+    fn tool_result_history() -> Vec<ChatMessage> {
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "call_abc",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            }]
+        });
+        vec![
+            ChatMessage::assistant(history_json.to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_abc",
+                    "content": "done"
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn convert_messages_for_native_omits_tool_result_name_for_opencode() {
+        // Strict backends behind the OpenCode relay reject the non-standard
+        // `name` on a tool result with HTTP 400 `"name" is not supported by
+        // this endpoint`, killing the turn (client_error is non-retryable and
+        // a delegate has no fallback). Measured 2026-09-17: glm-5.3-flash
+        // fails 5/5 with the field and passes 4/4 without it.
+        let provider = make_model_provider("opencode-go", OPENCODE_GO_URL, None);
+        let native = provider.convert_messages_for_native(&tool_result_history(), true);
+
+        assert_eq!(native.len(), 2);
+        let tool_msg = &native[1];
+        assert_eq!(tool_msg.role, "tool");
+        assert_eq!(
+            tool_msg.name, None,
+            "the OpenCode relay rejects `name` on tool results"
+        );
+        // The gate drops that one field and nothing else: the wire still needs
+        // the id and the payload.
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_abc"));
+        assert!(matches!(
+            tool_msg.content.as_ref(),
+            Some(MessageContent::Text(value)) if value == "done"
+        ));
+        let serialized = serde_json::to_value(tool_msg).unwrap();
+        assert!(
+            serialized.get("name").is_none(),
+            "no `name` key may reach the wire: {serialized}"
+        );
+    }
+
+    #[test]
+    fn convert_messages_for_native_omits_tool_result_name_for_opencode_zen() {
+        // Both relay endpoints share one backend pool, so the gate is on the
+        // host, not on the endpoint path.
+        let provider = make_model_provider("opencode", OPENCODE_ZEN_URL, None);
+        let native = provider.convert_messages_for_native(&tool_result_history(), true);
+
+        assert_eq!(native[1].name, None);
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_tool_result_name_for_non_opencode() {
+        // Groq is why the field exists: without it the tool result is rejected
+        // with `400 Tools should have a name!` (upstream #7909). Every host
+        // that is not the OpenCode relay keeps byte-identical behavior.
+        let provider = make_model_provider("groq", "https://api.groq.com/openai/v1", None);
+        let native = provider.convert_messages_for_native(&tool_result_history(), true);
+
+        assert_eq!(
+            native[1].name.as_deref(),
+            Some("shell"),
+            "non-OpenCode backends must keep the tool name"
         );
     }
 
