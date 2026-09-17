@@ -2327,7 +2327,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
-                        // fork(#47): the OpenCode relay's strict backends
+                        // fork(#48): the OpenCode relay's strict backends
                         // reject this non-standard field outright; see
                         // rejects_tool_result_name.
                         name: if self.rejects_tool_result_name() {
@@ -2461,7 +2461,7 @@ impl OpenAiCompatibleModelProvider {
     /// patch #41 pins a conversation to one backend, an unlucky session hits
     /// this on every tool result of its life rather than intermittently.
     ///
-    /// fork(#47)
+    /// fork(#48)
     fn rejects_tool_result_name(&self) -> bool {
         crate::opencode_session::is_opencode_target(&self.base_url)
     }
