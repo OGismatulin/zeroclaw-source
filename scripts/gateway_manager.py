@@ -642,7 +642,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         workers only: they are NOT in ANALYST_ROSTER and NOT in
 #         FAILURE_DOMAINS, so a research slot can never register as a core
 #         analyst and block the ensemble barrier.
-CURRENT_CONFIG_MARKER = "v3-64"
+CURRENT_CONFIG_MARKER = "v3-65"
 
 
 def sanitize_filename(filename: str) -> str:

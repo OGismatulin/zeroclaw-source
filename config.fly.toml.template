@@ -921,6 +921,22 @@ mcp_bundles = ["all"]
 [agents.jira_gap_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
+[agents.jira_evidence_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_evidence_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.jira_impact_researcher]
+model_provider = "openai.codex_luna"
+risk_profile = "default"
+runtime_profile = "jira_analysis"
+mcp_bundles = ["all"]
+[agents.jira_impact_researcher.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
 [image_gen]
 enabled = true
 default_backend = "fast"
