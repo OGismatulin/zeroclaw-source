@@ -72,6 +72,11 @@ swap_size_mb = 512
   ZEROCLAW_ERROR_REPORT_ENABLED = '1'
   ZEROCLAW_REPORT_TIMEZONE = 'Asia/Bishkek'
 
+  # ── Incident sweeper ────────────────────────────────────────────────────
+  # Ships inert. Turning it on is a separate, later step, after its own gates.
+  ZEROCLAW_INCIDENTS_ENABLED = '0'
+  ZEROCLAW_INCIDENTS_SWEEP_SECS = '1800'
+
   # Public URLs — plain env, not secrets. Values are non-sensitive (own app domain + CRM base URL).
   # Kept here instead of fly secrets so the integration wiring is visible in git.
   NOTIFY_URL = 'https://ai-forge-bot.fly.dev/zeroclaw/notify'

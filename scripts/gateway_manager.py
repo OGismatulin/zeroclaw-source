@@ -32,6 +32,18 @@ try:  # image layout: both scripts live side by side in /usr/local/bin
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
     from scripts import volume_janitor
 
+# The incident sweeper is stdlib-only, but it lives next to the other scripts
+# in the image; guard it the same way so a missing file degrades to "no
+# incident snapshot", never to "no chat".
+zeroclaw_incidents: object | None
+try:
+    import zeroclaw_incidents  # type: ignore[no-redef]
+except ModuleNotFoundError:
+    try:
+        from scripts import zeroclaw_incidents  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        zeroclaw_incidents = None
+
 # The metrics exporter is the ONLY thing here that needs a third-party package
 # (prometheus-client). It ships disabled, so a missing dependency must degrade to
 # "no metrics", never to "no chat": an ImportError at module scope would take the
@@ -2059,6 +2071,7 @@ class GatewayManagerServer:
         forward_webhook: Callable[..., tuple[int, dict[str, object]]],
         operator_error_notifier: OperatorErrorNotifier | object | None = None,
         volume_janitor: object | None = None,
+        incident_sweeper: object | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
@@ -2066,6 +2079,7 @@ class GatewayManagerServer:
         self.forward_webhook = forward_webhook
         self.operator_error_notifier = operator_error_notifier
         self.volume_janitor = volume_janitor
+        self.incident_sweeper = incident_sweeper
         self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
         self.error_report_worker: threading.Thread | None = None
 
@@ -3747,6 +3761,141 @@ class VolumeJanitor:
                 return
 
 
+class IncidentSweeper:
+    """Periodic incident-digest sweep. Never raises into the manager.
+
+    Mirrors VolumeJanitor: a daemon thread on an Event, run_once() wraps the
+    sweeper call in try/except and alerts on failure instead of propagating.
+
+    Unlike VolumeJanitor, which runs daily, this sweeps every 30 minutes —
+    shorter than OperatorErrorNotifier's 600s dedupe window, so an unguarded
+    alert would page the operator 48 times a day over one stuck workspace.
+    Alerts are therefore streak-scoped: at most one per run of consecutive
+    failures, re-armed only by a clean sweep.
+    """
+
+    #: Partial (per-workspace) errors are often transient; a raised sweep is
+    #: not, so it alerts on its first occurrence.
+    ALERT_AFTER_PARTIAL = 3
+
+    def __init__(
+        self,
+        *,
+        data_root: Path,
+        interval_secs: float = 1800.0,
+        initial_delay_secs: float = 120.0,
+        sweeper: Callable[..., dict[str, object]] | None = None,
+        alert: Callable[[str, str, str], None] | None = None,
+    ) -> None:
+        self._data_root = data_root
+        self._interval = max(interval_secs, 60.0)
+        self._initial_delay = max(initial_delay_secs, 0.0)
+        # Resolved here, not as a parameter default, so a test that
+        # monkeypatches zeroclaw_incidents.sweep after import is honored.
+        self._sweeper = sweeper if sweeper is not None else zeroclaw_incidents.sweep
+        self._alert = alert
+        self._fail_streak = 0
+        self._alerted_this_streak = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="incident-sweeper", daemon=True
+        )
+        self._thread.start()
+        print(
+            "[gateway-manager] incidents: thread started"
+            f" (every {int(self._interval)}s)",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> dict[str, object]:
+        try:
+            report = self._sweeper(self._data_root, datetime.now(timezone.utc))
+        except Exception as exc:  # a sweep failure must not kill the loop
+            self._record_failure(
+                1,
+                f"incident sweep failed: {exc}",
+                "Check manager logs; the incident digest is not updating",
+            )
+            return {"errors": [{"error": str(exc)}]}
+        print(
+            "[gateway-manager] incidents:"
+            f" appended={report.get('appended')}"
+            f" errors={len(report.get('errors') or [])}",
+            flush=True,
+        )
+        if report.get("errors"):
+            self._record_failure(
+                self.ALERT_AFTER_PARTIAL,
+                f"incident sweep hit {len(report['errors'])} errors",
+                "See manager logs for the incident sweep run",
+            )
+        else:
+            self._fail_streak = 0
+            self._alerted_this_streak = False
+        return report
+
+    def _record_failure(self, threshold: int, error: str, hint: str) -> None:
+        """One alert per streak of failures, never one per run."""
+        self._fail_streak += 1
+        if self._fail_streak >= threshold and not self._alerted_this_streak:
+            self._alerted_this_streak = True
+            self._emit("incident_sweep_failed", error, hint)
+
+    def _emit(self, code: str, error: str, hint: str) -> None:
+        if self._alert is None:
+            return
+        try:
+            self._alert(code, error, hint)
+        except Exception:
+            pass
+
+    def _loop(self) -> None:
+        if self._stop.wait(self._initial_delay):
+            return
+        while not self._stop.is_set():
+            self.run_once()
+            if self._stop.wait(self._interval):
+                return
+
+
+def _start_incident_sweeper(
+    *, data_root: Path, alert: Callable[[str, str, str], None] | None = None
+) -> IncidentSweeper | None:
+    """Start the incident sweeper thread, or explain in one line why not.
+
+    Off by default (ZEROCLAW_INCIDENTS_ENABLED). Every refusal to start is
+    printed on its own line — a sweeper that silently fails to start is
+    indistinguishable downstream from a day with no errors, which is exactly
+    the lie this feature exists to eliminate.
+    """
+    if not _env_bool("ZEROCLAW_INCIDENTS_ENABLED", False):
+        print("[gateway-manager] incidents: disabled by env", flush=True)
+        return None
+    if zeroclaw_incidents is None:
+        print(
+            "[gateway-manager] incidents: ENABLED but module unavailable",
+            flush=True,
+        )
+        return None
+    interval = max(_env_float("ZEROCLAW_INCIDENTS_SWEEP_SECS", 1800.0), 300.0)
+    sweeper = IncidentSweeper(
+        data_root=data_root,
+        interval_secs=interval,
+        initial_delay_secs=120.0,
+        alert=alert,
+    )
+    sweeper.start()
+    return sweeper
+
+
 def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     legacy_bearer_token = os.getenv("ZEROCLAW_BEARER_TOKEN", "").strip()
     pairing_state = PairingState(
@@ -3861,6 +4010,19 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
             operator={"scope": "volume-janitor"},
         )
 
+    def _incident_alert(code: str, error: str, hint: str) -> None:
+        operator_error_notifier.notify(
+            user_id=None,
+            payload=build_error_payload(
+                code=code,
+                component="manager",
+                retryable=False,
+                error=error,
+                hint=hint,
+            ),
+            operator={"scope": "incident-sweeper"},
+        )
+
     janitor: VolumeJanitor | None = None
     if _env_bool("ZEROCLAW_JANITOR_ENABLED", True):
         janitor = VolumeJanitor(
@@ -3876,6 +4038,10 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     else:
         print("[gateway-manager] janitor: disabled by env", flush=True)
 
+    incident_sweeper = _start_incident_sweeper(
+        data_root=settings.data_root, alert=_incident_alert
+    )
+
     server = GatewayManagerServer(
         settings=settings,
         pairing_state=pairing_state,
@@ -3883,6 +4049,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         forward_webhook=_forward,
         operator_error_notifier=operator_error_notifier,
         volume_janitor=janitor,
+        incident_sweeper=incident_sweeper,
     )
     server.metrics_exporter = _start_metrics_exporter(settings, registry)
     server.error_report_worker = _start_error_report_worker(
@@ -4164,6 +4331,9 @@ def main() -> int:
         active_janitor = getattr(app, "volume_janitor", None)
         if active_janitor is not None:
             active_janitor.stop()
+        active_sweeper = getattr(app, "incident_sweeper", None)
+        if active_sweeper is not None:
+            active_sweeper.stop()
         exporter = getattr(app, "metrics_exporter", None)
         if exporter is not None:
             exporter.stop()

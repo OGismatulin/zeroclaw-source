@@ -96,4 +96,5 @@ scripts/
 !scripts/volume_janitor.py
 !scripts/zeroclaw_metrics.py
 !scripts/zeroclaw_error_report.py
+!scripts/zeroclaw_incidents.py
 !scripts/agent_browser_wrapper.sh

@@ -19,6 +19,7 @@ import argparse
 from dataclasses import dataclass, field
 import datetime as dt
 import fcntl
+import functools
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,14 @@ from typing import Callable, Sequence
 import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
+
+try:  # the image ships both scripts side by side; tests import from scripts/
+    import zeroclaw_incidents
+except ImportError:  # pragma: no cover - packaging guard
+    try:
+        from scripts import zeroclaw_incidents  # type: ignore[no-redef]
+    except ImportError:  # pragma: no cover - degrades to no incident sections
+        zeroclaw_incidents = None  # type: ignore[assignment]
 
 DEFAULT_TIMEZONE = "Asia/Bishkek"
 DEFAULT_SEND_HOUR = 7
@@ -457,6 +466,9 @@ class ReportData:
     upload_errors: Measurement
     gateway_native_errors: Measurement
     daemon_restarts: Measurement
+    #: A `zeroclaw_incidents.Digest`, or None when it could not be built
+    #: (module missing, or the builder raised). Never a sign of "zero errors".
+    digest: object | None = None
 
 
 def _scalar(result: list[dict]) -> Measurement:
@@ -592,7 +604,181 @@ def _ru_number(value: float | None) -> str:
 
 
 def _state_icon(state: str) -> str:
-    return {COMPLETE: "✅", INCOMPLETE: "⚠️"}.get(state, "🚫")
+    return {COMPLETE: "✅", INCOMPLETE: "⚠️", "частичное": "⚠️"}.get(state, "🚫")
+
+
+#: HTTP/native use "неполное"; the incidents digest uses "частичное" — both
+#: rank as the same middle tier. The label shown is whichever raw state is
+#: worst, never renamed, so it stays traceable to its source axis.
+_STATE_RANK = {COMPLETE: 0, "частичное": 1, INCOMPLETE: 1, NO_DATA: 2}
+
+
+def _overall_state(data: ReportData) -> str:
+    digest_state = data.digest.state if data.digest is not None else NO_DATA
+    return max(
+        (data.completeness.http, data.completeness.native, digest_state),
+        key=lambda state: _STATE_RANK.get(state, 2),
+    )
+
+
+def _ru_count(n: int, one: str, few: str, many: str) -> str:
+    """Russian plural agreement: 1 отказ, 3 отказа, 5 отказов, 22 отказа…"""
+    n_abs = abs(n)
+    if n_abs % 100 in range(11, 15):
+        word = many
+    else:
+        last = n_abs % 10
+        if last == 1:
+            word = one
+        elif 2 <= last <= 4:
+            word = few
+        else:
+            word = many
+    return f"{n} {word}"
+
+
+_SUMMARY_CHANNEL_LABELS = {"chat": "чат", "cron": "cron", "jira": "jira", "delegate": "делегаты"}
+
+
+def _channel_breakdown(digest: object) -> str:
+    if zeroclaw_incidents is None:
+        return ""
+    return " · ".join(
+        f"{_SUMMARY_CHANNEL_LABELS.get(channel, channel)} {digest.by_channel.get(channel, 0)}"
+        for channel in zeroclaw_incidents.SECTION_ORDER
+    )
+
+
+def _summary_line(data: ReportData) -> str:
+    """The one honesty-bearing line: never a confident total over "нет данных"."""
+    digest = data.digest
+    state = _overall_state(data)
+    icon = _state_icon(state)
+    if digest is None or digest.state == NO_DATA:
+        return f"**Итог:** количество отказов не подтверждено · {icon} наблюдение {state}"
+    parts = [
+        _ru_count(digest.total, "отказ", "отказа", "отказов"),
+        _ru_count(len(digest.groups), "сигнатура", "сигнатуры", "сигнатур"),
+    ]
+    channels = _channel_breakdown(digest)
+    if channels:
+        parts.append(channels)
+    parts.append(f"{icon} наблюдение {state}")
+    return "**Итог:** " + " · ".join(parts)
+
+
+def _http_line(data: ReportData) -> str:
+    requests = data.webhook_requests
+    errors = data.webhook_errors
+    if requests.measured and requests.value == 0:
+        traffic = "запросов `/webhook` не было"
+    else:
+        traffic = f"{requests.render()} запросов `/webhook`, {errors.render()} неуспешных"
+    return f"**HTTP:** {traffic} · {data.daemon_restarts.render()} рестартов daemon"
+
+
+def _http_code_line(data: ReportData) -> str | None:
+    """HTTP `error_code`/`component` breakdown, only when it is non-empty.
+
+    v1 always printed a "Причины" section, even a placeholder one when there
+    was nothing to show. v2 hands that role to the incident sections below —
+    this line survives only for the HTTP-specific codes, and only when there
+    is something nonzero to report (spec §2).
+    """
+    if not data.webhook_by_code:
+        return None
+    codes = " · ".join(
+        f"{code} ≈{_ru_number(amount)} `{component}`"
+        for code, component, amount in data.webhook_by_code
+    )
+    return f"**HTTP-коды:** {codes}"
+
+
+def _http_extra_line(data: ReportData) -> str | None:
+    """`/upload` errors and native gateway failures — printed only when
+    non-zero or unmeasured.
+
+    Neither has any representation in the incidents digest (they are not
+    runtime-trace incidents, so the incidents module can never surface
+    them) — dropping them silently, as v2's one-line HTTP shape did at
+    first, would fetch a real spike and show nobody. Same conditional
+    pattern as `_http_code_line`: a proven zero stays folded away.
+    """
+    upload = data.upload_errors
+    native = data.gateway_native_errors
+    show_upload = not upload.measured or (upload.value or 0) != 0
+    show_native = not native.measured or (native.value or 0) != 0
+    if not show_upload and not show_native:
+        return None
+    parts = []
+    if show_upload:
+        parts.append(f"`/upload` {upload.render()}")
+    if show_native:
+        parts.append(f"native gateway {native.render()}")
+    return "**HTTP-доп:** " + " · ".join(parts)
+
+
+def _gap_lines(data: ReportData) -> list[str]:
+    """Up to 5 completeness reasons across all three axes, with a `+N ещё`.
+
+    Never a silent drop: every axis's reasons feed one shared, deduplicated
+    list, exactly the discipline the old two-line "Наблюдение" block had.
+    """
+    reasons = list(data.completeness.reasons)
+    digest = data.digest
+    if digest is not None:
+        for reason in digest.reasons:
+            if reason not in reasons:
+                reasons.append(reason)
+    elif not reasons:
+        reasons.append("снимок инцидентов недоступен — раздел по каналам не построен")
+    if not reasons:
+        return []
+    shown = reasons[:5]
+    lines = ["", "**Пробелы в наблюдении**"]
+    lines.extend(f"- {reason}" for reason in shown)
+    extra = len(reasons) - len(shown)
+    if extra:
+        lines.append(f"- +{extra} ещё")
+    return lines
+
+
+def _render_report_parts(data: ReportData) -> tuple[str, int]:
+    window = data.window
+    start_local = window.start_utc.astimezone(ZoneInfo(window.timezone))
+    head_lines = [
+        f"# 🛡 ZeroClaw — ошибки за {start_local:%d.%m}",
+        "",
+        _summary_line(data),
+        _http_line(data),
+    ]
+    http_codes = _http_code_line(data)
+    if http_codes is not None:
+        head_lines.append(http_codes)
+    http_extra = _http_extra_line(data)
+    if http_extra is not None:
+        head_lines.append(http_extra)
+    gap_lines = _gap_lines(data)
+    footer_lines = [
+        "",
+        "> Доставка ответа пользователю и bot-local ошибки: не измеряются",
+    ]
+    # The budget for the channel sections is everything NOT already spent on
+    # the head/gaps/footer, so the total is bounded by construction — no
+    # blind `text[:MAX_REPORT_CHARS]` slice at the end.
+    skeleton = "\n".join(head_lines + gap_lines + footer_lines)
+    budget = max(MAX_REPORT_CHARS - len(skeleton) - 1, 0)
+
+    digest = data.digest
+    if digest is not None and zeroclaw_incidents is not None:
+        section_lines, dropped = zeroclaw_incidents.render_sections(
+            digest, budget=budget, timezone_name=window.timezone
+        )
+    else:
+        section_lines, dropped = [], 0
+
+    lines = head_lines + section_lines + gap_lines + footer_lines
+    return "\n".join(lines), dropped
 
 
 def render_report(data: ReportData) -> str:
@@ -603,63 +789,8 @@ def render_report(data: ReportData) -> str:
     That fallback knows headings, bullets, bold, blockquote and inline code —
     tables and `<details>` reach the reader as raw pipes and literal tags.
     """
-    window = data.window
-    start_local = window.start_utc.astimezone(ZoneInfo(window.timezone))
-    end_local = window.end_utc.astimezone(ZoneInfo(window.timezone))
-    lines = [
-        f"# 🛡 ZeroClaw — ошибки за {start_local:%d.%m}",
-        "",
-        f"**Окно:** {start_local:%d.%m} 00:00–{end_local:%d.%m} 00:00 "
-        f"({window.timezone})",
-        "",
-        "**Наблюдение**",
-        f"- {_state_icon(data.completeness.http)} HTTP-наблюдение: "
-        f"{data.completeness.http}",
-        f"- {_state_icon(data.completeness.native)} Runtime-наблюдение: "
-        f"{data.completeness.native}",
-    ]
-    # One shared list: the reasons are not per-scope, and repeating the same
-    # three of them on both lines is what turned the old report into a wall.
-    if data.completeness.reasons:
-        lines.append("")
-        lines.append("**Пробелы в наблюдении**")
-        lines.extend(f"- {reason}" for reason in data.completeness.reasons[:3])
-    lines.append("")
-    lines.append("**Трафик**")
-    requests = data.webhook_requests
-    errors = data.webhook_errors
-    if requests.measured and requests.value == 0:
-        lines.append("- Запросов `/webhook` не было")
-    elif requests.measured and errors.measured and requests.value:
-        share = 100.0 * (errors.value or 0.0) / requests.value
-        lines.append(f"- Запросы `/webhook`: **{requests.render()}**")
-        lines.append(
-            f"- Неуспешные: **{errors.render()}** "
-            f"(≈{f'{share:.1f}'.replace('.', ',')}%)"
-        )
-    else:
-        lines.append(f"- Запросы `/webhook`: {requests.render()}")
-        lines.append(f"- Неуспешные: {errors.render()}")
-    lines.append(f"- Ошибки `/upload`: {data.upload_errors.render()} — вне error-rate")
-    lines.append(f"- Перезапуски daemon: {data.daemon_restarts.render()}")
-    lines.append(
-        f"- Терминальные gateway failures: {data.gateway_native_errors.render()} "
-        "— сверочный native-сигнал, не суммируется с HTTP"
-    )
-    lines.append("")
-    lines.append("**Причины**")
-    if data.webhook_by_code:
-        for code, component, amount in data.webhook_by_code:
-            lines.append(f"- {code} ≈{_ru_number(amount)} · `{component}`")
-    elif data.completeness.http == COMPLETE:
-        lines.append("- неуспешных запросов не зафиксировано")
-    else:
-        lines.append(f"- {UNMEASURED}")
-    lines.append("")
-    lines.append("> Model/tool breakdown: не измеряется в v1")
-    lines.append("> Доставка ответа пользователю и bot-local ошибки: не измеряются")
-    text = "\n".join(lines)
-    return text[:MAX_REPORT_CHARS]
+    text, _dropped = _render_report_parts(data)
+    return text
 
 
 def render_unavailable_notice(window: Window, kind: str) -> str:
@@ -820,6 +951,64 @@ def _open_notify(
         )
 
 
+def deliver_file(
+    name: str,
+    body: str,
+    caption: str,
+    *,
+    config: ReportConfig,
+    opener: Callable[[urllib.request.Request, float], tuple[int, bytes, str]]
+    | None = None,
+    timeout: float = 30.0,
+) -> tuple[str, str]:
+    """Best-effort multipart upload of the full incident list (spec §8).
+
+    Mirrors `workspace/scripts/send_file_telegram.py:95-145`, the proven
+    stdlib client for this endpoint — four parts (`file`, `user_id`,
+    `caption`, `filename`), CRLF-delimited, `X-Webhook-Secret` header.
+    """
+    boundary = "----ZeroClawErrorReportBoundary"
+    parts: list[bytes] = [
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'.encode(),
+        b"Content-Type: application/octet-stream\r\n\r\n",
+        body.encode("utf-8"),
+        b"\r\n",
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="user_id"\r\n\r\n',
+        str(config.recipient).encode(),
+        b"\r\n",
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="caption"\r\n\r\n',
+        caption.encode("utf-8"),
+        b"\r\n",
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="filename"\r\n\r\n',
+        name.encode("utf-8"),
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ]
+    request = urllib.request.Request(
+        url=config.notify_file_url,
+        data=b"".join(parts),
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-Webhook-Secret": config.notify_secret,
+        },
+    )
+    send = opener or _open_notify
+    try:
+        status, resp_body, content_type = send(request, timeout)
+    except urllib.error.HTTPError as exc:
+        return classify_response(
+            exc.code, exc.read(), exc.headers.get("Content-Type", "")
+        )
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return "unknown", f"transport failure: {exc.__class__.__name__}"
+    return classify_response(status, resp_body, content_type)
+
+
 # ── owner gate ───────────────────────────────────────────────────────────────
 
 
@@ -879,9 +1068,13 @@ class ReportConfig:
     timezone: str = DEFAULT_TIMEZONE
     notify_url: str = ""
     notify_secret: str = ""
+    notify_file_url: str = ""
     metrics_base_url: str = ""
     metrics_token: str = ""
     app: str = "ai-forge-zeroclaw"
+    #: Must match the sweeper's own interval, or the completeness gap check
+    #: measures against a cadence nobody runs at.
+    sweep_interval_secs: float = 1800.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ReportConfig":
@@ -893,13 +1086,23 @@ class ReportConfig:
             timezone=env.get("ZEROCLAW_REPORT_TIMEZONE", DEFAULT_TIMEZONE),
             notify_url=env.get("NOTIFY_URL", ""),
             notify_secret=env.get("NOTIFY_SECRET", ""),
+            notify_file_url=env.get("NOTIFY_FILE_URL", ""),
             metrics_base_url=env.get(
                 "ZEROCLAW_METRICS_QUERY_URL",
                 "https://api.fly.io/prometheus/personal",
             ),
             metrics_token=env.get("ZEROCLAW_METRICS_QUERY_TOKEN", ""),
             app=env.get("FLY_APP_NAME", "ai-forge-zeroclaw"),
+            # Same env name and same 300s floor as the sweeper's own reading.
+            sweep_interval_secs=_sweep_interval(env),
         )
+
+
+def _sweep_interval(env: dict[str, str]) -> float:
+    try:
+        return max(float(env.get("ZEROCLAW_INCIDENTS_SWEEP_SECS", "1800")), 300.0)
+    except ValueError:
+        return 1800.0
 
 
 def run_once(
@@ -910,6 +1113,8 @@ def run_once(
     retry_unknown: bool = False,
     client_factory: Callable[[ReportConfig], MetricsClient] | None = None,
     deliver_fn: Callable[..., tuple[str, str]] = deliver,
+    digest_builder: Callable[[Path, dt.datetime, dt.datetime], object] | None = None,
+    file_deliver_fn: Callable[[str, str, str], tuple[str, str]] | None = None,
     env: dict[str, str] | None = None,
     exporter: object | None = None,
 ) -> dict:
@@ -927,10 +1132,43 @@ def run_once(
     factory = client_factory or _default_client
     outcome: dict[str, object] = {"date": date.isoformat(), "kind": "report"}
 
+    # The incidents digest is read from the data root, independently of
+    # Prometheus: a metrics outage must not blind the runtime-incidents axis,
+    # and a broken snapshot must not blind the HTTP axis either. `state_root`
+    # is `<data_root>/observability/reports`, so `.parent.parent` is the data
+    # root the builder expects.
+    builder = digest_builder
+    if builder is None and zeroclaw_incidents is not None:
+        # Only the module's own builder gets the keywords: an injected builder
+        # keeps the three-positional contract the tests rely on.
+        builder = functools.partial(
+            zeroclaw_incidents.build_digest,
+            timezone_name=config.timezone,
+            sweep_interval_secs=config.sweep_interval_secs,
+        )
+    digest: object | None
+    digest_reason: str | None  # human prose, never an invented exception name
+    if builder is None:
+        digest = None
+        digest_reason = "модуль инцидентов недоступен — раздел по каналам не построен"
+    else:
+        try:
+            digest = builder(
+                config.state_root.parent.parent, window.start_utc, window.end_utc
+            )
+            digest_reason = None
+        except Exception as exc:  # a broken snapshot must not crash the report
+            digest = None
+            digest_reason = f"сборка инцидентов не удалась: {type(exc).__name__}"
+
+    dropped = 0
     try:
         client = factory(config)
         data = collect_report(client, window)
-        message = render_report(data)
+        data.digest = digest
+        if digest_reason:
+            data.completeness.note(digest_reason)
+        message, dropped = _render_report_parts(data)
         outcome["kind"] = "report"
     except QueryError as exc:
         _bump(exporter, "query_failed")
@@ -940,9 +1178,22 @@ def run_once(
             recipient=key.recipient,
             kind="unavailable_notice",
         )
-        message = render_unavailable_notice(window, exc.kind)
+        notice = render_unavailable_notice(window, exc.kind)
+        message = notice
         outcome["kind"] = "unavailable_notice"
         outcome["query_error"] = exc.kind
+        # The incident axis does not depend on Prometheus at all — it is read
+        # from the local volume — so an HTTP outage must not hide it. Fold
+        # the (already-built) digest's channel sections into the notice.
+        if zeroclaw_incidents is not None and digest is not None and digest.groups:
+            header = "**Инциденты за сутки (не зависят от HTTP):**"
+            skeleton = "\n".join([notice, "", header])
+            budget = max(MAX_REPORT_CHARS - len(skeleton) - 1, 0)
+            section_lines, dropped = zeroclaw_incidents.render_sections(
+                digest, budget=budget, timezone_name=window.timezone
+            )
+            if section_lines:
+                message = "\n".join([notice, "", header, *section_lines])
     else:
         _bump(exporter, "built")
 
@@ -996,6 +1247,30 @@ def run_once(
     outcome["state"] = state
     outcome["detail"] = detail
     _bump(exporter, "accepted" if state == "accepted" else "send_failed")
+
+    # Best-effort tail: the full incident list as a file, sent only once,
+    # only after the message itself was accepted, and only when something
+    # was actually dropped from it. Its failure must never change the
+    # receipt written above (spec §8).
+    if state == "accepted" and dropped and digest is not None:
+        sender = file_deliver_fn or (
+            lambda name, body, caption: deliver_file(
+                name, body, caption, config=config
+            )
+        )
+        try:
+            sender(
+                f"zeroclaw-errors-{date.isoformat()}.md",
+                zeroclaw_incidents.render_attachment(
+                    digest, date.isoformat(), timezone_name=config.timezone
+                ),
+                f"ZeroClaw — полный список инцидентов за {date:%d.%m}",
+            )
+        except Exception as exc:  # the tail must never fail the day
+            print(
+                f"[zeroclaw-error-report] attachment failed: {type(exc).__name__}",
+                flush=True,
+            )
     return outcome
 
 
