@@ -36,6 +36,9 @@ ignore = [
     # nothing to bump to. Removing it means dropping imbl, which is not ours to
     # drop. Published 2026-09-04, after the v0.8.4 tag.
     { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained (no CVE); transitive via imbl/imbl-sized-chunks with no patched release; awaiting an upstream imbl migration" },
+    # Matrix SDK 0.18 pins imbl 6.1, which requires imbl-sized-chunks 0.1.x;
+    # the 0.2.0 fix is incompatible. Matrix is not configured for Telegram.
+    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks panic-drop double free; matrix-sdk 0.18 pins imbl 6.1 and 0.1.x; Matrix unused on Telegram path; awaiting matrix-sdk/imbl upgrade; tracking #8519" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
