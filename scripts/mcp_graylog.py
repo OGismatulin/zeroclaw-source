@@ -583,7 +583,11 @@ class SilentSSORefresh:
     On network error → log, retry on next tick.
 
     Designed to run in a daemon thread with its own asyncio loop (see main()).
+    An exception escaping refresh_now() kills that thread silently, so every
+    iteration is bounded by ITERATION_TIMEOUT_S and catches all exceptions.
     """
+
+    ITERATION_TIMEOUT_S: float = 120
 
     def __init__(self, *, graylog_base: str, ms_session: "MSSessionAuth",
                  cookie_auth: "CookieAuth", interval_s: int,
@@ -618,9 +622,12 @@ class SilentSSORefresh:
             return
 
         try:
-            result = await silent_sso_refresh(
-                graylog_base=self.graylog_base,
-                ms_session=self.ms_session, cookie_auth=self.cookie_auth,
+            result = await asyncio.wait_for(
+                silent_sso_refresh(
+                    graylog_base=self.graylog_base,
+                    ms_session=self.ms_session, cookie_auth=self.cookie_auth,
+                ),
+                timeout=self.ITERATION_TIMEOUT_S,
             )
         except MSSessionExpired as exc:
             self.status = "expired"
@@ -640,6 +647,15 @@ class SilentSSORefresh:
             self.last_error = f"network: {exc}"
             try:
                 get_audit().log_event("silent_sso_network_error", error=str(exc))
+            except Exception:
+                pass
+            return
+        except Exception as exc:  # noqa: BLE001 - anything else kills the thread
+            # ReadError/WriteError/ProxyError/hung iteration (TimeoutError) etc.
+            self.status = "network_error"
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            try:
+                get_audit().log_event("silent_sso_error", error=self.last_error)
             except Exception:
                 pass
             return
@@ -877,6 +893,16 @@ def health_status() -> dict:
     if not auth._cookies_snapshot():
         # Silent SSO running but hasn't yet produced first cookie
         base.update({"status": "pending", "reason": "awaiting_first_refresh"})
+        return base
+    # The refresher can stop without flipping any status (dead thread, hung
+    # iteration); a refresh older than 3 intervals means the cookie is aging out.
+    silent_sso = get_silent_sso()
+    last = silent_sso.last_refresh_at
+    if last is not None and (
+        datetime.now(timezone.utc) - last
+    ).total_seconds() > 3 * silent_sso.interval_s:
+        base.update({"status": "stale", "reason": "silent_sso_stalled",
+                     "last_error": silent_sso.last_error})
         return base
     base["status"] = "healthy"
     return base
