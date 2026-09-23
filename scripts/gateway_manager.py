@@ -654,7 +654,10 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         workers only: they are NOT in ANALYST_ROSTER and NOT in
 #         FAILURE_DOMAINS, so a research slot can never register as a core
 #         analyst and block the ensemble barrier.
-CURRENT_CONFIG_MARKER = "v3-65"
+# v3-66 = model catalog v9 (2026-09-23): mimo-v2.6-pro / mimo-v2.6-flash in
+#         [reliability.model_fallbacks] and model_windows; mimo-v2.5-pro
+#         dropped (superseded by mimo-v2.6-pro).
+CURRENT_CONFIG_MARKER = "v3-66"
 
 
 def sanitize_filename(filename: str) -> str:
