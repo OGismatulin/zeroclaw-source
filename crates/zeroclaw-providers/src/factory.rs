@@ -205,6 +205,13 @@ pub fn apply_compat_options(
     Box::new(p)
 }
 
+/// fork(#49): effort for a Responses-wire provider — the alias knob first,
+/// then the process-wide `[runtime].reasoning_effort`.
+fn responses_reasoning_effort(alias: &str, opts: &ModelProviderRuntimeOptions) -> Option<String> {
+    crate::openai_codex::alias_reasoning_effort(alias, opts)
+        .or_else(|| opts.reasoning_effort.clone())
+}
+
 fn build_responses_provider_if_requested(
     wire_api: Option<zeroclaw_config::schema::WireApi>,
     alias: &str,
@@ -225,8 +232,13 @@ fn build_responses_provider_if_requested(
     if let Some(mt) = opts.provider_max_tokens {
         builder = builder.max_tokens(Some(mt));
     }
-    if let Some(ref effort) = opts.reasoning_effort {
-        builder = builder.reasoning_effort(Some(effort.clone()));
+    // fork(#49): the per-alias `provider_extra.reasoning_effort` wins over the
+    // process-wide `[runtime].reasoning_effort`. Before this, a compat family
+    // switched onto the Responses wire lost its alias effort: `provider_extra`
+    // is flattened into the Chat Completions body only, and this builder read
+    // the global knob alone.
+    if let Some(effort) = responses_reasoning_effort(alias, opts) {
+        builder = builder.reasoning_effort(Some(effort));
     }
     if !opts.extra_headers.is_empty() {
         builder = builder.extra_headers(opts.extra_headers.clone());
@@ -2287,6 +2299,40 @@ mod tests {
         assert_eq!(
             provider.default_base_url(),
             Some("https://opencode.ai/zen/v1/responses")
+        );
+    }
+
+    // fork(#49)
+    #[test]
+    fn responses_wire_prefers_alias_effort_over_runtime_effort() {
+        let opts = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("low".to_string()),
+            provider_extra: Some(serde_json::json!({"reasoning_effort": "xhigh"})),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert_eq!(
+            responses_reasoning_effort("muse", &opts).as_deref(),
+            Some("xhigh")
+        );
+
+        let global_only = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("low".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert_eq!(
+            responses_reasoning_effort("muse", &global_only).as_deref(),
+            Some("low")
+        );
+
+        // An unknown alias value fails closed onto the global knob, never the wire.
+        let typo = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("low".to_string()),
+            provider_extra: Some(serde_json::json!({"reasoning_effort": "ultra"})),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        assert_eq!(
+            responses_reasoning_effort("muse", &typo).as_deref(),
+            Some("low")
         );
     }
 

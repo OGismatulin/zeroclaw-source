@@ -192,7 +192,15 @@ const ALIAS_REASONING_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", 
 /// otherwise reach the wire and come back 400 — non-retryable
 /// (`reliable.rs`), and alias providers carry no fallback chain, which for the
 /// judge alias means the whole ensemble run degrades to PRELIMINARY.
-fn alias_reasoning_effort(alias: &str, options: &ModelProviderRuntimeOptions) -> Option<String> {
+///
+/// fork(#49): also read by `factory.rs::build_responses_provider_if_requested`,
+/// so any family routed onto the Responses wire (`wire_api = "responses"`, e.g.
+/// an `opencode.*` alias for a Responses-only model) honours the same per-alias
+/// knob instead of silently dropping it.
+pub(crate) fn alias_reasoning_effort(
+    alias: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> Option<String> {
     let extra = options.provider_extra.as_ref()?;
     let Some(object) = extra.as_object() else {
         warn_bad_alias_effort(alias, "provider_extra must be a JSON object");
@@ -222,7 +230,7 @@ fn warn_bad_alias_effort(alias: &str, reason: &str) {
             .with_attrs(::serde_json::json!({
                 "alias": alias,
                 "reason": reason,
-                "config_path": format!("[providers.models.openai.{alias}].provider_extra"),
+                "config_path": format!("[providers.models.<family>.{alias}].provider_extra"),
                 "allowed": ALIAS_REASONING_EFFORTS,
             })),
         format!("openai_codex: ignoring per-alias reasoning effort: {reason}"),

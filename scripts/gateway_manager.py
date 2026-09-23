@@ -659,7 +659,13 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         dropped (superseded by mimo-v2.6-pro).
 # v3-67 = GPT-6 Sol/Luna replace GPT-5.6 Sol/Luna in Codex aliases, fallbacks,
 #         and context windows; chat boot slot also moves to GPT-6 Luna.
-CURRENT_CONFIG_MARKER = "v3-67"
+# v3-68 = jira ensemble: analyst_deepseek_pro (opencode.deepseek) retired, new
+#         analyst_mimo_pro on opencode.mimo_pro (mimo-v2.6-pro, effort high);
+#         judge analyst_sol reasoning_effort medium -> xhigh; analyst_terra
+#         (openai.codex_terra) retired, new analyst_muse on opencode.muse
+#         (muse-spark-1.3-contributor, wire_api = responses, effort xhigh --
+#         needs fork patch #49 to reach the wire).
+CURRENT_CONFIG_MARKER = "v3-68"
 
 
 def sanitize_filename(filename: str) -> str:
