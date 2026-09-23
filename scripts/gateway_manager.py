@@ -657,7 +657,9 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-66 = model catalog v9 (2026-09-23): mimo-v2.6-pro / mimo-v2.6-flash in
 #         [reliability.model_fallbacks] and model_windows; mimo-v2.5-pro
 #         dropped (superseded by mimo-v2.6-pro).
-CURRENT_CONFIG_MARKER = "v3-66"
+# v3-67 = GPT-6 Sol/Luna replace GPT-5.6 Sol/Luna in Codex aliases, fallbacks,
+#         and context windows; chat boot slot also moves to GPT-6 Luna.
+CURRENT_CONFIG_MARKER = "v3-67"
 
 
 def sanitize_filename(filename: str) -> str:

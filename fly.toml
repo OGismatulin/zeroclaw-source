@@ -24,7 +24,7 @@ swap_size_mb = 512
   ZEROCLAW_PROVIDER = 'openai-codex'
   # inert on V3 (model comes from [providers.models.openai.codex].model);
   # kept in sync so the file does not misreport the live default.
-  ZEROCLAW_MODEL = 'gpt-5.6-luna'
+  ZEROCLAW_MODEL = 'gpt-6-luna'
   # Hot key rotation (fork patch #35): the daemon reads the opencode-go key from
   # this file first and falls back to the OPENCODE_GO_API_KEY secret when the
   # file is absent. Rotating = rewriting the file; no restart, no respawn.

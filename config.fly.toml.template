@@ -17,8 +17,9 @@ schema_version = 3
 # its model_provider here. Model lives on the entry, NOT in ZEROCLAW_MODEL (V3
 # ignores that env override).
 
-# Chat default = codex gpt-5.6-luna at reasoning_effort=high (2026-08-25, operator's
-# call after a measured bench). ZEROCLAW_PROVIDER=openai-codex hard-maps to
+# Chat default = codex gpt-6-luna at reasoning_effort=high (2026-09-23).
+# The previous GPT-5.6 Luna/high slot was selected after a measured bench.
+# ZEROCLAW_PROVIDER=openai-codex hard-maps to
 # [providers.models.openai.codex] (normalize_provider_type -> openai.codex) and the
 # webhook default path reads THAT boot slot, not agents.default, so the chat default
 # can only be set there.
@@ -30,9 +31,9 @@ schema_version = 3
 #     slot -- a dotted boot ref builds through the alias branch of the provider
 #     factory, which reads neither that table nor fallback_providers. The chat
 #     fallback is the per-alias `fallback` on the slot itself, below.
-#   * Why `high` and not the codex default `xhigh`: same three real tasks (weather,
-#     an SQL count, a Creatio report), same answers (Creatio 59/840 identical), 181 s
-#     total vs 220 s. Bench doc: docs/analysis/2026-08-25-chat-default-model-bench.md.
+#   * `high` is retained from the GPT-5.6 Luna bench; GPT-6 Luna needs its
+#     own latency and reliability observation before any effort change. Prior bench:
+#     docs/analysis/2026-08-25-chat-default-model-bench.md.
 #   * Delegates keep their own slots and have NO fallback by design (invariant D2), so
 #     they stay on proven models: [providers.models.opencode.flash] = deepseek-v4.1-flash.
 # Watch: grep -h Endpoint /zeroclaw-data/workspaces/tg_*/workspace/logs/daemon-stderr.log \
@@ -72,18 +73,17 @@ provider_extra = { reasoning_effort = "max" }
 
 # Codex subagents fold under the `openai` family with the codex OAuth runtime
 # (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
-# migration applies to "openai-codex"). worker = gpt-5.6-luna (cheap GPT-5.6
-# tier; reachable on Codex only via fork patch #22 originator=codex_cli_rs —
-# 404 under the old `pi` identity), coder = gpt-5.6-sol.
+# migration applies to "openai-codex"). worker = gpt-6-luna, coder = gpt-6-sol.
+# The codex_cli_rs identity patch #22 remains required for recent models.
 # CHAT BOOT SLOT. ZEROCLAW_PROVIDER=openai-codex resolves here
 # (normalize_provider_type("openai-codex", ..) -> family "openai", alias "codex",
 # schema/v2.rs), and both the synthesized default agent and the gateway boot provider
 # read this entry -- the webhook default path answers with it. reasoning_effort must
 # live on the alias: a bare family override gets provider_extra = None and silently
 # falls back to the codex default xhigh (providers/src/lib.rs:812-820).
-# gpt-5.6-luna has no clamp, so "high" reaches the wire as high.
+# GPT-6 Luna supports high effort on the Responses API.
 [providers.models.openai.codex]
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -104,7 +104,7 @@ fallback = ["opencode.flash"]
 # off the shared Go router because a rolling-window rate limit there killed the
 # actuator turn of a live analysis run while the ensemble itself was already
 # done: the coordinator is the ONE agent whose death strands a finished run.
-# gpt-5.6-luna at "high" on purpose -- the coordinator orchestrates, it never
+# gpt-6-luna at "high" on purpose -- the coordinator orchestrates, it never
 # investigates (invariant #10), so frontier reasoning would only buy latency.
 # Own alias rather than a reuse of [providers.models.openai.codex]: that one is
 # the boot slot resolving ZEROCLAW_PROVIDER, and a future chat-default change
@@ -112,29 +112,28 @@ fallback = ["opencode.flash"]
 # Rollback = repoint [agents.jira_coordinator] at opencode.go_coordinator (kept
 # below as an unreferenced slot) and bump the marker.
 [providers.models.openai.codex_coordinator]
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
 provider_extra = { reasoning_effort = "high" }
 
 [providers.models.openai.codex_worker]
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
 
 [providers.models.openai.codex_coder]
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
 
-# GPT-5.6 analyst slots on the same codex OAuth runtime (GA on Codex
-# 2026-07-09). sol = frontier tier, terra = balance tier (≈5.5 quality,
-# 2x cheaper). Referenced by [agents.analyst_sol] / [agents.analyst_terra].
+# Codex analyst slots: GPT-6 Sol and GPT-5.6 Terra on the same OAuth
+# runtime. Referenced by [agents.analyst_sol] / [agents.analyst_terra].
 [providers.models.openai.codex_sol]
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -154,12 +153,12 @@ requires_openai_auth = true
 provider_extra = { reasoning_effort = "xhigh" }
 
 # analyst_luna moved off the Go router onto the codex OAuth subscription
-# (2026-08-19). Same gpt-5.6-luna model, and `max` survives the move: fork patch
+# (2026-08-19). GPT-6 Luna keeps `max` on the same alias; fork patch
 # #34 teaches the codex wire to read provider_extra.reasoning_effort per alias.
 # Live-probed 2026-08-19: luna/terra/sol all answer 200 to max|xhigh|medium and
 # echo back the requested effort. Referenced by [agents.analyst_luna].
 [providers.models.openai.codex_luna]
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -257,9 +256,9 @@ fallback_providers = ["opencode-go"]
 # glm-5.3-flash + longcat-2.0 added (single + multi-turn tool loop PASS, 2 probes
 # each). deepseek-v4.1-flash is the fallback target, so it is never a key.
 # Codex family
-"gpt-5.6-sol"        = ["deepseek-v4.1-flash"]
+"gpt-6-sol"        = ["deepseek-v4.1-flash"]
 "gpt-5.6-terra"      = ["deepseek-v4.1-flash"]
-"gpt-5.6-luna"       = ["deepseek-v4.1-flash"]
+"gpt-6-luna"       = ["deepseek-v4.1-flash"]
 # Go-plan native opencode-go
 "glm-5.3"            = ["deepseek-v4.1-flash"]
 "kimi-k3"            = ["deepseek-v4.1-flash"]
@@ -653,9 +652,11 @@ protect_last_n = 10
 # 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
-"gpt-5.6-sol"             = 353_000
+# GPT-6 publishes 1.05M, but 353K remains the conservative effective
+# window until this Codex OAuth path is measured with long prompts.
+"gpt-6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
-"gpt-5.6-luna"            = 353_000
+"gpt-6-luna"            = 353_000
 # Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
 # (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
 # each; ox also had 40 prod failures). Windows of the two replacements are
@@ -714,9 +715,9 @@ protect_last_n = 10
 # 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
-"gpt-5.6-sol"             = 353_000
+"gpt-6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
-"gpt-5.6-luna"            = 353_000
+"gpt-6-luna"            = 353_000
 # Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
 # (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
 # each; ox also had 40 prod failures). Windows of the two replacements are
@@ -776,9 +777,9 @@ protect_last_n = 10
 # 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
-"gpt-5.6-sol"             = 353_000
+"gpt-6-sol"             = 353_000
 "gpt-5.6-terra"           = 353_000
-"gpt-5.6-luna"            = 353_000
+"gpt-6-luna"            = 353_000
 
 # ── Agents ──────────────────────────────────────────────────────────────────
 # Each agent carries ONLY model_provider / risk_profile / runtime_profile. Dead
@@ -805,11 +806,10 @@ risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
-# jira_html_worker = HTML-отчёт пакета (действие render_html, 2026-08-31).
-# Тот же alias, что у analyst_luna (gpt-5.6-luna + reasoning_effort = max):
-# отчёт читают люди и принимают по нему решение, поэтому он идёт на сильнейшую
-# доступную модель, а не на фоновый deepseek. jira_worker остаётся на
-# opencode.flash — он переводит OpenSpec и обслуживает legacy visual runs.
+# jira_html_worker renders the HTML report (render_html, 2026-08-31). It shares
+# openai.codex_luna with analyst_luna (gpt-6-luna, max effort); the report is
+# user-facing. jira_worker stays on opencode.flash for translation and legacy
+# visual runs.
 [agents.jira_html_worker]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
@@ -828,7 +828,7 @@ risk_profile = "default"
 runtime_profile = "agent_default"
 mcp_bundles = ["all"]
 
-# analyst_luna = GPT-5.6 Luna on the codex OAuth subscription (moved off the Go
+# analyst_luna = GPT-6 Luna on the codex OAuth subscription (moved off the Go
 # router 2026-08-19; replaced mimo-v2.5-pro 2026-08-16). Renamed (was
 # analyst_mimo) for audit truth — pipeline diagnostics key on the agent name, so
 # a stale name would misattribute every ensemble output. NOTE: this puts three
@@ -893,7 +893,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 # Research specialists (design 2026-09-11-jira-research-specialists, owner
 # decisions D1/D3): the map, the cross-service contracts and the acceptance
 # study, plus the single gap pass of the B contract. All four sit on the
-# existing openai.codex_luna alias (gpt-5.6-luna at reasoning_effort = max) and
+# existing openai.codex_luna alias (gpt-6-luna at reasoning_effort = max) and
 # on the existing jira_analysis runtime profile -- D1: an hour per role is
 # enough and a fourth profile would only add a fourth copy of
 # context_compression.model_windows to keep in sync. They are aux workers, NOT
