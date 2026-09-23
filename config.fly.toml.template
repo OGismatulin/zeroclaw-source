@@ -766,6 +766,10 @@ protect_last_n = 10
 "mimo-v2.6-pro"           = 1_000_000
 # analyst_muse (2026-09-23): models.json publishes 1_048_576.
 "muse-spark-1.3-contributor" = 1_000_000
+# jira_worker / analyst_glm_flash (2026-09-23): were silently on the profile
+# fallback (max_context_tokens); models.json publishes 1_000_000 for both.
+"deepseek-v4.1-flash"     = 1_000_000
+"glm-5.3-flash"           = 1_000_000
 "deepseek-v4-pro"         = 800_000
 "gemini-3-flash-preview"  = 800_000
 "qwen3.7-plus"            = 1_000_000

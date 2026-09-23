@@ -127,7 +127,12 @@ pub fn canonical_china_provider_name(name: &str) -> Option<&'static str> {
 }
 
 pub fn family_honors_wire_api(family: &str) -> bool {
-    matches!(family, "openai" | "llamacpp" | "custom")
+    // fork(#50): `opencode` too -- its factory spec overrides `wire_api()`
+    // (zeroclaw-providers factory.rs), and the Go router serves some models on
+    // /responses only (muse-spark-1.3-contributor). Keep this list in step with
+    // the factory's `wire_api()` overrides, or the validator warns an operator
+    // into deleting a setting the runtime actually uses.
+    matches!(family, "openai" | "llamacpp" | "custom" | "opencode")
 }
 
 #[cfg(test)]
@@ -316,7 +321,8 @@ mod tests {
 
     #[test]
     fn wire_api_honored_only_by_byo_endpoint_families() {
-        for family in ["openai", "llamacpp", "custom"] {
+        // fork(#50)
+        for family in ["openai", "llamacpp", "custom", "opencode"] {
             assert!(family_honors_wire_api(family), "{family} honors wire_api");
         }
         for family in [

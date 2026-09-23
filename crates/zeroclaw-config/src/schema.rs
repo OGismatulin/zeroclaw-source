@@ -19424,7 +19424,7 @@ impl Config {
                     format!(
                         "wire_api is set on `{family}.{alias}` but the `{family}` family has a \
                          fixed wire protocol and ignores it. wire_api only takes effect on the \
-                         openai, llamacpp, and custom (openai-compatible) families."
+                         openai, llamacpp, opencode, and custom (openai-compatible) families."
                     ),
                     format!("providers.models.{family}.{alias}.wire_api"),
                 ));

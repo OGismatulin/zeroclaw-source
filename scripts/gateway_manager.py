@@ -665,7 +665,9 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         (openai.codex_terra) retired, new analyst_muse on opencode.muse
 #         (muse-spark-1.3-contributor, wire_api = responses, effort xhigh --
 #         needs fork patch #49 to reach the wire).
-CURRENT_CONFIG_MARKER = "v3-68"
+# v3-69 = jira_analysis model_windows gain deepseek-v4.1-flash and glm-5.3-flash
+#         (jira_worker / analyst_glm_flash were on the silent 1M fallback).
+CURRENT_CONFIG_MARKER = "v3-69"
 
 
 def sanitize_filename(filename: str) -> str:
