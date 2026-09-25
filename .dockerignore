@@ -86,6 +86,9 @@ scripts/
 !scripts/fly-entrypoint.sh
 !scripts/mcp_db_server.py
 !scripts/mcp_graylog.py
+!scripts/m365_tokens.py
+!scripts/mcp_m365_stdio.py
+!scripts/m365_tools_snapshot.json
 !scripts/graylog_pack_cookie.py
 !scripts/extract_ms_cookies.py
 !scripts/code_repos_sync.py

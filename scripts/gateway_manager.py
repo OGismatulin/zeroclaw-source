@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Callable, TextIO, TypedDict
+from typing import Any, Callable, TextIO, TypedDict
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
 
@@ -31,6 +31,17 @@ try:  # image layout: both scripts live side by side in /usr/local/bin
     import volume_janitor
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
     from scripts import volume_janitor
+
+# Optional: the m365 token module ships next to the manager in the image. A missing
+# file means "no Microsoft 365 refresh", never "no chat" (I67).
+m365_tokens: object | None
+try:
+    import m365_tokens
+except ModuleNotFoundError:
+    try:
+        from scripts import m365_tokens
+    except ModuleNotFoundError:
+        m365_tokens = None
 
 # The incident sweeper is stdlib-only, but it lives next to the other scripts
 # in the image; guard it the same way so a missing file degrades to "no
@@ -667,7 +678,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         needs fork patch #49 to reach the wire).
 # v3-69 = jira_analysis model_windows gain deepseek-v4.1-flash and glm-5.3-flash
 #         (jira_worker / analyst_glm_flash were on the silent 1M fallback).
-CURRENT_CONFIG_MARKER = "v3-69"
+CURRENT_CONFIG_MARKER = "v3-70"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -2085,6 +2096,7 @@ class GatewayManagerServer:
         operator_error_notifier: OperatorErrorNotifier | object | None = None,
         volume_janitor: object | None = None,
         incident_sweeper: object | None = None,
+        m365_refresher: object | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
@@ -2093,6 +2105,7 @@ class GatewayManagerServer:
         self.operator_error_notifier = operator_error_notifier
         self.volume_janitor = volume_janitor
         self.incident_sweeper = incident_sweeper
+        self.m365_refresher = m365_refresher
         self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
         self.error_report_worker: threading.Thread | None = None
 
@@ -3774,6 +3787,114 @@ class VolumeJanitor:
                 return
 
 
+class M365Refresher:
+    """Keeps every user's Microsoft 365 refresh token alive. Never raises into the manager.
+
+    The m365 MCP shim lives only for one turn, so a user who does not touch
+    Microsoft 365 for 90 days would lose the sliding refresh window. This thread
+    refreshes tokens older than min_age_secs; the token file flock makes it a
+    safe second writer next to the shim.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_secs: float = 6 * 3600.0,
+        initial_delay_secs: float = 600.0,
+        min_age_secs: float = 20 * 3600.0,
+        tokens: object | None = None,
+        alert: Callable[[str, str, str, str | None], bool] | None = None,
+    ) -> None:
+        self._tokens: Any = tokens if tokens is not None else m365_tokens
+        self._interval = max(interval_secs, 60.0)
+        self._initial_delay = max(initial_delay_secs, 0.0)
+        self._min_age = min_age_secs
+        self._alert = alert
+        self._last_drift: tuple[str, ...] = ()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="m365-refresher", daemon=True)
+        self._thread.start()
+        print(
+            "[gateway-manager] m365: refresher started"
+            f" (first run in {int(self._initial_delay)}s, then every {int(self._interval)}s)",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> dict[str, object]:
+        try:
+            report = self._tokens.refresh_all(min_age_secs=self._min_age)
+        except Exception as exc:  # a sweep failure must not kill the loop (I111)
+            self._emit(
+                "m365_refresh_failed",
+                f"m365 refresh sweep failed: {type(exc).__name__}: {exc}",
+                "Check manager logs; Microsoft 365 tokens are not being refreshed",
+            )
+            return {"errors": [str(exc)]}
+        print(
+            "[gateway-manager] m365:"
+            f" refreshed={report.get('refreshed')}"
+            f" needs_login={report.get('needs_login')}"
+            f" transient={report.get('transient')}"
+            f" skipped={report.get('skipped')}"
+            f" errors={report.get('errors')}",
+            flush=True,
+        )
+        for key, login_error in report.get("new_needs_login", []):
+            accepted = self._emit(
+                "m365_needs_login",
+                f"{key}: Microsoft 365 access lost ({str(login_error)[:120]})",
+                "The user must reconnect: ask the agent to call m365__login_start",
+                user_key=key,
+            )
+            if not accepted:
+                continue  # flag stays unset, the next cycle retries the alert
+            try:
+                self._tokens.mark_alerted(key)
+            except Exception:
+                pass
+        self._check_drift()
+        return report
+
+    def _check_drift(self) -> None:
+        try:
+            drift = tuple(self._tokens.upstream_drift())
+        except Exception:
+            return
+        if drift and drift != self._last_drift:
+            self._emit(
+                "m365_snapshot_drift",
+                f"upstream Microsoft 365 connector drifted from the snapshot: {', '.join(drift)}",
+                "Re-run capture-snapshot (spec §4.3) and rebuild the image",
+            )
+        self._last_drift = drift
+
+    def _emit(self, code: str, error: str, hint: str, user_key: str | None = None) -> bool:
+        # The operator card does not render error/hint, so the details go to stdout.
+        print(f"[gateway-manager] m365: alert {code} {error}", flush=True)
+        if self._alert is None:
+            return False
+        try:
+            return bool(self._alert(code, error, hint, user_key))
+        except Exception:
+            return False
+
+    def _loop(self) -> None:
+        if self._stop.wait(self._initial_delay):
+            return
+        while not self._stop.is_set():
+            self.run_once()
+            if self._stop.wait(self._interval):
+                return
+
+
 class IncidentSweeper:
     """Periodic incident-digest sweep. Never raises into the manager.
 
@@ -4051,6 +4172,30 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
     else:
         print("[gateway-manager] janitor: disabled by env", flush=True)
 
+    def _m365_alert(code: str, error: str, hint: str, user_key: str | None) -> bool:
+        # user_id only labels the card ("User:"); the recipient is always the operator.
+        return operator_error_notifier.notify(
+            user_id=user_key,
+            payload=build_error_payload(
+                code=code,
+                component="manager",
+                retryable=False,
+                error=error,
+                hint=hint,
+            ),
+            operator={"scope": "m365-refresher"},
+        )
+
+    m365_refresher: M365Refresher | None = None
+    if m365_tokens is not None and _env_bool("ZEROCLAW_M365_REFRESH_ENABLED", True):
+        m365_refresher = M365Refresher(
+            interval_secs=_env_float("ZEROCLAW_M365_REFRESH_INTERVAL_HOURS", 6.0) * 3600.0,
+            alert=_m365_alert,
+        )
+        m365_refresher.start()
+    else:
+        print("[gateway-manager] m365: refresher disabled", flush=True)
+
     incident_sweeper = _start_incident_sweeper(
         data_root=settings.data_root, alert=_incident_alert
     )
@@ -4063,6 +4208,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         operator_error_notifier=operator_error_notifier,
         volume_janitor=janitor,
         incident_sweeper=incident_sweeper,
+        m365_refresher=m365_refresher,
     )
     server.metrics_exporter = _start_metrics_exporter(settings, registry)
     server.error_report_worker = _start_error_report_worker(

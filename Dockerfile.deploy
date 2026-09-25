@@ -193,6 +193,9 @@ COPY scripts/bootstrap_nightly_retro_cron.py /usr/local/bin/bootstrap_nightly_re
 COPY scripts/fly-entrypoint.sh /usr/local/bin/fly-entrypoint.sh
 COPY scripts/mcp_db_server.py /usr/local/bin/mcp_db_server.py
 COPY scripts/mcp_graylog.py /usr/local/bin/mcp_graylog.py
+COPY scripts/m365_tokens.py /usr/local/bin/m365_tokens.py
+COPY scripts/mcp_m365_stdio.py /usr/local/bin/mcp_m365_stdio.py
+COPY scripts/m365_tools_snapshot.json /usr/local/bin/m365_tools_snapshot.json
 COPY scripts/graylog_pack_cookie.py /usr/local/bin/graylog_pack_cookie.py
 COPY scripts/code_repos_sync.py /usr/local/bin/code_repos_sync.py
 COPY scripts/fly_warmup.py /usr/local/bin/fly_warmup.py
@@ -208,7 +211,7 @@ COPY scripts/zeroclaw_incidents.py /usr/local/bin/zeroclaw_incidents.py
 # which mcp_db_server.py imports — unpinned float broke lalafo-db MCP in prod 2026-08-03.
 RUN pip install --no-cache-dir --break-system-packages "prometheus-client==0.26.0" "tzdata==2025.3" requests pandas croniter psycopg2-binary httpx "mcp[cli]<2" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn yt-dlp
 
-RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py /usr/local/bin/backfill_cron_agent_alias.py /usr/local/bin/volume_janitor.py /usr/local/bin/zeroclaw_metrics.py /usr/local/bin/zeroclaw_error_report.py /usr/local/bin/zeroclaw_incidents.py
+RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py /usr/local/bin/backfill_cron_agent_alias.py /usr/local/bin/volume_janitor.py /usr/local/bin/zeroclaw_metrics.py /usr/local/bin/zeroclaw_error_report.py /usr/local/bin/zeroclaw_incidents.py /usr/local/bin/m365_tokens.py /usr/local/bin/mcp_m365_stdio.py
 
 # agent-browser: native Rust browser-automation CLI (vercel-labs/agent-browser).
 # Baked as the real binary; a sh wrapper installed as `agent-browser` fronts it

@@ -1,0 +1,616 @@
+{
+  "captured_at": "2026-09-25T17:25:09+00:00",
+  "source": "https://microsoft365.mcp.claude.com/mcp",
+  "tools": [
+    {
+      "name": "read_resource",
+      "description": "Read full content of any Microsoft Graph resource by URI. Use this tool after search tools return URIs. Returns complete resource data including: email bodies, file contents, calendar event details, folder listings, chat messages, etc. Each resource type returns different fields based on what's available.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "uri": {
+            "type": "string",
+            "description": "The URI of the resource to read. Supported formats:        'file:///{driveId}/{itemId}' or 'file:///{driveId}/{folder path}/{file name}' (SharePoint/OneDrive files; the path is relative to the drive root — when adapting a SharePoint web URL, omit the document-library segment such as \"Shared Documents\"; web URLs (https://) are NOT supported),        'site:///{siteId}/{groupId}' (SharePoint sites),        'mail:///messages/{messageId}[?owner={email}]' (Outlook emails; owner for shared/delegated mailboxes),        'mail:///folders/{folderId}' (Outlook folders),        'calendar:///events/{eventId}[?owner={email}]' (Calendar events; owner for delegated calendars),        'page:///sites/{siteId}/pages/{pageId}' (SharePoint pages),        'drive:///{entityType}/{entityId}' (OneDrive drives; entityType must be one of: users, groups, sites. Use entityType=users with entityId=me for the signed-in user's drives),        'meeting-transcript:///events/{joinUrlToken}[?start={iso}&end={iso}]' (Teams meeting transcripts — pass the meetingTranscriptUrl field from a calendar event read verbatim; the token is an opaque base64url encoding of the join URL; start/end scope a recurring series to one occurrence, omit to receive the most recent transcripts of the series (capped)),        'teams:///chats/{chatId}/messages/{messageId}' (Teams chat messages),        'teams:///teams/{teamId}/channels/{channelId}/messages/{messageId}' (Teams channel messages)"
+          },
+          "startPage": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "For paginated file:/// (SharePoint/OneDrive) reads only: 1-based page number to start from. Applies to PDFs and Office formats that the connector reads via Graph's PDF conversion (e.g. docx, pptx), where a page is a document page, and to plain-text files (.txt, .csv, .tsv, .json, .md, .xml, .html, .htm, .log), where a page is as many whole lines as fit in one call and each call returns one page (for .csv/.tsv a line is a record — a line break inside a double-quoted field does not end it — and the header line is repeated on every page after the first). When more remains, the text ends with a footer like '[truncated: pages 1-14 of 16 — re-call with startPage=15]' or '[page 1 — lines 1–590 of a 6800000-byte file — more follows; re-call with startPage=2]'; follow that hint to read later pages. A plain-text file returned with no footer is complete; otherwise its final page ends in 'last page'. Each call can return up to ~200k characters of text, so many pages may fill the context window quickly. Ignored for every other URI scheme and for image and .xlsx workbook reads."
+          },
+          "endPage": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "1-based last page to extract, inclusive. Must be >= startPage. Same applicability as startPage; plain-text reads return one page per call, so it has no effect on them."
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "sharepoint_search",
+      "description": "Search SharePoint documents and pages by content, filename, or metadata. Returns document metadata - use read_resource tool with returned URIs for full content. Filters use AND logic (must match ALL criteria). Use sharepoint_folder_search tool to find folders. Returns max 50 documents per request. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Text to search for in document content, filename, or metadata. Required field"
+          },
+          "offset": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Number of results to skip for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0"
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum number of documents to return. Default: 10, Max: 50"
+          },
+          "fileType": {
+            "type": "string",
+            "description": "Filter by file extension (e.g., 'pdf', 'docx', 'xlsx'). Omit to search all file types"
+          },
+          "folderName": {
+            "type": "string",
+            "description": "Filter by folder name. Searches within folders matching this name (partial match supported)"
+          },
+          "author": {
+            "type": "string",
+            "description": "Filter by document author name or email (partial match supported)"
+          },
+          "afterDateTime": {
+            "type": "string",
+            "description": "Return documents modified after this date/time. Accepts natural language: 'yesterday', 'last week', 'March 15 2024', ISO dates, etc."
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "description": "Return documents modified before this date/time. Accepts natural language: 'today', 'next month', ISO dates, etc."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "sharepoint_folder_search",
+      "description": "Search SharePoint folders by name (partial match supported). Returns folder metadata and URIs - use read_resource tool with returned URIs to list folder contents. Case-insensitive search. Returns max 50 folders per request. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name or partial name of the folder to search for. Case-insensitive partial matching supported"
+          },
+          "offset": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Number of results to skip for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0"
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum number of folders to return. Default: 10, Max: 50"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "outlook_email_search",
+      "description": "Search Outlook emails. Returns email metadata (subject, sender, date, etc) - use read_resource tool with returned URIs to get full email content. Supports natural language dates like 'yesterday' or 'last week'. Filters combine with AND, except three combinations that are rejected: (1) `recipient` with `folderName`, `mailboxOwnerEmail` or `order`; (2) `query` with `order`; (3) `query` with `sender`, `afterDateTime` or `beforeDateTime` when `folderName` or `mailboxOwnerEmail` is set. When a request would need a rejected combination, drop a parameter instead of sending it: for the latest emails about a topic, send `query` with no `order` (add `afterDateTime` only if the user gave a time window; never invent an old date); results are relevance-ranked, not date-sorted, so sort the returned dates yourself. For 'emails I sent to X' or 'the last thing I emailed X', send `recipient` (optionally with `sender` set to the user's own address): it searches the whole mailbox, including Sent Items, so do not add `folderName` or `order`; pick the newest from the returned dates, narrowing with `afterDateTime` if the page is full. For a topic plus a sender or date inside a named folder of the user's own mailbox, omit `folderName` and search globally with `query` plus `sender`/dates (you may say the search covered all folders). In a shared mailbox (`mailboxOwnerEmail`), send the `sender`/date filters without `query` and check the returned subjects for the topic; retry with `mailboxOwnerEmail` plus `query` alone only if nothing useful comes back. To search a shared mailbox or another user's mailbox you have delegate access to, pass mailboxOwnerEmail with their email address. Returns max 25 emails per request. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages). If the final item includes `nextCursor` instead of `nextOffset`, pass that value as the `cursor` parameter (and omit `offset`). Always start with no cursor.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text to search for in email subject, body, or attachments. Omit for all emails. Cannot be combined with `order`. When `folderName` or `mailboxOwnerEmail` is set, cannot be combined with `sender`, `afterDateTime` or `beforeDateTime` either. If the user also names a folder of their own mailbox plus a sender or date, keep `query` and drop `folderName` (search all folders). Do not add an old `afterDateTime` just to accompany `query`. On the global search path the text must have balanced ( ) and an even number of \" — wrap a phrase in double quotes (e.g. '\"thanks :)\"') to search literal parentheses, or add `folderName`/`mailboxOwnerEmail`, which use the mailbox endpoint where parentheses are plain text."
+          },
+          "folderName": {
+            "type": "string",
+            "description": "Name of a specific Outlook mail folder to search in (case-insensitive). Common folders 'Inbox', 'Sent Items', 'Drafts', 'Deleted Items', 'Archive', 'Junk Email', 'Outbox' are recognized directly (locale-independent; works for delegated mailboxes). Any other name is looked up by enumerating the mailbox's folders. Use ONLY when the user explicitly names a mail folder. Do NOT use this to filter by a person's name — use 'sender' or 'recipient' instead, which search across all folders. Omit to search all folders. If set: use `query` OR sender/date filters, NOT both; when the user wants a topic plus a sender or date in this folder, omit folderName and search all folders instead (in a shared mailbox, keep folderName and send the sender/date filters without `query`). `recipient` NOT supported. To find emails the user sent to a particular person, use `recipient` rather than folderName 'Sent Items'."
+          },
+          "mailboxOwnerEmail": {
+            "type": "string",
+            "format": "email",
+            "description": "Email address of a shared mailbox or another user's mailbox you have delegated access to. Omit to search your own mailbox. Requires Mail.Read.Shared permission. If set: use `query` OR sender/date filters, NOT both; when the request has a topic plus a sender or date, send the sender/date filters without `query` and check the returned subjects for the topic. `recipient` NOT supported."
+          },
+          "sender": {
+            "type": "string",
+            "description": "Email address (full or partial) of sender to filter by. Matches any part of the sender's email address. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+          },
+          "recipient": {
+            "type": "string",
+            "description": "Email address (full or partial) of recipient to filter by. Matches TO, CC, or BCC recipients; searches the whole mailbox, including Sent Items. Use it (optionally with `sender` set to the user's own address) for 'emails I sent to X'; narrow with `afterDateTime` if the page is full. NOT compatible with `folderName`/`mailboxOwnerEmail`/`order`."
+          },
+          "afterDateTime": {
+            "type": "string",
+            "description": "Return emails received after this date/time. Accepts natural language: 'yesterday', 'last week', 'March 15 2024', ISO dates, etc. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "description": "Return emails received before this date/time. Accepts natural language: 'today', 'next month', ISO dates, etc. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+          },
+          "order": {
+            "type": "string",
+            "enum": [
+              "newest",
+              "oldest"
+            ],
+            "description": "Sort results by received date: 'newest' (most recent first) or 'oldest' (earliest first). When omitted, results are newest-first for folder/mailbox listings and relevance-ranked for free-text query. When set without a `folderName`, the search is scoped to Inbox by default; pass a different `folderName` (e.g. 'Sent Items') to sort within that folder instead. Cannot be combined with `query` (for the latest emails about a topic, send `query` without `order`, adding `afterDateTime` only if the user gave a time window, then sort the returned dates yourself) or with `recipient`. Not for 'the last email I sent to X': use `recipient` without `order` and pick the newest returned date."
+          },
+          "offset": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Number of results to skip for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0. Ignored when `cursor` is set. Free-text `query` searches in a folder or shared mailbox page by `cursor`, not `offset`."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor returned in a prior response as `nextCursor`. Pass it back unchanged to fetch the next page; other filter parameters are ignored when set. Used by free-text `query` searches in a folder or shared mailbox, where `offset` is not supported."
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "Maximum number of emails to return. Default: 10, Max: 25"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "outlook_calendar_search",
+      "description": "Search Outlook calendar events with flexible filters. Returns event metadata (subject, time, attendees, etc) - use read_resource tool with returned URIs for full details. Each event's start/end are returned as {dateTime, timeZone} pairs where dateTime is a wall-clock string in the named timeZone (the user's Outlook mailbox time zone, or UTC when unavailable); present it together with the timeZone and do not re-interpret dateTime as UTC. Supports natural language dates like 'tomorrow', 'next week', 'July 4th 2024'. All filters use AND logic (must match ALL criteria). Date range: max 5 years, defaults to 1 year past to 1 year future. To search a delegated or shared calendar (e.g. an executive's calendar you have access to), pass calendarOwnerEmail with their email address. The query string is required. To search everything use the wildcard (*) operator. Returns max 25 events per request. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Text to search for in event subject, body, or location. Use '*' or omit for all events. Empty string returns all events."
+          },
+          "calendarName": {
+            "type": "string",
+            "description": "Name of specific calendar to search in (case-insensitive). Omit to search default calendar."
+          },
+          "calendarOwnerEmail": {
+            "type": "string",
+            "format": "email",
+            "description": "Email address of another user whose calendar to search (for delegated/shared calendar access). Use when the user asks about someone else's calendar (e.g. an executive's calendar that an assistant has delegate access to). Omit to search your own calendars."
+          },
+          "organizer": {
+            "type": "string",
+            "description": "Email address (full or partial) of event organizer to filter by"
+          },
+          "attendee": {
+            "type": "string",
+            "description": "Email address (full or partial) of attendee to filter by. Matches any attendee in the event."
+          },
+          "afterDateTime": {
+            "type": "string",
+            "description": "Return events starting after this date/time. Accepts natural language: 'tomorrow', 'next Monday', 'July 4th 2024', ISO dates, etc. Default: 1 year ago"
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "description": "Return events ending before this date/time. Accepts natural language: 'next week', 'December 31st', ISO dates, etc. Default: 1 year from now"
+          },
+          "order": {
+            "type": "string",
+            "enum": [
+              "newest",
+              "oldest"
+            ],
+            "description": "Sort results by event start time: 'newest' (latest start first) or 'oldest' (earliest start first). When omitted, results use Graph's default ordering (chronological earliest-first when any date/calendar/organizer/attendee filter is set; relevance-ranked for pure free-text `query`). Setting `order` always uses the date-range path, so results are bounded by afterDateTime/beforeDateTime (or the 1-year-each-way default)."
+          },
+          "offset": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Number of results to skip for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0"
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "Maximum number of events to return. Default: 10, Max: 25"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "find_meeting_availability",
+      "description": "Find available meeting times when all participants are free. Searches within specified date range and returns best time slots based on availability. Current user is automatically included as organizer. Returns max 50 suggestions ranked by confidence. The beforeDateTime and afterDateTime inputs must be formatted in UTC. Each meetingTimeSlot in the response carries a dateTime (wall-clock) paired with the timeZone it is expressed in (the user's Outlook mailbox time zone, or UTC when that is unavailable). nowDateTimeLocalized is the current time in that same zone. When outputting these times to the user, Claude should present the dateTime together with the timeZone shown; do not apply a further UTC-to-local conversion unless the user is known to be in a different zone. When Claude receives the result, nowDateTime represents the authoritative current time (Claude's system prompt may contain an inaccurate date relative to the user's locale). If nowDateTime reveals that Claude's understanding of 'now' differs significantly from the actual current time, and if this would change how relative time references in the user's request should be interpreted (e.g., 'tomorrow', 'later today', 'next week'), Claude should make a new API request with corrected UTC date/times. For example: if Claude's system prompt says today is January 1 and the user asks for 'tomorrow', Claude would initially search January 2. But if nowDateTime reveals it's actually 6:00 AM January 2 in the user's time zone, Claude should make a new request searching January 3 instead. If Graph could not read some participants' calendars, those emails are listed in unavailableParticipants and marked 'unknown' in each slot's attendeeAvailability; treat their availability as unconfirmed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "participants": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "email"
+            },
+            "minItems": 1,
+            "description": "List of participant email addresses. The current user is automatically included as organizer"
+          },
+          "afterDateTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of time range to search for availability (ISO 8601 format in UTC: YYYY-MM-DDTHH:mm:ssZ)"
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of time range to search for availability (ISO 8601 format in UTC: YYYY-MM-DDTHH:mm:ssZ)"
+          },
+          "duration": {
+            "type": "number",
+            "minimum": 15,
+            "maximum": 480,
+            "default": 60,
+            "description": "Meeting duration in minutes"
+          },
+          "maxCandidates": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 3,
+            "description": "Maximum number of time slots to return"
+          },
+          "isOrganizerOptional": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether the organizer (current user) attendance is optional"
+          }
+        },
+        "required": [
+          "participants",
+          "afterDateTime",
+          "beforeDateTime"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "outlook_find_available_time",
+      "description": "Find open time slots for a meeting between the signed-in user and the given participants. Searches the given UTC date range and returns up to maxCandidates slots ranked by confidence. Each returned slot's start and end are {dateTime, timeZone} objects in exactly the shape event creation accepts, so if outlook_create_event is available a chosen slot can be passed straight to it. Inputs are UTC. Each output slot's dateTime is a wall-clock time in the paired timeZone (the user's Outlook mailbox zone, or UTC when that is unavailable); present dateTime together with its timeZone and do not apply a further UTC-to-local conversion unless the user is known to be in a different zone. The result's nowDateTime is the authoritative current time; if it differs materially from Claude's assumed 'now', re-issue the search with corrected dates before interpreting relative references like 'tomorrow'. Suggestions are NOT confined to working hours (activityDomain is unrestricted, not the Graph default of 'work'), so filter out-of-hours slots yourself if appropriate. If Graph could not read some participants' calendars, those emails are listed in unavailableParticipants and marked 'unknown' in each slot's attendeeAvailability; treat their availability as unconfirmed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "participants": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "email"
+            },
+            "maxItems": 50,
+            "default": [],
+            "description": "Participant email addresses (max 50). The signed-in user is always included as organizer. Omit or pass an empty list to search the organizer's own availability."
+          },
+          "afterDateTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the search range (ISO 8601 UTC: YYYY-MM-DDTHH:mm:ssZ)"
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of the search range (ISO 8601 UTC: YYYY-MM-DDTHH:mm:ssZ)"
+          },
+          "durationMinutes": {
+            "type": "integer",
+            "minimum": 15,
+            "maximum": 480,
+            "default": 60,
+            "description": "Meeting duration in minutes"
+          },
+          "maxCandidates": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 10,
+            "description": "Maximum number of time slots to return"
+          },
+          "isOrganizerOptional": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether the organizer (signed-in user) attendance is optional"
+          }
+        },
+        "required": [
+          "afterDateTime",
+          "beforeDateTime"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "chat_message_search",
+      "description": "Searches Microsoft Teams messages across every 1:1 chat, group chat, meeting chat, and Teams channel the signed-in user is a member of. Results include messages sent by ANY participant in those chats and channels, not only the signed-in user — call get_me first if you need to know who the signed-in user is. Filters: sender, recipient, send-date range, and attachments. Returns max 25 messages per request. Requires the ChannelMessage.Read.All permission (with Chat.Read); without it every call fails. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Keywords to search message text, in Keyword Query Language (KQL): words, \"quoted phrases\", OR, NOT. Use '*' for NO keyword (any filters still apply). Do NOT put 'from:', 'to:', or date terms such as 'sent:' here; use sender, recipient, afterDateTime, and beforeDateTime instead."
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Starting index for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "Maximum number of results to return (default: 25, max: 25)"
+          },
+          "sender": {
+            "type": "string",
+            "description": "Filter by sender: email address, display name, or the part of the address before '@'"
+          },
+          "recipient": {
+            "type": "string",
+            "description": "Filter by recipient: email address, display name, or the part of the address before '@'. Channel posts have NO recipients, so this filter excludes them."
+          },
+          "afterDateTime": {
+            "type": "string",
+            "description": "Only messages sent at or after this date/time. A date alone starts at midnight; a time without a zone uses the user's mailbox time zone. Accepts natural language: 'yesterday', 'last week', 'March 15 2024', ISO dates, etc."
+          },
+          "beforeDateTime": {
+            "type": "string",
+            "description": "Only messages sent before this date/time. A date alone INCLUDES that whole day; a time without a zone uses the user's mailbox time zone. Accepts natural language: 'today', 'next month', ISO dates, etc."
+          },
+          "hasAttachment": {
+            "type": "boolean",
+            "description": "Filter messages with or without attachments"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "teams_list_chats",
+      "description": "List the Microsoft Teams chats (1:1, group, and meeting chats) the signed-in user is a member of, with each chat's id, type, topic, last-updated time, member count, and member list (group and meeting chats show at most 20 members; see memberCount for the full total). Use this to discover chat ids for teams_send_chat_message when that write-gated tool is available, or for teams:///chats/... resource reads. Results are ordered by most recent message first; note that lastUpdatedDateTime is when the chat was renamed or its membership changed, not the last-message time. The signed-in user's own notes-to-self chat typically has the id '48:notes'; if that id is not in the list, the self-chat is the oneOnOne chat whose only member is the signed-in user (use get_me to identify them). This tool lists chats only, not Teams channels. If the response includes a final item with `nextCursor`, there are more results; pass that value as the `cursor` parameter to fetch the next page. Always start with no cursor.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor returned in a prior response as `nextCursor`. Pass it back unchanged to fetch the next page; `limit` is ignored when `cursor` is set (the cursor carries the page size). Omit on the first call."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "description": "Maximum number of chats to return. Default: 25, max: 25."
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "get_me",
+      "description": "Return the signed-in user's own Microsoft 365 profile (displayName, mail, userPrincipalName, id, jobTitle). Use this to learn who the current user is — for example, before filtering searches to 'my' messages or events, or when personalising a response. The mail field is the canonical primary SMTP address; it can be null for guest or unlicensed accounts, in which case userPrincipalName is the best available identifier.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "search_people",
+      "description": "Search for people by name or email address. Results are drawn from and relevance-ranked by the signed-in user's own communication and collaboration history (mail, Teams, directory), so frequent contacts rank highest. Use this to resolve a name to an id or userPrincipalName before calling teams_create_chat (when that write-gated tool is available), or to find an email address before composing a message. Returns id, displayName, userPrincipalName, mail, jobTitle, relevanceScore, and personType (class/subclass, e.g. Person/OrganizationUser). Only Person/OrganizationUser entries (directory users with a non-null userPrincipalName) are valid teams_create_chat members when that tool is enabled; Person/PersonalContact entries are Outlook contacts reachable by mail instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Name, email address, or other identifying text to search for. Matches against names and email addresses of people relevant to the signed-in user."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 25,
+            "default": 10,
+            "description": "Maximum number of results to return (default 10, max 25)."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "teams_list_channels",
+      "description": "List the channels in a team the signed-in user is a member of. Returns each channel's id, displayName, description, membershipType, and webUrl. Use the id with teams_list_channel_messages (when available) to read the channel, or with teams_send_channel_message / teams_reply_channel_message when those write-gated tools are available.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "teamId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "The id of the team whose channels to list. Obtain from teams_list_teams, or from the teamId segment embedded in the channelUri on chat_message_search channel results (percent-decode it first)."
+          }
+        },
+        "required": [
+          "teamId"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "teams_list_channel_messages",
+      "description": "List the messages in a Microsoft Teams channel the signed-in user is a member of: by default the channel's top-level messages (conversation roots), or, when parentMessageId is set, the replies in that conversation. Each item carries the message id, sender, timestamps, webUrl, attachments (names and links only), and a sanitized body preview of up to 1000 characters; top-level items also carry a teams:/// uri for read_resource, which returns the full body, mentions, and reactions. Top-level messages come in Graph's order, by last activity in each conversation; use createdDateTime to order replies. System event messages (member added, channel renamed, ...) have a null from and bodyPreview and a messageType other than 'message'. Use a top-level id as the messageId for teams_reply_channel_message when that write-gated tool is available. If the response includes a final item with `nextCursor`, there are more results; pass that value as the `cursor` parameter (keeping the other parameters the same) to fetch the next page. Always start with no cursor.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "teamId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "The id (group id GUID) of the team that owns the channel. Obtain from teams_list_teams, or from the teamId segment embedded in the channelUri on chat_message_search channel results (percent-decode it first)."
+          },
+          "channelId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "The id of the channel, typically of the form 19:...@thread.tacv2. Obtain from teams_list_channels."
+          },
+          "parentMessageId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Omit to list the channel's top-level messages (conversation roots). Set to a top-level message id to list the replies in that conversation instead."
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Opaque pagination cursor returned in a prior response as `nextCursor`. Pass it back unchanged, with the same teamId, channelId, and parentMessageId, to fetch the next page; `limit` is ignored when `cursor` is set. Omit on the first call."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum number of messages to return. Default: 20, max: 50."
+          }
+        },
+        "required": [
+          "teamId",
+          "channelId"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "get_granted_scopes",
+      "description": "Return the Microsoft 365 (Microsoft Graph) delegated permissions, also called scopes, that Microsoft Entra currently grants this connector for the signed-in account, as a list of names such as Mail.Read. Use this when the user asks to test or verify the Microsoft 365 connection, asks what the connector is allowed to access for them, or is an administrator setting the connector up for their organization. If Microsoft will not issue a token for this account at all (for example, an administrator has not approved the app for the organization), the call fails with an error that says why, including the AADSTS error code and the Entra trace id an administrator can look up when Entra reported them. Read-only; takes no parameters.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    }
+  ]
+}

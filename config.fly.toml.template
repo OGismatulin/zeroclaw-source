@@ -442,6 +442,18 @@ transport = "http"
 url = "http://localhost:4001/mcp"
 tool_timeout_secs = 120
 
+# m365: stdio shim over the claude.ai Microsoft 365 connector — read-only Teams,
+# Outlook and SharePoint with each user's OWN Microsoft token (device-code login
+# via m365__login_start). Spawned per turn; tokens in /zeroclaw-data/m365.
+# Keep ABOVE the codemap* blocks: their [mcp.servers.headers] bind to the last
+# [[mcp.servers]]. Spec: docs/superpowers/specs/2026-09-25-m365-teams-read-mcp-design.md
+[[mcp.servers]]
+name = "m365"
+transport = "stdio"
+command = "python3"
+args = ["/usr/local/bin/mcp_m365_stdio.py"]
+tool_timeout_secs = 120
+
 # codemap-semantic: second remote MCP on the SAME box — natural-language semantic
 # search over the monorepa (claude-context + Zilliz), for "how does X work / where is
 # the logic for Y" where the symbol name is unknown. Its [mcp.servers.headers] MUST sit
@@ -492,7 +504,7 @@ Authorization = "Bearer __CODEMAP_API_KEY__"
 # every agent got every [[mcp.servers]] globally; this bundle + per-agent
 # `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
 [mcp_bundles.all]
-servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic", "codemap-fs"]
+servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic", "codemap-fs", "m365"]
 
 # ── Risk profile (default) ──────────────────────────────────────────────────
 # Replaces the pre-V3 top-level [autonomy] block. Main agent runs at level=Full
@@ -560,6 +572,7 @@ forbidden_paths = [
     "~/.aws",
     "~/.config",
     "/zeroclaw-data/mcp_graylog",
+    "/zeroclaw-data/m365",
 ]
 require_approval_for_medium_risk = false
 block_high_risk_commands = false
@@ -594,6 +607,13 @@ allowed_tools = [
     "lalafo-db__ch_tables", "lalafo-db__query_to_file", "lalafo-db__ch_query_to_file", "lalafo-db__health",
     "graylog__health", "graylog__count", "graylog__search", "graylog__by_request_id",
     "graylog__by_user", "graylog__search_to_file",
+    # m365: read-only Microsoft 365 (spec 2026-09-25 §4.3) + own login tools.
+    "m365__login_start", "m365__login_status", "m365__read_resource",
+    "m365__sharepoint_search", "m365__sharepoint_folder_search", "m365__outlook_email_search",
+    "m365__outlook_calendar_search", "m365__find_meeting_availability",
+    "m365__outlook_find_available_time", "m365__chat_message_search", "m365__teams_list_chats",
+    "m365__get_me", "m365__search_people", "m365__teams_list_channels",
+    "m365__teams_list_channel_messages", "m365__get_granted_scopes",
     "codemap__query_graph", "codemap__get_node", "codemap__get_neighbors", "codemap__get_community",
     "codemap__god_nodes", "codemap__graph_stats", "codemap__shortest_path",
     # codemap-semantic: read-only tools only (O3). index_codebase (heavy) + clear_index
