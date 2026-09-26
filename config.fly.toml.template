@@ -444,7 +444,8 @@ tool_timeout_secs = 120
 
 # m365: stdio shim over the claude.ai Microsoft 365 connector — read-only Teams,
 # Outlook and SharePoint with each user's OWN Microsoft token (device-code login
-# via m365__login_start). Spawned per turn; tokens in /zeroclaw-data/m365.
+# via m365__login_start). Spawned by the daemon — per webhook turn and as
+# long-lived children of the daemon's shared registries; tokens in /zeroclaw-data/m365.
 # Keep ABOVE the codemap* blocks: their [mcp.servers.headers] bind to the last
 # [[mcp.servers]]. Spec: docs/superpowers/specs/2026-09-25-m365-teams-read-mcp-design.md
 [[mcp.servers]]

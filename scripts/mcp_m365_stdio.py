@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """stdio MCP shim that serves the claude.ai Microsoft 365 connector to one daemon.
 
-The ZeroClaw daemon spawns this per webhook turn (stdio MCP children die with
-the turn). initialize and tools/list are answered locally from a baked snapshot
+Spawned by the ZeroClaw daemon — per webhook turn and as long-lived children of
+the daemon's shared registries (heartbeat, agents). initialize and tools/list are answered locally from a baked snapshot
 so the connect budget never depends on the network; read-only tools/call is
 forwarded upstream with the calling user's own token. The user is derived from
 the inherited ZEROCLAW_WORKSPACE, never from call arguments.
@@ -11,10 +11,12 @@ Spec: docs/superpowers/specs/2026-09-25-m365-teams-read-mcp-design.md
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, TextIO
@@ -25,6 +27,9 @@ except ModuleNotFoundError:  # repo layout: imported as scripts.mcp_m365_stdio
     from scripts import m365_tokens as tok
 
 SNAPSHOT_PATH = tok.SNAPSHOT_PATH
+# The fork client reads replies up to 4 MB per line; stay well below it.
+MAX_REPLY_BYTES = 1_000_000
+CALL_WORKERS = 4
 NOT_CONNECTED = (
     "Microsoft 365 is not connected for this user. Call m365__login_start and "
     "forward the link and code to the user verbatim."
@@ -136,7 +141,28 @@ def _forward(key: str, name: str, args: Mapping[str, Any], rid: object) -> dict[
         return _text(UNAVAILABLE.format(detail=f"HTTP {code}"), True)
     if "error" in message:
         return _text(f"Microsoft 365 error: {message['error'].get('message', '')}"[:2000], True)
-    return message["result"]
+    return _cap(message["result"])
+
+
+def _cap(result: dict[str, Any]) -> dict[str, Any]:
+    """Truncate content texts so the serialised reply stays under MAX_REPLY_BYTES."""
+    budget = MAX_REPLY_BYTES - 1000  # JSON-RPC envelope headroom
+    excess = len(json.dumps(result, ensure_ascii=False).encode()) - budget
+    for item in result.get("content", []):
+        text = item.get("text") if isinstance(item, dict) else None
+        if excess <= 0 or not isinstance(text, str):
+            continue
+        raw = text.encode()
+        # Cut by the text's serialised size so JSON escaping cannot overshoot.
+        ratio = len(json.dumps(text, ensure_ascii=False).encode()) / max(len(raw), 1)
+        keep = max(0, len(raw) - int((excess + 200) / ratio) - 1)
+        kept = raw[:keep].decode("utf-8", "ignore")
+        omitted = len(raw) - len(kept.encode())
+        item["text"] = kept + f"\n[truncated by m365 shim: {omitted} bytes omitted]"
+        excess = len(json.dumps(result, ensure_ascii=False).encode()) - budget
+    if excess > 0:
+        return _text("Microsoft 365 result was too large to return; narrow the query.", True)
+    return result
 
 
 def handle(message: dict[str, Any], *, key: str | None,
@@ -173,28 +199,57 @@ def handle(message: dict[str, Any], *, key: str | None,
     return {"jsonrpc": "2.0", "id": rid, "result": result}
 
 
+def _safe_handle(message: Any, *, key: str | None,
+                 tools: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "invalid request"}}
+    try:
+        return handle(message, key=key, tools=tools)
+    except Exception as exc:  # a long-lived shim must survive one bad message
+        _log("m365_internal", key or "-", type(exc).__name__)  # never the text: may echo data
+        if "id" not in message:
+            return None
+        return {"jsonrpc": "2.0", "id": message["id"],
+                "error": {"code": -32603, "message": "internal error"}}
+
+
 def serve(stdin: TextIO, stdout: TextIO, env: Mapping[str, str]) -> int:
     try:
         key: str | None = tok.user_key_from_env(env)
     except ValueError:
         key = None
     tools = LOGIN_TOOLS + load_snapshot()
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except ValueError:
-            reply: dict[str, Any] | None = {
-                "jsonrpc": "2.0", "id": None,
-                "error": {"code": -32700, "message": "parse error"}}
-        else:
-            reply = handle(message, key=key, tools=tools)
-        if reply is not None:
-            stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
-            stdout.flush()
-    return 0
+    write_lock = threading.Lock()
+
+    def reply(message: Any) -> None:
+        out = _safe_handle(message, key=key, tools=tools)
+        if out is not None:
+            with write_lock:
+                stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+                stdout.flush()
+
+    # The client runs tool calls in parallel and times each one from send time, so
+    # calls run concurrently; control messages stay inline and in order.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CALL_WORKERS) as pool:
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                with write_lock:
+                    stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {
+                        "code": -32700, "message": "parse error"}}) + "\n")
+                    stdout.flush()
+                continue
+            if isinstance(message, dict) and message.get("method") == "tools/call" \
+                    and "id" in message:
+                pool.submit(reply, message)
+            else:
+                reply(message)
+    return 0  # the with-block waited for in-flight calls
 
 
 def _cli_login(key: str) -> int:

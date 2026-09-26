@@ -141,6 +141,19 @@ def _apply_tokens(record: dict[str, Any], body: Mapping[str, Any], now: float) -
     record.pop("needs_login_alerted", None)
 
 
+def _oauth_error(code: int, body: Mapping[str, Any]) -> str:
+    """The OAuth error of a final 4xx, else TransientError (record left untouched).
+
+    Only a string OAuth `error` (other than temporarily_unavailable) proves the
+    grant itself was refused; a proxy page or empty body must not log the user out.
+    """
+    error = body.get("error")
+    if code >= 500 or code == 429 or not isinstance(error, str) \
+            or error == "temporarily_unavailable":
+        raise TransientError(f"token http {code}")
+    return error
+
+
 def status(key: str) -> dict[str, Any]:
     with _locked(key):
         record = _read(key)
@@ -193,9 +206,7 @@ def poll_device_login(key: str, *, now: float | None = None) -> str:
             record.pop("device", None)
             _write(key, record)
             return "ok"
-        if code >= 500 or code == 429:
-            raise TransientError(f"token http {code}")
-        error = str(body.get("error", f"http_{code}"))
+        error = _oauth_error(code, body)
         if error in ("authorization_pending", "slow_down") and now < device["expires_at"]:
             return "pending"
         outcome = "expired" if error in ("expired_token", "authorization_pending", "slow_down") else "denied"
@@ -218,9 +229,7 @@ def _refresh_locked(key: str, record: dict[str, Any], now: float) -> str:
         _apply_tokens(record, body, now)
         _write(key, record)
         return str(record["access_token"])
-    if code >= 500 or code == 429:
-        raise TransientError(f"token http {code}")
-    error = str(body.get("error", f"http_{code}"))
+    error = _oauth_error(code, body)
     record["state"] = "needs_login"
     record["error"] = f"{error}: {str(body.get('error_description', ''))[:160]}"
     _write(key, record)
@@ -265,6 +274,11 @@ def refresh_all(*, now: float | None = None, min_age_secs: float = 72000.0) -> d
             with _locked(key):
                 record = _read(key)
                 if not record:
+                    if (_token_dir() / f"{key}.json").exists():
+                        report["errors"] += 1  # corrupt or non-object JSON
+                    continue
+                if record.get("state") == "ok" and not record.get("refresh_token"):
+                    report["errors"] += 1
                     continue
                 if record.get("state") == "ok":
                     if now - float(record.get("refreshed_at", 0)) < min_age_secs:
