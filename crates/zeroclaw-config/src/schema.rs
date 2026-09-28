@@ -5996,8 +5996,9 @@ pub struct PacingConfig {
 
     /// Two tools alternating A->B->A->B for this many full cycles before the
     /// ping-pong detector's first escalation (Warning). Block at N+1, Break at
-    /// N+2. Defaults to 6 (was hardcoded 4). Value 0 disables the ping-pong
-    /// detector. Detection needs `2 * value <= loop_detection_window_size`.
+    /// N+2. Defaults to 20 (was 6, before that hardcoded 4). Value 0 disables
+    /// the ping-pong detector. Detection needs `2 * value <= loop_detection_window_size`,
+    /// so with the default window of 20 this default never fires by design.
     #[serde(default = "default_loop_detection_ping_pong_min_cycles")]
     pub loop_detection_ping_pong_min_cycles: usize,
 }
@@ -6019,7 +6020,15 @@ fn default_loop_detection_no_progress_min_calls() -> usize {
 }
 
 fn default_loop_detection_ping_pong_min_cycles() -> usize {
-    6
+    // Fork: 20, not upstream's 6. The pattern compares tool NAMES only, so an
+    // analyst doing ordinary work (write a script, run it, write the next one)
+    // was killed as a loop: DV-35153 2026-09-28, analyst_glm_flash, 8 cycles of
+    // shell/file_write with a different script and command each time. Real
+    // stuck loops are still caught by the exact-repeat and no-progress patterns.
+    // 20 cycles = 40 calls > the default window of 20, i.e. effectively off.
+    // Delegates run with PacingConfig::default(), so this default is what
+    // reaches ensemble analysts (config [pacing] does not).
+    20
 }
 
 impl Default for PacingConfig {
@@ -33056,7 +33065,7 @@ url = "http://localhost:8080/mcp"
             manual.loop_detection_ping_pong_min_cycles
         );
         assert_eq!(from_toml.loop_detection_no_progress_min_calls, 8);
-        assert_eq!(from_toml.loop_detection_ping_pong_min_cycles, 6);
+        assert_eq!(from_toml.loop_detection_ping_pong_min_cycles, 20);
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
