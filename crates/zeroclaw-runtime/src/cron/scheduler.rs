@@ -629,6 +629,17 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
         .await
 }
 
+/// Translates a cron job's `allowed_tools` into the turn's `caller_allowed`.
+// fork(2026-09-29): `["*"]` = full risk-profile envelope WITH cron tools.
+// `None` on the job would strip cron_add (continuations need it); an explicit
+// name list narrows MCP registration too, which left bounded delegates with no MCP.
+fn cron_caller_allowed(job: &CronJob) -> Option<Vec<String>> {
+    match job.allowed_tools.as_deref() {
+        Some([only]) if only == "*" => None,
+        other => other.map(<[String]>::to_vec),
+    }
+}
+
 fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
     let mut policy = base.clone();
     if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
@@ -971,7 +982,7 @@ async fn run_agent_job(
                     vec![],
                     false,
                     Some(session_path.clone()),
-                    job.allowed_tools.clone(),
+                    cron_caller_allowed(job),
                     zeroclaw_api::ingress::TurnOrigin::Cron,
                     run_overrides,
                 )
@@ -1631,6 +1642,39 @@ mod tests {
             policy.is_tool_allowed("cron_add"),
             "explicit cron job allowed_tools should remain the override for intentional scheduler automation"
         );
+    }
+
+    #[test]
+    fn cron_caller_allowed_star_sentinel_means_no_narrowing() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = Some(vec!["*".into()]);
+        assert_eq!(cron_caller_allowed(&job), None);
+
+        job.allowed_tools = Some(vec!["cron_add".into()]);
+        assert_eq!(
+            cron_caller_allowed(&job),
+            Some(vec!["cron_add".to_string()])
+        );
+
+        job.allowed_tools = None;
+        assert_eq!(cron_caller_allowed(&job), None);
+
+        job.allowed_tools = Some(vec!["*".into(), "shell".into()]);
+        assert_eq!(
+            cron_caller_allowed(&job),
+            Some(vec!["*".to_string(), "shell".to_string()])
+        );
+    }
+
+    #[test]
+    fn cron_agent_run_security_policy_star_sentinel_keeps_cron_tools() {
+        let security = SecurityPolicy::default();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = Some(vec!["*".into()]);
+        let policy = cron_agent_run_security_policy(&security, &job);
+        assert!(policy.is_tool_allowed("cron_add"));
     }
 
     #[tokio::test]
