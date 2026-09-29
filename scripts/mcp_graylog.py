@@ -1025,7 +1025,8 @@ _RANGE_HARD_CAP_S = 90 * 86400  # 90 days
 
 
 def _range_to_seconds(value: str) -> int:
-    """Parse '1h', '24h', '7d' → seconds. Hard cap 90d. Raises ValueError."""
+    """Parse '1h', '24h', '7d' → seconds. Hard cap 90d on the query window;
+    this is not the log retention. Raises ValueError."""
     if not value or not isinstance(value, str):
         raise ValueError(f"Invalid range: {value!r}")
     m = _RANGE_RE.match(value.strip())
@@ -1038,7 +1039,8 @@ def _range_to_seconds(value: str) -> int:
         raise ValueError(f"Range must be positive: {value!r}")
     seconds = n * _RANGE_UNITS[unit]
     if seconds > _RANGE_HARD_CAP_S:
-        raise ValueError(f"Range exceeds hard cap 90d: {value!r}")
+        raise ValueError(f"Range exceeds the search range limit of 90d "
+            f"(a query-window limit, not log retention): {value!r}")
     return seconds
 
 
