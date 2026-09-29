@@ -678,7 +678,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         needs fork patch #49 to reach the wire).
 # v3-69 = jira_analysis model_windows gain deepseek-v4.1-flash and glm-5.3-flash
 #         (jira_worker / analyst_glm_flash were on the silent 1M fallback).
-CURRENT_CONFIG_MARKER = "v3-71"
+CURRENT_CONFIG_MARKER = "v3-72"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -1195,6 +1195,7 @@ class WorkspaceBootstrapper:
                 config_text,
                 host=self.settings.child_host,
                 port=port,
+                user_workspace=workspace_dir,
             )
             config_text = config_text.rstrip("\n") + (
                 f"\n\n# config-gen = {CURRENT_CONFIG_MARKER}\n"
@@ -1286,7 +1287,14 @@ class WorkspaceBootstrapper:
         *,
         host: str,
         port: int,
+        user_workspace: Path | None = None,
     ) -> str:
+        if user_workspace is not None:
+            # [agents.jira_coordinator.workspace] path: the coordinator's cron
+            # turn must load the user's skills, not an empty per-agent dir.
+            config_text = config_text.replace(
+                "__USER_WORKSPACE__", str(user_workspace)
+            )
         lines = config_text.splitlines()
         output: list[str] = []
         in_gateway = False
@@ -1410,6 +1418,7 @@ class WorkspaceBootstrapper:
             template.read_text(encoding="utf-8"),
             host=host,
             port=port,
+            user_workspace=cfg.parent.parent / "workspace",
         )
         rendered = rendered.rstrip("\n") + f"\n\n# config-gen = {marker}\n"
 

@@ -843,6 +843,12 @@ risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
+[agents.jira_coordinator.workspace]
+# The user's workspace, substituted per user by gateway_manager: without it
+# the coordinator's cron turn loads skills from an empty
+# .zeroclaw/agents/jira_coordinator/workspace (design 2026-09-29 D4).
+path = "__USER_WORKSPACE__"
+
 [agents.jira_worker]
 model_provider = "opencode.flash"
 risk_profile = "default"
