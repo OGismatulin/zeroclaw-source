@@ -218,10 +218,13 @@ impl SecurityPolicy {
     /// `allowed_tools = None` is unrestricted; `Some(list)` is the
     /// allowlist. `excluded_tools` always subtracts.
     pub fn is_tool_allowed(&self, name: &str) -> bool {
-        let allowed = self
-            .allowed_tools
-            .as_ref()
-            .is_none_or(|list| list.iter().any(|t| t == name));
+        // fork(2026-09-29): parity with the MCP risk gate (ToolAccessPolicy):
+        // `<server>__<tool>` names are admitted by a non-empty allowlist, so the
+        // server set is decided by mcp_bundles, not by a hand-kept name list
+        // (the profile listed 45 of 48 live MCP tools; delegates lost 3).
+        let allowed = self.allowed_tools.as_ref().is_none_or(|list| {
+            list.iter().any(|t| t == name) || (!list.is_empty() && name.contains("__"))
+        });
         allowed && !self.is_tool_excluded(name)
     }
 
@@ -2528,6 +2531,22 @@ mod tests {
         assert!(p.is_tool_allowed("memory_recall"));
         assert!(!p.is_tool_allowed("spawn_subagent"));
         assert!(!p.is_tool_allowed("file_write"));
+    }
+
+    #[test]
+    fn allowlist_admits_mcp_names_like_the_risk_gate() {
+        let mut p = SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("lalafo-db__query"));
+        assert!(!p.is_tool_allowed("file_write"));
+        p.excluded_tools = Some(vec!["lalafo-db__query".into()]);
+        assert!(!p.is_tool_allowed("lalafo-db__query"));
+        p.allowed_tools = Some(vec![]);
+        p.excluded_tools = None;
+        assert!(!p.is_tool_allowed("lalafo-db__query"));
     }
 
     #[test]
