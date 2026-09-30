@@ -585,6 +585,10 @@ allowed_commands = [
     "uname",
     "du",
     "bash",
+    "nl",
+    "base64",
+    "which",
+    "printf",
 ]
 forbidden_paths = [
     "/etc",
