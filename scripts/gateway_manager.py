@@ -678,7 +678,8 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 #         needs fork patch #49 to reach the wire).
 # v3-69 = jira_analysis model_windows gain deepseek-v4.1-flash and glm-5.3-flash
 #         (jira_worker / analyst_glm_flash were on the silent 1M fallback).
-CURRENT_CONFIG_MARKER = "v3-72"
+# v3-73 = GPT-6.1 Sol replaces GPT-6 Sol (codex_coder, codex_sol, fallbacks, windows).
+CURRENT_CONFIG_MARKER = "v3-73"
 
 
 def sanitize_filename(filename: str) -> str:
