@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::PluginPermission;
 use crate::instance::PluginInstanceScope;
@@ -220,7 +219,7 @@ impl WasiHttpView for PluginState {
         WasiHttpCtxView {
             ctx,
             table: &mut self.table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: wasmtime_wasi_http::default_hooks(),
         }
     }
 }
