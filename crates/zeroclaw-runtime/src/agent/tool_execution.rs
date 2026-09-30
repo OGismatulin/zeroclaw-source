@@ -103,6 +103,18 @@ pub struct ToolExecutionOutcome {
     pub receipt: Option<String>,
 }
 
+const MAX_FAILURE_DATA_CHARS: usize = 4096;
+
+fn serialize_failure_data(data: &serde_json::Value) -> String {
+    let text = data.to_string();
+    if text.chars().count() <= MAX_FAILURE_DATA_CHARS {
+        return text;
+    }
+    let mut truncated: String = text.chars().take(MAX_FAILURE_DATA_CHARS).collect();
+    truncated.push_str("... [truncated]");
+    truncated
+}
+
 // ── Single tool execution ────────────────────────────────────────────────
 
 pub(crate) async fn execute_one_tool(
@@ -338,7 +350,15 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
+                    let failure_data = r.output.data().cloned();
+                    let has_error_text = r.error.is_some();
                     let reason = r.error.unwrap_or_else(|| r.output.into_string());
+                    let output = match failure_data.as_ref() {
+                        Some(data) if has_error_text => {
+                            format!("Error: {reason}\n{}", serialize_failure_data(data))
+                        }
+                        _ => format!("Error: {reason}"),
+                    };
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
@@ -352,12 +372,12 @@ pub(crate) async fn execute_one_tool(
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
-                        output: format!("Error: {reason}"),
+                        output,
                         success: false,
                         error_reason: Some(reason),
                         duration,
                         receipt: None,
-                        output_data: None,
+                        output_data: failure_data,
                     })
                 }
             }
@@ -672,6 +692,143 @@ mod tests {
             1,
             "recovered activated tool should have been invoked exactly once"
         );
+    }
+
+    struct FailingWithTool {
+        name: &'static str,
+        data: Option<serde_json::Value>,
+        error: Option<String>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingWithTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-failing-with-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingWithTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let output = match &self.data {
+                Some(data) => zeroclaw_api::tool::ToolOutput::json(data.clone()),
+                None => zeroclaw_api::tool::ToolOutput::default(),
+            };
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output,
+                error: self.error.clone(),
+            })
+        }
+    }
+
+    async fn run_failing(tool: FailingWithTool) -> super::ToolExecutionOutcome {
+        let name = tool.name;
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        execute_one_tool(
+            name,
+            serde_json::json!({}),
+            Some("call-1"),
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool returns an outcome")
+    }
+
+    #[tokio::test]
+    async fn failure_with_data_keeps_error_prefix_and_serializes_data_into_output() {
+        let outcome = run_failing(FailingWithTool {
+            name: "denier",
+            data: Some(serde_json::json!({"status": "denied", "policy_reason": "x"})),
+            error: Some("Command not allowed by security policy: y".into()),
+        })
+        .await;
+
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .output
+                .starts_with("Error: Command not allowed by security policy: y\n")
+        );
+        assert!(outcome.output.contains("\"policy_reason\":\"x\""));
+        assert_eq!(
+            outcome.output_data,
+            Some(serde_json::json!({"status": "denied", "policy_reason": "x"}))
+        );
+        assert_eq!(
+            outcome.error_reason.as_deref(),
+            Some("Command not allowed by security policy: y")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_without_data_keeps_error_only_output() {
+        let outcome = run_failing(FailingWithTool {
+            name: "plain",
+            data: None,
+            error: Some("plain reason".into()),
+        })
+        .await;
+
+        assert_eq!(outcome.output, "Error: plain reason");
+        assert!(outcome.output_data.is_none());
+    }
+
+    #[tokio::test]
+    async fn failure_data_serialization_is_size_bounded() {
+        let outcome = run_failing(FailingWithTool {
+            name: "big",
+            data: Some(serde_json::json!({"blob": "z".repeat(20_000)})),
+            error: Some("big failure".into()),
+        })
+        .await;
+
+        assert!(outcome.output.starts_with("Error: big failure\n"));
+        assert!(outcome.output.ends_with("... [truncated]"));
+        assert!(outcome.output.chars().count() < 4300);
+    }
+
+    #[tokio::test]
+    async fn failure_with_data_and_no_error_text_does_not_duplicate_payload() {
+        let outcome = run_failing(FailingWithTool {
+            name: "rejecter",
+            data: Some(serde_json::json!({"status": "rejected", "reason": "r"})),
+            error: None,
+        })
+        .await;
+
+        assert_eq!(outcome.output.matches("rejected").count(), 1);
+        assert!(outcome.output_data.is_some());
     }
 
     #[tokio::test]

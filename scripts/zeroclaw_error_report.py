@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import datetime as dt
 import fcntl
 import functools
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,7 +51,7 @@ STALE_FLOOR_SECS = 45.0
 MAX_REPORT_CHARS = 3500
 MAX_ERROR_ROWS = 12
 
-RECEIPT_KINDS = ("report", "unavailable_notice")
+RECEIPT_KINDS = ("report", "unavailable_notice", "attachment")
 RECEIPT_STATES = ("pending", "sending", "accepted", "failed", "unknown")
 
 
@@ -836,6 +837,9 @@ class ReceiptStore:
         except (OSError, ValueError):
             return None
 
+    def payload_path(self, key: ReceiptKey) -> Path:
+        return self.root / f"{key.filename()[: -len('.json')]}.payload.md"
+
     def write(self, key: ReceiptKey, state: str, **extra: object) -> dict:
         if state not in RECEIPT_STATES:
             raise ValueError(f"unknown receipt state: {state}")
@@ -848,11 +852,34 @@ class ReceiptStore:
             "updated_at": _utc_stamp(),
             **extra,
         }
+        self._atomic_write(
+            self.path(key), json.dumps(receipt, ensure_ascii=False, indent=2).encode("utf-8")
+        )
+        return receipt
+
+    def write_payload(self, key: ReceiptKey, text: str) -> tuple[Path, str]:
+        data = text.encode("utf-8")
+        target = self.payload_path(key)
+        self._atomic_write(target, data)
+        return target, hashlib.sha256(data).hexdigest()
+
+    def read_payload(self, key: ReceiptKey) -> bytes | None:
+        try:
+            return self.payload_path(key).read_bytes()
+        except OSError:
+            return None
+
+    def remove_payload(self, key: ReceiptKey) -> None:
+        try:
+            self.payload_path(key).unlink()
+        except OSError:
+            pass
+
+    def _atomic_write(self, target: Path, data: bytes) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        target = self.path(key)
         tmp = target.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(receipt, handle, ensure_ascii=False, indent=2)
+        with open(tmp, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, target)
@@ -863,7 +890,6 @@ class ReceiptStore:
             os.fsync(directory)
         finally:
             os.close(directory)
-        return receipt
 
 
 class DeliveryError(RuntimeError):
@@ -1208,17 +1234,29 @@ def run_once(
         outcome["reason"] = reason
         return outcome
 
+    attachment_key = ReceiptKey(
+        date=key.date,
+        timezone=key.timezone,
+        recipient=key.recipient,
+        kind="attachment",
+    )
+    file_needed = bool(dropped and digest is not None and zeroclaw_incidents is not None)
+    sender = file_deliver_fn or (
+        lambda name, body, caption: deliver_file(name, body, caption, config=config)
+    )
+    sent_now = False
     with ProcessLock(config.state_root / ".report.lock"):
         existing = store.load(key)
+        message_state = existing.get("state") if existing is not None else None
+        proceed = True
         if existing is not None:
-            state = existing.get("state")
-            if state == "accepted":
+            if message_state == "accepted":
                 outcome["state"] = "already-accepted"
-                return outcome
-            if state == "failed":
+                proceed = False
+            elif message_state == "failed":
                 outcome["state"] = "already-failed"
-                return outcome
-            if state == "sending" and not retry_unknown:
+                proceed = False
+            elif message_state == "sending" and not retry_unknown:
                 # A durable `sending` means a previous process reached the
                 # network and never came back. The bot may well have delivered
                 # the message before dying, so this is exactly the `unknown`
@@ -1227,51 +1265,112 @@ def run_once(
                 store.write(
                     key, "unknown", detail="process died after sending"
                 )
+                message_state = "unknown"
                 outcome["state"] = "unknown-held"
-                return outcome
-            if state == "unknown" and not retry_unknown:
+                proceed = False
+            elif message_state == "unknown" and not retry_unknown:
                 # An unknown send may already have reached Telegram. Retrying is
                 # an explicit operator decision, not an automatic one.
                 outcome["state"] = "unknown-held"
-                return outcome
-        # Durable `sending` BEFORE the network call: a crash between the two
-        # must be visible as `sending`, never as "never attempted".
-        store.write(key, "sending", attempted_at=_utc_stamp())
-        state, detail = deliver_fn(
-            notify_url=config.notify_url,
-            notify_secret=config.notify_secret,
-            recipient=config.recipient,
-            message=message,
+                proceed = False
+        if proceed:
+            if file_needed and store.load(attachment_key) is None:
+                payload_file, payload_sha = store.write_payload(
+                    attachment_key,
+                    zeroclaw_incidents.render_attachment(
+                        digest, date.isoformat(), timezone_name=config.timezone
+                    ),
+                )
+                store.write(
+                    attachment_key,
+                    "pending",
+                    payload_sha256=payload_sha,
+                    payload_path=str(payload_file),
+                )
+            # Durable `sending` BEFORE the network call: a crash between the two
+            # must be visible as `sending`, never as "never attempted".
+            store.write(key, "sending", attempted_at=_utc_stamp())
+            state, detail = deliver_fn(
+                notify_url=config.notify_url,
+                notify_secret=config.notify_secret,
+                recipient=config.recipient,
+                message=message,
+            )
+            store.write(key, state, detail=detail)
+            message_state = state
+            outcome["state"] = state
+            outcome["detail"] = detail
+            sent_now = True
+        attachment = _settle_attachment(
+            store=store,
+            key=attachment_key,
+            message_state=message_state,
+            retry_unknown=retry_unknown,
+            sender=sender,
+            name=f"zeroclaw-errors-{date.isoformat()}.md",
+            caption=f"ZeroClaw — полный список инцидентов за {date:%d.%m}",
         )
-        store.write(key, state, detail=detail)
-    outcome["state"] = state
-    outcome["detail"] = detail
-    _bump(exporter, "accepted" if state == "accepted" else "send_failed")
-
-    # Best-effort tail: the full incident list as a file, sent only once,
-    # only after the message itself was accepted, and only when something
-    # was actually dropped from it. Its failure must never change the
-    # receipt written above (spec §8).
-    if state == "accepted" and dropped and digest is not None:
-        sender = file_deliver_fn or (
-            lambda name, body, caption: deliver_file(
-                name, body, caption, config=config
-            )
-        )
-        try:
-            sender(
-                f"zeroclaw-errors-{date.isoformat()}.md",
-                zeroclaw_incidents.render_attachment(
-                    digest, date.isoformat(), timezone_name=config.timezone
-                ),
-                f"ZeroClaw — полный список инцидентов за {date:%d.%m}",
-            )
-        except Exception as exc:  # the tail must never fail the day
-            print(
-                f"[zeroclaw-error-report] attachment failed: {type(exc).__name__}",
-                flush=True,
-            )
+        if attachment is not None:
+            outcome["attachment"] = attachment
+    if sent_now:
+        _bump(exporter, "accepted" if outcome["state"] == "accepted" else "send_failed")
     return outcome
+
+
+def _settle_attachment(
+    *,
+    store: ReceiptStore,
+    key: ReceiptKey,
+    message_state: object,
+    retry_unknown: bool,
+    sender: Callable[[str, str, str], tuple[str, str]],
+    name: str,
+    caption: str,
+) -> dict | None:
+    receipt = store.load(key)
+    if receipt is None:
+        return None
+    state = receipt.get("state")
+    carried = {
+        "payload_sha256": receipt.get("payload_sha256"),
+        "payload_path": receipt.get("payload_path"),
+    }
+    if state in ("accepted", "failed"):
+        return {"state": state, "detail": str(receipt.get("detail", ""))}
+    if state == "pending" and message_state == "failed":
+        store.write(key, "failed", detail="report message failed", **carried)
+        store.remove_payload(key)
+        return {"state": "failed", "detail": "report message failed"}
+    if message_state != "accepted":
+        return {"state": state, "detail": "held: report message is not accepted"}
+    if state == "sending" and not retry_unknown:
+        store.write(key, "unknown", detail="process died after sending", **carried)
+        return {"state": "unknown-held", "detail": "process died after sending"}
+    if state == "unknown" and not retry_unknown:
+        return {"state": "unknown-held", "detail": str(receipt.get("detail", ""))}
+    payload = store.read_payload(key)
+    if payload is None:
+        store.write(key, "failed", detail="payload missing", **carried)
+        return {"state": "failed", "detail": "payload missing"}
+    if hashlib.sha256(payload).hexdigest() != carried["payload_sha256"]:
+        store.write(key, "failed", detail="payload hash mismatch", **carried)
+        store.remove_payload(key)
+        return {"state": "failed", "detail": "payload hash mismatch"}
+    store.write(key, "sending", attempted_at=_utc_stamp(), **carried)
+    try:
+        file_state, detail = sender(name, payload.decode("utf-8"), caption)
+    except Exception as exc:  # the tail must never fail the day
+        file_state, detail = "failed", f"sender raised {type(exc).__name__}"
+        print(
+            f"[zeroclaw-error-report] attachment failed: {type(exc).__name__}",
+            flush=True,
+        )
+    if file_state not in ("accepted", "failed", "unknown"):
+        file_state, detail = "unknown", f"unexpected sender state {file_state}"
+    store.write(key, file_state, detail=detail, **carried)
+    if file_state in ("accepted", "failed"):
+        store.remove_payload(key)
+    return {"state": file_state, "detail": detail}
 
 
 def _bump(exporter: object | None, outcome: str) -> None:
@@ -1374,6 +1473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(result.get("message", ""))
     print(f"-- state: {result.get('state')} {result.get('detail', '')}", flush=True)
+    attachment = result.get("attachment")
+    if attachment:
+        print(f"-- attachment: {attachment['state']} {attachment['detail']}", flush=True)
     return 0 if result.get("state") in ("dry-run", "accepted") else 1
 
 

@@ -1434,6 +1434,7 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's risk profile (also baked into `approval`); retained
     /// because system-prompt construction renders autonomy guidance from it.
     risk_profile: zeroclaw_config::schema::RiskProfileConfig,
+    security: Arc<crate::security::SecurityPolicy>,
     /// The step agent's own skills, for its system prompt.
     skills: Vec<crate::skills::Skill>,
     /// MCP-origin ground truth for the per-turn `tool_filter_groups` gate.
@@ -1595,6 +1596,7 @@ pub(crate) async fn assemble_owned_execution(
         activated_tools: activated_handle,
         agent,
         risk_profile,
+        security,
         skills,
         mcp_tool_names,
         mcp_prompt_section,
@@ -1644,6 +1646,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        Some(owned.security.as_ref()),
     )
 }
 
@@ -2885,6 +2888,7 @@ mod sop_step_reassembly_tests {
             activated_tools: None,
             agent,
             risk_profile: zeroclaw_config::schema::RiskProfileConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
@@ -3618,6 +3622,7 @@ mod sop_step_reassembly_tests {
                 activated_tools: None,
                 agent: stepper_agent,
                 risk_profile: stepper_risk_profile,
+                security: Arc::new(crate::security::SecurityPolicy::default()),
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),

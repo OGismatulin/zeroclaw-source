@@ -617,7 +617,11 @@ impl Tool for HttpRequestTool {
 
                 Ok(ToolResult {
                     success: status.is_success(),
-                    output: ToolOutput::json_with_text(data, output),
+                    output: if status.is_success() {
+                        ToolOutput::json_with_text(data, output)
+                    } else {
+                        ToolOutput::text(output)
+                    },
                     error: if status.is_client_error() || status.is_server_error() {
                         Some(format!("HTTP {}", status_code))
                     } else {

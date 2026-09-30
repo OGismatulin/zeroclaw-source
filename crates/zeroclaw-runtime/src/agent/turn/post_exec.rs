@@ -44,6 +44,8 @@ pub(crate) async fn record_executed_outcomes(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
+                    "tool_call_id": call.tool_call_id.clone(),
+                    "tool_diagnostic": tool_diagnostic(&outcome),
                     "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
                     "output": scrub_credentials(&outcome.output),
                     "trace_id": ctx.turn_id,
@@ -96,6 +98,44 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+}
+
+const TOOL_DIAGNOSTIC_KEYS: [&str; 8] = [
+    "status",
+    "policy_reason",
+    "blocked_command",
+    "path",
+    "completed",
+    "pending",
+    "missing",
+    "failed",
+];
+
+fn tool_diagnostic(outcome: &ToolExecutionOutcome) -> Option<serde_json::Value> {
+    if outcome.success {
+        return None;
+    }
+    let map = outcome.output_data.as_ref()?.as_object()?;
+    let projected: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .filter(|(key, _)| TOOL_DIAGNOSTIC_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), scrub_diagnostic_value(value)))
+        .collect();
+    if projected.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(projected))
+    }
+}
+
+fn scrub_diagnostic_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(scrub_credentials(text)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(scrub_diagnostic_value).collect())
+        }
+        other => other.clone(),
     }
 }
 

@@ -87,6 +87,7 @@ pub fn build_system_prompt_with_tool_calls(
         0,
         true,
         show_tool_calls,
+        None,
     )
 }
 
@@ -119,7 +120,29 @@ pub fn build_system_prompt_with_mode(
         0,
         true,
         false,
+        None,
     )
+}
+
+const SHELL_POLICY_GUIDANCE: &str = "\
+- The shell working directory is already your workspace. Do not use `cd`; it is not allowed. To work in another repository use `git -C <repo> ...`.
+- Every pipeline segment is checked against the allowlist, and argument, path and syntax guards still apply; a listed command can still be refused.
+- Read a file at a git ref with line numbers: `git -C <repo> show <ref>:<path> | grep -n '' | head -N | tail -n +M`. Search a ref: `git -C <repo> grep -n <pattern> <ref> -- <path>`. For the working tree use `file_read` with offset and limit.
+- `git_operations` works only inside the workspace.
+- Use workspace-relative paths (`skills/`, `scripts/`, `state/`, `uploads/`). For external code use the declared MCP tools or the lalafo-code skill, not absolute paths.
+- When a call is denied, read `policy_reason` in the tool result if present and change the command; do not repeat the same call.
+- After a `file_edit` mismatch, re-read only the needed fragment with `file_read` offset and limit and choose a unique `old_string`; re-read the whole file only before a full rewrite.
+- `agent-browser close` is a shell command, not a `file_edit` argument.
+- Background tasks: pending after a wait timeout means still running; missing means check the task ID; failed or cancelled is terminal.
+- Avoid interactive commands that block on stdin, quote paths with spaces, and do not exfiltrate data or modify system-critical paths.";
+
+pub(crate) fn shell_policy_block(security_summary: Option<&str>) -> String {
+    let mut out = format!("## Shell Policy\n\n{SHELL_POLICY_GUIDANCE}");
+    if let Some(summary) = security_summary {
+        out.push_str("\n\n### Active Security Policy\n\n");
+        out.push_str(summary.trim_end());
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,6 +165,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // response. When `false` (default), the system prompt instructs
     // the model to treat tool calls as invisible infrastructure.
     show_tool_calls: bool,
+    shell_security_summary: Option<&str>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -281,7 +305,6 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
@@ -298,6 +321,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+
+    if let Some(summary) = shell_security_summary {
+        prompt.push_str(&shell_policy_block(Some(summary)));
+        prompt.push_str("\n\n");
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -504,7 +532,61 @@ mod tests {
             0,
             true,
             false,
+            None,
         )
+    }
+
+    fn build_with_summary(summary: Option<&str>) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let autonomy = zeroclaw_config::schema::RiskProfileConfig::default();
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[("shell", "Run a shell command")],
+            &[],
+            None,
+            Some(512),
+            Some(&autonomy),
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            summary,
+        )
+    }
+
+    #[test]
+    fn shell_policy_block_carries_effective_summary_and_guidance() {
+        let prompt = build_with_summary(Some("**Allowed shell commands**: `effective-cmd`."));
+        assert!(prompt.contains("## Shell Policy"));
+        assert!(prompt.contains("`effective-cmd`"));
+        assert!(prompt.contains("Do not use `cd`"));
+        assert!(prompt.contains("git -C <repo> show <ref>:<path>"));
+        assert!(prompt.contains("policy_reason"));
+        assert!(prompt.contains("`agent-browser close` is a shell command"));
+    }
+
+    #[test]
+    fn shell_policy_block_absent_without_summary() {
+        let prompt = build_with_summary(None);
+        assert!(!prompt.contains("## Shell Policy"));
+        assert!(!prompt.contains("Do not use `cd`"));
+    }
+
+    #[test]
+    fn prompt_never_recommends_trash() {
+        let with = build_with_summary(Some("summary"));
+        let without = build_with_summary(None);
+        assert!(!with.contains("trash"));
+        assert!(!without.contains("trash"));
+    }
+
+    #[test]
+    fn shell_policy_guidance_stays_within_word_budget() {
+        let words = SHELL_POLICY_GUIDANCE.split_whitespace().count();
+        assert!(words <= 300, "guidance is {words} words");
     }
 
     #[test]

@@ -164,9 +164,14 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             };
 
             if let Some(path) = blocked {
+                let safe_path = self.security.safe_denial_path(&path);
                 return Ok(ToolResult {
                     success: false,
-                    output: ToolOutput::default(),
+                    output: ToolOutput::json(zeroclaw_config::policy::policy_denial_json(
+                        zeroclaw_config::policy::PolicyDenialReason::PathNotAllowed,
+                        None,
+                        Some(&safe_path),
+                    )),
                     error: Some(format!("Path blocked by security policy: {path}")),
                 });
             }
@@ -320,6 +325,34 @@ mod tests {
             0,
             "inner must not be called"
         );
+    }
+
+    #[tokio::test]
+    async fn path_guard_denial_carries_typed_reason_and_safe_path() {
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let result = tool
+            .execute(serde_json::json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("Path blocked by security policy: ")
+        );
+        assert_eq!(
+            result.output.data().unwrap(),
+            &serde_json::json!({
+                "status": "denied",
+                "policy_reason": "path_not_allowed",
+                "blocked_command": null,
+                "path": "outside_workspace"
+            })
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
