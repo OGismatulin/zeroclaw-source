@@ -1192,6 +1192,386 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDenialReason {
+    Readonly,
+    CommandNotAllowed,
+    ShellExpansion,
+    ProcessSubstitution,
+    OutputRedirect,
+    InputRedirect,
+    Background,
+    ArgumentNotAllowed,
+    PathNotAllowed,
+    ApprovalRequired,
+    HighRisk,
+    InvalidSyntax,
+}
+
+impl PolicyDenialReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::CommandNotAllowed => "command_not_allowed",
+            Self::ShellExpansion => "shell_expansion",
+            Self::ProcessSubstitution => "process_substitution",
+            Self::OutputRedirect => "output_redirect",
+            Self::InputRedirect => "input_redirect",
+            Self::Background => "background",
+            Self::ArgumentNotAllowed => "argument_not_allowed",
+            Self::PathNotAllowed => "path_not_allowed",
+            Self::ApprovalRequired => "approval_required",
+            Self::HighRisk => "high_risk",
+            Self::InvalidSyntax => "invalid_syntax",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDenial {
+    pub reason: PolicyDenialReason,
+    pub blocked_command: Option<String>,
+    pub message: String,
+}
+
+impl CommandDenial {
+    pub fn to_json(&self) -> serde_json::Value {
+        policy_denial_json(self.reason, self.blocked_command.as_deref(), None)
+    }
+}
+
+pub fn policy_denial_json(
+    reason: PolicyDenialReason,
+    blocked_command: Option<&str>,
+    path: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "status": "denied",
+        "policy_reason": reason.as_str(),
+        "blocked_command": blocked_command,
+    });
+    if let Some(path) = path
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert("path".into(), serde_json::Value::String(path.to_string()));
+    }
+    value
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessSubstitutionScan {
+    Literal,
+    Active,
+    UnterminatedQuote,
+}
+
+fn scan_process_substitution(command: &str) -> ProcessSubstitutionScan {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Plain,
+        Single,
+        Double,
+        AnsiC,
+    }
+
+    let chars: Vec<char> = command.chars().collect();
+    let mut state = State::Plain;
+    let mut escaped = false;
+    let mut prev_is_unescaped_dollar = false;
+
+    for (i, &ch) in chars.iter().enumerate() {
+        match state {
+            State::Single => {
+                if ch == '\'' {
+                    state = State::Plain;
+                }
+                prev_is_unescaped_dollar = false;
+            }
+            State::AnsiC | State::Double => {
+                let closer = if state == State::AnsiC { '\'' } else { '"' };
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == closer {
+                    state = State::Plain;
+                }
+                prev_is_unescaped_dollar = false;
+            }
+            State::Plain => {
+                if escaped {
+                    escaped = false;
+                    prev_is_unescaped_dollar = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '\'' => {
+                        state = if prev_is_unescaped_dollar {
+                            State::AnsiC
+                        } else {
+                            State::Single
+                        };
+                    }
+                    '"' => state = State::Double,
+                    '<' | '>' if chars.get(i + 1) == Some(&'(') => {
+                        return ProcessSubstitutionScan::Active;
+                    }
+                    _ => {}
+                }
+                prev_is_unescaped_dollar = ch == '$';
+            }
+        }
+    }
+
+    if state == State::Plain {
+        ProcessSubstitutionScan::Literal
+    } else {
+        ProcessSubstitutionScan::UnterminatedQuote
+    }
+}
+
+fn segment_runs_nested_interpreter(segment: &str) -> bool {
+    const INTERPRETERS: [&str; 7] = ["sh", "bash", "dash", "zsh", "ksh", "npx", "npm"];
+    const PREFIXES: [&str; 6] = ["env", "exec", "command", "nohup", "timeout", "xargs"];
+
+    let mut after_prefix = false;
+    for (index, token) in skip_env_assignments(segment).split_whitespace().enumerate() {
+        let base_owned = command_basename(strip_wrapping_quotes(token)).to_ascii_lowercase();
+        let base = strip_windows_exe_suffix(&base_owned);
+        if (index == 0 || after_prefix) && INTERPRETERS.contains(&base) {
+            return true;
+        }
+        if index == 0 {
+            if !PREFIXES.contains(&base) {
+                return false;
+            }
+            after_prefix = true;
+        }
+    }
+    false
+}
+
+fn command_runs_nested_interpreter(command: &str) -> bool {
+    split_unquoted_segments(command)
+        .iter()
+        .any(|segment| segment_runs_nested_interpreter(segment))
+}
+
+fn process_substitution_denial(command: &str) -> Option<PolicyDenialReason> {
+    if !command.contains("<(") && !command.contains(">(") {
+        return None;
+    }
+    if command.contains('\n') || command.contains('\r') || command.contains("<<") {
+        return Some(PolicyDenialReason::ProcessSubstitution);
+    }
+    if command_runs_nested_interpreter(command) {
+        return Some(PolicyDenialReason::ProcessSubstitution);
+    }
+    match scan_process_substitution(command) {
+        ProcessSubstitutionScan::Literal => None,
+        ProcessSubstitutionScan::Active => Some(PolicyDenialReason::ProcessSubstitution),
+        ProcessSubstitutionScan::UnterminatedQuote => Some(PolicyDenialReason::InvalidSyntax),
+    }
+}
+
+fn sed_script_is_safe(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    let mut i = 0;
+
+    let skip_delimited = |i: &mut usize, delimiter: char| -> bool {
+        while *i < chars.len() {
+            let ch = chars[*i];
+            *i += 1;
+            if ch == '\\' {
+                if *i >= chars.len() {
+                    return false;
+                }
+                *i += 1;
+            } else if ch == delimiter {
+                return true;
+            }
+        }
+        false
+    };
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_ascii_whitespace()
+            || matches!(ch, ';' | '{' | '}' | '!' | ',' | '$' | '~' | '+')
+            || ch.is_ascii_digit()
+        {
+            i += 1;
+            continue;
+        }
+        if ch == '/' {
+            i += 1;
+            if !skip_delimited(&mut i, '/') {
+                return false;
+            }
+            while i < chars.len() && matches!(chars[i], 'I' | 'M') {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\\' {
+            let Some(&delimiter) = chars.get(i + 1) else {
+                return false;
+            };
+            if delimiter.is_ascii_alphanumeric() || delimiter.is_ascii_whitespace() {
+                return false;
+            }
+            i += 2;
+            if !skip_delimited(&mut i, delimiter) {
+                return false;
+            }
+            while i < chars.len() && matches!(chars[i], 'I' | 'M') {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+        match ch {
+            'p' | 'P' | 'd' | 'D' | 'n' | 'N' | 'h' | 'H' | 'g' | 'G' | 'x' | '=' | 'l' | 'q'
+            | 'Q' | 'z' => {}
+            's' => {
+                let Some(&delimiter) = chars.get(i) else {
+                    return false;
+                };
+                if delimiter.is_ascii_alphanumeric()
+                    || delimiter.is_ascii_whitespace()
+                    || delimiter == '\\'
+                {
+                    return false;
+                }
+                i += 1;
+                if !skip_delimited(&mut i, delimiter) || !skip_delimited(&mut i, delimiter) {
+                    return false;
+                }
+                while i < chars.len() && !matches!(chars[i], ';' | '}') && !chars[i].is_whitespace()
+                {
+                    if !matches!(chars[i], 'g' | 'p' | 'I' | 'i' | 'M' | 'm')
+                        && !chars[i].is_ascii_digit()
+                    {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            'y' => {
+                let Some(&delimiter) = chars.get(i) else {
+                    return false;
+                };
+                if delimiter.is_ascii_alphanumeric()
+                    || delimiter.is_ascii_whitespace()
+                    || delimiter == '\\'
+                {
+                    return false;
+                }
+                i += 1;
+                if !skip_delimited(&mut i, delimiter) || !skip_delimited(&mut i, delimiter) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn sed_args_safe(args: &[String]) -> bool {
+    let mut i = 0;
+    let mut script_seen = false;
+    let mut options_done = false;
+
+    let take_script = |i: &mut usize| -> Option<String> {
+        let first = args.get(*i)?;
+        *i += 1;
+        let quote = first.chars().next().filter(|c| matches!(c, '\'' | '"'));
+        let Some(quote) = quote else {
+            return Some(first.clone());
+        };
+        let mut text = first[1..].to_string();
+        loop {
+            if let Some(stripped) = text.strip_suffix(quote) {
+                let body = stripped.to_string();
+                if body.contains(quote) {
+                    return None;
+                }
+                return Some(body);
+            }
+            let next = args.get(*i)?;
+            *i += 1;
+            text.push(' ');
+            text.push_str(next);
+        }
+    };
+
+    while i < args.len() {
+        let token = args[i].as_str();
+        if !options_done && token == "--" {
+            options_done = true;
+            i += 1;
+            continue;
+        }
+        if !options_done && token.starts_with("--") {
+            match token {
+                "--quiet" | "--silent" | "--regexp-extended" | "--separate" | "--unbuffered"
+                | "--null-data" | "--posix" | "--debug" | "--sandbox" => {
+                    i += 1;
+                    continue;
+                }
+                "--expression" => {
+                    i += 1;
+                    let Some(script) = take_script(&mut i) else {
+                        return false;
+                    };
+                    if !sed_script_is_safe(&script) {
+                        return false;
+                    }
+                    script_seen = true;
+                    continue;
+                }
+                _ => return false,
+            }
+        }
+        if !options_done && token.starts_with('-') && token.len() > 1 {
+            let cluster = &token[1..];
+            let mut takes_script = false;
+            for (pos, flag) in cluster.char_indices() {
+                match flag {
+                    'n' | 'E' | 'r' | 's' | 'u' | 'z' => {}
+                    'e' if pos + 1 == cluster.len() => takes_script = true,
+                    _ => return false,
+                }
+            }
+            i += 1;
+            if takes_script {
+                let Some(script) = take_script(&mut i) else {
+                    return false;
+                };
+                if !sed_script_is_safe(&script) {
+                    return false;
+                }
+                script_seen = true;
+            }
+            continue;
+        }
+        if !script_seen {
+            let Some(script) = take_script(&mut i) else {
+                return false;
+            };
+            if !sed_script_is_safe(&script) {
+                return false;
+            }
+            script_seen = true;
+            continue;
+        }
+        i += 1;
+    }
+    script_seen
+}
+
 impl SecurityPolicy {
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
@@ -1328,21 +1708,35 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
+        self.validate_command_execution_detailed(command, approved)
+            .map_err(|denial| denial.message)
+    }
+
+    pub fn validate_command_execution_detailed(
+        &self,
+        command: &str,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, CommandDenial> {
+        self.check_command_admission(command)?;
 
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
+                return Err(CommandDenial {
+                    reason: PolicyDenialReason::HighRisk,
+                    blocked_command: None,
+                    message: "Command blocked: high-risk command is disallowed by policy".into(),
+                });
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
+                return Err(CommandDenial {
+                    reason: PolicyDenialReason::ApprovalRequired,
+                    blocked_command: None,
+                    message:
+                        "Command requires explicit approval (approved=true): high-risk operation"
+                            .into(),
+                });
             }
         }
 
@@ -1351,9 +1745,13 @@ impl SecurityPolicy {
             && self.require_approval_for_medium_risk
             && !approved
         {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+            return Err(CommandDenial {
+                reason: PolicyDenialReason::ApprovalRequired,
+                blocked_command: None,
+                message:
+                    "Command requires explicit approval (approved=true): medium-risk operation"
+                        .into(),
+            });
         }
 
         Ok(risk)
@@ -1404,8 +1802,18 @@ impl SecurityPolicy {
     // technique. If any gate rejects, the whole command is blocked.
 
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        self.check_command_admission(command).is_ok()
+    }
+
+    pub fn check_command_admission(&self, command: &str) -> Result<(), CommandDenial> {
+        let deny = |reason: PolicyDenialReason, blocked: Option<&str>| CommandDenial {
+            reason,
+            blocked_command: blocked.filter(|b| !b.is_empty()).map(str::to_string),
+            message: format!("Command not allowed by security policy: {command}"),
+        };
+
         if self.autonomy == AutonomyLevel::ReadOnly {
-            return false;
+            return Err(deny(PolicyDenialReason::Readonly, None));
         }
 
         // When the operator has explicitly opted out of all command-level
@@ -1414,15 +1822,14 @@ impl SecurityPolicy {
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            return Ok(());
         }
 
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
+        if command.contains('`') || contains_unquoted_shell_variable_expansion(command) {
+            return Err(deny(PolicyDenialReason::ShellExpansion, None));
+        }
+        if let Some(reason) = process_substitution_denial(command) {
+            return Err(deny(reason, None));
         }
 
         // Block shell redirections that target files. Allow safe forms:
@@ -1430,10 +1837,10 @@ impl SecurityPolicy {
         //   - `2>&1`, `1>&2` (fd merging)
         //   - `<<` heredocs, `<<<` here-strings (input literals)
         if contains_unsafe_output_redirect(command) {
-            return false;
+            return Err(deny(PolicyDenialReason::OutputRedirect, None));
         }
         if contains_unquoted_input_redirect(command) {
-            return false;
+            return Err(deny(PolicyDenialReason::InputRedirect, None));
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -1442,7 +1849,7 @@ impl SecurityPolicy {
             .split_whitespace()
             .any(|w| w == "tee" || w.ends_with("/tee"))
         {
-            return false;
+            return Err(deny(PolicyDenialReason::CommandNotAllowed, Some("tee")));
         }
 
         // Block background command chaining (`&`), which can hide extra
@@ -1451,7 +1858,7 @@ impl SecurityPolicy {
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
         if contains_unquoted_single_ampersand(&ampersand_check) {
-            return false;
+            return Err(deny(PolicyDenialReason::Background, None));
         }
 
         // Split on unquoted command separators and validate each sub-command.
@@ -1482,7 +1889,7 @@ impl SecurityPolicy {
                 .iter()
                 .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
-                return false;
+                return Err(deny(PolicyDenialReason::CommandNotAllowed, Some(base_cmd)));
             }
 
             // Validate arguments for the command.
@@ -1492,15 +1899,19 @@ impl SecurityPolicy {
             let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
-                return false;
+                return Err(deny(PolicyDenialReason::ArgumentNotAllowed, Some(base_cmd)));
             }
         }
 
         // At least one command must be present
-        segments.iter().any(|s| {
+        if segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        })
+        }) {
+            Ok(())
+        } else {
+            Err(deny(PolicyDenialReason::InvalidSyntax, None))
+        }
     }
 
     fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
@@ -1558,6 +1969,7 @@ impl SecurityPolicy {
                     arg == "exec" || arg == "install" || arg == "i" || arg == "add" || arg == "ci"
                 })
             }
+            "sed" => sed_args_safe(args_cased),
             "cargo" => {
                 // install fetches+builds external crate; build.rs executes arbitrary code
                 // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
@@ -2315,6 +2727,30 @@ impl SecurityPolicy {
         Ok(policy)
     }
 
+    pub fn safe_denial_path(&self, path: &str) -> String {
+        let trimmed = strip_wrapping_quotes(path).trim();
+        let relative = !trimmed.starts_with('/')
+            && !trimmed.starts_with('~')
+            && !trimmed.contains(':')
+            && !trimmed.contains('\\')
+            && !trimmed.split('/').any(|part| part == "..");
+        if relative && !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        if let Some(inside) = Path::new(trimmed)
+            .strip_prefix(&self.workspace_dir)
+            .ok()
+            .filter(|rest| {
+                !rest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            })
+        {
+            return inside.display().to_string();
+        }
+        "outside_workspace".to_string()
+    }
+
     pub fn prompt_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -2352,7 +2788,8 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Allowed shell commands**: {}. \
-                 You may execute these commands freely.",
+                 Every pipeline segment is checked against this list; \
+                 argument, path and syntax guards still apply.",
                 cmds.join(", ")
             );
         }
@@ -5395,8 +5832,16 @@ mod tests {
         assert!(summary.contains("`git`"), "should list allowed commands");
         assert!(summary.contains("`ls`"), "should list allowed commands");
         assert!(
-            summary.contains("You may execute these commands freely"),
-            "should mention allowed commands positively"
+            summary.contains("Every pipeline segment is checked against this list"),
+            "should say the allowlist is checked per segment"
+        );
+        assert!(
+            summary.contains("argument, path and syntax guards still apply"),
+            "should say guards still apply"
+        );
+        assert!(
+            !summary.contains("freely"),
+            "allowlist must not read as unconditional permission"
         );
     }
 
@@ -5617,30 +6062,223 @@ mod tests {
         assert!(!p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
     }
 
-    #[test]
-    fn process_substitution_guard_is_quote_blind_and_hits_js_arrow_functions() {
-        // Documented consequence, not a wish: the `>(` / `<(` guard is a raw
-        // substring check, so it fires inside quotes too. A JS arrow function
-        // returning an object literal (`e=>({...})`) contains `>(` and is
-        // rejected before the browser is ever reached -- that is what killed
-        // the mandated `agent-browser eval` measurement pass of the Jira HTML
-        // worker on 2026-09-08 (two rejected calls, then the loop detector).
-        // The guard stays as-is (loosening it re-opens process substitution);
-        // callers must write `=> (` or a plain `function`.
-        let p = SecurityPolicy {
-            allowed_commands: vec!["agent-browser".into()],
+    fn nested_shell_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            allowed_commands: vec![
+                "agent-browser".into(),
+                "cat".into(),
+                "echo".into(),
+                "grep".into(),
+                "bash".into(),
+                "sh".into(),
+                "npx".into(),
+                "env".into(),
+            ],
             block_high_risk_commands: false,
             ..SecurityPolicy::default()
-        };
-        assert!(!p.is_command_allowed(
+        }
+    }
+
+    #[test]
+    fn process_substitution_guard_is_quote_aware_and_keeps_nested_interpreters_closed() {
+        let p = nested_shell_policy();
+        assert!(
+            p.is_command_allowed("agent-browser eval 'JSON.stringify([1].map(e=>({value:e})))'")
+        );
+        assert!(p.is_command_allowed(
             "agent-browser eval 'JSON.stringify([...document.querySelectorAll(\".x\")].map(e=>({w:e.scrollWidth})))'"
         ));
         assert!(p.is_command_allowed(
             "agent-browser eval 'JSON.stringify([...document.querySelectorAll(\".x\")].map(e => ({w:e.scrollWidth})))'"
         ));
+        assert!(p.is_command_allowed("agent-browser eval \"[1].map(e=>({value:e}))\""));
         assert!(p.is_command_allowed(
             "agent-browser eval 'document.documentElement.scrollWidth > innerWidth'"
         ));
+        assert!(p.is_command_allowed("echo \"it's\""));
+        assert!(p.is_command_allowed("grep -n \"a'b\" file"));
+        assert!(p.is_command_allowed("echo 'a <(b)' && echo \"c >(d)\""));
+
+        for denied in [
+            "cat <(echo x)",
+            "cat >(echo x)",
+            "echo x | cat <(echo y)",
+            "echo 'a' <(echo y)",
+            "echo \"a\" >(cat)",
+            "cat \\<(echo x) <(echo y)",
+            "bash -c 'cat <(echo x)'",
+            "bash -lc 'cat <(echo x)'",
+            "'bash' -lc 'cat <(echo x)'",
+            "\"bash\" -c 'cat <(echo x)'",
+            "/bin/bash -c 'cat <(echo x)'",
+            "sh -xc 'cat <(echo x)'",
+            "sh -ec 'cat >(echo x)'",
+            "bash --norc -c 'cat <(echo x)'",
+            "env bash -c 'cat <(echo x)'",
+            "echo 'cat <(echo x)' | bash",
+            "bash <<< 'cat <(echo x)'",
+            "npx -c 'cat <(echo x)'",
+            "echo 'unterminated <(echo x)",
+            "echo $'\\'' <(cat x) '\\'''",
+            "echo \\$'\\' <(cat x) '\\'",
+            "echo a\n<(cat x)",
+            "cat <<'EOF'\n<(x)\nEOF",
+        ] {
+            assert!(!p.is_command_allowed(denied), "must stay denied: {denied}");
+        }
+    }
+
+    #[test]
+    fn process_substitution_denials_carry_closed_reasons() {
+        let p = nested_shell_policy();
+        let reason = |command: &str| {
+            p.check_command_admission(command)
+                .expect_err(command)
+                .reason
+                .as_str()
+        };
+        assert_eq!(reason("cat <(echo x)"), "process_substitution");
+        assert_eq!(reason("bash -lc 'cat <(echo x)'"), "process_substitution");
+        assert_eq!(reason("echo 'unterminated <(echo x)"), "invalid_syntax");
+        assert_eq!(reason("echo $HOME"), "shell_expansion");
+        assert_eq!(reason("echo hi > out.txt"), "output_redirect");
+        assert_eq!(reason("cat < in.txt"), "input_redirect");
+        assert_eq!(reason("echo hi &"), "background");
+        assert_eq!(reason("rm file"), "command_not_allowed");
+        assert_eq!(reason("echo hi | tee out"), "command_not_allowed");
+        assert_eq!(reason("   "), "invalid_syntax");
+        assert_eq!(
+            p.check_command_admission("rm file")
+                .unwrap_err()
+                .blocked_command,
+            Some("rm".to_string())
+        );
+        assert_eq!(
+            p.check_command_admission("echo hi | tee out")
+                .unwrap_err()
+                .blocked_command,
+            Some("tee".to_string())
+        );
+        let readonly = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..nested_shell_policy()
+        };
+        assert_eq!(
+            readonly
+                .check_command_admission("echo hi")
+                .unwrap_err()
+                .reason
+                .as_str(),
+            "readonly"
+        );
+        let node_policy = SecurityPolicy {
+            allowed_commands: vec!["node".into(), "pip".into()],
+            ..SecurityPolicy::default()
+        };
+        let denial = node_policy
+            .check_command_admission("node -e 1")
+            .unwrap_err();
+        assert_eq!(denial.reason.as_str(), "argument_not_allowed");
+        assert_eq!(denial.blocked_command.as_deref(), Some("node"));
+        assert_eq!(
+            denial.to_json(),
+            serde_json::json!({
+                "status": "denied",
+                "policy_reason": "argument_not_allowed",
+                "blocked_command": "node"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_command_execution_detailed_keeps_prefixes_and_reasons() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let blocked = p
+            .validate_command_execution_detailed("rm -rf x", false)
+            .unwrap_err();
+        assert_eq!(blocked.reason.as_str(), "high_risk");
+        assert!(blocked.message.starts_with("Command blocked: high-risk"));
+
+        let supervised = SecurityPolicy {
+            allowed_commands: vec!["rm".into()],
+            block_high_risk_commands: false,
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        };
+        let approval = supervised
+            .validate_command_execution_detailed("rm x", false)
+            .unwrap_err();
+        assert_eq!(approval.reason.as_str(), "approval_required");
+        assert!(
+            approval
+                .message
+                .starts_with("Command requires explicit approval")
+        );
+
+        let denied = nested_shell_policy()
+            .validate_command_execution("nope", false)
+            .unwrap_err();
+        assert!(denied.starts_with("Command not allowed by security policy: "));
+    }
+
+    fn sed_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            allowed_commands: vec!["sed".into(), "nl".into(), "git".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn sed_branch_allows_read_only_scripts_and_denies_writes() {
+        let p = sed_policy();
+        for allowed in [
+            "sed -n '1,190p' a.php",
+            "git -C r show origin/stage:a.php | nl -ba | sed -n '1,190p'",
+            "sed -n '10,20p;30q' a.php",
+            "sed -E 's/a+/b/g' a.php",
+            "sed -n '/foo/,/bar/p' a.php",
+            "sed -n -e '5p' -e '9p' a.php",
+            "sed 's/a b/c d/' a.php",
+            "sed 'y/abc/xyz/' a.php",
+        ] {
+            assert!(p.is_command_allowed(allowed), "must be allowed: {allowed}");
+        }
+        for denied in [
+            "sed -i 's/a/b/' f",
+            "sed -i.bak 's/a/b/' f",
+            "sed -ni 's/a/b/p' f",
+            "sed --in-place 's/a/b/' f",
+            "sed -n 'p' f -i",
+            "sed '1e id'",
+            "sed 's/a/b/e' f",
+            "sed 's/a/b/w out' f",
+            "sed '1w out' f",
+            "sed 'w out' f",
+            "sed 'W out' f",
+            "sed 'r other' f",
+            "sed 'R other' f",
+            "sed -f script.sed f",
+            "sed --file=script.sed f",
+            "sed -e '1e id' f",
+            "sed 's/a/b/;1e id' f",
+            "sed -n '1p;1w out' f",
+            "sed 1a\\text f",
+            "sed -s -n '$w x' f",
+            "sed",
+        ] {
+            let denial = p.check_command_admission(denied);
+            assert!(denial.is_err(), "must be denied: {denied}");
+            let reason = denial.unwrap_err().reason.as_str();
+            assert!(
+                matches!(reason, "argument_not_allowed" | "shell_expansion"),
+                "{denied}: {reason}"
+            );
+        }
     }
 
     #[test]

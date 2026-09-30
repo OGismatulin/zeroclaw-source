@@ -608,6 +608,7 @@ pub(crate) fn build_system_prompt_for_turn(
     inject_memory: bool,
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
+    security: Option<&SecurityPolicy>,
 ) -> Result<String> {
     let native_tools = model_provider.supports_native_tools();
     let native_tool_specs_present = native_tool_specs_present_for_turn(
@@ -631,6 +632,9 @@ pub(crate) fn build_system_prompt_for_turn(
         &mut turn_tool_descs,
         &mut turn_deferred_section,
     );
+    let shell_security_summary = security
+        .filter(|_| effective_tool_names.contains("shell"))
+        .map(SecurityPolicy::prompt_summary);
     let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
         agent_workspace,
         model_name,
@@ -645,6 +649,7 @@ pub(crate) fn build_system_prompt_for_turn(
         max_system_prompt_chars,
         inject_memory,
         show_tool_calls,
+        shell_security_summary.as_deref(),
     );
 
     if expose_text_tool_protocol {
@@ -1840,6 +1845,7 @@ pub async fn run(
             true,
             config.channels.show_tool_calls,
             None,
+            Some(security.as_ref()),
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1934,6 +1940,7 @@ pub async fn run(
                 true,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
+                Some(security.as_ref()),
             )?;
 
             let excluded_tool_names: HashSet<&str> =
@@ -2055,6 +2062,7 @@ pub async fn run(
                         true,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
+                        Some(security.as_ref()),
                     )?;
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2601,6 +2609,7 @@ pub async fn run(
                             true,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
+                            Some(security.as_ref()),
                         )?;
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -3351,6 +3360,10 @@ pub async fn process_message(
                 eff_max_system_prompt_chars,
                 false,
                 config.channels.show_tool_calls,
+                effective_tool_names
+                    .contains("shell")
+                    .then(|| security.prompt_summary())
+                    .as_deref(),
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -13436,6 +13449,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            None,
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13467,6 +13481,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("no-tools turn prompt should build");
@@ -13502,6 +13517,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("tools turn prompt should build");
@@ -14426,6 +14442,321 @@ Let me check the result."#;
             rt.context_window_for_model("gpt-5.6-luna") * 9 / 10,
             317_700
         );
+    }
+
+    struct CapturingNativeProvider {
+        responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    impl CapturingNativeProvider {
+        fn one_call_then_text(id: &str, name: &str, arguments: &str, final_text: &str) -> Self {
+            let tool_turn = ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            };
+            let final_turn = ChatResponse {
+                text: Some(final_text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(vec![tool_turn, final_turn]))),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CapturingNativeProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in capturing provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .push(request.messages.to_vec());
+            self.responses
+                .lock()
+                .expect("responses lock should be valid")
+                .pop_front()
+                .ok_or_else(|| anyhow::Error::msg("capturing provider exhausted responses"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CapturingNativeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapturingNativeProvider"
+        }
+    }
+
+    async fn run_capturing_tool_loop(
+        model_provider: &CapturingNativeProvider,
+        tools_registry: &[Box<dyn Tool>],
+    ) -> Vec<serde_json::Value> {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("do it"),
+        ];
+        let observer = NoopObserver;
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool loop should complete");
+
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => events.push(value),
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        events
+    }
+
+    fn second_request_text(model_provider: &CapturingNativeProvider) -> String {
+        let requests = model_provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "tool turn then final turn");
+        requests[1]
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| {
+                serde_json::from_str::<serde_json::Value>(&m.content)
+                    .ok()
+                    .filter(|v| v.get("tool_call_id").is_some())
+                    .and_then(|v| v["content"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| m.content.clone())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn find_tool_call_result(events: &[serde_json::Value], call_id: &str) -> serde_json::Value {
+        events
+            .iter()
+            .find(|value| {
+                value.get("message").and_then(|m| m.as_str()) == Some("tool_call_result")
+                    && value["attributes"]["tool_call_id"] == call_id
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no post_exec tool_call_result for {call_id}: {events:?}"))
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_denial_diagnostics_in_next_request() {
+        let tmp = TempDir::new().expect("temp dir");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            allowed_commands: vec!["echo".into()],
+            block_high_risk_commands: false,
+            ..crate::security::SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::new());
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            crate::tools::shell::ShellTool::new(security, runtime),
+        )];
+        let model_provider = CapturingNativeProvider::one_call_then_text(
+            "call_denied_1",
+            "shell",
+            r#"{"command":"echo ok | sed -n 1p"}"#,
+            "adjusted",
+        );
+
+        let events = run_capturing_tool_loop(&model_provider, &tools_registry).await;
+
+        let next_request = second_request_text(&model_provider);
+        assert!(
+            next_request.contains("Command not allowed by security policy"),
+            "{next_request}"
+        );
+        assert!(next_request.contains("policy_reason"), "{next_request}");
+        assert!(
+            next_request.contains("command_not_allowed"),
+            "{next_request}"
+        );
+        assert!(
+            next_request.contains("\"blocked_command\":\"sed\""),
+            "{next_request}"
+        );
+
+        let post_exec = find_tool_call_result(&events, "call_denied_1");
+        assert_eq!(
+            post_exec["attributes"]["tool_diagnostic"]["policy_reason"],
+            "command_not_allowed"
+        );
+        assert_eq!(
+            post_exec["attributes"]["tool_diagnostic"]["blocked_command"],
+            "sed"
+        );
+        assert_eq!(post_exec["attributes"]["tool"], "shell");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_await_diagnostics_in_next_request() {
+        let tmp = TempDir::new().expect("temp dir");
+        let security = Arc::new(crate::security::SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let missing = uuid::Uuid::new_v4().to_string();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
+            crate::tools::delegate::DelegateTool::new(
+                std::collections::HashMap::new(),
+                None,
+                security,
+            )
+            .with_workspace_dir(tmp.path().to_path_buf()),
+        )];
+        let arguments = serde_json::json!({
+            "action": "await_sessions",
+            "task_ids": [missing],
+            "timeout_ms": 0
+        })
+        .to_string();
+        let model_provider = CapturingNativeProvider::one_call_then_text(
+            "call_await_1",
+            "delegate",
+            &arguments,
+            "checked",
+        );
+
+        let events = run_capturing_tool_loop(&model_provider, &tools_registry).await;
+
+        let next_request = second_request_text(&model_provider);
+        assert!(
+            next_request.contains("still pending or missing"),
+            "{next_request}"
+        );
+        assert!(next_request.contains(&missing), "{next_request}");
+        assert!(next_request.contains("\"missing\""), "{next_request}");
+        assert!(next_request.contains("\"pending\""), "{next_request}");
+        assert!(next_request.contains("\"failed\""), "{next_request}");
+        assert!(!next_request.contains("\"results\""), "{next_request}");
+
+        let post_exec = find_tool_call_result(&events, "call_await_1");
+        assert_eq!(
+            post_exec["attributes"]["tool_diagnostic"]["status"],
+            "timeout"
+        );
+        assert_eq!(
+            post_exec["attributes"]["tool_diagnostic"]["missing"],
+            serde_json::json!([missing])
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_keeps_error_only_output_for_failures_without_data() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "plain failure reason",
+        ))];
+        let model_provider = CapturingNativeProvider::one_call_then_text(
+            "call_plain_1",
+            "failing_shell",
+            r#"{"command":"x"}"#,
+            "ok",
+        );
+
+        let events = run_capturing_tool_loop(&model_provider, &tools_registry).await;
+
+        let next_request = second_request_text(&model_provider);
+        assert!(
+            next_request.contains("Error: plain failure reason"),
+            "{next_request}"
+        );
+        assert!(!next_request.contains("policy_reason"));
+        let post_exec = find_tool_call_result(&events, "call_plain_1");
+        assert!(post_exec["attributes"]["tool_diagnostic"].is_null());
     }
 
     #[tokio::test]
@@ -16637,6 +16968,125 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_prompt_carries_effective_override_shell_policy_not_base_profile() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+        async fn capture(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            seen.lock().unwrap().push(body.to_string());
+            axum::Json(serde_json::json!({
+                "choices": [{"message": {"content": "done"}}]
+            }))
+        }
+
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(Arc::clone(&seen));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("prompt-policy-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "prompt-policy-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["base-profile-cmd".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+
+        let override_policy = Arc::new(SecurityPolicy {
+            allowed_commands: vec!["effective-override-cmd".to_string()],
+            workspace_dir: config.agent_workspace_dir("prompt-policy-agent"),
+            ..SecurityPolicy::default()
+        });
+        let overridden = super::run(
+            config.clone(),
+            "prompt-policy-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides {
+                security: Some(override_policy),
+                ..super::AgentRunOverrides::default()
+            },
+        )
+        .await;
+        assert_eq!(overridden.expect("override run"), "done");
+
+        let plain = super::run(
+            config,
+            "prompt-policy-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        server.abort();
+        assert_eq!(plain.expect("plain run"), "done");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one request per run: {bodies:?}");
+        assert!(
+            bodies[0].contains("effective-override-cmd"),
+            "{}",
+            bodies[0]
+        );
+        assert!(!bodies[0].contains("base-profile-cmd"), "{}", bodies[0]);
+        assert!(bodies[0].contains("Do not use `cd`"));
+        assert!(!bodies[0].contains("trash"));
+        assert!(bodies[1].contains("base-profile-cmd"), "{}", bodies[1]);
+        assert!(!bodies[1].contains("effective-override-cmd"));
     }
 
     #[tokio::test]

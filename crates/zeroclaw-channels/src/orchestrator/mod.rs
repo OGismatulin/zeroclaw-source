@@ -10732,6 +10732,7 @@ pub async fn start_channels(
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
+            None,
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -19894,6 +19895,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -19923,7 +19925,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Respect the runtime autonomy policy"));
-        assert!(prompt.contains("Prefer `trash` over `rm`"));
+        assert!(!prompt.contains("trash"));
     }
 
     #[test]
@@ -20243,6 +20245,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -20276,6 +20279,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -20324,10 +20328,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("Do not exfiltrate private data"),
             "data exfiltration guard must remain"
         );
-        assert!(
-            prompt.contains("Prefer `trash` over `rm`"),
-            "trash-over-rm hint must remain"
-        );
+        assert!(!prompt.contains("trash"), "trash advice must not be shown");
     }
 
     #[test]

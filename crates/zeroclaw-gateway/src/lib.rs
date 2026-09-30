@@ -3051,6 +3051,11 @@ async fn run_gateway_webhook_agentic(
             agent.resolved.max_system_prompt_chars,
             true,  // inject_memory: include MEMORY.md in the bootstrap files
             false, // allow tool narration: fork keeps tool calls invisible
+            tools_registry
+                .iter()
+                .any(|tool| tool.name() == "shell")
+                .then(|| security.prompt_summary())
+                .as_deref(),
         );
     if !native_tools {
         system_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(

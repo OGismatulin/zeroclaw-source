@@ -191,7 +191,6 @@ impl PromptSection for SafetySection {
             );
         }
 
-        out.push_str("- Prefer `trash` over `rm`.\n");
         out.push_str(match ctx.autonomy_level {
             AutonomyLevel::Full => {
                 "- Execute tools and actions directly — no extra approval needed.\n\

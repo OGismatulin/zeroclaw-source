@@ -9,9 +9,10 @@ window for an active user.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 import argparse
 import json
@@ -38,6 +39,36 @@ def _clip(text: object, limit: int) -> str:
     return value if len(value) <= limit else value[:limit] + "…"
 
 
+REDACTED = "[REDACTED]"
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.DOTALL),
+     REDACTED),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), rf"\1 {REDACTED}"),
+    (re.compile(
+        r"(?i)\b([\w.-]*(?:token|secret|password|passwd|api[_-]?key|authorization|credential)[\w.-]*)"
+        r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"
+    ), rf"\1\2{REDACTED}"),
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), REDACTED),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), REDACTED),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{10,}"), REDACTED),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"), REDACTED),
+    (re.compile(r"\bfo1_[A-Za-z0-9_-]{10,}"), REDACTED),
+    (re.compile(r"\bFlyV1\s+\S+"), REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
+)
+
+
+def _scrub(text: object) -> str:
+    value = "" if text is None else str(text)
+    for pattern, replacement in _SECRET_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+def _safe_clip(text: object, limit: int) -> str:
+    return _clip(_scrub(text), limit)
+
+
 @dataclass(frozen=True, slots=True)
 class Incident:
     id: str
@@ -59,6 +90,11 @@ class Incident:
     location: str | None
     turn_id: str | None
     gate: bool
+    tool_call_id: str | None = None
+    task_ids: list[str] | None = None
+    policy_reason: str | None = None
+    input_path: str | None = None
+    parent_tool: str | None = None
 
     def as_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -186,6 +222,114 @@ def is_expected_gate(error: str, tool: str | None, agent_alias: str | None) -> b
     return any(error.startswith(literal) for literal in _GATE_LITERALS)
 
 
+POLICY_REASONS = frozenset({
+    "readonly", "command_not_allowed", "shell_expansion", "process_substitution",
+    "output_redirect", "input_redirect", "background", "argument_not_allowed",
+    "path_not_allowed", "approval_required", "high_risk", "invalid_syntax",
+})
+LEGACY_OUTPUT_LIMIT = 262144
+MAX_TASK_IDS = 20
+MAX_ID_CHARS = 128
+_SECRET_PATH_RE = re.compile(
+    r"(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|\.netrc|secrets?|credentials?|auth[-_.]?profiles?[^/]*"
+    r"|[^/]*\.(pem|key|p12|pfx)|id_(rsa|dsa|ecdsa|ed25519)|[^/]*(token|password|secret)[^/]*)(/|$)",
+    re.IGNORECASE,
+)
+_WORKSPACE_ABS_RE = re.compile(r"^/zeroclaw-data/workspaces/tg_[^/]+/workspace/")
+
+
+def _as_diagnostic(value: object) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and len(value) <= LEGACY_OUTPUT_LIMIT:
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _legacy_output_diagnostic(output: object) -> dict | None:
+    if isinstance(output, dict):
+        data = output.get("data")
+        if isinstance(data, dict):
+            return data
+        output = output.get("text")
+    if not isinstance(output, str) or len(output) > LEGACY_OUTPUT_LIMIT:
+        return None
+    if output.startswith("{"):
+        start = 0
+    else:
+        marker = output.find("\n{")
+        if marker < 0:
+            return None
+        start = marker + 1
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(output, start)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _diagnostic(attrs: dict) -> dict | None:
+    if "tool_diagnostic" in attrs:
+        return _as_diagnostic(attrs.get("tool_diagnostic"))
+    return _legacy_output_diagnostic(attrs.get("output"))
+
+
+def _policy_reason(diagnostic: dict | None) -> str | None:
+    if not diagnostic or "policy_reason" not in diagnostic:
+        return None
+    value = diagnostic.get("policy_reason")
+    return value if isinstance(value, str) and value in POLICY_REASONS else "unknown"
+
+
+def _id_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    return [
+        _clip(item, 64) for item in value[:MAX_TASK_IDS]
+        if isinstance(item, (str, int)) and not isinstance(item, bool)
+    ]
+
+
+def _await_outcome(diagnostic: dict | None) -> tuple[str | None, list[str] | None]:
+    if not diagnostic or diagnostic.get("status") not in ("timeout", "complete"):
+        return None, None
+    pending = _id_list(diagnostic.get("pending"))
+    missing = _id_list(diagnostic.get("missing"))
+    failed = _id_list(diagnostic.get("failed"))
+    if pending is None or missing is None or failed is None:
+        return None, None
+    task_ids = list(dict.fromkeys([*failed, *pending, *missing])) or None
+    if failed:
+        return "tool_failure", task_ids
+    if missing:
+        return "delegate_missing", task_ids
+    if pending:
+        return "delegate_wait", task_ids
+    return None, None
+
+
+def _normalize_input_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    raw = _WORKSPACE_ABS_RE.sub("", raw)
+    if raw.startswith("/") or raw.startswith("~") or "\x00" in raw:
+        return "outside_workspace"
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        return "outside_workspace"
+    cleaned = "/".join(parts)
+    if not cleaned:
+        return None
+    if _SECRET_PATH_RE.search(cleaned):
+        return "sensitive_path"
+    return _safe_clip(cleaned, MAX_DETAIL_CHARS)
+
+
 def normalize_trace_row(row: dict, user: str) -> Incident | None:
     """Map one trace row (native schema_version=2 OR legacy) to an Incident.
 
@@ -208,13 +352,17 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
     attrs = attrs if isinstance(attrs, dict) else {}
     payload = row.get("payload")
     payload = payload if isinstance(payload, dict) else {}
-    tool = zc.get("tool") or attrs.get("tool") or payload.get("tool")
+    tool = attrs.get("tool") or zc.get("tool") or payload.get("tool")
+    envelope = zc.get("tool")
+    parent_tool = str(envelope) if envelope and tool and str(envelope) != str(tool) else None
     if kind == "mcp_failure" and not tool:
         tool = payload.get("server")
     command = None
+    input_path = None
     raw_input = attrs.get("input")
     if isinstance(raw_input, dict):
         command = raw_input.get("command")
+        input_path = _normalize_input_path(raw_input.get("path"))
     if native:
         error = attrs.get("error") or attrs.get("error_reason") or row.get("message")
     else:
@@ -222,7 +370,16 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
     location = None
     if attrs.get("_file"):
         location = f"{attrs['_file']}:{attrs.get('_line', '?')}"
-    clipped_error = _clip(error, MAX_ERROR_CHARS)
+    diagnostic = _diagnostic(attrs) if native else None
+    policy_reason = _policy_reason(diagnostic)
+    task_ids = None
+    if kind == "tool_failure":
+        refined, task_ids = _await_outcome(diagnostic)
+        if refined:
+            kind = refined
+    call_id = attrs.get("tool_call_id")
+    call_id = _clip(call_id, MAX_ID_CHARS) if call_id else None
+    clipped_error = _safe_clip(error, MAX_ERROR_CHARS)
     channel, channel_ref = classify_channel(row, zc)
     return Incident(
         id=ident,
@@ -240,10 +397,15 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         error_kind=attrs.get("error_kind"),
         error_disposition=attrs.get("error_disposition"),
         error=clipped_error,
-        detail=_clip(command, MAX_DETAIL_CHARS) if command else None,
+        detail=_safe_clip(command, MAX_DETAIL_CHARS) if command else None,
         location=location,
         turn_id=row.get("turn_id") or row.get("trace_id"),
         gate=is_expected_gate(clipped_error, str(tool) if tool else None, zc.get("agent_alias")),
+        tool_call_id=call_id or None,
+        task_ids=task_ids,
+        policy_reason=policy_reason,
+        input_path=input_path,
+        parent_tool=parent_tool,
     )
 
 
@@ -258,6 +420,23 @@ def _parse_ts(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+SOURCE_OK = "ok"
+SOURCE_NOT_INITIALIZED = "not_initialized"
+SOURCE_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRead:
+    incidents: list[Incident]
+    status: str
+
+
+def _missing_status(*, seen: bool, never_created: bool) -> str:
+    if seen or not never_created:
+        return SOURCE_UNAVAILABLE
+    return SOURCE_NOT_INITIALIZED
 
 
 def _connect_ro(db: Path) -> sqlite3.Connection | None:
@@ -283,8 +462,14 @@ def cron_job_names(workspace: Path) -> dict[str, str]:
 
 
 def read_cron_failures(
-    workspace: Path, since: datetime, until: datetime, user: str
-) -> list[Incident]:
+    workspace: Path,
+    since: datetime,
+    until: datetime,
+    user: str,
+    *,
+    seen: bool = False,
+    never_created: bool = False,
+) -> SourceRead:
     """Failed cron runs from the per-user jobs.db (read-only, never written).
 
     `cron_runs.status` is ok | error | degraded (`skipped` lives on
@@ -292,9 +477,12 @@ def read_cron_failures(
     `delivery failed: …` to output, so the tail of output is the informative
     line.
     """
-    con = _connect_ro(workspace / "cron" / "jobs.db")
+    db = workspace / "cron" / "jobs.db"
+    if not db.is_file():
+        return SourceRead([], _missing_status(seen=seen, never_created=never_created))
+    con = _connect_ro(db)
     if con is None:
-        return []
+        return SourceRead([], SOURCE_UNAVAILABLE)
     try:
         rows = con.execute(
             "SELECT r.job_id, r.started_at, r.status, r.output, j.name"
@@ -303,7 +491,7 @@ def read_cron_failures(
             CRON_FAILURE_STATUSES,
         ).fetchall()
     except sqlite3.Error:
-        return []
+        return SourceRead([], SOURCE_UNAVAILABLE)
     finally:
         con.close()
     out: list[Incident] = []
@@ -320,22 +508,37 @@ def read_cron_failures(
                 channel="cron", channel_ref=name or job_id, kind="cron_failure",
                 tool=None, agent_alias=None, model=None, provider=None,
                 error_kind=status, error_disposition=None,
-                error=_clip(message, MAX_ERROR_CHARS), detail=None, location=None,
+                error=_safe_clip(message, MAX_ERROR_CHARS), detail=None, location=None,
                 turn_id=None, gate=False,
             )
         )
-    return out
+    return SourceRead(out, SOURCE_OK)
 
 
 def read_delegate_failures(
-    workspace: Path, since: datetime, until: datetime, user: str
-) -> list[Incident]:
+    workspace: Path,
+    since: datetime,
+    until: datetime,
+    user: str,
+    *,
+    seen: bool = False,
+    never_created: bool = False,
+) -> SourceRead:
     """Terminal delegate failures; `error` carries TerminalProviderFailure."""
     root = workspace / "delegate_results"
+    if not root.exists():
+        return SourceRead([], _missing_status(seen=seen, never_created=never_created))
     if not root.is_dir():
-        return []
+        return SourceRead([], SOURCE_UNAVAILABLE)
     out: list[Incident] = []
-    for path in sorted(root.glob("*.json")):
+    status = SOURCE_OK
+    try:
+        paths = sorted(root.glob("*.json"))
+    except OSError:
+        return SourceRead([], SOURCE_UNAVAILABLE)
+    for path in paths:
+        if path.name.endswith(".progress.json"):
+            continue
         # Nothing prunes delegate_results, so this directory only grows and is
         # re-read 48x/day on the public edge. A file last written before the
         # window cannot carry a `finished_at` inside it, so skip without opening.
@@ -344,6 +547,7 @@ def read_delegate_failures(
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            status = SOURCE_UNAVAILABLE
             continue
         if not isinstance(data, dict) or data.get("status") not in ("failed", "cancelled"):
             continue
@@ -354,19 +558,21 @@ def read_delegate_failures(
         error = str(data.get("error") or "")
         kind_match = _KIND_RE.search(error)
         disp_match = _DISPOSITION_RE.search(error)
+        task_id = data.get("task_id")
         out.append(
             Incident(
-                id=f"delegate:{data.get('task_id')}:{finished}", ts=str(finished),
+                id=f"delegate:{task_id}:{finished}", ts=str(finished),
                 user=user, source="delegate", severity="ERROR", channel="delegate",
                 channel_ref=data.get("agent"), kind="delegate_failure", tool=None,
                 agent_alias=data.get("agent"), model=None, provider=None,
                 error_kind=kind_match.group(1) if kind_match else None,
                 error_disposition=disp_match.group(1) if disp_match else None,
-                error=_clip(error, MAX_ERROR_CHARS), detail=None, location=None,
+                error=_safe_clip(error, MAX_ERROR_CHARS), detail=None, location=None,
                 turn_id=None, gate=False,
+                task_ids=[_clip(task_id, 64)] if task_id else None,
             )
         )
-    return out
+    return SourceRead(out, status)
 
 
 SNAPSHOT_DIRNAME = "incidents"
@@ -392,6 +598,34 @@ def _known_ids(path: Path) -> set[str]:
     return known
 
 
+def _previous_sources_seen(out_dir: Path) -> dict[str, set[str]]:
+    try:
+        files = sorted(out_dir.glob("*.jsonl"), reverse=True)
+    except OSError:
+        return {}
+    for path in files:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("kind") != "sweep":
+                continue
+            sources = row.get("sources")
+            if not isinstance(sources, dict):
+                return {}
+            return {
+                str(user): {str(name) for name in info.get("sources_seen", []) if name}
+                for user, info in sources.items()
+                if isinstance(info, dict) and isinstance(info.get("sources_seen"), list)
+            }
+    return {}
+
+
 def sweep(
     data_root: Path,
     now: datetime,
@@ -400,6 +634,7 @@ def sweep(
     timezone_name: str = DEFAULT_TIMEZONE,
     retention_days: int = 14,
     max_per_day: int = 20000,
+    lifecycle_evidence: Callable[[Path, str], bool] | None = None,
 ) -> dict:
     """Capture new failures into the durable daily snapshot. Never raises.
 
@@ -443,19 +678,31 @@ def sweep(
     except OSError as exc:  # never let enumeration escape into the caller
         errors.append(f"workspace_dirs: {type(exc).__name__}")
         workspaces = []
+    previous_seen = _previous_sources_seen(out_dir)
     for workspace in workspaces:
         user = workspace.parent.name
-        state = {"trace": False, "cron": False, "earliest_trace_ts": None}
+        state: dict = {
+            "trace": False, "cron": False, "delegate": False,
+            "earliest_trace_ts": None, "trace_malformed_lines": 0,
+            "source_status": {}, "sources_seen": sorted(previous_seen.get(user, set())),
+        }
         try:
+            seen_now = set(previous_seen.get(user, set()))
             names = cron_job_names(workspace)
-            state["cron"] = bool((workspace / "cron" / "jobs.db").is_file())
             trace = workspace / "logs" / "runtime-trace.jsonl"
             if trace.is_file():
+                malformed = 0
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
+                        if not line.strip():
+                            continue
                         try:
                             row = json.loads(line)
                         except ValueError:
+                            malformed += 1
+                            continue
+                        if not isinstance(row, dict):
+                            malformed += 1
                             continue
                         stamp = row.get("@timestamp") or row.get("timestamp")
                         if stamp and state["earliest_trace_ts"] is None:
@@ -470,13 +717,23 @@ def sweep(
                                                       incident.channel_ref),
                             )
                         _sink(incident)
+                state["trace_malformed_lines"] = malformed
                 # Set only once the file has been read to the end: a source
                 # that threw halfway must never advertise itself as healthy.
                 state["trace"] = True
-            for incident in read_cron_failures(workspace, *window, user):
-                _sink(incident)
-            for incident in read_delegate_failures(workspace, *window, user):
-                _sink(incident)
+            for name, reader in (("cron", read_cron_failures), ("delegate", read_delegate_failures)):
+                never_created = bool(lifecycle_evidence and lifecycle_evidence(workspace, name))
+                result = reader(
+                    workspace, *window, user,
+                    seen=name in seen_now, never_created=never_created,
+                )
+                state["source_status"][name] = result.status
+                state[name] = result.status != SOURCE_UNAVAILABLE
+                if result.status == SOURCE_OK:
+                    seen_now.add(name)
+                for incident in result.incidents:
+                    _sink(incident)
+            state["sources_seen"] = sorted(seen_now)
         except Exception as exc:  # one broken workspace must not stop the sweep
             errors.append(f"{user}: {type(exc).__name__}")
         sources[user] = state
@@ -524,9 +781,12 @@ HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"kind=rate_limited|\b429\b"),
      "лимит провайдера; фолбэк есть у чата, у делегатов его нет"),
     (re.compile(r"connect to MCP server `?codemap"),
-     "окно обслуживания графа 02:30–03:00 UTC, деградация на lalafo-code"),
+     "codemap недоступен: возможен временный отказ, агент деградирует на lalafo-code;"
+     " окно обслуживания графа называть причиной только по подтверждённому receipt таймера"),
+    (re.compile(r"MCP (server )?`?lalafo-db`? failed during tool call"),
+     "sidecar MCP БД: `curl :4000/health`, скилл zeroclaw-runtime-sidecars"),
     (re.compile(r"MCP (server )?`?[\w-]+`? failed during tool call"),
-     "sidecar MCP: `curl :4000/health`, скилл zeroclaw-runtime-sidecars"),
+     "сбой MCP-сервера: `:4000/health` относится только к lalafo-db и здоровья этого сервера не доказывает"),
     (re.compile(r"database is locked"),
      "конкуренция за brain.db — обычно параллельный турн и cron"),
     (re.compile(r"Traceback \(most recent call last\)"),
@@ -579,6 +839,11 @@ class Group:
     gate: bool
     agent_alias: str | None
     turn_id: str | None = None
+    tool_call_id: str | None = None
+    task_ids: list[str] | None = None
+    policy_reason: str | None = None
+    input_path: str | None = None
+    parent_tool: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +854,7 @@ class Digest:
     by_channel: dict[str, int]
     state: str
     reasons: list[str]
+    counters: dict = field(default_factory=dict)
 
 
 def _completeness(
@@ -645,11 +911,19 @@ def _completeness(
         for user, info in sources.items():
             if not isinstance(info, dict):
                 continue
-            if (info.get("trace") is False or info.get("cron") is False) and (
-                f"src:{user}" not in seen
+            for name in ("trace", "cron", "delegate"):
+                if info.get(name) is False and f"src:{user}:{name}" not in seen:
+                    reasons.append(f"`{user}`: источник недоступен ({name})")
+                    seen.add(f"src:{user}:{name}")
+            malformed = info.get("trace_malformed_lines")
+            if (
+                isinstance(malformed, int)
+                and not isinstance(malformed, bool)
+                and malformed > 0
+                and f"malformed:{user}" not in seen
             ):
-                reasons.append(f"`{user}`: источник недоступен")
-                seen.add(f"src:{user}")
+                reasons.append(f"`{user}`: невалидных строк трейса {malformed}")
+                seen.add(f"malformed:{user}")
             earliest = _parse_ts(info.get("earliest_trace_ts"))
             # The trace is a rolling ring, so by evening its earliest entry is
             # ALWAYS later than the morning's window start. That is only a hole
@@ -669,6 +943,58 @@ def _completeness(
     if measured_nothing:
         return "нет данных", reasons
     return ("частичное" if reasons else "полное"), reasons
+
+
+_MERGE_FILL = (
+    "parent_tool", "policy_reason", "task_ids", "input_path", "detail", "location",
+    "tool", "error", "channel_ref",
+)
+_WAIT_KINDS = ("delegate_wait", "delegate_missing")
+
+
+def _merge_same_call(
+    incidents: list[tuple[datetime, dict]],
+) -> list[tuple[datetime, dict]]:
+    merged: list[tuple[datetime, dict]] = []
+    index: dict[tuple[object, str], int] = {}
+    for ts, row in sorted(incidents, key=lambda item: (item[0], str(item[1].get("id") or ""))):
+        call_id = row.get("tool_call_id")
+        if not call_id:
+            merged.append((ts, dict(row)))
+            continue
+        key = (row.get("user"), str(call_id))
+        position = index.get(key)
+        if position is not None:
+            base = merged[position][1]
+            turn, base_turn = row.get("turn_id"), base.get("turn_id")
+            if not turn or not base_turn or turn == base_turn:
+                for name in _MERGE_FILL:
+                    if base.get(name) in (None, "", []) and row.get(name) not in (None, "", []):
+                        base[name] = row[name]
+                if base.get("kind") == "tool_failure" and row.get("kind") in _WAIT_KINDS:
+                    base["kind"] = row["kind"]
+                continue
+        index[key] = len(merged)
+        merged.append((ts, dict(row)))
+    return merged
+
+
+def _source_status_counts(receipts: list[tuple[datetime, dict]]) -> dict[str, int]:
+    counts = {SOURCE_OK: 0, SOURCE_NOT_INITIALIZED: 0, SOURCE_UNAVAILABLE: 0}
+    if not receipts:
+        return counts
+    _, latest = max(receipts, key=lambda item: item[0])
+    sources = latest.get("sources")
+    if not isinstance(sources, dict):
+        return counts
+    for info in sources.values():
+        statuses = info.get("source_status") if isinstance(info, dict) else None
+        if not isinstance(statuses, dict):
+            continue
+        for value in statuses.values():
+            if value in counts:
+                counts[value] += 1
+    return counts
 
 
 def build_digest(
@@ -726,15 +1052,33 @@ def build_digest(
 
     state, reasons = _completeness(receipts, start_utc, end_utc, sweep_interval_secs, tz)
 
+    raw_gate = sum(1 for _, row in incidents if row.get("gate"))
+    raw_non_gate = len(incidents) - raw_gate
+    incidents = _merge_same_call(incidents)
+
     gate_count = 0
     by_channel: dict[str, int] = {}
+    denials: dict[str, int] = {}
+    waits = missing = terminal = calls_with_id = 0
     buckets: dict[tuple, list[tuple[datetime, dict]]] = {}
     for ts, row in incidents:
+        reason = row.get("policy_reason")
+        if reason:
+            denials[str(reason)] = denials.get(str(reason), 0) + 1
         if row.get("gate"):
             gate_count += 1
             continue
         channel = str(row.get("channel") or "")
         by_channel[channel] = by_channel.get(channel, 0) + 1
+        kind = row.get("kind")
+        if kind == "delegate_wait":
+            waits += 1
+        elif kind == "delegate_missing":
+            missing += 1
+        elif kind == "delegate_failure":
+            terminal += 1
+        if row.get("tool_call_id"):
+            calls_with_id += 1
         key = (
             row.get("user"), channel, row.get("channel_ref"), row.get("kind"),
             _subject(row), row.get("agent_alias"), _signature(str(row.get("error") or "")),
@@ -752,15 +1096,39 @@ def build_digest(
             last_ts=members[-1][0], error=error, detail=sample.get("detail"),
             location=sample.get("location"), hint=hint_for(error, sample.get("error_kind")),
             gate=False, agent_alias=agent_alias, turn_id=sample.get("turn_id"),
+            tool_call_id=sample.get("tool_call_id"), task_ids=sample.get("task_ids"),
+            policy_reason=sample.get("policy_reason"), input_path=sample.get("input_path"),
+            parent_tool=sample.get("parent_tool"),
         ))
     groups.sort(key=lambda g: (-g.count, g.first_ts))
+
+    malformed_total = 0
+    if receipts:
+        _, latest = max(receipts, key=lambda item: item[0])
+        latest_sources = latest.get("sources")
+        if isinstance(latest_sources, dict):
+            for info in latest_sources.values():
+                value = info.get("trace_malformed_lines") if isinstance(info, dict) else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    malformed_total += value
+    counters = {
+        "non_gate_records": raw_non_gate,
+        "gate_records": raw_gate,
+        "unique_calls_with_id": calls_with_id,
+        "policy_denials": dict(sorted(denials.items())),
+        "waits": waits,
+        "missing": missing,
+        "terminal": terminal,
+        "source_status": _source_status_counts(receipts),
+        "trace_malformed_lines": malformed_total,
+    }
 
     # `total` is what the summary line breaks down by channel, and the
     # breakdown is built from non-gates only — counting gates here made the
     # operator read a total that did not add up (13 != 5+5+1+0).
     return Digest(
-        groups=groups, gate_count=gate_count, total=len(incidents) - gate_count,
-        by_channel=by_channel, state=state, reasons=reasons,
+        groups=groups, gate_count=gate_count, total=sum(by_channel.values()),
+        by_channel=by_channel, state=state, reasons=reasons, counters=counters,
     )
 
 
@@ -934,8 +1302,45 @@ def _attachment_group_lines(group: Group, tz: ZoneInfo) -> list[str]:
         lines.append(f"  {group.location}")
     if group.turn_id:
         lines.append(f"  turn_id: {group.turn_id}")
+    if group.tool_call_id:
+        lines.append(f"  tool_call_id: {group.tool_call_id}")
+    if group.parent_tool:
+        lines.append(f"  parent_tool: {group.parent_tool}")
+    if group.policy_reason:
+        lines.append(f"  policy_reason: {group.policy_reason}")
+    if group.task_ids:
+        lines.append(f"  task_ids: {', '.join(group.task_ids)}")
+    if group.input_path:
+        lines.append(f"  input_path: {group.input_path}")
     if group.hint:
         lines.append(f"  ↳ {group.hint}")
+    return lines
+
+
+def _counter_lines(counters: dict) -> list[str]:
+    if not counters:
+        return []
+    lines = [
+        "",
+        "**Счётчики**",
+        f"- записей без гейтов: {counters.get('non_gate_records', 0)}"
+        f" · записей-гейтов: {counters.get('gate_records', 0)}"
+        f" · уникальных вызовов с call ID: {counters.get('unique_calls_with_id', 0)}",
+        f"- ожидание делегатов: {counters.get('waits', 0)}"
+        f" · missing: {counters.get('missing', 0)}"
+        f" · терминальные отказы: {counters.get('terminal', 0)}",
+    ]
+    denials = counters.get("policy_denials") or {}
+    if denials:
+        lines.append(
+            "- отказы policy: " + " · ".join(f"{name} {count}" for name, count in denials.items())
+        )
+    status = counters.get("source_status") or {}
+    if status:
+        lines.append(
+            "- источники: " + " · ".join(f"{name} {count}" for name, count in status.items())
+            + f" · невалидных строк трейса {counters.get('trace_malformed_lines', 0)}"
+        )
     return lines
 
 
@@ -958,6 +1363,7 @@ def render_attachment(
         buckets.setdefault((group.channel, group.channel_ref, group.user), []).append(group)
 
     lines = [f"# ZeroClaw — инциденты за {date}"]
+    lines.extend(_counter_lines(digest.counters))
     for key in sorted(buckets, key=lambda k: _section_order_index(k[0])):
         members = buckets[key]
         lines.append("")
@@ -983,6 +1389,7 @@ def _digest_as_dict(digest: Digest) -> dict:
         "total": digest.total,
         "gate_count": digest.gate_count,
         "by_channel": digest.by_channel,
+        "counters": digest.counters,
         "groups": [
             {
                 "channel": g.channel, "channel_ref": g.channel_ref, "user": g.user,
@@ -990,7 +1397,9 @@ def _digest_as_dict(digest: Digest) -> dict:
                 "first_ts": g.first_ts.isoformat(), "last_ts": g.last_ts.isoformat(),
                 "error": g.error, "detail": g.detail, "location": g.location,
                 "hint": g.hint, "gate": g.gate, "agent_alias": g.agent_alias,
-                "turn_id": g.turn_id,
+                "turn_id": g.turn_id, "tool_call_id": g.tool_call_id,
+                "task_ids": g.task_ids, "policy_reason": g.policy_reason,
+                "input_path": g.input_path, "parent_tool": g.parent_tool,
             }
             for g in digest.groups
         ],

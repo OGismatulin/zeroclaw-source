@@ -1351,6 +1351,7 @@ impl DelegateTool {
             &self.workspace_dir,
             false,
             None,
+            None,
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -2249,22 +2250,34 @@ impl DelegateTool {
                 let success = missing.is_empty() && pending.is_empty() && failed.is_empty();
                 let error = if success {
                     None
+                } else if timed_out && !failed.is_empty() {
+                    Some("one or more background tasks failed; pending or missing remain".into())
                 } else if timed_out {
                     Some("one or more background tasks are still pending or missing".into())
                 } else {
                     Some("one or more background tasks failed or were cancelled".into())
                 };
+                let status = if timed_out { "timeout" } else { "complete" };
+                let mut full = json!({
+                    "status": status,
+                    "completed": completed,
+                    "pending": pending,
+                    "missing": missing,
+                    "failed": failed,
+                    "results": results,
+                });
+                let output = if success {
+                    ToolOutput::json(full)
+                } else {
+                    let display = serde_json::to_string_pretty(&full)?;
+                    if let Some(map) = full.as_object_mut() {
+                        map.remove("results");
+                    }
+                    ToolOutput::json_with_text(full, display)
+                };
                 return Ok(ToolResult {
                     success,
-                    output: serde_json::to_string_pretty(&json!({
-                        "status": if timed_out { "timeout" } else { "complete" },
-                        "completed": completed,
-                        "pending": pending,
-                        "missing": missing,
-                        "failed": failed,
-                        "results": results,
-                    }))?
-                    .into(),
+                    output,
                     error,
                 });
             }
@@ -2498,6 +2511,7 @@ impl DelegateTool {
         workspace_dir: &Path,
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
+        shell_security: Option<&SecurityPolicy>,
     ) -> Option<String> {
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
@@ -2535,12 +2549,11 @@ impl DelegateTool {
         };
         let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
         let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
+            crate::agent::system_prompt::shell_policy_block(
+                shell_security
+                    .map(SecurityPolicy::prompt_summary)
+                    .as_deref(),
+            )
         } else {
             String::new()
         };
@@ -2677,6 +2690,10 @@ impl DelegateTool {
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
+        let prompt_policy = match target_mode {
+            DelegateExecutionMode::Independent => Arc::clone(&target_policy),
+            DelegateExecutionMode::Bounded => Arc::clone(&self.security),
+        };
         // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
         // inject the deferred-tools prompt section and thread the activated set, exactly as
         // a fresh target turn does. Bounded delegation leaves these empty (it starts from
@@ -2779,6 +2796,7 @@ impl DelegateTool {
             prompt_workspace,
             model_provider.supports_native_tools(),
             sub_skills.as_deref(),
+            Some(prompt_policy.as_ref()),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
         // target turn does. See `compose_independent_system_prompt`: it applies the turn
@@ -4989,6 +5007,7 @@ mod tests {
             Path::new("/tmp/workspace"),
             false,
             Some(&skills),
+            None,
         )
         .expect("prompt should render")
     }
@@ -5050,6 +5069,7 @@ mod tests {
                 &prompt_tools,
                 Path::new("/tmp"),
                 false,
+                None,
                 None,
             )
             .expect("prompt should render");
@@ -5772,6 +5792,7 @@ mod tests {
                 &workspace,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -5846,6 +5867,7 @@ mod tests {
                 &workspace,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -5903,6 +5925,7 @@ mod tests {
                 &tools,
                 &workspace,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5984,6 +6007,7 @@ mod tests {
                 &workspace,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -6024,6 +6048,7 @@ mod tests {
                 &tools,
                 &workspace,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -6328,6 +6353,139 @@ mod tests {
                 .unwrap_or_default()
                 .contains("missing")
         );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_success_exposes_full_schema_as_data() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_data_ok_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &task_id,
+                BackgroundTaskStatus::Completed,
+                Some("delegate output"),
+                None,
+            ),
+        );
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let data = result.output.data().expect("success carries data");
+        for key in [
+            "status",
+            "completed",
+            "pending",
+            "missing",
+            "failed",
+            "results",
+        ] {
+            assert!(data.get(key).is_some(), "missing {key}: {data}");
+        }
+        assert_eq!(data["results"].as_array().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_failure_data_is_projection_without_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_data_fail_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let failed = uuid::Uuid::new_v4().to_string();
+        let pending = uuid::Uuid::new_v4().to_string();
+        let missing = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &failed,
+                BackgroundTaskStatus::Failed,
+                Some("SECRET-DELEGATE-OUTPUT"),
+                Some("model failed"),
+            ),
+        );
+        write_background_result(
+            &workspace,
+            &background_result(&pending, BackgroundTaskStatus::Running, None, None),
+        );
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [failed, pending, missing],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more background tasks failed; pending or missing remain")
+        );
+        let data = result.output.data().expect("failure carries projection");
+        assert!(data.get("results").is_none(), "{data}");
+        assert_eq!(data["status"], "timeout");
+        assert_eq!(data["failed"], json!([failed]));
+        assert_eq!(data["pending"], json!([pending]));
+        assert_eq!(data["missing"], json!([missing]));
+        assert!(!data.to_string().contains("SECRET-DELEGATE-OUTPUT"));
+        let display: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            display.get("results").is_some(),
+            "display keeps full schema"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_pending_timeout_keeps_success_false_and_legacy_text() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_pending_text_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let pending = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(&pending, BackgroundTaskStatus::Running, None, None),
+        );
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [pending],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("one or more background tasks are still pending or missing")
+        );
+        assert_eq!(result.output.data().unwrap()["pending"], json!([pending]));
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -7890,6 +8048,267 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "got: {:?}", result.error);
+    }
+
+    struct SystemPromptCaptureProvider {
+        system: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SystemPromptCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            *self.system.lock().unwrap() = request
+                .messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.clone());
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for SystemPromptCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SystemPromptCaptureProvider"
+        }
+    }
+
+    struct NamedShellTool;
+    impl ::zeroclaw_api::attribution::Attributable for NamedShellTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Shell)
+        }
+        fn alias(&self) -> &str {
+            "shell"
+        }
+    }
+    #[async_trait]
+    impl Tool for NamedShellTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+        fn description(&self) -> &str {
+            "Execute shell commands"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn enriched_prompt_carries_given_shell_policy_and_no_trash_advice() {
+        let config = AliasedAgentConfig::default();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedShellTool)];
+        let workspace = std::env::temp_dir();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+        let policy = SecurityPolicy {
+            allowed_commands: vec!["only-this-command".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let with_policy = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+                Some(&policy),
+            )
+            .unwrap();
+        assert!(with_policy.contains("`only-this-command`"));
+        assert!(with_policy.contains("Do not use `cd`"));
+        assert!(!with_policy.contains("trash"));
+
+        let non_agentic = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &[],
+                &workspace,
+                false,
+                None,
+                Some(&policy),
+            )
+            .unwrap();
+        assert!(!non_agentic.contains("## Shell Policy"));
+        assert!(!non_agentic.contains("only-this-command"));
+        assert!(!non_agentic.contains("trash"));
+    }
+
+    #[tokio::test]
+    async fn bounded_agentic_prompt_uses_caller_shell_policy() {
+        let config = agentic_agent_config();
+        let caller_policy = Arc::new(SecurityPolicy {
+            allowed_commands: vec!["parent-only".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, caller_policy)
+            .with_runtime_profiles(agentic_runtime_profiles(2))
+            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(NamedShellTool)])));
+        let provider = SystemPromptCaptureProvider {
+            system: std::sync::Mutex::new(None),
+        };
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        let system = provider
+            .system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("system prompt");
+        assert!(system.contains("## Shell Policy"));
+        assert!(system.contains("`parent-only`"));
+        assert!(!system.contains("trash"));
+    }
+
+    #[tokio::test]
+    async fn independent_agentic_prompt_uses_target_shell_policy() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_commands: vec!["parent-only".to_string()],
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["target-only".to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let provider = SystemPromptCaptureProvider {
+            system: std::sync::Mutex::new(None),
+        };
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &config.agents["target"],
+                "ollama",
+                "model-test",
+                &provider,
+                "run",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        let system = provider
+            .system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("system prompt");
+        assert!(system.contains("`target-only`"), "{system}");
+        assert!(!system.contains("`parent-only`"));
+        assert!(!system.contains("trash"));
     }
 
     #[tokio::test]

@@ -299,13 +299,16 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(command, approved) {
+        match self
+            .security
+            .validate_command_execution_detailed(command, approved)
+        {
             Ok(_) => {}
-            Err(reason) => {
+            Err(denial) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: ToolOutput::default(),
-                    error: Some(reason),
+                    output: ToolOutput::json(denial.to_json()),
+                    error: Some(denial.message),
                 });
             }
         }
@@ -1714,5 +1717,135 @@ mod tests {
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
         );
+    }
+
+    #[cfg(unix)]
+    fn sentinel_workspace() -> (tempfile::TempDir, Arc<SecurityPolicy>) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = tmp.path().join("sentinel");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho run >> sentinel_count.txt\nprintf '%s\\n' \"$*\"\n",
+        )
+        .expect("write sentinel");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod sentinel");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            allowed_commands: vec![
+                "sentinel".into(),
+                "cat".into(),
+                "echo".into(),
+                "bash".into(),
+                "sh".into(),
+            ],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        (tmp, security)
+    }
+
+    #[cfg(unix)]
+    fn sentinel_runs(tmp: &tempfile::TempDir) -> usize {
+        std::fs::read_to_string(tmp.path().join("sentinel_count.txt"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parser_to_wrapper_to_shell_runs_quoted_literal_once_and_denials_never() {
+        let (tmp, security) = sentinel_workspace();
+        let tool = wrapped_shell(security);
+        let js = "./sentinel eval 'JSON.stringify([1].map(e=>({value:e})))'";
+
+        let text = format!(
+            "<tool_call>\n{}\n</tool_call>",
+            json!({"name": "shell", "arguments": {"command": js}})
+        );
+        let (_, calls) = zeroclaw_tool_call_parser::parse_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        let text_call = tool
+            .execute(calls[0].arguments.clone())
+            .await
+            .expect("text-transport call executes");
+        assert!(text_call.success, "{:?}", text_call.error);
+        assert!(text_call.output.contains("[1].map(e=>({value:e}))"));
+        assert_eq!(sentinel_runs(&tmp), 1);
+
+        let native_args: serde_json::Value =
+            serde_json::from_str(&json!({"command": js}).to_string()).unwrap();
+        let native_call = tool.execute(native_args).await.unwrap();
+        assert!(native_call.success, "{:?}", native_call.error);
+        assert_eq!(sentinel_runs(&tmp), 2);
+
+        for denied in [
+            "./sentinel <(echo x)",
+            "sh -c './sentinel <(echo x)'",
+            "bash -lc './sentinel <(echo x)'",
+            "echo './sentinel <(echo x)' | sh",
+            "sh <<< './sentinel <(echo x)'",
+            "./sentinel 'unterminated <(echo x)",
+            "echo hi | sed -n 1p | ./sentinel",
+            "cat /etc/passwd | ./sentinel",
+            "./sentinel > out.txt",
+        ] {
+            let result = tool.execute(json!({"command": denied})).await.unwrap();
+            assert!(!result.success, "must be denied: {denied}");
+            let data = result
+                .output
+                .data()
+                .unwrap_or_else(|| panic!("no data: {denied}"));
+            assert_eq!(data["status"], "denied", "{denied}");
+            assert!(data["policy_reason"].is_string(), "{denied}");
+            assert_eq!(sentinel_runs(&tmp), 2, "denied command executed: {denied}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denial_output_carries_typed_reason_blocked_command_and_safe_path() {
+        let (_tmp, security) = sentinel_workspace();
+        let tool = wrapped_shell(security);
+
+        let not_allowed = tool
+            .execute(json!({"command": "sed -n 1p x"}))
+            .await
+            .unwrap();
+        assert!(!not_allowed.success);
+        assert!(
+            not_allowed
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("Command not allowed by security policy: ")
+        );
+        assert_eq!(
+            not_allowed.output.data().unwrap(),
+            &json!({
+                "status": "denied",
+                "policy_reason": "command_not_allowed",
+                "blocked_command": "sed"
+            })
+        );
+
+        let outside = tool
+            .execute(json!({"command": "cat /etc/passwd"}))
+            .await
+            .unwrap();
+        assert!(!outside.success);
+        assert!(
+            outside
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("Path blocked by security policy: ")
+        );
+        let data = outside.output.data().unwrap();
+        assert_eq!(data["policy_reason"], "path_not_allowed");
+        assert_eq!(data["path"], "outside_workspace");
+        assert!(data["blocked_command"].is_null());
     }
 }
