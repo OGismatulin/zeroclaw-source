@@ -409,7 +409,10 @@ mod tests {
         let mut writer = CountingWriter { calls: Vec::new() };
         write_trace_line(&mut writer, r#"{"event_type":"tool_call_result"}"#).unwrap();
         assert_eq!(writer.calls.len(), 1);
-        assert_eq!(writer.calls[0], b"{\"event_type\":\"tool_call_result\"}\n".to_vec());
+        assert_eq!(
+            writer.calls[0],
+            b"{\"event_type\":\"tool_call_result\"}\n".to_vec()
+        );
     }
 
     #[test]

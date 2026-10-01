@@ -1000,11 +1000,15 @@ mod tests {
     #[test]
     fn jsonl_line_is_one_write_even_above_buffer_size() {
         let value = serde_json::json!({"payload": "x".repeat(20_000)});
-        let mut writer = CountingWriter { calls: 0, bytes: Vec::new() };
+        let mut writer = CountingWriter {
+            calls: 0,
+            bytes: Vec::new(),
+        };
         write_jsonl_line(&mut writer, &value).unwrap();
         assert_eq!(writer.calls, 1);
         assert_eq!(writer.bytes.last(), Some(&b'\n'));
-        let parsed: Value = serde_json::from_slice(&writer.bytes[..writer.bytes.len() - 1]).unwrap();
+        let parsed: Value =
+            serde_json::from_slice(&writer.bytes[..writer.bytes.len() - 1]).unwrap();
         assert_eq!(parsed, value);
     }
 
