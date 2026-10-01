@@ -1004,6 +1004,7 @@ def build_digest(
     *,
     timezone_name: str = DEFAULT_TIMEZONE,
     sweep_interval_secs: float = DEFAULT_SWEEP_INTERVAL_SECS,
+    now: datetime | None = None,
 ) -> Digest:
     """Read the daily snapshot(s) covering the window and build a report digest.
 
@@ -1050,7 +1051,8 @@ def build_digest(
             seen_ids.add(ident)
             incidents.append((ts, row))
 
-    state, reasons = _completeness(receipts, start_utc, end_utc, sweep_interval_secs, tz)
+    observed_until = min(end_utc, now or datetime.now(timezone.utc))
+    state, reasons = _completeness(receipts, start_utc, observed_until, sweep_interval_secs, tz)
 
     raw_gate = sum(1 for _, row in incidents if row.get("gate"))
     raw_non_gate = len(incidents) - raw_gate

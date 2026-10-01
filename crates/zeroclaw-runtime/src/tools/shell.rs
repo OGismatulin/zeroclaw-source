@@ -272,7 +272,7 @@ impl Tool for ShellTool {
                 "timeout_secs": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional per-call timeout in seconds, clamped to the profile ceiling. Use ~60-90 for network CLIs (glab api, curl) so a hung call fails fast instead of blocking the whole turn."
+                    "description": "Optional per-call timeout in seconds, clamped to the profile ceiling. Use ~60-90 only for a single network CLI call (glab api, curl). For a skill script pass the timeout its SKILL.md names, or omit it to get the profile ceiling."
                 }
             },
             "required": ["command"]
@@ -729,6 +729,11 @@ mod tests {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["timeout_secs"].is_object());
+        let description = schema["properties"]["timeout_secs"]["description"]
+            .as_str()
+            .expect("timeout_secs description should be a string");
+        assert!(description.contains("single network CLI"));
+        assert!(description.contains("SKILL.md"));
         assert!(
             !schema["required"]
                 .as_array()

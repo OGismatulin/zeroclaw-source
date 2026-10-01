@@ -158,6 +158,13 @@ struct LegacyTraceLogger {
     write_lock: std::sync::Mutex<()>,
 }
 
+fn write_trace_line<W: Write>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    writer.write_all(buf.as_bytes())
+}
+
 impl LegacyTraceLogger {
     fn new(mode: LegacyStorageMode, max_entries: usize, path: PathBuf) -> Self {
         Self {
@@ -190,7 +197,7 @@ impl LegacyTraceLogger {
         }
 
         let mut file = options.open(&self.path)?;
-        writeln!(file, "{line}")?;
+        write_trace_line(&mut file, &line)?;
         file.sync_data()?;
 
         #[cfg(unix)]
@@ -380,6 +387,32 @@ mod tests {
             log_persistence_max_entries: 2,
             ..ObservabilityConfig::default()
         }
+    }
+
+    struct CountingWriter {
+        calls: Vec<Vec<u8>>,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_trace_line_is_one_write() {
+        let mut writer = CountingWriter { calls: Vec::new() };
+        write_trace_line(&mut writer, r#"{"event_type":"tool_call_result"}"#).unwrap();
+        assert_eq!(writer.calls.len(), 1);
+        assert_eq!(
+            writer.calls[0],
+            b"{\"event_type\":\"tool_call_result\"}\n".to_vec()
+        );
     }
 
     #[test]
