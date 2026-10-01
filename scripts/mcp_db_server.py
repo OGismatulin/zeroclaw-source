@@ -19,6 +19,15 @@ import urllib.request
 import psycopg2
 from psycopg2 import errors as pg_errors
 
+openvpn_log: object | None
+try:
+    import openvpn_log
+except ModuleNotFoundError:
+    try:
+        from scripts import openvpn_log
+    except ModuleNotFoundError:
+        openvpn_log = None
+
 DDL_BLOCKLIST_RE = re.compile(
     r"\b(DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|COPY|VACUUM|REINDEX|CLUSTER)\b",
     re.IGNORECASE,
@@ -474,7 +483,11 @@ def _ch_post_with_retry_initial(req: urllib.request.Request, timeout: int):
 
 
 def _count_openvpn_resets(log_path: str, window_secs: int = 300) -> int:
-    """Count recent-looking OpenVPN soft reconnects from the tail of its log."""
+    if openvpn_log is not None:
+        try:
+            return openvpn_log.count_recent_resets(log_path, window_secs=window_secs)
+        except OSError:
+            return 0
     try:
         with open(log_path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -483,9 +496,6 @@ def _count_openvpn_resets(log_path: str, window_secs: int = 300) -> int:
             tail = f.read().decode("utf-8", errors="replace")
     except OSError:
         return 0
-    # OpenVPN logs are not reliably machine-parseable across configs. Keep this
-    # cheap and deterministic; smoke checks divide by their observed window.
-    _ = window_secs
     return tail.count("SIGUSR1[soft,connection-reset]")
 
 

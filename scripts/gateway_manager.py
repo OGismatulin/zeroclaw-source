@@ -32,6 +32,15 @@ try:  # image layout: both scripts live side by side in /usr/local/bin
 except ModuleNotFoundError:  # repo layout: imported as scripts.gateway_manager
     from scripts import volume_janitor
 
+openvpn_log: object | None
+try:
+    import openvpn_log
+except ModuleNotFoundError:
+    try:
+        from scripts import openvpn_log
+    except ModuleNotFoundError:
+        openvpn_log = None
+
 # Optional: the m365 token module ships next to the manager in the image. A missing
 # file means "no Microsoft 365 refresh", never "no chat" (I67).
 m365_tokens: object | None
@@ -3588,7 +3597,7 @@ def _read_recent_mcp_failures(
 
 def _post_operator_telegram(
     *, notify_url: str, notify_secret: str, user_id: int, message: str
-) -> None:
+) -> bool:
     """Fire-and-forget operator Telegram notify for the boot path. Mirrors
     ProgressNotifier._post_notify; failures are logged and swallowed so a scan
     never breaks daemon spawn."""
@@ -3610,6 +3619,8 @@ def _post_operator_telegram(
             f"[gateway-manager] boot mcp-failure notify failed: {exc}",
             flush=True,
         )
+        return False
+    return True
 
 
 def forward_webhook_to_child(
@@ -3795,6 +3806,91 @@ class VolumeJanitor:
             self.run_once()
             if self._stop.wait(self._interval):
                 return
+
+
+def vpn_flap_message(count: int, window_secs: float) -> str:
+    minutes = max(int(window_secs) // 60, 1)
+    return (
+        f"⚠ VPN-туннель прода флапает: {count} обрывов за {minutes} мин.\n\n"
+        "Частая причина — второй клиент того же `client.ovpn`, обычно поднятый"
+        " локальный docker-стек. Погаси его: `docker compose stop zeroclaw`\n\n"
+        "Пока туннель флапает, БД, Grafana и Graylog с прода недоступны."
+        " Последние обрывы: `grep SIGUSR1 /tmp/openvpn.log | tail -3`"
+    )
+
+
+class VpnFlapWatcher:
+    def __init__(
+        self,
+        *,
+        log_path: Path,
+        threshold: int = 5,
+        window_secs: float = 600.0,
+        interval_secs: float = 60.0,
+        counter: Callable[..., int],
+        alert: Callable[[int, float], bool] | None = None,
+    ) -> None:
+        self._log_path = log_path
+        self._threshold = max(threshold, 1)
+        self._window = max(window_secs, 60.0)
+        self._interval = max(interval_secs, 10.0)
+        self._counter = counter
+        self._alert = alert
+        self._flapping = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="vpn-flap-watcher", daemon=True
+        )
+        self._thread.start()
+        print(
+            "[gateway-manager] vpn-flap: thread started"
+            f" (threshold={self._threshold} resets / {int(self._window)}s,"
+            f" every {int(self._interval)}s, log={self._log_path})",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_once(self) -> int | None:
+        try:
+            count = int(
+                self._counter(
+                    self._log_path, window_secs=self._window, now=datetime.now()
+                )
+            )
+        except Exception as exc:
+            print(f"[gateway-manager] vpn-flap: log read failed: {exc}", flush=True)
+            return None
+        if count == 0:
+            if self._flapping:
+                print("[gateway-manager] vpn-flap: recovered, 0 resets in window", flush=True)
+            self._flapping = False
+            return count
+        print(
+            f"[gateway-manager] vpn-flap: resets={count} in {int(self._window)}s"
+            f" flapping={self._flapping}",
+            flush=True,
+        )
+        if count >= self._threshold and not self._flapping:
+            self._flapping = True
+            sent = False
+            if self._alert is not None:
+                try:
+                    sent = bool(self._alert(count, self._window))
+                except Exception as exc:
+                    print(f"[gateway-manager] vpn-flap: alert failed: {exc}", flush=True)
+            print(f"[gateway-manager] vpn-flap: alert sent={bool(sent)}", flush=True)
+        return count
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.run_once()
 
 
 class M365Refresher:
@@ -4181,6 +4277,32 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         janitor.start()
     else:
         print("[gateway-manager] janitor: disabled by env", flush=True)
+
+    def _vpn_flap_alert(count: int, window_secs: float) -> bool:
+        if not notify_url or not operator_user_id.strip().isdigit():
+            return False
+        return _post_operator_telegram(
+            notify_url=notify_url,
+            notify_secret=notify_secret,
+            user_id=int(operator_user_id.strip()),
+            message=vpn_flap_message(count, window_secs),
+        )
+
+    vpn_flap_watcher: VpnFlapWatcher | None = None
+    if openvpn_log is None:
+        print("[gateway-manager] vpn-flap: openvpn_log module missing, watcher off", flush=True)
+    elif _env_bool("ZEROCLAW_VPN_FLAP_ENABLED", True):
+        vpn_flap_watcher = VpnFlapWatcher(
+            log_path=Path(os.environ.get("OPENVPN_LOG_PATH", "/tmp/openvpn.log")),
+            threshold=int(_env_float("ZEROCLAW_VPN_FLAP_THRESHOLD", 5.0)),
+            window_secs=_env_float("ZEROCLAW_VPN_FLAP_WINDOW_SECS", 600.0),
+            interval_secs=_env_float("ZEROCLAW_VPN_FLAP_INTERVAL_SECS", 60.0),
+            counter=openvpn_log.count_recent_resets,
+            alert=_vpn_flap_alert,
+        )
+        vpn_flap_watcher.start()
+    else:
+        print("[gateway-manager] vpn-flap: disabled by env", flush=True)
 
     def _m365_alert(code: str, error: str, hint: str, user_key: str | None) -> bool:
         # user_id only labels the card ("User:"); the recipient is always the operator.
