@@ -379,11 +379,7 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
         maybe_rotate_for_date(state)?;
     }
     let mut file = open_active_file(state)?;
-    {
-        let mut writer = BufWriter::new(&mut file);
-        write_jsonl_line(&mut writer, value)?;
-        writer.flush()?;
-    }
+    write_jsonl_line(&mut file, value)?;
     match state.policy.storage {
         StoragePolicy::Rolling => trim_to_last_entries(state)?,
         StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
@@ -614,18 +610,18 @@ fn deep_merge(target: &mut Value, incoming: &Value) {
     }
 }
 
-/// Serialize one event as a single JSONL line (terminated with `\n`) to the
-/// provided buffered writer. Pure helper: does not open, flush, or fsync the
-/// file — the caller owns the [`BufWriter`] lifecycle.
+/// Serialize one event as a single JSONL line (terminated with `\n`) and hand it to the
+/// writer in one `write_all`. Pure helper: does not open, flush, or fsync the file.
 ///
-/// Used by the production append path (`append_line`). The rolling trim path
+/// Used by the production append path (`write_one`). The rolling trim path
 /// (`trim_to_last_entries`) writes the original JSONL bytes from the
 /// line-buffered reader directly, so it stays inline rather than going
 /// through this helper (re-serializing would risk non-byte-identical output
 /// for non-canonical input, e.g. reordered keys or whitespace).
 fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, value).context("serializing log line")?;
-    writer.write_all(b"\n").context("writing newline")?;
+    let mut line = serde_json::to_vec(value).context("serializing log line")?;
+    line.push(b'\n');
+    writer.write_all(&line).context("writing log line")?;
     Ok(())
 }
 
@@ -982,6 +978,34 @@ mod tests {
             tx,
             worker_dead,
         }));
+    }
+
+    struct CountingWriter {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn jsonl_line_is_one_write_even_above_buffer_size() {
+        let value = serde_json::json!({"payload": "x".repeat(20_000)});
+        let mut writer = CountingWriter { calls: 0, bytes: Vec::new() };
+        write_jsonl_line(&mut writer, &value).unwrap();
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes.last(), Some(&b'\n'));
+        let parsed: Value = serde_json::from_slice(&writer.bytes[..writer.bytes.len() - 1]).unwrap();
+        assert_eq!(parsed, value);
     }
 
     #[test]
