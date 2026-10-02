@@ -3888,6 +3888,35 @@ mod tests {
         socket.write_all(response.as_bytes()).await.unwrap();
     }
 
+    async fn write_chat_response(
+        socket: &mut tokio::net::TcpStream,
+        request: &[u8],
+        body: serde_json::Value,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        if !String::from_utf8_lossy(request).contains("\"stream\":true") {
+            write_json_response(socket, body).await;
+            return;
+        }
+        let mut delta = body["choices"][0]["message"].clone();
+        if let Some(calls) = delta["tool_calls"].as_array_mut() {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = serde_json::json!(index);
+            }
+        }
+        let chunk = serde_json::json!({
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": "stop" }]
+        });
+        let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            events.len(),
+            events
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
@@ -3921,8 +3950,8 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let _request = read_http_request(&mut socket).await;
-                write_json_response(&mut socket, response).await;
+                let request = read_http_request(&mut socket).await;
+                write_chat_response(&mut socket, &request, response).await;
             }
         });
 
@@ -3951,8 +3980,8 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let _request = read_http_request(&mut socket).await;
-                write_json_response(&mut socket, response).await;
+                let request = read_http_request(&mut socket).await;
+                write_chat_response(&mut socket, &request, response).await;
             }
         });
 
