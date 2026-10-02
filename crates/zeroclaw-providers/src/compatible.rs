@@ -2575,6 +2575,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         true
     }
 
+    // fork(#52): `http_client` caps the whole response, `streaming_http_client` only idle gaps.
+    fn delegate_turns_should_stream(&self) -> bool {
+        true
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
@@ -3928,6 +3933,12 @@ mod tests {
     fn compatible_provider_supports_reasoning_only_history() {
         let p = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
         assert!(p.supports_reasoning_only_history());
+    }
+
+    #[test]
+    fn compatible_provider_requires_streamed_delegate_turns() {
+        let p = make_model_provider("OpenCode", "https://opencode.ai/zen/go/v1", None);
+        assert!(p.delegate_turns_should_stream());
     }
 
     #[test]

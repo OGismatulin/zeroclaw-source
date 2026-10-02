@@ -639,6 +639,11 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    // fork(#52): non-streaming chat caps the whole response with one timeout.
+    fn delegate_turns_should_stream(&self) -> bool {
+        false
+    }
+
     /// Warm up the HTTP connection pool.
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())
@@ -768,6 +773,11 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn supports_reasoning_only_history(&self) -> bool {
         self.as_ref().supports_reasoning_only_history()
+    }
+
+    // fork(#52)
+    fn delegate_turns_should_stream(&self) -> bool {
+        self.as_ref().delegate_turns_should_stream()
     }
 
     async fn chat_with_system(

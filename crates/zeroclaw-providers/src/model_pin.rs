@@ -74,6 +74,11 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.supports_reasoning_only_history()
     }
 
+    // fork(#52)
+    fn delegate_turns_should_stream(&self) -> bool {
+        self.inner.delegate_turns_should_stream()
+    }
+
     fn supports_streaming(&self) -> bool {
         self.inner.supports_streaming()
     }
@@ -216,6 +221,10 @@ mod tests {
         fn supports_reasoning_only_history(&self) -> bool {
             self.0
         }
+
+        fn delegate_turns_should_stream(&self) -> bool {
+            self.0
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -252,5 +261,15 @@ mod tests {
         assert!(provider.supports_reasoning_only_history());
         let provider: Arc<dyn ModelProvider> = Arc::new(ReasoningHistoryMock(false));
         assert!(!provider.supports_reasoning_only_history());
+    }
+
+    #[test]
+    fn model_pin_and_arc_forward_delegate_turns_should_stream() {
+        assert!(pinned(true).delegate_turns_should_stream());
+        assert!(!pinned(false).delegate_turns_should_stream());
+        let provider: Arc<dyn ModelProvider> = Arc::new(ReasoningHistoryMock(true));
+        assert!(provider.delegate_turns_should_stream());
+        let provider: Arc<dyn ModelProvider> = Arc::new(ReasoningHistoryMock(false));
+        assert!(!provider.delegate_turns_should_stream());
     }
 }

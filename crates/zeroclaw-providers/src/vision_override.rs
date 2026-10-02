@@ -87,6 +87,11 @@ impl ModelProvider for VisionOverrideProvider {
         self.inner.supports_streaming_tool_events()
     }
 
+    // fork(#52)
+    fn delegate_turns_should_stream(&self) -> bool {
+        self.inner.delegate_turns_should_stream()
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         ProviderDispatch::from_ref(&*self.inner).list_models().await
     }
@@ -210,6 +215,42 @@ mod tests {
     use crate::traits::ProviderCapabilities;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::ModelPricing;
+
+    struct StreamGateFake;
+
+    impl Attributable for StreamGateFake {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "stream_gate_fake"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamGateFake {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn delegate_turns_should_stream(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn vision_override_forwards_delegate_turns_should_stream() {
+        let wrapped = VisionOverrideProvider::new(Box::new(StreamGateFake), true);
+        assert!(wrapped.delegate_turns_should_stream());
+        let wrapped = VisionOverrideProvider::new(Box::new(PricedVisionFake), true);
+        assert!(!wrapped.delegate_turns_should_stream());
+    }
 
     /// Minimal inner provider that reports vision support and returns a priced
     /// model listing. Everything else falls back to the trait defaults.
