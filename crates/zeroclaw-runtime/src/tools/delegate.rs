@@ -2827,6 +2827,13 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
+        // fork(#52): a receiver makes the turn stream, so compat providers hit the
+        // idle timeout instead of the whole-response one; the drain ends with the sender.
+        let stream_sink = model_provider.delegate_turns_should_stream().then(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::agent::turn::DraftEvent>(64);
+            zeroclaw_spawn::spawn!(async move { while rx.recv().await.is_some() {} });
+            tx
+        });
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
@@ -2880,7 +2887,7 @@ impl DelegateTool {
                 channel_name: "delegate",
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),
-                on_delta: None,
+                on_delta: stream_sink,
                 shared_budget: None,
                 // TODO thread from parent in future
                 channel: None,
@@ -3881,6 +3888,35 @@ mod tests {
         socket.write_all(response.as_bytes()).await.unwrap();
     }
 
+    async fn write_chat_response(
+        socket: &mut tokio::net::TcpStream,
+        request: &[u8],
+        body: serde_json::Value,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        if !String::from_utf8_lossy(request).contains("\"stream\":true") {
+            write_json_response(socket, body).await;
+            return;
+        }
+        let mut delta = body["choices"][0]["message"].clone();
+        if let Some(calls) = delta["tool_calls"].as_array_mut() {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = serde_json::json!(index);
+            }
+        }
+        let chunk = serde_json::json!({
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": "stop" }]
+        });
+        let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            events.len(),
+            events
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
@@ -3914,8 +3950,8 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let _request = read_http_request(&mut socket).await;
-                write_json_response(&mut socket, response).await;
+                let request = read_http_request(&mut socket).await;
+                write_chat_response(&mut socket, &request, response).await;
             }
         });
 
@@ -3944,8 +3980,8 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let _request = read_http_request(&mut socket).await;
-                write_json_response(&mut socket, response).await;
+                let request = read_http_request(&mut socket).await;
+                write_chat_response(&mut socket, &request, response).await;
             }
         });
 
@@ -5313,6 +5349,171 @@ mod tests {
             !result.output.contains("[receipt: "),
             "no receipt trailer must appear in agent output when receipts are disabled, got: {}",
             result.output
+        );
+    }
+
+    struct StreamGateModelProvider {
+        should_stream: bool,
+        chat_calls: std::sync::atomic::AtomicUsize,
+        stream_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StreamGateModelProvider {
+        fn new(should_stream: bool) -> Self {
+            Self {
+                should_stream,
+                chat_calls: std::sync::atomic::AtomicUsize::new(0),
+                stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamGateModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("chat-done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn delegate_turns_should_stream(&self) -> bool {
+            self.should_stream
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+            self.stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            futures_util::stream::iter(vec![
+                Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk::delta("streamed-done"),
+                )),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamGateModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamGateModelProvider"
+        }
+    }
+
+    async fn run_stream_gate(model_provider: &StreamGateModelProvider) -> ToolResult {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        tool.execute_agentic(
+            "agentic",
+            &config,
+            "opencode",
+            "model-test",
+            model_provider,
+            "run",
+            Some(0.2),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_streams_when_provider_requires_it() {
+        let model_provider = StreamGateModelProvider::new(true);
+        let result = run_stream_gate(&model_provider).await;
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            result.output.contains("streamed-done"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            model_provider
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+        );
+        assert_eq!(
+            model_provider
+                .chat_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_stays_non_streaming_by_default() {
+        let model_provider = StreamGateModelProvider::new(false);
+        let result = run_stream_gate(&model_provider).await;
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            result.output.contains("chat-done"),
+            "got: {}",
+            result.output
+        );
+        assert_eq!(
+            model_provider
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            model_provider
+                .chat_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
         );
     }
 

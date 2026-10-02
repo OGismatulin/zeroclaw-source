@@ -39,6 +39,8 @@ ignore = [
     # Matrix SDK 0.18 pins imbl 6.1, which requires imbl-sized-chunks 0.1.x;
     # the 0.2.0 fix is incompatible. Matrix is not configured for Telegram.
     { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks panic-drop double free; matrix-sdk 0.18 pins imbl 6.1 and 0.1.x; Matrix unused on Telegram path; awaiting matrix-sdk/imbl upgrade; tracking #8519" },
+    { id = "RUSTSEC-2026-0318", reason = "matrix-sdk-crypto custom to-device send panic; fixed only in 0.19, a breaking matrix-sdk 0.18 -> 0.19 bump; Matrix channel unconfigured on the Telegram path; tracking #8519" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained (no CVE, no safe upgrade); transitive via matrix-sdk 0.18; Matrix unused on Telegram path; tracking #8519" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },

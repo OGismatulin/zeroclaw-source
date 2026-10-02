@@ -2056,6 +2056,14 @@ impl ModelProvider for ReliableModelProvider {
             .unwrap_or(false)
     }
 
+    // fork(#52): primary decides, like supports_reasoning_only_history.
+    fn delegate_turns_should_stream(&self) -> bool {
+        self.model_providers
+            .first()
+            .map(|entry| entry.provider.delegate_turns_should_stream())
+            .unwrap_or(false)
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
@@ -6448,6 +6456,10 @@ mod tests {
             fn supports_reasoning_only_history(&self) -> bool {
                 self.0
             }
+
+            fn delegate_turns_should_stream(&self) -> bool {
+                self.0
+            }
         }
         impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
             fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -6481,6 +6493,7 @@ mod tests {
             provider.supports_reasoning_only_history(),
             "ReliableModelProvider must propagate supports_reasoning_only_history from the first provider"
         );
+        assert!(provider.delegate_turns_should_stream());
 
         let provider = ReliableModelProvider::new(
             "test",
@@ -6501,6 +6514,7 @@ mod tests {
             !provider.supports_reasoning_only_history(),
             "a non-supporting primary must not inherit the capability from a fallback"
         );
+        assert!(!provider.delegate_turns_should_stream());
     }
 
     #[tokio::test]

@@ -276,6 +276,14 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or(false)
     }
 
+    // fork(#52): default provider decides, like supports_reasoning_only_history.
+    fn delegate_turns_should_stream(&self) -> bool {
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.delegate_turns_should_stream())
+            .unwrap_or(false)
+    }
+
     fn supports_streaming(&self) -> bool {
         self.model_providers
             .iter()
@@ -949,6 +957,10 @@ mod tests {
             fn supports_reasoning_only_history(&self) -> bool {
                 self.0
             }
+
+            fn delegate_turns_should_stream(&self) -> bool {
+                self.0
+            }
         }
         impl ::zeroclaw_api::attribution::Attributable for ReasoningHistoryMock {
             fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -992,6 +1004,8 @@ mod tests {
             !router(false, true).supports_reasoning_only_history(),
             "a non-supporting default must not inherit the capability from a route"
         );
+        assert!(router(true, false).delegate_turns_should_stream());
+        assert!(!router(false, true).delegate_turns_should_stream());
     }
 
     #[test]

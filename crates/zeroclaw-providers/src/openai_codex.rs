@@ -4103,6 +4103,7 @@ data: [DONE]
 
         assert!(provider.supports_streaming());
         assert!(provider.supports_streaming_tool_events());
+        assert!(!provider.delegate_turns_should_stream());
     }
 
     #[test]
