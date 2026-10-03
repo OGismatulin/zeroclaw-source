@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import Callable, Sequence
 import urllib.error
@@ -638,6 +639,7 @@ def _ru_count(n: int, one: str, few: str, many: str) -> str:
     return f"{n} {word}"
 
 
+_SKIP_LOGGED: set[dt.date] = set()
 _SUMMARY_CHANNEL_LABELS = {"chat": "чат", "cron": "cron", "jira": "jira", "delegate": "делегаты"}
 
 
@@ -648,6 +650,42 @@ def _channel_breakdown(digest: object) -> str:
         f"{_SUMMARY_CHANNEL_LABELS.get(channel, channel)} {digest.by_channel.get(channel, 0)}"
         for channel in zeroclaw_incidents.SECTION_ORDER
     )
+
+
+def _novelty_part(digest: object) -> str | None:
+    counters = getattr(digest, "counters", None) or {}
+    days = counters.get("history_days")
+    if zeroclaw_incidents is None or not isinstance(days, int):
+        return None
+    if days >= zeroclaw_incidents.HISTORY_DAYS:
+        new = sum(1 for g in digest.groups if getattr(g, "new", False))
+        return f"🆕 {new}" if new else None
+    return f"новизна не оценена (история {days} из {zeroclaw_incidents.HISTORY_DAYS} дн.)"
+
+
+def _side_lines(data: ReportData) -> list[str]:
+    counters = getattr(data.digest, "counters", None) or {}
+    lines = []
+    recovered = counters.get("recovered_episodes") or 0
+    if recovered:
+        lines.append(
+            "**Восстановлено:** "
+            + _ru_count(recovered, "эпизод", "эпизода", "эпизодов")
+            + " провайдера"
+        )
+    tests = counters.get("test_users") or {}
+    if tests:
+        lines.append(
+            "**Тестовые воркспейсы:** "
+            + " · ".join(
+                f"{u} {n}" for u, n in sorted(tests.items(), key=lambda i: -i[1])
+            )
+        )
+    return lines
+
+
+def _spaced(lines: list[str]) -> list[str]:
+    return [part for line in lines for part in ("", line)] + ([""] if lines else [])
 
 
 def _summary_line(data: ReportData) -> str:
@@ -661,6 +699,9 @@ def _summary_line(data: ReportData) -> str:
         _ru_count(digest.total, "отказ", "отказа", "отказов"),
         _ru_count(len(digest.groups), "сигнатура", "сигнатуры", "сигнатур"),
     ]
+    novelty = _novelty_part(digest)
+    if novelty:
+        parts.append(novelty)
     channels = _channel_breakdown(digest)
     if channels:
         parts.append(channels)
@@ -719,6 +760,52 @@ def _http_extra_line(data: ReportData) -> str | None:
     return "**HTTP-доп:** " + " · ".join(parts)
 
 
+_SLOT_REASON_RE = re.compile(r"^слот (?:(?P<inst>[^/\s]+)/)?(?P<num>\d+): (?P<text>.+)$")
+
+
+def _slot_ranges(numbers: list[str]) -> str:
+    ordered = sorted(set(numbers), key=int)
+    parts, run = [], [ordered[0]]
+    for number in ordered[1:]:
+        if int(number) == int(run[-1]) + 1:
+            run.append(number)
+        else:
+            parts.append(run)
+            run = [number]
+    parts.append(run)
+    return ", ".join(r[0] if len(r) == 1 else f"{r[0]}–{r[-1]}" for r in parts)
+
+
+def _collapse_slot_reasons(reasons: list[str]) -> list[str]:
+    order: list[tuple[str, object]] = []
+    slots: dict[tuple[str, str], list[str]] = {}
+    originals: dict[tuple[str, str], str] = {}
+    for reason in reasons:
+        match = _SLOT_REASON_RE.match(reason)
+        if not match:
+            order.append(("plain", reason))
+            continue
+        key = (match.group("inst") or "", match.group("text"))
+        if key not in slots:
+            slots[key] = []
+            originals[key] = reason
+            order.append(("slot", key))
+        slots[key].append(match.group("num"))
+    out = []
+    for kind, value in order:
+        if kind == "plain":
+            out.append(value)
+            continue
+        numbers = slots[value]
+        if len(numbers) == 1:
+            out.append(originals[value])
+            continue
+        instance, text = value
+        prefix = f"{instance}/" if instance else ""
+        out.append(f"слоты {prefix}{_slot_ranges(numbers)}: {text}")
+    return out
+
+
 def _gap_lines(data: ReportData) -> list[str]:
     """Up to 5 completeness reasons across all three axes, with a `+N ещё`.
 
@@ -735,6 +822,7 @@ def _gap_lines(data: ReportData) -> list[str]:
         reasons.append("снимок инцидентов недоступен — раздел по каналам не построен")
     if not reasons:
         return []
+    reasons = _collapse_slot_reasons(reasons)
     shown = reasons[:5]
     lines = ["", "**Пробелы в наблюдении**"]
     lines.extend(f"- {reason}" for reason in shown)
@@ -751,14 +839,17 @@ def _render_report_parts(data: ReportData) -> tuple[str, int]:
         f"# 🛡 ZeroClaw — ошибки за {start_local:%d.%m}",
         "",
         _summary_line(data),
-        _http_line(data),
+        *_spaced(_side_lines(data)),
     ]
+    if not _side_lines(data):
+        head_lines.append("")
+    head_lines.append(_http_line(data))
     http_codes = _http_code_line(data)
     if http_codes is not None:
-        head_lines.append(http_codes)
+        head_lines.extend(["", http_codes])
     http_extra = _http_extra_line(data)
     if http_extra is not None:
-        head_lines.append(http_extra)
+        head_lines.extend(["", http_extra])
     gap_lines = _gap_lines(data)
     footer_lines = [
         "",
@@ -856,6 +947,30 @@ class ReceiptStore:
             self.path(key), json.dumps(receipt, ensure_ascii=False, indent=2).encode("utf-8")
         )
         return receipt
+
+    def sent_path(self, key: ReceiptKey) -> Path:
+        return self.root / f"{key.filename()[: -len('.json')]}.sent.md"
+
+    def write_sent(self, key: ReceiptKey, text: str) -> Path:
+        target = self.sent_path(key)
+        self._atomic_write(target, text.encode("utf-8"))
+        return target
+
+    def prune_sent(self, today: dt.date, keep_days: int = 14) -> int:
+        removed = 0
+        cutoff = (today - dt.timedelta(days=keep_days)).isoformat()
+        try:
+            paths = list(self.root.glob("*.sent.md"))
+        except OSError:
+            return 0
+        for path in paths:
+            if path.name[:10] < cutoff:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
 
     def write_payload(self, key: ReceiptKey, text: str) -> tuple[Path, str]:
         data = text.encode("utf-8")
@@ -1157,6 +1272,41 @@ def run_once(
     )
     factory = client_factory or _default_client
     outcome: dict[str, object] = {"date": date.isoformat(), "kind": "report"}
+    attachment_key = ReceiptKey(
+        date=key.date, timezone=key.timezone, recipient=key.recipient, kind="attachment",
+    )
+    sender = file_deliver_fn or (
+        lambda name, body, caption: deliver_file(name, body, caption, config=config)
+    )
+    if send:
+        message_state = (store.load(key) or {}).get("state")
+        held = {"accepted": "already-accepted", "failed": "already-failed"}
+        if message_state in held or (message_state == "unknown" and not retry_unknown):
+            allowed, reason = owner_check(env)
+            if not allowed:
+                outcome.update({"state": "not-owner", "reason": reason})
+                return outcome
+            outcome["state"] = held.get(message_state, "unknown-held")
+            with ProcessLock(config.state_root / ".report.lock"):
+                attachment = _settle_attachment(
+                    store=store,
+                    key=attachment_key,
+                    message_state=message_state,
+                    retry_unknown=retry_unknown,
+                    sender=sender,
+                    name=f"zeroclaw-errors-{date.isoformat()}.md",
+                    caption=f"ZeroClaw — полный список инцидентов за {date:%d.%m}",
+                )
+            if attachment is not None:
+                outcome["attachment"] = attachment
+            if date not in _SKIP_LOGGED:
+                _SKIP_LOGGED.add(date)
+                print(
+                    f"[zeroclaw-error-report] skipped date={date.isoformat()} "
+                    f"state={outcome['state']}",
+                    flush=True,
+                )
+            return outcome
 
     # The incidents digest is read from the data root, independently of
     # Prometheus: a metrics outage must not blind the runtime-incidents axis,
@@ -1222,6 +1372,10 @@ def run_once(
                 message = "\n".join([notice, "", header, *section_lines])
     else:
         _bump(exporter, "built")
+        print(
+            f"[zeroclaw-error-report] built date={date.isoformat()} kind={outcome['kind']}",
+            flush=True,
+        )
 
     outcome["message"] = message
     if not send:
@@ -1234,16 +1388,7 @@ def run_once(
         outcome["reason"] = reason
         return outcome
 
-    attachment_key = ReceiptKey(
-        date=key.date,
-        timezone=key.timezone,
-        recipient=key.recipient,
-        kind="attachment",
-    )
     file_needed = bool(dropped and digest is not None and zeroclaw_incidents is not None)
-    sender = file_deliver_fn or (
-        lambda name, body, caption: deliver_file(name, body, caption, config=config)
-    )
     sent_now = False
     with ProcessLock(config.state_root / ".report.lock"):
         existing = store.load(key)
@@ -1287,16 +1432,16 @@ def run_once(
                     payload_sha256=payload_sha,
                     payload_path=str(payload_file),
                 )
-            # Durable `sending` BEFORE the network call: a crash between the two
-            # must be visible as `sending`, never as "never attempted".
-            store.write(key, "sending", attempted_at=_utc_stamp())
+            store.prune_sent(dt.datetime.now(tz).date())
+            sent_file = store.write_sent(key, message)
+            store.write(key, "sending", attempted_at=_utc_stamp(), sent_path=str(sent_file))
             state, detail = deliver_fn(
                 notify_url=config.notify_url,
                 notify_secret=config.notify_secret,
                 recipient=config.recipient,
                 message=message,
             )
-            store.write(key, state, detail=detail)
+            store.write(key, state, detail=detail, sent_path=str(sent_file))
             message_state = state
             outcome["state"] = state
             outcome["detail"] = detail

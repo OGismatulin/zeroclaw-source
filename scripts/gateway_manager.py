@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 import email.parser
 import email.policy
+import functools
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
@@ -4032,7 +4033,10 @@ class IncidentSweeper:
         self._initial_delay = max(initial_delay_secs, 0.0)
         # Resolved here, not as a parameter default, so a test that
         # monkeypatches zeroclaw_incidents.sweep after import is honored.
-        self._sweeper = sweeper if sweeper is not None else zeroclaw_incidents.sweep
+        self._sweeper = sweeper if sweeper is not None else functools.partial(
+            zeroclaw_incidents.sweep,
+            lifecycle_evidence=zeroclaw_incidents.delegate_never_created,
+        )
         self._alert = alert
         self._fail_streak = 0
         self._alerted_this_streak = False

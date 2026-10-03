@@ -9,6 +9,8 @@ window for an active user.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from collections import Counter
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -95,6 +97,7 @@ class Incident:
     policy_reason: str | None = None
     input_path: str | None = None
     parent_tool: str | None = None
+    gate_reason: str | None = None
 
     def as_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -330,6 +333,23 @@ def _normalize_input_path(value: object) -> str | None:
     return _safe_clip(cleaned, MAX_DETAIL_CHARS)
 
 
+_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;]")
+
+
+def _is_grep_no_match(command: object, output: object, error: object) -> bool:
+    if not isinstance(command, str):
+        return False
+    last = _SEGMENT_SPLIT_RE.split(command)[-1].lstrip()
+    if not (last.startswith("grep ") or last.startswith("git grep ")):
+        return False
+    if "2>" in last:
+        return False
+    text = output.get("text") if isinstance(output, dict) else output
+    if not isinstance(text, str) or text.strip():
+        return False
+    return not str(error or "").strip()
+
+
 def normalize_trace_row(row: dict, user: str) -> Incident | None:
     """Map one trace row (native schema_version=2 OR legacy) to an Incident.
 
@@ -381,6 +401,14 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
     call_id = _clip(call_id, MAX_ID_CHARS) if call_id else None
     clipped_error = _safe_clip(error, MAX_ERROR_CHARS)
     channel, channel_ref = classify_channel(row, zc)
+    gate = is_expected_gate(clipped_error, str(tool) if tool else None, zc.get("agent_alias"))
+    gate_reason = None
+    if (
+        native and not gate and kind == "tool_failure" and str(tool) == "shell"
+        and policy_reason is None
+        and _is_grep_no_match(command, attrs.get("output"), attrs.get("error"))
+    ):
+        gate, gate_reason = True, "no_match"
     return Incident(
         id=ident,
         ts=ts,
@@ -400,7 +428,8 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         detail=_safe_clip(command, MAX_DETAIL_CHARS) if command else None,
         location=location,
         turn_id=row.get("turn_id") or row.get("trace_id"),
-        gate=is_expected_gate(clipped_error, str(tool) if tool else None, zc.get("agent_alias")),
+        gate=gate,
+        gate_reason=gate_reason,
         tool_call_id=call_id or None,
         task_ids=task_ids,
         policy_reason=policy_reason,
@@ -410,6 +439,17 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
 
 
 CRON_FAILURE_STATUSES = ("error", "degraded")
+CRON_OK_STATUS = "ok"
+CRON_DEGRADED_JOBS = frozenset({"lalafo-errors-digest", "lalafo-commits-digest"})
+
+
+def _is_degraded_output(output: object) -> bool:
+    if not isinstance(output, str):
+        return False
+    for line in output.splitlines():
+        if line.strip():
+            return line.strip().startswith("⚠")
+    return False
 _KIND_RE = re.compile(r"\bkind=([a-z_]+)")
 _DISPOSITION_RE = re.compile(r"\bdisposition=([a-z_]+)")
 
@@ -487,8 +527,9 @@ def read_cron_failures(
         rows = con.execute(
             "SELECT r.job_id, r.started_at, r.status, r.output, j.name"
             " FROM cron_runs r LEFT JOIN cron_jobs j ON j.id = r.job_id"
-            " WHERE r.status IN (?, ?)",
-            CRON_FAILURE_STATUSES,
+            " WHERE r.status IN (?, ?, ?) AND r.started_at >= ?",
+            (*CRON_FAILURE_STATUSES, CRON_OK_STATUS,
+             since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")),
         ).fetchall()
     except sqlite3.Error:
         return SourceRead([], SOURCE_UNAVAILABLE)
@@ -499,13 +540,21 @@ def read_cron_failures(
         ts = _parse_ts(started_at)
         if ts is None or not (since <= ts < until):
             continue
-        text = (output or "").strip().splitlines()
-        message = text[-1] if text else f"cron run {status}"
+        if status == CRON_OK_STATUS:
+            if name not in CRON_DEGRADED_JOBS or not _is_degraded_output(output):
+                continue
+            first = next(line.strip() for line in output.splitlines() if line.strip())
+            kind, severity, message = "cron_degraded", "WARN", first
+        else:
+            text = (output or "").strip().splitlines()
+            kind = "cron_failure"
+            severity = "ERROR" if status == "error" else "WARN"
+            message = text[-1] if text else f"cron run {status}"
         out.append(
             Incident(
                 id=f"cron:{job_id}:{started_at}", ts=str(started_at), user=user,
-                source="cron", severity="ERROR" if status == "error" else "WARN",
-                channel="cron", channel_ref=name or job_id, kind="cron_failure",
+                source="cron", severity=severity,
+                channel="cron", channel_ref=name or job_id, kind=kind,
                 tool=None, agent_alias=None, model=None, provider=None,
                 error_kind=status, error_disposition=None,
                 error=_safe_clip(message, MAX_ERROR_CHARS), detail=None, location=None,
@@ -576,14 +625,33 @@ def read_delegate_failures(
 
 
 SNAPSHOT_DIRNAME = "incidents"
+EPISODE_GAP_SECS = 120.0
+RECOVERY_WINDOW_SECS = 300.0
+ABSORB_WINDOW_SECS = 300.0
+RECOVERY_KIND = "recovery"
+
+
+def recovery_marker(row: dict, user: str) -> dict | None:
+    if row.get("message") != "llm_response":
+        return None
+    event = row.get("event") or {}
+    if event.get("outcome") != "success":
+        return None
+    attrs = row.get("attributes") or {}
+    zc = row.get("zeroclaw") or {}
+    ident, ts = row.get("id"), row.get("@timestamp")
+    if not ident or not ts or not attrs.get("model"):
+        return None
+    return {"kind": RECOVERY_KIND, "id": f"recovery:{ident}", "ts": str(ts), "user": user,
+            "agent_alias": zc.get("agent_alias"), "model": attrs.get("model"),
+            "trace_id": attrs.get("trace_id") or row.get("trace_id")}
 
 
 def snapshot_dir(data_root: Path) -> Path:
     return data_root / "observability" / SNAPSHOT_DIRNAME
 
 
-def _known_ids(path: Path) -> set[str]:
-    """Ids already in the snapshot. A torn last line is ignored, not fatal."""
+def _known_ids(path: Path, *, markers: bool = False) -> set[str]:
     known: set[str] = set()
     if not path.is_file():
         return known
@@ -591,6 +659,8 @@ def _known_ids(path: Path) -> set[str]:
         try:
             row = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(row, dict) or (row.get("kind") == RECOVERY_KIND) != markers:
             continue
         ident = row.get("id")
         if ident:
@@ -624,6 +694,10 @@ def _previous_sources_seen(out_dir: Path) -> dict[str, set[str]]:
                 if isinstance(info, dict) and isinstance(info.get("sources_seen"), list)
             }
     return {}
+
+
+def delegate_never_created(workspace: Path, name: str) -> bool:
+    return name == "delegate"
 
 
 def sweep(
@@ -673,6 +747,23 @@ def sweep(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(inc.to_json() + "\n")
 
+    marker_known: dict[str, set[str]] = {}
+
+    def _sink_marker(marker: dict) -> None:
+        stamp = _parse_ts(marker["ts"]) or now
+        day = stamp.astimezone(tz).date().isoformat()
+        path = out_dir / f"{day}.jsonl"
+        if day not in marker_known:
+            marker_known[day] = _known_ids(path, markers=True)
+        if marker["id"] in marker_known[day]:
+            return
+        marker_known[day].add(marker["id"])
+        if not apply:
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n")
+
     try:
         workspaces = volume_janitor.workspace_dirs(data_root)
     except OSError as exc:  # never let enumeration escape into the caller
@@ -692,6 +783,7 @@ def sweep(
             trace = workspace / "logs" / "runtime-trace.jsonl"
             if trace.is_file():
                 malformed = 0
+                last_provider_failure: dict[tuple, datetime] = {}
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
                         if not line.strip():
@@ -707,9 +799,25 @@ def sweep(
                         stamp = row.get("@timestamp") or row.get("timestamp")
                         if stamp and state["earliest_trace_ts"] is None:
                             state["earliest_trace_ts"] = str(stamp)
+                        marker = recovery_marker(row, user)
+                        if marker is not None:
+                            failed_at = last_provider_failure.get(
+                                (marker["agent_alias"], marker["model"]))
+                            stamp_ok = _parse_ts(marker["ts"])
+                            if (
+                                failed_at and stamp_ok
+                                and 0 < (stamp_ok - failed_at).total_seconds()
+                                <= RECOVERY_WINDOW_SECS
+                            ):
+                                _sink_marker(marker)
+                            continue
                         incident = normalize_trace_row(row, user)
                         if incident is None:
                             continue
+                        if incident.kind.startswith("provider"):
+                            failed_ts = _parse_ts(incident.ts)
+                            if failed_ts:
+                                last_provider_failure[(incident.agent_alias, incident.model)] = failed_ts
                         if incident.channel == "cron":
                             incident = replace(
                                 incident,
@@ -822,6 +930,49 @@ def _subject(row: dict) -> str | None:
     return row.get("tool")
 
 
+HISTORY_DAYS = 7
+
+
+def _novelty_key(channel, channel_ref, kind, subject, error) -> tuple:
+    kind = "provider" if str(kind or "").startswith("provider") else kind
+    if channel in ("jira", "delegate"):
+        channel_ref = None
+    return (channel, channel_ref, kind, subject, _signature(str(error or "")))
+
+
+def _history_keys(
+    data_root: Path, start_utc: datetime, tz: ZoneInfo, skip: frozenset[str] = frozenset(),
+) -> tuple[set[tuple], int]:
+    keys: set[tuple] = set()
+    found = 0
+    first = start_utc.astimezone(tz).date()
+    for back in range(1, HISTORY_DAYS + 1):
+        path = snapshot_dir(data_root) / f"{(first - timedelta(days=back)).isoformat()}.jsonl"
+        if not path.is_file():
+            continue
+        day_keys: set[tuple] = set()
+        swept = truncated = False
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("kind") == "sweep":
+                swept = True
+                truncated = truncated or bool(row.get("truncated"))
+                continue
+            if row.get("kind") == RECOVERY_KIND or row.get("gate") or row.get("user") in skip:
+                continue
+            day_keys.add(_novelty_key(row.get("channel"), row.get("channel_ref"), row.get("kind"),
+                                      _subject(row), row.get("error")))
+        if swept and not truncated:
+            found += 1
+            keys |= day_keys
+    return keys, found
+
+
 @dataclass(frozen=True, slots=True)
 class Group:
     channel: str
@@ -844,6 +995,7 @@ class Group:
     policy_reason: str | None = None
     input_path: str | None = None
     parent_tool: str | None = None
+    new: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -855,6 +1007,18 @@ class Digest:
     state: str
     reasons: list[str]
     counters: dict = field(default_factory=dict)
+    test_groups: list[Group] = field(default_factory=list)
+
+
+DEFAULT_TEST_USERS = frozenset({"tg_99999", "tg_88888"})
+
+
+def resolve_test_users(env: Mapping[str, str] | None = None) -> frozenset[str]:
+    source = os.environ if env is None else env
+    raw = source.get("ZEROCLAW_INCIDENTS_TEST_USERS")
+    if raw is None:
+        return DEFAULT_TEST_USERS
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _completeness(
@@ -863,6 +1027,7 @@ def _completeness(
     end_utc: datetime,
     sweep_interval_secs: float,
     tz: ZoneInfo,
+    skip_users: frozenset[str] = frozenset(),
 ) -> tuple[str, list[str]]:
     """Grade coverage from the sweep receipts, never from incident silence.
 
@@ -909,7 +1074,7 @@ def _completeness(
         if not isinstance(sources, dict):
             continue
         for user, info in sources.items():
-            if not isinstance(info, dict):
+            if user in skip_users or not isinstance(info, dict):
                 continue
             for name in ("trace", "cron", "delegate"):
                 if info.get(name) is False and f"src:{user}:{name}" not in seen:
@@ -952,6 +1117,55 @@ _MERGE_FILL = (
 _WAIT_KINDS = ("delegate_wait", "delegate_missing")
 
 
+TWIN_WINDOW_SECS = 2.0
+MCP_TWIN_WINDOW_SECS = 5.0
+_MCP_CONNECT_RE = re.compile(r"Failed to connect to MCP server [`ʼ']?([\w.-]+)")
+
+
+def _twin_base(
+    ts: datetime, row: dict, bases: list[tuple[datetime, dict]], used: set[int],
+) -> dict | None:
+    match = _MCP_CONNECT_RE.search(str(row.get("error") or ""))
+    server = match.group(1) if match else None
+    best: tuple[float, dict] | None = None
+    for base_ts, base in bases:
+        if id(base) in used or base.get("user") != row.get("user"):
+            continue
+        if base.get("agent_alias") != row.get("agent_alias"):
+            continue
+        gap = abs((base_ts - ts).total_seconds())
+        tool_twin = (
+            base.get("kind") == "tool_failure" and bool(row.get("tool"))
+            and base.get("tool") == row.get("tool") and gap <= TWIN_WINDOW_SECS
+        )
+        mcp_twin = (
+            base.get("kind") == "mcp_failure" and server is not None
+            and base.get("tool") == server and gap <= MCP_TWIN_WINDOW_SECS
+        )
+        if (tool_twin or mcp_twin) and (best is None or gap < best[0]):
+            best = (gap, base)
+    return best[1] if best is not None else None
+
+
+def _merge_runtime_twins(
+    incidents: list[tuple[datetime, dict]],
+) -> list[tuple[datetime, dict]]:
+    bases = [(ts, row) for ts, row in incidents if row.get("kind") in ("tool_failure", "mcp_failure")]
+    used: set[int] = set()
+    kept: list[tuple[datetime, dict]] = []
+    for ts, row in incidents:
+        if row.get("kind") == "runtime_error":
+            base = _twin_base(ts, row, bases, used)
+            if base is not None:
+                used.add(id(base))
+                for name in ("location", "detail"):
+                    if base.get(name) in (None, "") and row.get(name) not in (None, ""):
+                        base[name] = row[name]
+                continue
+        kept.append((ts, row))
+    return kept
+
+
 def _merge_same_call(
     incidents: list[tuple[datetime, dict]],
 ) -> list[tuple[datetime, dict]]:
@@ -971,6 +1185,9 @@ def _merge_same_call(
                 for name in _MERGE_FILL:
                     if base.get(name) in (None, "", []) and row.get(name) not in (None, "", []):
                         base[name] = row[name]
+                if row.get("gate") and not base.get("gate"):
+                    base["gate"] = True
+                    base["gate_reason"] = row.get("gate_reason")
                 if base.get("kind") == "tool_failure" and row.get("kind") in _WAIT_KINDS:
                     base["kind"] = row["kind"]
                 continue
@@ -979,7 +1196,79 @@ def _merge_same_call(
     return merged
 
 
-def _source_status_counts(receipts: list[tuple[datetime, dict]]) -> dict[str, int]:
+def _is_provider_row(row: dict) -> bool:
+    return str(row.get("kind") or "").startswith("provider") and not row.get("gate")
+
+
+def _episode_fits(episode: dict, ts: datetime, turn: object) -> bool:
+    if (ts - episode["end"]).total_seconds() > EPISODE_GAP_SECS:
+        return False
+    return not turn or not episode["turn"] or turn == episode["turn"]
+
+
+def _provider_episodes(provider: list[tuple[datetime, dict]]) -> list[dict]:
+    episodes: list[dict] = []
+    for ts, row in sorted(provider, key=lambda item: item[0]):
+        user, alias = row.get("user"), row.get("agent_alias")
+        model, turn = row.get("model"), row.get("turn_id")
+        candidates = [
+            episode for episode in episodes
+            if episode["user"] == user and episode["alias"] == alias
+            and (model is None or episode["model"] == model)
+            and _episode_fits(episode, ts, turn)
+        ]
+        if candidates:
+            episode = max(candidates, key=lambda item: item["end"])
+            episode["end"], episode["last"] = ts, row
+            episode["turn"] = episode["turn"] or turn
+            continue
+        episodes.append({"user": user, "alias": alias, "model": model, "turn": turn,
+                         "start": ts, "end": ts, "last": row})
+    return episodes
+
+
+def _is_recovered(episode: dict, recoveries: list[tuple[datetime, dict]]) -> bool:
+    for ts, marker in recoveries:
+        if marker.get("user") != episode["user"]:
+            continue
+        if not 0 < (ts - episode["end"]).total_seconds() <= RECOVERY_WINDOW_SECS:
+            continue
+        if episode["turn"]:
+            if marker.get("trace_id") == episode["turn"]:
+                return True
+        elif (marker.get("agent_alias") == episode["alias"]
+              and marker.get("model") == episode["model"]):
+            return True
+    return False
+
+
+def _collapse_provider_episodes(
+    incidents: list[tuple[datetime, dict]],
+    recoveries: list[tuple[datetime, dict]],
+) -> tuple[list[tuple[datetime, dict]], list[tuple]]:
+    provider = [(ts, row) for ts, row in incidents if _is_provider_row(row)]
+    others = [(ts, row) for ts, row in incidents if not _is_provider_row(row)]
+    kept: list[tuple[datetime, dict]] = []
+    recovered: list[tuple] = []
+    for episode in _provider_episodes(provider):
+        key = (episode["user"], episode["alias"], episode["model"])
+        if _is_recovered(episode, recoveries):
+            recovered.append(key)
+            continue
+        if any(
+            row.get("kind") == "delegate_failure" and not row.get("gate")
+            and row.get("user") == episode["user"] and row.get("agent_alias") == episode["alias"]
+            and 0 <= (ts - episode["end"]).total_seconds() <= ABSORB_WINDOW_SECS
+            for ts, row in others
+        ):
+            continue
+        kept.append((episode["start"], dict(episode["last"], kind="provider_failure")))
+    return others + kept, recovered
+
+
+def _source_status_counts(
+    receipts: list[tuple[datetime, dict]], skip_users: frozenset[str] = frozenset()
+) -> dict[str, int]:
     counts = {SOURCE_OK: 0, SOURCE_NOT_INITIALIZED: 0, SOURCE_UNAVAILABLE: 0}
     if not receipts:
         return counts
@@ -987,7 +1276,9 @@ def _source_status_counts(receipts: list[tuple[datetime, dict]]) -> dict[str, in
     sources = latest.get("sources")
     if not isinstance(sources, dict):
         return counts
-    for info in sources.values():
+    for user, info in sources.items():
+        if user in skip_users:
+            continue
         statuses = info.get("source_status") if isinstance(info, dict) else None
         if not isinstance(statuses, dict):
             continue
@@ -997,78 +1288,23 @@ def _source_status_counts(receipts: list[tuple[datetime, dict]]) -> dict[str, in
     return counts
 
 
-def build_digest(
-    data_root: Path,
-    start_utc: datetime,
-    end_utc: datetime,
-    *,
-    timezone_name: str = DEFAULT_TIMEZONE,
-    sweep_interval_secs: float = DEFAULT_SWEEP_INTERVAL_SECS,
-    now: datetime | None = None,
-) -> Digest:
-    """Read the daily snapshot(s) covering the window and build a report digest.
-
-    Never raises: a corrupt line, a missing file, or an unparseable
-    timestamp is skipped, never propagated — the caller (Task 8) runs this
-    inside a try only as belt-and-suspenders.
-    """
-    tz = ZoneInfo(timezone_name)
-    dates = {start_utc.astimezone(tz).date(), end_utc.astimezone(tz).date()}
-    rows: list[dict] = []
-    for day in dates:
-        path = snapshot_dir(data_root) / f"{day.isoformat()}.jsonl"
-        if not path.is_file():
-            continue
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-
-    # Incidents: half-open, same convention as read_cron_failures/read_delegate_failures
-    # elsewhere in this module. Receipts: inclusive of end_utc — a sweep fires on a
-    # fixed cadence and its last tick of the day commonly lands exactly on the
-    # window edge (e.g. a 30-min cadence over a 24h window); excluding it would
-    # silently blind the completeness check to that receipt's source state.
-    receipts: list[tuple[datetime, dict]] = []
-    incidents: list[tuple[datetime, dict]] = []
-    seen_ids: set[str] = set()
-    for row in rows:
-        ts = _parse_ts(row.get("ts"))
-        if ts is None or ts < start_utc:
-            continue
-        if row.get("kind") == "sweep":
-            if ts <= end_utc:
-                receipts.append((ts, row))
-        elif ts < end_utc:
-            # A torn snapshot line is skipped by `_known_ids`, so the sweep
-            # re-appends that id on its next pass. Count the incident once.
-            ident = str(row.get("id") or "")
-            if ident and ident in seen_ids:
-                continue
-            seen_ids.add(ident)
-            incidents.append((ts, row))
-
-    observed_until = min(end_utc, now or datetime.now(timezone.utc))
-    state, reasons = _completeness(receipts, start_utc, observed_until, sweep_interval_secs, tz)
-
-    raw_gate = sum(1 for _, row in incidents if row.get("gate"))
-    raw_non_gate = len(incidents) - raw_gate
-    incidents = _merge_same_call(incidents)
-
+def _build_groups(
+    rows: list[tuple[datetime, dict]],
+) -> tuple[list[Group], dict[str, int], int, dict]:
     gate_count = 0
+    gate_reasons: dict[str, int] = {}
     by_channel: dict[str, int] = {}
     denials: dict[str, int] = {}
     waits = missing = terminal = calls_with_id = 0
     buckets: dict[tuple, list[tuple[datetime, dict]]] = {}
-    for ts, row in incidents:
+    for ts, row in rows:
         reason = row.get("policy_reason")
         if reason:
             denials[str(reason)] = denials.get(str(reason), 0) + 1
         if row.get("gate"):
             gate_count += 1
+            name = str(row.get("gate_reason") or "literal")
+            gate_reasons[name] = gate_reasons.get(name, 0) + 1
             continue
         channel = str(row.get("channel") or "")
         by_channel[channel] = by_channel.get(channel, 0) + 1
@@ -1103,6 +1339,94 @@ def build_digest(
             parent_tool=sample.get("parent_tool"),
         ))
     groups.sort(key=lambda g: (-g.count, g.first_ts))
+    partial = {
+        "waits": waits, "missing": missing, "terminal": terminal,
+        "unique_calls_with_id": calls_with_id, "policy_denials": dict(sorted(denials.items())),
+        "gate_reasons": dict(sorted(gate_reasons.items())),
+    }
+    return groups, by_channel, gate_count, partial
+
+
+def build_digest(
+    data_root: Path,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    timezone_name: str = DEFAULT_TIMEZONE,
+    sweep_interval_secs: float = DEFAULT_SWEEP_INTERVAL_SECS,
+    now: datetime | None = None,
+    test_users: frozenset[str] | None = None,
+) -> Digest:
+    """Read the daily snapshot(s) covering the window and build a report digest.
+
+    Never raises: a corrupt line, a missing file, or an unparseable
+    timestamp is skipped, never propagated — the caller (Task 8) runs this
+    inside a try only as belt-and-suspenders.
+    """
+    skip = test_users if test_users is not None else resolve_test_users()
+    tz = ZoneInfo(timezone_name)
+    dates = {start_utc.astimezone(tz).date(), end_utc.astimezone(tz).date()}
+    rows: list[dict] = []
+    for day in dates:
+        path = snapshot_dir(data_root) / f"{day.isoformat()}.jsonl"
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+
+    # Incidents: half-open, same convention as read_cron_failures/read_delegate_failures
+    # elsewhere in this module. Receipts: inclusive of end_utc — a sweep fires on a
+    # fixed cadence and its last tick of the day commonly lands exactly on the
+    # window edge (e.g. a 30-min cadence over a 24h window); excluding it would
+    # silently blind the completeness check to that receipt's source state.
+    receipts: list[tuple[datetime, dict]] = []
+    recoveries: list[tuple[datetime, dict]] = []
+    incidents: list[tuple[datetime, dict]] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        ts = _parse_ts(row.get("ts"))
+        if ts is None or ts < start_utc:
+            continue
+        if row.get("kind") == RECOVERY_KIND:
+            if ts <= end_utc + timedelta(seconds=RECOVERY_WINDOW_SECS):
+                recoveries.append((ts, row))
+            continue
+        if row.get("kind") == "sweep":
+            if ts <= end_utc:
+                receipts.append((ts, row))
+        elif ts < end_utc:
+            # A torn snapshot line is skipped by `_known_ids`, so the sweep
+            # re-appends that id on its next pass. Count the incident once.
+            ident = str(row.get("id") or "")
+            if ident and ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+            incidents.append((ts, row))
+
+    observed_until = min(end_utc, now or datetime.now(timezone.utc))
+    state, reasons = _completeness(receipts, start_utc, observed_until, sweep_interval_secs, tz, skip_users=skip)
+
+    raw_gate = sum(1 for _, row in incidents if row.get("gate"))
+    raw_non_gate = len(incidents) - raw_gate
+    incidents = _merge_same_call(incidents)
+    incidents = _merge_runtime_twins(incidents)
+    incidents, recovered_keys = _collapse_provider_episodes(incidents, recoveries)
+
+    prod_rows = [p for p in incidents if p[1].get("user") not in skip]
+    test_rows = [p for p in incidents if p[1].get("user") in skip]
+    groups, by_channel, gate_count, part = _build_groups(prod_rows)
+    test_groups, _, _, _ = _build_groups(test_rows)
+    history, history_days = _history_keys(data_root, start_utc, tz, skip)
+    if history_days == HISTORY_DAYS:
+        groups = [
+            replace(g, new=_novelty_key(g.channel, g.channel_ref, g.kind, g.subject, g.error) not in history)
+            for g in groups
+        ]
 
     malformed_total = 0
     if receipts:
@@ -1116,13 +1440,14 @@ def build_digest(
     counters = {
         "non_gate_records": raw_non_gate,
         "gate_records": raw_gate,
-        "unique_calls_with_id": calls_with_id,
-        "policy_denials": dict(sorted(denials.items())),
-        "waits": waits,
-        "missing": missing,
-        "terminal": terminal,
-        "source_status": _source_status_counts(receipts),
+        **part,
+        "source_status": _source_status_counts(receipts, skip_users=skip),
         "trace_malformed_lines": malformed_total,
+        "history_days": history_days,
+        "recovered_episodes": sum(1 for key in recovered_keys if key[0] not in skip),
+        "test_users": dict(
+            Counter(row["user"] for _, row in test_rows if not row.get("gate"))
+        ),
     }
 
     # `total` is what the summary line breaks down by channel, and the
@@ -1131,10 +1456,23 @@ def build_digest(
     return Digest(
         groups=groups, gate_count=gate_count, total=sum(by_channel.values()),
         by_channel=by_channel, state=state, reasons=reasons, counters=counters,
+        test_groups=test_groups,
     )
 
 
 # --- Rendering: channel sections within an explicit character budget ---
+
+def _gates_line(digest: "Digest") -> str:
+    reasons = (digest.counters or {}).get("gate_reasons") or {}
+    detail = ", ".join(
+        f"{name} {count}" for name, count in sorted(reasons.items()) if name != "literal"
+    )
+    return (
+        f"**Ожидаемые гейты:** {digest.gate_count}"
+        + (f" ({detail})" if detail else "")
+        + " — не дефекты"
+    )
+
 
 CHANNEL_TITLES = {"chat": "Чат", "cron": "Cron", "jira": "Jira-разбор", "delegate": "Делегаты"}
 SECTION_ORDER = ("chat", "cron", "jira", "delegate")
@@ -1194,7 +1532,7 @@ def _section_title(group: Group) -> str:
 def _group_lines(
     group: Group, *, with_sample: bool, with_hint: bool, tz: ZoneInfo
 ) -> list[str]:
-    head = f"- **{group.kind} ×{group.count}** · {_span(group.first_ts, group.last_ts, tz)}"
+    head = f"- {'🆕 ' if group.new else ''}**{group.kind} ×{group.count}** · {_span(group.first_ts, group.last_ts, tz)}"
     if group.subject:
         head += f" · {_code(group.subject)}"
     lines = [head]
@@ -1209,6 +1547,19 @@ def _group_lines(
 
 def _sections_plural(n: int) -> str:
     return "секции" if n % 10 == 1 and n % 100 != 11 else "секциях"
+
+
+def _allocate_rooms(keys_by_weight: list, buckets: dict, per_section: int) -> dict:
+    rooms = {key: 0 for key in keys_by_weight}
+    left = MAX_GROUPS_TOTAL
+    for level in range(1, per_section + 1):
+        for key in keys_by_weight:
+            if left == 0:
+                return rooms
+            if len(buckets[key]) >= level:
+                rooms[key] = level
+                left -= 1
+    return rooms
 
 
 def render_sections(
@@ -1254,26 +1605,27 @@ def render_sections(
         (False, False, 1, 1),
     ):
         chosen = set(by_weight if max_sections is None else by_weight[:max_sections])
+        chosen_by_weight = [key for key in by_weight if key in chosen]
+        rooms = _allocate_rooms(chosen_by_weight, buckets, per_section)
         lines = []
         dropped = 0
-        shown = 0
+        folded = [key for key in ordered_keys if key in chosen and rooms[key] == 0]
         for key in ordered_keys:
-            if key not in chosen:
+            if key not in chosen or rooms[key] == 0:
                 continue
             members = buckets[key]
-            room = min(per_section, max(0, MAX_GROUPS_TOTAL - shown))
+            room = rooms[key]
             lines.append("")
             lines.append(_section_title(members[0]))
             for group in members[:room]:
                 lines.extend(
                     _group_lines(group, with_sample=with_sample, with_hint=with_hint, tz=tz)
                 )
-            shown += min(room, len(members))
-            rest = len(members) - min(room, len(members))
+            rest = len(members) - room
             if rest:
                 dropped += rest
                 lines.append(f"- +{rest} ещё")
-        rest_keys = [key for key in ordered_keys if key not in chosen]
+        rest_keys = [key for key in ordered_keys if key not in chosen] + folded
         if rest_keys:
             rest_groups = sum(len(buckets[key]) for key in rest_keys)
             dropped += rest_groups
@@ -1283,7 +1635,7 @@ def render_sections(
             )
         if digest.gate_count:
             lines.append("")
-            lines.append(f"**Ожидаемые гейты:** {digest.gate_count} — не дефекты")
+            lines.append(_gates_line(digest))
         if len("\n".join(lines)) <= budget:
             return lines, dropped
     return lines, dropped
@@ -1292,7 +1644,7 @@ def render_sections(
 def _attachment_group_lines(group: Group, tz: ZoneInfo) -> list[str]:
     """Same layout as `_group_lines`, but no message-side clip (400/300 chars
     are already applied at ingestion) and no cap: every field, always."""
-    head = f"- **{group.kind} ×{group.count}** · {_span(group.first_ts, group.last_ts, tz)}"
+    head = f"- {'🆕 ' if group.new else ''}**{group.kind} ×{group.count}** · {_span(group.first_ts, group.last_ts, tz)}"
     if group.subject:
         head += f" · {_code(group.subject)}"
     lines = [head]
@@ -1374,7 +1726,11 @@ def render_attachment(
             lines.extend(_attachment_group_lines(group, tz))
     if digest.gate_count:
         lines.append("")
-        lines.append(f"**Ожидаемые гейты:** {digest.gate_count} — не дефекты")
+        lines.append(_gates_line(digest))
+    if digest.test_groups:
+        lines.extend(["", "## Тестовые воркспейсы", ""])
+        for group in digest.test_groups:
+            lines.extend(_attachment_group_lines(group, tz))
     return "\n".join(lines) + "\n"
 
 
@@ -1383,8 +1739,21 @@ def render_attachment(
 DEFAULT_DATA_ROOT = "/zeroclaw-data"
 
 
+def _group_as_dict(g: Group) -> dict:
+    return {
+        "channel": g.channel, "channel_ref": g.channel_ref, "user": g.user,
+        "kind": g.kind, "subject": g.subject, "count": g.count,
+        "first_ts": g.first_ts.isoformat(), "last_ts": g.last_ts.isoformat(),
+        "error": g.error, "detail": g.detail, "location": g.location,
+        "hint": g.hint, "gate": g.gate, "agent_alias": g.agent_alias,
+        "turn_id": g.turn_id, "tool_call_id": g.tool_call_id,
+        "task_ids": g.task_ids, "policy_reason": g.policy_reason,
+        "input_path": g.input_path, "parent_tool": g.parent_tool,
+        "new": g.new,
+    }
+
+
 def _digest_as_dict(digest: Digest) -> dict:
-    """JSON-serializable form of a Digest — Group's timestamps need an explicit isoformat."""
     return {
         "state": digest.state,
         "reasons": digest.reasons,
@@ -1392,19 +1761,8 @@ def _digest_as_dict(digest: Digest) -> dict:
         "gate_count": digest.gate_count,
         "by_channel": digest.by_channel,
         "counters": digest.counters,
-        "groups": [
-            {
-                "channel": g.channel, "channel_ref": g.channel_ref, "user": g.user,
-                "kind": g.kind, "subject": g.subject, "count": g.count,
-                "first_ts": g.first_ts.isoformat(), "last_ts": g.last_ts.isoformat(),
-                "error": g.error, "detail": g.detail, "location": g.location,
-                "hint": g.hint, "gate": g.gate, "agent_alias": g.agent_alias,
-                "turn_id": g.turn_id, "tool_call_id": g.tool_call_id,
-                "task_ids": g.task_ids, "policy_reason": g.policy_reason,
-                "input_path": g.input_path, "parent_tool": g.parent_tool,
-            }
-            for g in digest.groups
-        ],
+        "groups": [_group_as_dict(g) for g in digest.groups],
+        "test_groups": [_group_as_dict(g) for g in digest.test_groups],
     }
 
 
