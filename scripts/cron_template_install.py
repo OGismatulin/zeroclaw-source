@@ -59,6 +59,7 @@ class CronTemplate:
     model_provider: str = ""
     model_name: str = ""
     model_reasoning_effort: str = ""
+    owner_agent: str = ""
     source_dir: Path | None = None
 
     @classmethod
@@ -102,6 +103,7 @@ class CronTemplate:
             model_provider=data.get("model", {}).get("provider", ""),
             model_name=data.get("model", {}).get("model", ""),
             model_reasoning_effort=data.get("model", {}).get("reasoning_effort", ""),
+            owner_agent=data.get("owner_agent", ""),
             source_dir=template_dir,
         )
 
@@ -227,6 +229,15 @@ def resolve_params(
 CRON_OWNING_AGENT = "default"
 
 
+def agent_alias_exists(workspaces_root: Path, user_id: str, alias: str) -> bool:
+    config_path = workspaces_root / f"tg_{user_id}" / ".zeroclaw" / "config.toml"
+    try:
+        with config_path.open("rb") as fh:
+            return alias in tomllib.load(fh).get("agents", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+
 def _ensure_agent_alias_column(conn: sqlite3.Connection) -> None:
     """Defensive guard: the daemon's DB migration normally adds this column
     before bootstrap runs (install happens after the daemon is healthy), but
@@ -261,6 +272,15 @@ def install_template(
     jobs_db = workspaces_root / f"tg_{user_id}" / "workspace" / "cron" / "jobs.db"
     if not jobs_db.is_file():
         return InstallResult("no_jobs_db", user_id, template.name)
+
+    owner = template.owner_agent or CRON_OWNING_AGENT
+    if template.owner_agent and not agent_alias_exists(
+        workspaces_root, user_id, owner
+    ):
+        return InstallResult(
+            "owner_missing", user_id, template.name,
+            error=f"agent '{owner}' not in per-user config",
+        )
 
     schedule = schedule_override or template.default_schedule
     CronTemplate._validate_schedule(schedule, delete_after_run=template.delete_after_run)
@@ -309,7 +329,7 @@ def install_template(
                 1 if template.delete_after_run else 0,
                 (now or datetime.now(timezone.utc)).isoformat(),
                 next_run.isoformat(),
-                CRON_OWNING_AGENT,
+                owner,
             ),
         )
         conn.commit()
@@ -338,7 +358,7 @@ def format_text(result: InstallResult) -> str:
     prefix = {
         "installed": "+", "existing": "✓", "reinstalled": "~",
         "removed": "-", "not_found": "⊘", "no_jobs_db": "⚠",
-        "audience_skip": "⊘", "error": "✗",
+        "audience_skip": "⊘", "error": "✗", "owner_missing": "⚠",
     }[result.status]
     parts = [f"{prefix} tg_{result.user_id}: {result.status} '{result.template}'"]
     if result.id:
@@ -352,7 +372,60 @@ def format_text(result: InstallResult) -> str:
     return " ".join(parts)
 
 
+def set_owner(
+    workspaces_root: Path, user_id: str, template_name: str, expect: str, to: str
+) -> tuple[int, str]:
+    jobs_db = workspaces_root / f"tg_{user_id}" / "workspace" / "cron" / "jobs.db"
+    if not jobs_db.is_file():
+        return 2, "no_jobs_db"
+    conn = sqlite3.connect(jobs_db)
+    try:
+        row = conn.execute(
+            "SELECT agent_alias FROM cron_jobs WHERE name = ?", (template_name,)
+        ).fetchone()
+        if row is None:
+            return 2, "not_found"
+        if row[0] == to:
+            return 0, "already_owned"
+        if row[0] != expect:
+            return 2, f"owner_conflict current={row[0]!r} expect={expect!r}"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = jobs_db.with_name(f"{jobs_db.name}.bak-{stamp}")
+        dest = sqlite3.connect(backup)
+        try:
+            conn.backup(dest)
+        finally:
+            dest.close()
+        cur = conn.execute(
+            "UPDATE cron_jobs SET agent_alias = ? WHERE name = ? AND agent_alias = ?",
+            (to, template_name, expect),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return 2, "owner_conflict lost race"
+        return 0, f"owner_set backup={backup.name}"
+    finally:
+        conn.close()
+
+
+def main_set_owner(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="cron_template_install.py set-owner")
+    parser.add_argument("--workspaces-root", type=Path, required=True)
+    parser.add_argument("--template", required=True)
+    parser.add_argument("--user", required=True)
+    parser.add_argument("--expect", required=True)
+    parser.add_argument("--to", required=True)
+    args = parser.parse_args(argv)
+    rc, message = set_owner(
+        args.workspaces_root, args.user, args.template, args.expect, args.to
+    )
+    print(f"tg_{args.user}: {message}")
+    return rc
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "set-owner":
+        return main_set_owner(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspaces-root", type=Path)
     parser.add_argument("--templates-root", type=Path, default=None)
