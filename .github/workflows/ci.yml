@@ -136,9 +136,10 @@ jobs:
     name: Lint
     needs: [fmt]
     runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
-    # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
-    # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
-    timeout-minutes: 15
+    # Fork patch #21: the fork's Lint also builds root tests for the config-write
+    # guard and runs the v0.8.5 rustdoc gate; PR run took 14m47s and the first
+    # master run hit the 15m ceiling, so give it headroom.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
