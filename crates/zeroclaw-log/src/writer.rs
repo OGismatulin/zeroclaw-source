@@ -27,7 +27,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -109,7 +109,10 @@ type WorkerDead = Arc<AtomicBool>;
 struct WorkerState {
     policy: ResolvedPolicy,
     worker_dead: WorkerDead,
+    rolling_lines: AtomicUsize,
 }
+
+const LINES_UNKNOWN: usize = usize::MAX;
 
 /// Producer-facing state. The `tx` sender is NOT shared with the worker
 /// so the channel's [`Disconnected`](std::sync::mpsc::TrySendError::Disconnected)
@@ -188,6 +191,7 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
+            rolling_lines: AtomicUsize::new(LINES_UNKNOWN),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -377,6 +381,9 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     // is needed.
     if state.policy.storage == StoragePolicy::Rotating {
         maybe_rotate_for_date(state)?;
+    }
+    if state.policy.storage == StoragePolicy::Rolling && !state.policy.path.exists() {
+        state.rolling_lines.store(LINES_UNKNOWN, Ordering::Relaxed);
     }
     let mut file = open_active_file(state)?;
     write_jsonl_line(&mut file, value)?;
@@ -629,9 +636,17 @@ fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<
 /// the last `max_entries` lines, then atomically renames. Never loads the
 /// whole file into memory.
 fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
-    // Count lines first (cheap pass).
-    let total = count_nonempty_lines(&state.policy.path)?;
-    if total <= state.policy.max_entries {
+    // fork(#53): trim in batches off a cached line count; per-event full-file count + rewrite
+    // made the writer queue lag minutes behind under load (prod 2026-10-04).
+    let cached = state.rolling_lines.load(Ordering::Relaxed);
+    let total = if cached == LINES_UNKNOWN {
+        count_nonempty_lines(&state.policy.path)?
+    } else {
+        cached + 1
+    };
+    state.rolling_lines.store(total, Ordering::Relaxed);
+    let slack = (state.policy.max_entries / 10).max(1);
+    if total <= state.policy.max_entries + slack {
         return Ok(());
     }
     let skip = total - state.policy.max_entries;
@@ -690,6 +705,7 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
+    state.rolling_lines.store(LINES_UNKNOWN, Ordering::Relaxed);
     fs::rename(&tmp, &state.policy.path).with_context(|| {
         format!(
             "renaming trim temp {} → {}",
@@ -697,6 +713,9 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
             state.policy.path.display()
         )
     })?;
+    state
+        .rolling_lines
+        .store(state.policy.max_entries, Ordering::Relaxed);
 
     Ok(())
 }
@@ -1129,12 +1148,56 @@ mod tests {
         let path = runtime_trace_path().unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 3);
-        // Last three should be 7, 8, 9 (oldest to newest order preserved).
+        assert!((3..=4).contains(&lines.len()));
+        let first = 10 - lines.len();
         for (idx, &line) in lines.iter().enumerate() {
             let v: Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
+            assert_eq!(
+                v["message"].as_str().unwrap(),
+                format!("event-{}", idx + first)
+            );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_trims_in_batches_and_keeps_newest_ordered() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 20);
+        let path = runtime_trace_path().unwrap();
+        let mut inode_changes = 0;
+        let mut last_ino = None;
+        for i in 0..100 {
+            emit(&format!("event-{i}"));
+            flush_for_test().unwrap();
+            let ino = fs::metadata(&path).unwrap().ino();
+            if last_ino.is_some_and(|l| l != ino) {
+                inode_changes += 1;
+            }
+            last_ino = Some(ino);
+            let n = count_lines(&path);
+            assert!(n <= 22, "at most max + slack lines, got {n}");
+            if i >= 22 {
+                assert!(n >= 20, "at least max lines once past slack, got {n}");
+            }
+        }
+        assert!(inode_changes > 0, "trim must still happen");
+        assert!(
+            inode_changes <= 100 / 2 + 1,
+            "trim must not run per event: {inode_changes}"
+        );
+        let body = fs::read_to_string(&path).unwrap();
+        let msgs: Vec<usize> = body
+            .lines()
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["message"].as_str().unwrap()[6..].parse().unwrap()
+            })
+            .collect();
+        assert_eq!(*msgs.last().unwrap(), 99);
+        assert!(msgs.windows(2).all(|w| w[1] == w[0] + 1));
     }
 
     #[test]
@@ -1372,7 +1435,10 @@ mod tests {
         }
         flush_for_test().unwrap();
 
-        assert_eq!(count_lines(&path), 3, "trim keeps the configured tail");
+        assert!(
+            (3..=4).contains(&count_lines(&path)),
+            "trim keeps the configured tail"
+        );
         let body = fs::read_to_string(&path).unwrap();
         assert!(
             !body.contains("stale"),
