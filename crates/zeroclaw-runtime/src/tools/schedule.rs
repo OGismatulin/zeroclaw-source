@@ -258,7 +258,8 @@ impl ScheduleTool {
     }
 
     fn handle_list(&self) -> Result<ToolResult> {
-        let jobs = cron::list_jobs_by_agent(&self.config, &self.agent_alias)?;
+        // fork(#55)
+        let jobs = cron::list_jobs_visible_to(&self.config, &self.agent_alias)?;
         if jobs.is_empty() {
             return Ok(ToolResult {
                 success: true,

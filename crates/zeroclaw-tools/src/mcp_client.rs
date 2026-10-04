@@ -438,7 +438,7 @@ impl Drop for OutcomeUnknownGuard {
 
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the
-    /// tool list. Thin `anyhow` wrapper over [`Self::connect_classified`] with
+    /// tool list. Thin `anyhow` wrapper over `Self::connect_classified` with
     /// the boot budget, kept for the callers that only need pass/fail.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
         Self::connect_classified(config, MCP_CONNECT_TIMEOUT_SECS)

@@ -6477,9 +6477,7 @@ mod tests {
                 .kind(),
             "empty_completion"
         );
-        assert!(
-            below_terminal_record(&err).contains("All model providers/models failed")
-        );
+        assert!(below_terminal_record(&err).contains("All model providers/models failed"));
         assert!(below_terminal_record(&err).contains("empty_response"));
         // Initial attempt + max_retries (2) re-rolls = 3 calls.
         assert_eq!(calls.load(Ordering::SeqCst), 3);

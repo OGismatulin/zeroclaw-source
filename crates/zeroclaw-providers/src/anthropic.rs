@@ -7386,7 +7386,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
-
     /// Regression guard: ordinary user-message images take the user arm and
     /// must still become real image blocks. This fix must not touch them. The
     /// payload is canonical, which is why this pin survives the stricter

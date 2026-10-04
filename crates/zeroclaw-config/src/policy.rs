@@ -2875,7 +2875,8 @@ impl SecurityPolicy {
     /// platform-specific redirect safety (the Windows `nul` null device is only
     /// discard-safe under `cmd.exe`).
     pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
-        self.check_command_admission_for_shell(command, dialect).is_ok()
+        self.check_command_admission_for_shell(command, dialect)
+            .is_ok()
     }
 
     // fork: admission returns a typed CommandDenial per dialect.

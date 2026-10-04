@@ -236,6 +236,31 @@ mod tests {
         .unwrap()
     }
 
+    // fork(#55)
+    #[tokio::test]
+    async fn default_agent_reads_another_agents_run_history() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+        let now = chrono::Utc::now();
+        cron::record_run(
+            &cfg,
+            &theirs.id,
+            now,
+            now,
+            "ok",
+            Some("coordinator-output"),
+            5,
+        )
+        .unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone(), "default");
+        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(format!("{:?}", result.output).contains("coordinator-output"));
+    }
+
     #[tokio::test]
     async fn cannot_read_another_agents_run_history() {
         let tmp = TempDir::new().unwrap();

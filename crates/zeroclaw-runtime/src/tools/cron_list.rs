@@ -48,7 +48,9 @@ impl Tool for CronListTool {
             });
         }
 
-        match cron::list_jobs_by_agent(&self.config, &self.agent_alias) {
+        // fork(#55)
+
+        match cron::list_jobs_visible_to(&self.config, &self.agent_alias) {
             Ok(jobs) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(

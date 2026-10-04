@@ -259,9 +259,23 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
 /// than refused, so the error cannot confirm that it exists. Rows predating the
 /// `agent_alias` column belong to no agent and are reachable only from the
 /// unscoped operator surfaces.
+// fork(#55): the workspace owner agent keeps the pre-v0.8.5 unscoped view by job id.
+pub fn owner_scope(agent_alias: &str) -> Option<&str> {
+    (agent_alias != "default").then_some(agent_alias)
+}
+
+// fork(#55): cron_list / schedule list for `default` show every job, as before v0.8.5.
+pub fn list_jobs_visible_to(config: &Config, agent_alias: &str) -> Result<Vec<CronJob>> {
+    match owner_scope(agent_alias) {
+        Some(alias) => list_jobs_by_agent(config, alias),
+        None => list_jobs(config),
+    }
+}
+
 pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
     let job = get_job(config, job_id)?;
-    if job.agent_alias == agent_alias {
+    // fork(#55)
+    if owner_scope(agent_alias).is_none_or(|alias| job.agent_alias == alias) {
         Ok(job)
     } else {
         anyhow::bail!("Cron job '{job_id}' not found")
@@ -306,8 +320,9 @@ pub fn resolve_job_id_or_name(
 pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
         conn.execute(
-            "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
-            params![id, agent_alias],
+            // fork(#55)
+            "DELETE FROM cron_jobs WHERE id = ?1 AND (?2 IS NULL OR agent_alias = ?2)",
+            params![id, owner_scope(agent_alias)],
         )
         .context("Failed to delete cron job")
     })?;
@@ -524,7 +539,8 @@ pub fn update_job_for_agent(
     // Read-side check first so an ordinary miss gets the usual error before any
     // work happens; the WHERE guard below is what makes the write itself safe.
     get_job_for_agent(config, job_id, agent_alias)?;
-    update_job_inner(config, job_id, Some(agent_alias), patch)
+    // fork(#55)
+    update_job_inner(config, job_id, owner_scope(agent_alias), patch)
 }
 
 fn update_job_inner(
@@ -3773,6 +3789,46 @@ schedule = { kind = "every", every_ms = 300000 }
             resolved, mine.id,
             "name must resolve to the caller's own job, not the other agent's"
         );
+    }
+
+    // fork(#55)
+    #[test]
+    fn default_agent_reaches_other_agents_jobs_by_id_others_do_not() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "jira_coordinator",
+            Some("jira-analysis-DV-1".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let listed = list_jobs_visible_to(&config, "default").unwrap();
+        assert!(listed.iter().any(|j| j.id == theirs.id));
+        assert!(list_jobs_visible_to(&config, "worker").unwrap().is_empty());
+
+        assert!(get_job_for_agent(&config, &theirs.id, "default").is_ok());
+        assert!(get_job_for_agent(&config, &theirs.id, "worker").is_err());
+        assert_eq!(
+            resolve_job_id_or_name(&config, &theirs.id, "default").unwrap(),
+            theirs.id
+        );
+        assert!(resolve_job_id_or_name(&config, "jira-analysis-DV-1", "default").is_err());
+
+        assert!(
+            update_job_for_agent(&config, &theirs.id, "worker", CronJobPatch::default()).is_err()
+        );
+        update_job_for_agent(&config, &theirs.id, "default", CronJobPatch::default()).unwrap();
+
+        assert!(remove_job_for_agent(&config, &theirs.id, "worker").is_err());
+        remove_job_for_agent(&config, &theirs.id, "default").unwrap();
+        assert!(get_job(&config, &theirs.id).is_err());
     }
 
     #[test]
