@@ -25,11 +25,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY Cargo.toml Cargo.lock ./
 # Copy all workspace crate Cargo.toml files for dependency caching
-COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
-COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
 COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
 COPY crates/zeroclaw-infra/Cargo.toml crates/zeroclaw-infra/Cargo.toml
 COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
+COPY crates/zeroclaw-tls/Cargo.toml crates/zeroclaw-tls/Cargo.toml
+COPY crates/zeroclaw-relay-proto/Cargo.toml crates/zeroclaw-relay-proto/Cargo.toml
 COPY crates/zeroclaw-commands/Cargo.toml crates/zeroclaw-commands/Cargo.toml
 COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
 COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
@@ -42,28 +42,37 @@ COPY crates/zeroclaw-log/Cargo.toml crates/zeroclaw-log/Cargo.toml
 COPY crates/zeroclaw-spawn/Cargo.toml crates/zeroclaw-spawn/Cargo.toml
 COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
 COPY crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml
+COPY crates/zeroclaw-log/tests/fixtures/attribution-macro-support/Cargo.toml crates/zeroclaw-log/tests/fixtures/attribution-macro-support/Cargo.toml
+COPY crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/Cargo.toml crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/Cargo.toml
+COPY crates/zeroclaw-plugins/tests/fixtures/egress-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/egress-fixture/Cargo.toml
+COPY crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml
+COPY crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture/Cargo.toml
+COPY crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture/Cargo.toml crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture/Cargo.toml
 COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
 COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
 COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
 COPY crates/zeroclaw-macros/Cargo.toml crates/zeroclaw-macros/Cargo.toml
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
 # Create stub source files for all crates so cargo can resolve the workspace
-RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
+    && echo "fn main() {}" > apps/zerorelay/src/main.rs \
+    && echo "" > apps/zerorelay/src/lib.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
     && echo "fn main() {}" > xtask/src/bin/fluent.rs \
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && for crate_dir in \
-         robot-kit aardvark-sys zeroclaw-api zeroclaw-infra zeroclaw-config \
+         zeroclaw-api zeroclaw-infra zeroclaw-config zeroclaw-tls zeroclaw-relay-proto \
          zeroclaw-log zeroclaw-spawn zeroclaw-commands \
          zeroclaw-providers zeroclaw-memory zeroclaw-channels zeroclaw-tools \
          zeroclaw-sop-graph \
@@ -74,6 +83,8 @@ RUN mkdir -p src/bin benches apps/tauri/src apps/zerocode/src tools/fill-transla
     done \
     && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
     && echo "pub fn placeholder() {}" > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs \
+    && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && [ -f "${d}src/lib.rs" ] || printf '' > "${d}src/lib.rs"; done \
+    && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs \
     && mkdir -p crates/zeroclaw-macros/src \
     && echo "" > crates/zeroclaw-macros/src/lib.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \

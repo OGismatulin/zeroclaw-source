@@ -1,11 +1,137 @@
+use crate::helpers::{domain_guard, response_body};
 use anyhow::Context;
 use async_trait::async_trait;
+use reqwest::header::LOCATION;
 use serde_json::json;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+
+const FAL_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+const FAL_ERROR_LIMIT_BYTES: usize = 16 * 1024;
+const GENERATED_IMAGE_LIMIT_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_REDIRECTS: usize = 10;
+
+struct ValidatedImageTarget {
+    url: reqwest::Url,
+    host: String,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String, u16)> {
+    let raw_url = raw_url.trim();
+    if raw_url.is_empty() || raw_url.chars().any(char::is_whitespace) {
+        anyhow::bail!("Generated image URL must be a non-empty URL without whitespace");
+    }
+
+    let mut url = reqwest::Url::parse(raw_url).context("Invalid generated image URL")?;
+    if url.scheme() != "https" {
+        anyhow::bail!("Generated image URL must use HTTPS");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("Generated image URL userinfo is not allowed");
+    }
+
+    let request_host = url
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("Generated image URL must include a host"))?;
+    if request_host.ends_with('.') {
+        anyhow::bail!("Generated image URL host must not end with a dot");
+    }
+    let host = domain_guard::normalize_domain(request_host)
+        .ok_or_else(|| anyhow::Error::msg("Generated image URL host is invalid"))?;
+    let ip_literal = host.parse::<IpAddr>().ok();
+    if domain_guard::is_private_or_local_host(&host) {
+        anyhow::bail!("Generated image URL targets a local or non-global host");
+    }
+    if ip_literal.is_some_and(domain_guard::is_cloud_metadata_ip) {
+        anyhow::bail!("Generated image URL targets a cloud metadata host");
+    }
+
+    // Request the host that was validated, not the raw spelling. Normalization
+    // can change the host (a leading dot is stripped), and the DNS pin applied
+    // by `generated_image_client_with_builder` is keyed on the normalized host.
+    // Without this, `resolve_to_addrs` never matches the request host and
+    // reqwest silently falls back to its own unvalidated lookup. IP-literal
+    // hosts are left alone: they carry no DNS pin, and `set_host` rejects the
+    // unbracketed IPv6 form that normalization produces.
+    if ip_literal.is_none() {
+        url.set_host(Some(&host))
+            .map_err(|_| anyhow::Error::msg("Generated image URL host is invalid"))?;
+    }
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::Error::msg("Generated image URL must include a valid port"))?;
+    Ok((url, host, port))
+}
+
+async fn validate_image_target(
+    raw_url: &str,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
+) -> anyhow::Result<ValidatedImageTarget> {
+    let (url, host, port) = parse_public_https_url(raw_url)?;
+    let resolved_addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .with_context(|| format!("Failed to resolve generated image host '{host}'"))?
+            .collect::<Vec<_>>()
+    };
+    let ips = resolved_addrs
+        .iter()
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+    domain_guard::validate_resolved_ips_are_public(&host, &ips, nat64_prefixes)?;
+
+    Ok(ValidatedImageTarget {
+        url,
+        host,
+        resolved_addrs,
+    })
+}
+
+fn generated_image_client_with_builder(
+    target: &ValidatedImageTarget,
+    builder: reqwest::ClientBuilder,
+) -> anyhow::Result<reqwest::Client> {
+    let builder = builder
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    let builder = if target.host.parse::<IpAddr>().is_ok() {
+        builder
+    } else {
+        builder.resolve_to_addrs(&target.host, &target.resolved_addrs)
+    };
+    builder
+        .build()
+        .context("Failed to build generated image HTTP client")
+}
+
+fn generated_image_client(target: &ValidatedImageTarget) -> anyhow::Result<reqwest::Client> {
+    generated_image_client_with_builder(target, reqwest::Client::builder())
+}
+
+async fn prepare_generated_image_target(
+    raw_url: &str,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
+) -> anyhow::Result<(ValidatedImageTarget, reqwest::Client)> {
+    let target = validate_image_target(raw_url, nat64_prefixes).await?;
+    let client = generated_image_client(&target)?;
+    Ok((target, client))
+}
+
+fn resolve_redirect_url(current: &reqwest::Url, location: &str) -> anyhow::Result<reqwest::Url> {
+    current
+        .join(location)
+        .context("Invalid generated image redirect target")
+}
 
 fn resolve_image_filename(filename_arg: Option<&str>, nanos: u128) -> String {
     filename_arg
@@ -40,6 +166,35 @@ fn format_image_tool_output(
          Model: {model}\n\
          Prompt: {prompt}",
     )
+}
+
+async fn read_fal_success_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let body = response_body::read_bounded(response, Some(FAL_RESPONSE_LIMIT_BYTES))
+        .await
+        .context("Failed to read fal.ai response")?;
+    if body.overflowed {
+        anyhow::bail!("fal.ai response exceeds the 1 MiB size limit");
+    }
+    Ok(body.bytes)
+}
+
+async fn read_fal_error_text(response: reqwest::Response) -> anyhow::Result<String> {
+    response_body::read_text(response, Some(FAL_ERROR_LIMIT_BYTES))
+        .await
+        .map(|(text, _)| text)
+}
+
+async fn read_generated_image_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let body = response_body::read_bounded(response, Some(GENERATED_IMAGE_LIMIT_BYTES))
+        .await
+        .context("Failed to read generated image bytes")?;
+    if body.overflowed {
+        anyhow::bail!(
+            "Generated image exceeds the {} MiB size limit",
+            GENERATED_IMAGE_LIMIT_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(body.bytes)
 }
 
 /// Maximum accepted image size in bytes for either backend (fal download /
@@ -221,6 +376,7 @@ pub struct ImageGenTool {
     /// production; overridable in-crate by tests to point at a mock server
     /// (no trailing slash — callers append `/{model}`).
     fal_base_url: String,
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
 }
 
 impl ImageGenTool {
@@ -229,22 +385,23 @@ impl ImageGenTool {
         workspace_dir: PathBuf,
         fal_model: String,
         api_key_env: String,
-    ) -> Self {
-        Self {
+        nat64_prefixes: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_persistence(
             security,
             workspace_dir,
             fal_model,
             api_key_env,
-            persistent_writes: true,
-            default_backend: "fast".into(),
-            codex_model: "gpt-5.5".into(),
-            codex_state_dir: PathBuf::from("."),
-            codex_encrypt_secrets: false,
-            fal_size_param: "image_size".into(),
-            fal_size_map: Default::default(),
-            fal_extra_body: Default::default(),
-            fal_base_url: "https://fal.run".into(),
-        }
+            true,
+            "fast".into(),
+            "gpt-5.5".into(),
+            PathBuf::from("."),
+            false,
+            "image_size".into(),
+            Default::default(),
+            Default::default(),
+            nat64_prefixes,
+        )
     }
 
     /// Construct with an explicit persistence flag derived from the active
@@ -264,8 +421,9 @@ impl ImageGenTool {
         fal_size_param: String,
         fal_size_map: std::collections::HashMap<String, String>,
         fal_extra_body: std::collections::HashMap<String, serde_json::Value>,
-    ) -> Self {
-        Self {
+        nat64_prefixes: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
             workspace_dir,
             fal_model,
@@ -279,15 +437,63 @@ impl ImageGenTool {
             fal_size_map,
             fal_extra_body,
             fal_base_url: "https://fal.run".into(),
-        }
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
+        })
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
-    fn http_client() -> reqwest::Client {
+    fn http_client() -> anyhow::Result<reqwest::Client> {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_default()
+            .context("Failed to build fal.ai HTTP client")
+    }
+
+    async fn download_generated_image(
+        image_url: &str,
+        nat64_prefixes: &[domain_guard::Nat64Prefix],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut current_url =
+            reqwest::Url::parse(image_url).context("Invalid generated image URL")?;
+
+        for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
+            let (target, client) =
+                prepare_generated_image_target(current_url.as_str(), nat64_prefixes).await?;
+            let response = client
+                .get(target.url.clone())
+                .send()
+                .await
+                .context("Failed to download generated image")?;
+
+            if response.status().is_redirection() {
+                if redirect_count == MAX_IMAGE_REDIRECTS {
+                    anyhow::bail!("Too many generated image redirects (max {MAX_IMAGE_REDIRECTS})");
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .ok_or_else(|| anyhow::Error::msg("Generated image redirect omitted Location"))?
+                    .to_str()
+                    .context("Generated image redirect Location is not valid text")?;
+                current_url = resolve_redirect_url(&target.url, location)?;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "Generated image download failed with HTTP {}",
+                    response.status()
+                );
+            }
+
+            return read_generated_image_body(response).await;
+        }
+
+        anyhow::bail!("Generated image redirect limit exceeded")
     }
 
     /// Read an API key from the environment.
@@ -454,7 +660,7 @@ impl ImageGenTool {
         };
 
         // ── Call fal.ai ────────────────────────────────────────────
-        let client = Self::http_client();
+        let client = Self::http_client()?;
         let url = format!("{}/{model}", self.fal_base_url);
 
         let body = build_fal_body(
@@ -476,7 +682,7 @@ impl ImageGenTool {
 
         let status = resp.status();
         if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_text = read_fal_error_text(resp).await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -484,10 +690,9 @@ impl ImageGenTool {
             });
         }
 
-        let resp_json: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to parse fal.ai response as JSON")?;
+        let fal_body = read_fal_success_body(resp).await?;
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&fal_body).context("Failed to parse fal.ai response as JSON")?;
 
         let image_url = resp_json
             .pointer("/images/0/url")
@@ -503,27 +708,16 @@ impl ImageGenTool {
             })?;
 
         // ── Download image ─────────────────────────────────────────
-        let img_resp = client
-            .get(image_url)
-            .send()
-            .await
-            .context("Failed to download generated image")?;
-
-        if !img_resp.status().is_success() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Failed to download image from {image_url} ({})",
-                    img_resp.status()
-                )),
-            });
-        }
-
-        let bytes = img_resp
-            .bytes()
-            .await
-            .context("Failed to read image bytes")?;
+        let bytes = match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
 
         // fal may return PNG/JPEG/WEBP depending on the model; enforce the byte
         // cap but not the PNG signature here.
@@ -648,8 +842,59 @@ impl Tool for ImageGenTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+
+    async fn held_open_chunked_response(
+        byte_count: usize,
+    ) -> (
+        reqwest::Response,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = byte_count;
+            while remaining > 0 {
+                let chunk_len = remaining.min(chunk.len());
+                stream
+                    .write_all(format!("{chunk_len:x}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk[..chunk_len]).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                remaining -= chunk_len;
+            }
+            let _ = release_rx.await;
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        (
+            reqwest::get(format!("http://{addr}")).await.unwrap(),
+            release_tx,
+            server,
+        )
+    }
+
+    async fn finish_held_open_response(
+        release: tokio::sync::oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = release.send(());
+        server.await.unwrap();
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -665,7 +910,225 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY".into(),
+            Vec::new(),
         )
+        .unwrap()
+    }
+
+    #[test]
+    fn generated_image_target_rejects_private_and_userinfo_urls() {
+        for url in [
+            "https://127.0.0.1/image.png",
+            "https://169.254.169.254/latest/meta-data",
+            "https://user@example.com/image.png",
+        ] {
+            assert!(parse_public_https_url(url).is_err(), "accepted {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_image_redirect_to_private_target_is_rejected() {
+        let current = reqwest::Url::parse("https://cdn.example.com/image.png").unwrap();
+        let redirect = resolve_redirect_url(&current, "https://127.0.0.1/private.png").unwrap();
+
+        assert!(
+            prepare_generated_image_target(redirect.as_str(), &[])
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_image_target_requires_https() {
+        assert!(parse_public_https_url("http://example.com/image.png").is_err());
+        assert!(parse_public_https_url("https://example.com/image.png").is_ok());
+    }
+
+    #[test]
+    fn generated_image_target_rejects_trailing_dot_host() {
+        assert!(parse_public_https_url("https://example.com./image.png").is_err());
+    }
+
+    /// The returned URL must carry the host that was actually validated, not
+    /// the raw spelling. `normalize_domain` strips a leading dot, so
+    /// `https://.example.com/` validates and pins `example.com` while the raw
+    /// URL still asks for `.example.com`. The pin is keyed on the normalized
+    /// host, so a mismatch means `resolve_to_addrs` never matches and reqwest
+    /// performs its own unvalidated lookup for the request host.
+    #[test]
+    fn generated_image_target_url_host_matches_the_validated_host() {
+        let (url, host, _port) = parse_public_https_url("https://.example.com/img.png")
+            .expect("leading-dot host normalizes to a public host");
+
+        assert_eq!(host, "example.com", "host must normalize");
+        assert_eq!(
+            url.host_str(),
+            Some(host.as_str()),
+            "returned URL must request the validated host, otherwise the DNS \
+             pin keyed on '{host}' never matches and reqwest re-resolves \
+             '{:?}' unvalidated",
+            url.host_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_image_target_accepts_public_ipv6_literal_without_dns() {
+        let (target, _client) =
+            prepare_generated_image_target("https://[2606:4700:4700::1111]/image.png", &[])
+                .await
+                .unwrap();
+        let expected_ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
+
+        assert_eq!(target.host, expected_ip.to_string());
+        assert_eq!(
+            target.resolved_addrs,
+            vec![SocketAddr::new(expected_ip, 443)]
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_image_client_clears_proxy_configuration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let direct_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let direct_task = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = direct_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .await
+                .unwrap();
+        });
+        let proxy_task = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy",
+                )
+                .await
+                .unwrap();
+        });
+
+        let target = ValidatedImageTarget {
+            url: reqwest::Url::parse(&format!("http://image.test:{}/", direct_addr.port()))
+                .unwrap(),
+            host: "image.test".to_string(),
+            resolved_addrs: vec![direct_addr],
+        };
+        let proxy = reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap();
+        let proxied_response = reqwest::Client::builder()
+            .proxy(proxy.clone())
+            .resolve_to_addrs(&target.host, &target.resolved_addrs)
+            .build()
+            .unwrap()
+            .get(target.url.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proxied_response.text().await.unwrap(), "proxy");
+        proxy_task.await.unwrap();
+
+        let direct_response =
+            generated_image_client_with_builder(&target, reqwest::Client::builder().proxy(proxy))
+                .unwrap()
+                .get(target.url.clone())
+                .send()
+                .await
+                .unwrap();
+
+        assert_eq!(direct_response.text().await.unwrap(), "direct");
+        direct_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_image_body_rejects_oversized_chunked_response() {
+        let (response, release, server) =
+            held_open_chunked_response(GENERATED_IMAGE_LIMIT_BYTES + 1).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_generated_image_body(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let error = result
+            .expect("generated image reader waited for EOF after crossing its limit")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("20 MiB size limit"));
+    }
+
+    #[tokio::test]
+    async fn fal_success_body_rejects_oversized_chunked_response() {
+        let (response, release, server) =
+            held_open_chunked_response(FAL_RESPONSE_LIMIT_BYTES + 1).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_fal_success_body(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let error = result
+            .expect("fal.ai success reader waited for EOF after crossing its limit")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("1 MiB size limit"));
+    }
+
+    #[tokio::test]
+    async fn fal_error_body_is_bounded_during_streaming() {
+        let (response, release, server) =
+            held_open_chunked_response(FAL_ERROR_LIMIT_BYTES + 1).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_fal_error_text(response),
+        )
+        .await;
+        finish_held_open_response(release, server).await;
+        let body = result
+            .expect("fal.ai error reader waited for EOF after crossing its limit")
+            .unwrap();
+
+        assert_eq!(body.len(), FAL_ERROR_LIMIT_BYTES);
+        assert!(body.bytes().all(|byte| byte == b'x'));
+    }
+
+    #[tokio::test]
+    async fn fal_client_does_not_follow_redirects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/unchecked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = ImageGenTool::http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
     }
 
     #[test]
@@ -885,7 +1348,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_IMAGE_GEN".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "a sunset over the ocean"}))
             .await
@@ -917,7 +1382,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_SIZE".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "test", "size": "invalid_size"}))
             .await
@@ -941,7 +1408,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
         assert!(!result.success);
         let err = result.error.as_deref().unwrap();
@@ -961,7 +1430,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux-2/turbo".into(),
             "FAL_API_KEY_TEST_MODEL".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "test", "model": "../../evil-endpoint"}))
             .await
@@ -1102,7 +1573,9 @@ mod tests {
             "aspect_ratio".into(),
             Default::default(),
             extra,
-        );
+            Vec::new(),
+        )
+        .unwrap();
         tool.fal_base_url = mock_server.uri();
 
         let image_url = format!("{}/img.png", mock_server.uri());
@@ -1111,17 +1584,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "images": [{ "url": image_url }]
             })))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        // Minimal PNG-looking bytes; fal downloads use require_png=false so any
-        // bytes pass, but keep the signature for realism.
-        let mut png_bytes = PNG_MAGIC.to_vec();
-        png_bytes.extend_from_slice(&[0x00, 0x01, 0x02]);
-        Mock::given(method("GET"))
-            .and(path("/img.png"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(png_bytes))
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -1135,11 +1597,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "expected success, got: {:?}", result.error);
+        // fork(#24): upstream v0.8.5 download guard rejects the plain-http mock image URL; the wire body is still asserted below.
+        assert!(!result.success);
         assert!(
-            result.output.contains("File:"),
-            "output missing File: line: {}",
-            result.output
+            result.error.as_deref().is_some_and(|e| e.contains("HTTPS")),
+            "expected the HTTPS download guard, got: {:?}",
+            result.error
         );
 
         let received = mock_server.received_requests().await.unwrap();

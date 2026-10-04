@@ -126,14 +126,13 @@ pub(crate) fn resolve_vision_provider(
                 model: vision_model,
             })
         } else if latest_user_image_marker_count > 0 {
-            // The user *just* sent an image we cannot see. Surface a capability
-            // error so the attachment is not silently ignored — channels
-            // render this back to the user (e.g. "⚠️ Error … does not
-            // support vision"). Configuring a `vision_model_provider`
-            // routes around it.
-            return Err(
-                VisionRouteFailure::new("vision_not_supported", provider_name, None).into(),
-            );
+            // fork(#23): keep the typed `VisionRouteFailure`; upstream's fallback
+            // naming is re-applied by reporting the non-vision fallback entry
+            // (when one is the limiter) as the failing provider identity.
+            let limiting = model_provider
+                .vision_limited_by(model)
+                .unwrap_or_else(|| provider_name.to_string());
+            return Err(VisionRouteFailure::new("vision_not_supported", &limiting, None).into());
         } else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -500,6 +499,123 @@ vision = false
             .expect("vision route failures stay typed");
         assert_eq!(failure.kind(), "vision_provider_misconfigured");
         assert_eq!(failure.provider(), "llamacpp.forced_off");
+    }
+
+    /// Regression: when the primary is an aggregate (e.g. a reliable
+    /// model_provider) whose non-vision entry is a configured fallback, the
+    /// capability error must name that fallback rather than blaming the
+    /// primary, since the primary itself may well support vision.
+    #[test]
+    fn resolve_vision_provider_names_fallback_in_capability_error() {
+        struct NonVisionWithNamedFallback;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionWithNamedFallback {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn capabilities_for_model(
+                &self,
+                _model: &str,
+            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: false,
+                    ..Default::default()
+                }
+            }
+            fn vision_limited_by(&self, _model: &str) -> Option<String> {
+                Some("zai.default".to_string())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionWithNamedFallback {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionWithNamedFallback"
+            }
+        }
+
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let err = resolve_vision_provider(
+            None,
+            &NonVisionWithNamedFallback,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("a non-vision aggregate with no vision route must surface a capability error");
+
+        let failure = err
+            .downcast_ref::<VisionRouteFailure>()
+            .expect("fork(#23): vision refusal stays a typed VisionRouteFailure");
+        assert_eq!(failure.kind(), "vision_not_supported");
+        assert_eq!(failure.provider(), "zai.default");
+    }
+
+    /// Companion to the fallback-naming test above: a lone non-vision
+    /// provider (no aggregate, so nothing names a fallback) must keep the
+    /// original wording rather than being mislabeled as a fallback problem.
+    #[test]
+    fn resolve_vision_provider_keeps_primary_wording_without_a_named_fallback() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let err = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("a non-vision primary with no vision route must surface a capability error");
+
+        let failure = err
+            .downcast_ref::<VisionRouteFailure>()
+            .expect("fork(#23): vision refusal stays a typed VisionRouteFailure");
+        assert_eq!(failure.kind(), "vision_not_supported");
+        assert_eq!(failure.provider(), "primary");
     }
 
     /// Success-path companion to the error-branch test above: when the primary
