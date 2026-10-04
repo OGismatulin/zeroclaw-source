@@ -501,20 +501,43 @@ fn open_no_follow(key_path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     // O_NOFOLLOW: if the final path component is a symlink, open() fails with
     // ELOOP.  This binds "not a symlink" to the returned fd atomically.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(key_path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Key file path is a symlink — refusing to read",
-                )
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    match open(key_path) {
+        // fork(#57): per-user `.secret_key` is a symlink into the shared codex
+        // auth dir by design; follow exactly one hop and open the target itself
+        // no-follow, so a chain of links or a link to a non-file is still refused.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            let target = std::fs::read_link(key_path)?;
+            let target = if target.is_absolute() {
+                target
             } else {
-                e
+                key_path.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            let file = open(&target).map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Key file path is a symlink — refusing to read",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Key file symlink target is not a regular file — refusing to read",
+                ));
             }
-        })
+            Ok(file)
+        }
+        other => other,
+    }
 }
 
 #[cfg(windows)]
@@ -2227,31 +2250,23 @@ exit 65
 
     #[cfg(unix)]
     #[test]
-    fn read_key_file_rejects_valid_symlink() {
-        // A valid symlink pointing to a legitimate key file must still
-        // be rejected — the no-symlink invariant applies to every
-        // code path that accepts key bytes.
+    fn read_key_file_follows_one_symlink_hop() {
+        // fork(#57): the shared codex auth layout links each per-user key file
+        // to one shared key; a single hop to a regular file must load it.
         use std::os::unix::fs as unix_fs;
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("real-key");
         let link = tmp.path().join(".secret_key");
-        // Create a valid key file at the target.
         let key = generate_random_key();
         fs::write(&target, hex_encode(&key)).unwrap();
         unix_fs::symlink(&target, &link).unwrap();
 
-        // Reading through the symlink must fail.
-        let result = load_or_create_key(&link);
-        assert!(
-            result.is_err(),
-            "Valid symlink on read path must be rejected: {result:?}"
-        );
+        assert_eq!(load_or_create_key(&link).unwrap(), key);
     }
 
     #[cfg(unix)]
     #[test]
-    fn provisioning_state_rejects_symlink() {
-        // provisioning_state must not report a symlink as Initialized.
+    fn provisioning_state_accepts_single_symlink_hop() {
         use std::os::unix::fs as unix_fs;
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("real-key");
@@ -2260,11 +2275,7 @@ exit 65
         unix_fs::symlink(&target, &link).unwrap();
 
         let fs = FileKeySource::new(link);
-        assert_eq!(
-            fs.provisioning_state(),
-            ProvisioningState::NeedsInitialization,
-            "Symlink must not be reported as Initialized"
-        );
+        assert_eq!(fs.provisioning_state(), ProvisioningState::Initialized);
     }
 
     // ── Temp-file guard cleanup & no-follow open boundary ──
@@ -2362,39 +2373,32 @@ exit 65
 
     #[cfg(unix)]
     #[test]
-    fn open_no_follow_rejects_symlink_deterministically() {
-        // O_NOFOLLOW must reject at open() — deterministic, no race needed.
+    fn open_no_follow_rejects_symlink_chain_deterministically() {
         use std::os::unix::fs as unix_fs;
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("real-key");
+        let middle = tmp.path().join("middle");
         let link = tmp.path().join(".secret_key");
         fs::write(&target, hex_encode(&generate_random_key())).unwrap();
-        unix_fs::symlink(&target, &link).unwrap();
+        unix_fs::symlink(&target, &middle).unwrap();
+        unix_fs::symlink(&middle, &link).unwrap();
 
         let err = read_key_file_no_follow(&link).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        // A regular file must still read fine (no false positive).
         assert!(read_key_file_no_follow(&target).is_ok());
     }
 
     #[cfg(unix)]
     #[test]
-    fn no_follow_open_binds_check_and_read() {
-        // Worst case: the path is already a symlink at open time.  A
-        // check-then-follow implementation could still read the target; a
-        // no-follow open cannot.
+    fn symlink_to_directory_is_refused() {
         use std::os::unix::fs as unix_fs;
         let tmp = TempDir::new().unwrap();
-        let attacker = tmp.path().join("attacker-key");
-        fs::write(&attacker, hex_encode(&generate_random_key())).unwrap();
+        let dir = tmp.path().join("not-a-key");
+        fs::create_dir(&dir).unwrap();
         let path = tmp.path().join(".secret_key");
-        unix_fs::symlink(&attacker, &path).unwrap();
+        unix_fs::symlink(&dir, &path).unwrap();
 
-        let result = load_or_create_key(&path);
-        assert!(
-            result.is_err(),
-            "no-follow open must refuse the symlink, never read the attacker target: {result:?}"
-        );
+        assert!(load_or_create_key(&path).is_err());
     }
 
     // Windows concurrent publication interleaving: multiple threads racing on
