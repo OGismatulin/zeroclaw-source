@@ -1053,14 +1053,21 @@ pub fn ensure_terminal_provider_failure(
     if terminal_provider_failure(&err).is_some() {
         return err;
     }
-    TerminalProviderFailure::new(
+    let terminal = TerminalProviderFailure::new(
         &ProviderCandidateDescriptor::requested(actual_provider, None),
         actual_model,
         route,
         1,
         provider_error_diagnostic(&err),
-    )
-    .into()
+    );
+    // fork(#23): the raw cause stays out of the chain, but a semantic-empty
+    // completion keeps upstream's unit marker beneath the typed record so the
+    // localized "invalid semantic completion" projection still finds it.
+    if is_semantic_empty_completion_error(&err) {
+        return anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+            .context(terminal);
+    }
+    terminal.into()
 }
 
 /// Build the typed terminal record for the runtime's outer inference-step
@@ -1425,7 +1432,9 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
         };
     }
 
-    if is_empty_completion_error(err) {
+    // fork(#23): upstream's semantic-empty terminal completion is the same
+    // class as the codex empty payload, so it shares the `empty_completion` kind.
+    if is_empty_completion_error(err) || is_semantic_empty_completion_error(err) {
         return ProviderErrorDiagnostic {
             kind: "empty_completion",
             disposition,

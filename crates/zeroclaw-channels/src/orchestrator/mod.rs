@@ -2482,6 +2482,14 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     {
         return true;
     }
+    // fork(#23): the vision route reports its refusal as a typed
+    // `VisionRouteFailure` instead of upstream's `ProviderCapabilityError`.
+    if error
+        .downcast_ref::<zeroclaw_runtime::agent::loop_::VisionRouteFailure>()
+        .is_some()
+    {
+        return true;
+    }
 
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
@@ -18603,9 +18611,12 @@ api_key = "anthropic-key"
             !reply.contains(TEST_PROVIDER_QUERY_SECRET),
             "channel reply leaked provider query secret: {reply}"
         );
+        // fork(#23): the reply is the typed terminal summary, which carries the
+        // safe kind/provider/model and keeps the endpoint in the structured
+        // diagnostic only.
         assert!(
-            reply.contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
-            "sanitized reply should preserve the useful endpoint: {reply}"
+            reply.contains("provider call failed:"),
+            "reply must be the typed terminal summary: {reply}"
         );
         drop(sent_messages);
 
@@ -18639,9 +18650,8 @@ api_key = "anthropic-key"
             "structured log leaked provider query secret: {event}"
         );
         assert!(
-            logged_error
-                .contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
-            "structured log should preserve the useful endpoint: {event}"
+            logged_error.contains("provider call failed:"),
+            "fork(#23): the log carries the typed terminal summary: {event}"
         );
     }
 
@@ -34763,10 +34773,9 @@ Done."#;
             !draft.contains("tool_result") && !draft.contains("secret"),
             "tool_result must be stripped even in an example: {draft:?}"
         );
-        assert!(
-            draft.contains("This is an example, not an invocation."),
-            "the example prose must survive: {draft:?}"
-        );
+        // fork: `parse_tool_calls` treats tool_call + tool_result in one turn as
+        // roleplayed execution and drops its prose (6745aecd3), so the example
+        // exemption no longer applies once a result envelope is present.
 
         // Same input through the shared final sanitizer: the two boundaries
         // must agree on what survives.
@@ -34859,23 +34868,14 @@ Done."#;
             );
         }
 
-        // Once the example is complete it must stay visible, including across
-        // the frames where the result envelope is still arriving.
-        for (i, frame) in frames.iter().enumerate().skip(1) {
-            assert!(
-                frame.contains("This is an example, not an invocation."),
-                "frame {i} dropped the preserved example: {frame:?}"
-            );
-            assert!(
-                frame.contains("<tool_call>"),
-                "frame {i} dropped the preserved tool_call tags: {frame:?}"
-            );
-        }
-
+        // fork: the example stays visible until a result envelope arrives; from
+        // then on `parse_tool_calls` treats the turn as roleplayed execution and
+        // drops its prose (6745aecd3), so later frames are blank, never leaky.
         assert!(
-            frames.last().unwrap().contains("Done."),
-            "the closing prose must survive: {:?}",
-            frames.last().unwrap()
+            frames[1].contains("This is an example, not an invocation.")
+                && frames[1].contains("<tool_call>"),
+            "frame 1 dropped the preserved example: {:?}",
+            frames[1]
         );
     }
 

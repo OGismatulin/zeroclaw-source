@@ -92,8 +92,9 @@ runtime_profile = "default"
             .await
             .expect("request recording enabled")
             .len(),
-        1,
-        "the CLI must reach the local provider fixture exactly once"
+        // fork(#36): an empty completion is nudged twice before it is terminal.
+        3,
+        "the CLI must reach the local provider fixture once plus two nudges"
     );
 }
 
@@ -188,7 +189,8 @@ runtime_profile = "default"
             .await
             .expect("request recording enabled")
             .len(),
-        1,
-        "the interactive CLI must reach the local provider fixture exactly once"
+        // fork(#36): an empty completion is nudged twice before it is terminal.
+        3,
+        "the interactive CLI must reach the local provider fixture once plus two nudges"
     );
 }

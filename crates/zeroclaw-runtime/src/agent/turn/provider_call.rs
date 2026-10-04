@@ -387,6 +387,15 @@ pub(crate) async fn call_provider(
             || zeroclaw_providers::terminal_provider_failure(&err).is_some()
         {
             err
+        } else if super::outcome::is_semantic_empty_terminal_completion(&err) {
+            // fork(#23): normalize every semantic-empty shape to upstream's unit
+            // marker; the providers boundary keeps it beneath the typed record.
+            ensure_terminal_provider_failure(
+                anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion),
+                active_model_provider_name,
+                active_model,
+                provider_route,
+            )
         } else {
             let companion = safe_terminal_companion(&err);
             let typed = ensure_terminal_provider_failure(
