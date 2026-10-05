@@ -6216,7 +6216,7 @@ pub struct PacingConfig {
 
     /// Same tool called with DIFFERENT args but identical result this many times
     /// before the no-progress detector's first escalation (Warning). Block at
-    /// N+1, circuit-breaker Break at N+2. Defaults to 8 (was hardcoded 5).
+    /// N+1, circuit-breaker Break at N+2. Defaults to 15 (was 8, before that hardcoded 5).
     /// Value 0 disables the no-progress detector. If greater than
     /// `loop_detection_window_size` the detector effectively never fires.
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
@@ -6244,7 +6244,7 @@ fn default_loop_detection_max_repeats() -> usize {
 }
 
 fn default_loop_detection_no_progress_min_calls() -> usize {
-    8
+    15
 }
 
 fn default_loop_detection_ping_pong_min_cycles() -> usize {
@@ -36822,7 +36822,7 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_ping_pong_min_cycles,
             manual.loop_detection_ping_pong_min_cycles
         );
-        assert_eq!(from_toml.loop_detection_no_progress_min_calls, 8);
+        assert_eq!(from_toml.loop_detection_no_progress_min_calls, 15);
         assert_eq!(from_toml.loop_detection_ping_pong_min_cycles, 20);
 
         // Verify concrete values so a silent change to the defaults is caught.

@@ -8,7 +8,7 @@
 //! 2. **Ping-pong** — two tools alternating (A->B->A->B) for a configurable
 //!    number of cycles (`ping_pong_min_cycles`, default 6; `0` disables).
 //! 3. **No progress** — same tool called a configurable number of times
-//!    (`no_progress_min_calls`, default 8; `0` disables) with different args
+//!    (`no_progress_min_calls`, pacing default 15; `0` disables) with different args
 //!    but identical result hash each time, counted across the window rather
 //!    than only consecutively, so interleaving other calls does not evade it.
 //!
