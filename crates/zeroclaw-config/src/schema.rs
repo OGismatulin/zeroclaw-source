@@ -6217,6 +6217,8 @@ pub struct PacingConfig {
     /// Same tool called with DIFFERENT args but identical result this many times
     /// before the no-progress detector's first escalation (Warning). Block at
     /// N+1, circuit-breaker Break at N+2. Defaults to 15 (was 8, before that hardcoded 5).
+    /// Delegates (analysts, judge, workers) do not read config `[pacing]`: they run with this
+    /// default, so changing it takes an image build.
     /// Value 0 disables the no-progress detector. If greater than
     /// `loop_detection_window_size` the detector effectively never fires.
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
