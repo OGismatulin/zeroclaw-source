@@ -6194,6 +6194,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agentic_delegate_forwards_minimum_answer_length() {
+        for streaming in [false, true] {
+            for (min_chars, expected_calls) in [(Some(1000), 3), (None, 1)] {
+                let mut config = agentic_agent_config();
+                config.final_response_min_chars = min_chars;
+                let tool = DelegateTool::new(HashMap::new(), None, test_security())
+                    .with_runtime_profiles(agentic_runtime_profiles(10))
+                    .with_risk_profiles(agentic_risk_profiles(Vec::new()));
+                let provider = StreamGateModelProvider::new(streaming);
+                let result = tool
+                    .execute_agentic(
+                        "agentic",
+                        &config,
+                        "opencode",
+                        "model-test",
+                        &provider,
+                        "run",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "got: {:?}", result.error);
+                assert!(result.output.contains(if streaming {
+                    "streamed-done"
+                } else {
+                    "chat-done"
+                }));
+                assert_eq!(
+                    provider
+                        .stream_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    if streaming { expected_calls } else { 0 }
+                );
+                assert_eq!(
+                    provider
+                        .chat_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    if streaming { 0 } else { expected_calls }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn execute_agentic_streams_when_provider_requires_it() {
         let model_provider = StreamGateModelProvider::new(true);
         let result = run_stream_gate(&model_provider).await;
