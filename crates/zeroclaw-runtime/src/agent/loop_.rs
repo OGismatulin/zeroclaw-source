@@ -6655,7 +6655,7 @@ mod tests {
                 .map(|message| (&message.role, &message.content))
                 .collect::<Vec<_>>(),
         );
-        for messages in canonical.chunks_exact(2) {
+        for messages in canonical.as_chunks::<2>().0 {
             assert_eq!(messages[0].role, "assistant");
             assert_eq!(messages[1].role, "user");
             assert_eq!(
