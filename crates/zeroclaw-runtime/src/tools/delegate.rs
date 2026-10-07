@@ -1006,6 +1006,7 @@ impl DelegateTool {
         }
 
         let mut resolved = agent_config.resolved.clone();
+        resolved.final_response_min_chars = agent_config.final_response_min_chars;
 
         if let Some(profile) = self
             .runtime_profiles
@@ -3095,6 +3096,7 @@ impl DelegateTool {
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                final_response_min_chars: loop_runtime.final_response_min_chars,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -7175,6 +7177,30 @@ mod tests {
         assert!(!prompt.contains("ISO 8601:"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn delegate_runtime_carries_final_response_min_chars() {
+        for min_chars in [Some(1000), None] {
+            let config = AliasedAgentConfig {
+                final_response_min_chars: min_chars,
+                ..AliasedAgentConfig::default()
+            };
+            let tool = DelegateTool::new(HashMap::new(), None, test_security());
+            assert_eq!(
+                tool.resolve_loop_runtime("alpha", &config)
+                    .final_response_min_chars,
+                min_chars
+            );
+            let mut root_config = Config::default();
+            root_config.agents.insert("alpha".into(), config.clone());
+            let tool = tool.with_root_config(Arc::new(root_config));
+            assert_eq!(
+                tool.resolve_loop_runtime("alpha", &config)
+                    .final_response_min_chars,
+                min_chars
+            );
+        }
     }
 
     #[test]

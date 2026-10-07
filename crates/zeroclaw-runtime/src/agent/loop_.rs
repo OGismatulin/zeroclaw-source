@@ -1073,6 +1073,7 @@ async fn agent_turn_with_sop_reassembly(
         Some(turn_id.clone()),
     );
     let result = run_tool_call_loop(ToolLoop {
+        final_response_min_chars: None,
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -2127,6 +2128,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
+                                final_response_min_chars: None,
                                 exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
@@ -2686,6 +2688,7 @@ pub async fn run(
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
+                                    final_response_min_chars: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -5432,6 +5435,7 @@ mod tests {
         let observer = NoopObserver;
 
         let _ = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -5847,6 +5851,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             exec: ResolvedAgentExecution::resolve(
                 ResolvedModelAccess {
                     model_provider,
@@ -6103,6 +6108,7 @@ mod tests {
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6184,6 +6190,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6269,6 +6276,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6359,6 +6367,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6434,6 +6443,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6512,6 +6522,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6572,6 +6583,118 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    async fn run_scripted_loop(
+        provider: &ScriptedModelProvider,
+        min_chars: Option<usize>,
+    ) -> String {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let mut history = vec![ChatMessage::user("Analyze the task")];
+        let mut canonical = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = NoopObserver;
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: min_chars,
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &multimodal,
+                config: None,
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: Some(&mut canonical),
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("analyst_test"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("scripted final-response turn succeeds");
+
+        assert_eq!(
+            history[1..]
+                .iter()
+                .map(|message| (&message.role, &message.content))
+                .collect::<Vec<_>>(),
+            canonical
+                .iter()
+                .map(|message| (&message.role, &message.content))
+                .collect::<Vec<_>>(),
+        );
+        for messages in canonical.chunks_exact(2) {
+            assert_eq!(messages[0].role, "assistant");
+            assert_eq!(messages[1].role, "user");
+            assert_eq!(
+                messages[1].content,
+                crate::agent::turn::context_recovery::FINAL_RESPONSE_NUDGE_TEXT
+            );
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn short_final_then_report_returns_the_report() {
+        let report = "SUMMARY ".repeat(200);
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            "Возвращаю структурированный результат.",
+            report.as_str(),
+        ]);
+        let text = run_scripted_loop(&provider, Some(1000)).await;
+        assert_eq!(text.trim(), report.trim());
+        assert!(provider.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn three_short_finals_return_the_third() {
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["раз", "два", "три", "четыре"]);
+        let text = run_scripted_loop(&provider, Some(1000)).await;
+        assert_eq!(text.trim(), "три");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unset_min_chars_returns_the_first_short_answer() {
+        let provider = ScriptedModelProvider::from_text_responses(vec!["раз", "два"]);
+        let text = run_scripted_loop(&provider, None).await;
+        assert_eq!(text.trim(), "раз");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_no_images_uses_default_provider() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6591,6 +6714,7 @@ mod tests {
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6657,6 +6781,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                final_response_min_chars: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -6844,6 +6969,7 @@ mod tests {
             let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
+                final_response_min_chars: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
@@ -6970,6 +7096,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7049,6 +7176,7 @@ mod tests {
         };
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7126,6 +7254,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7287,6 +7416,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7429,6 +7559,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7590,6 +7721,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7708,6 +7840,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7881,6 +8014,7 @@ mod tests {
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
         let _ = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7990,6 +8124,7 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8083,6 +8218,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8168,6 +8304,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8261,6 +8398,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8357,6 +8495,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8459,6 +8598,7 @@ mod tests {
         );
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8553,6 +8693,7 @@ mod tests {
         let observer = NoopObserver;
 
         let _ = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8673,6 +8814,7 @@ mod tests {
         };
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8771,6 +8913,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8874,6 +9017,7 @@ mod tests {
         let dedup_exempt = vec!["shell".to_string()];
 
         let err = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -8967,6 +9111,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9064,6 +9209,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9163,6 +9309,7 @@ mod tests {
         let exempt = vec!["count_tool".to_string()];
 
         let _result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9248,6 +9395,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9337,6 +9485,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9421,6 +9570,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9503,6 +9653,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9588,6 +9739,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9671,6 +9823,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9759,6 +9912,7 @@ mod tests {
         let expected_content = format!("visible\n\n{interrupted_marker}");
 
         let error = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9850,6 +10004,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9924,6 +10079,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -9999,6 +10155,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10074,6 +10231,7 @@ mod tests {
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10151,6 +10309,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10232,6 +10391,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10325,6 +10485,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10402,6 +10563,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10482,6 +10644,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10560,6 +10723,7 @@ Done."#;
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10639,6 +10803,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10775,6 +10940,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10862,6 +11028,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -10952,6 +11119,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11065,6 +11233,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11210,6 +11379,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11304,6 +11474,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11409,6 +11580,7 @@ This is an example, not an invocation."#;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -12303,6 +12475,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -12410,6 +12583,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -12514,6 +12688,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -12618,6 +12793,7 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -12779,6 +12955,7 @@ This is an example, not an invocation."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -15596,6 +15773,7 @@ Let me check the result."#;
         ];
         let observer = NoopObserver;
         run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -15841,6 +16019,7 @@ Let me check the result."#;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -16024,6 +16203,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    final_response_min_chars: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -16143,6 +16323,7 @@ Let me check the result."#;
             .scope(
                 Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
+                    final_response_min_chars: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -16259,6 +16440,7 @@ Let me check the result."#;
         ];
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -16380,6 +16562,7 @@ Let me check the result."#;
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
+                    final_response_min_chars: None,
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
@@ -16473,6 +16656,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -16564,6 +16748,7 @@ Let me check the result."#;
         ];
 
         let _ = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -18046,6 +18231,7 @@ Let me check the result."#;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
         let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {

@@ -3528,6 +3528,7 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    pub final_response_min_chars: Option<usize>,
     pub max_history_messages: usize,
     /// Token budget for preemptive context/history trimming (from runtime profile).
     /// NOT the provider `max_tokens` output limit.
@@ -3619,6 +3620,7 @@ impl Default for ResolvedRuntime {
         Self {
             compact_context: true,
             max_tool_iterations: 10,
+            final_response_min_chars: None,
             max_history_messages: 50,
             max_context_tokens: 32_000,
             model_context_window: 32_000,
@@ -3789,6 +3791,9 @@ pub struct AliasedAgentConfig {
     #[tab(General)]
     #[serde(default)]
     pub runtime_profile: crate::providers::RuntimeProfileRef,
+    #[tab(General)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_min_chars: Option<usize>,
     /// Skill bundle aliases. Each entry resolves to
     /// `skill_bundles[key].directory` at runtime; the agent loads every
     /// listed bundle.
@@ -3965,6 +3970,7 @@ impl Default for AliasedAgentConfig {
             model_provider: crate::providers::ModelProviderRef::default(),
             risk_profile: crate::providers::RiskProfileRef::default(),
             runtime_profile: crate::providers::RuntimeProfileRef::default(),
+            final_response_min_chars: None,
             skill_bundles: Vec::new(),
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
@@ -4365,6 +4371,7 @@ impl Config {
         let mut out = self.agents.get(agent_alias)?.clone();
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
+            final_response_min_chars: out.final_response_min_chars,
             max_history_messages: self.effective_max_history_messages(agent_alias),
             // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
