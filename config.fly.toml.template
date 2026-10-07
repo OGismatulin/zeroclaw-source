@@ -59,6 +59,10 @@ model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
 provider_extra = { reasoning_effort = "high" }
+# deepseek-v4.1-flash accepts images on the Go router (probe 2026-10-07: red/blue/green PNGs named
+# correctly, +194 prompt tokens). Without this the chat chain (codex + this fallback) is non-vision
+# by AND and every image turn leaves for [multimodal] vision_provider (incident zc-479765ddf18949c5).
+vision = true
 
 # UNREFERENCED rollback slot since 2026-08-31: the coordinator moved to
 # [providers.models.openai.codex_coordinator] after a Go rolling-window rate
