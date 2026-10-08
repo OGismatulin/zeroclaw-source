@@ -1,5 +1,5 @@
 {
-  "captured_at": "2026-09-25T17:25:09+00:00",
+  "captured_at": "2026-10-08T15:58:48+00:00",
   "source": "https://microsoft365.mcp.claude.com/mcp",
   "tools": [
     {
@@ -134,38 +134,38 @@
     },
     {
       "name": "outlook_email_search",
-      "description": "Search Outlook emails. Returns email metadata (subject, sender, date, etc) - use read_resource tool with returned URIs to get full email content. Supports natural language dates like 'yesterday' or 'last week'. Filters combine with AND, except three combinations that are rejected: (1) `recipient` with `folderName`, `mailboxOwnerEmail` or `order`; (2) `query` with `order`; (3) `query` with `sender`, `afterDateTime` or `beforeDateTime` when `folderName` or `mailboxOwnerEmail` is set. When a request would need a rejected combination, drop a parameter instead of sending it: for the latest emails about a topic, send `query` with no `order` (add `afterDateTime` only if the user gave a time window; never invent an old date); results are relevance-ranked, not date-sorted, so sort the returned dates yourself. For 'emails I sent to X' or 'the last thing I emailed X', send `recipient` (optionally with `sender` set to the user's own address): it searches the whole mailbox, including Sent Items, so do not add `folderName` or `order`; pick the newest from the returned dates, narrowing with `afterDateTime` if the page is full. For a topic plus a sender or date inside a named folder of the user's own mailbox, omit `folderName` and search globally with `query` plus `sender`/dates (you may say the search covered all folders). In a shared mailbox (`mailboxOwnerEmail`), send the `sender`/date filters without `query` and check the returned subjects for the topic; retry with `mailboxOwnerEmail` plus `query` alone only if nothing useful comes back. To search a shared mailbox or another user's mailbox you have delegate access to, pass mailboxOwnerEmail with their email address. Returns max 25 emails per request. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages). If the final item includes `nextCursor` instead of `nextOffset`, pass that value as the `cursor` parameter (and omit `offset`). Always start with no cursor.",
+      "description": "Search Outlook mail by text, sender, recipient, date, folder or shared mailbox. Read full emails with the read_resource tool on the returned URIs. Filters combine with AND, except three combinations that are rejected. When a request would need one, drop a parameter instead of sending it. (1) `order: \"oldest\"` with `query` or `recipient`. For the earliest, drop `order` and compare dates across all pages. `order: \"newest\"` with either is accepted but not applied: for the latest emails about a topic send `query` (add `afterDateTime` only if the user gave a time window; never invent an old date) and sort the returned dates yourself, checking later pages. (2) With `folderName`: a date (`afterDateTime`/`beforeDateTime`) together with `query` or `recipient`. In the user's own mailbox, omit `folderName`, search all folders, and tell the user you did. (3) With `mailboxOwnerEmail`: any `recipient`, or `query` together with `sender` or a date. Keep `mailboxOwnerEmail` (and any `folderName`), drop `recipient` and `query`, send any `sender`/date filters, and check the returned subjects and recipients; retry with `query` alone (no `sender` or dates) only if nothing useful comes back. For 'emails I sent to X' or 'the last thing I emailed X', send `recipient` with no `folderName` or `order`, keep hits whose `sender` is the user or starts with `/O=`, pick the newest, and narrow with `afterDateTime` if the page is full. Send at least one of `query`, `sender`, `recipient`, a date, `folderName`, `mailboxOwnerEmail` or `order`; for the newest Inbox emails, send `order: \"newest\"` alone. If the response includes a final item with `nextOffset`, there are more results — pass that value as the `offset` parameter to fetch the next page. Always start with offset: 0. When a reliable total is available, that item also includes `totalResultCount` (the number of results across all pages). If the final item includes `nextCursor` instead of `nextOffset`, pass that value as the `cursor` parameter (and omit `offset`). Always start with no cursor.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Text to search for in email subject, body, or attachments. Omit for all emails. Cannot be combined with `order`. When `folderName` or `mailboxOwnerEmail` is set, cannot be combined with `sender`, `afterDateTime` or `beforeDateTime` either. If the user also names a folder of their own mailbox plus a sender or date, keep `query` and drop `folderName` (search all folders). Do not add an old `afterDateTime` just to accompany `query`. On the global search path the text must have balanced ( ) and an even number of \" — wrap a phrase in double quotes (e.g. '\"thanks :)\"') to search literal parentheses, or add `folderName`/`mailboxOwnerEmail`, which use the mailbox endpoint where parentheses are plain text."
+            "description": "Text to search for in email subject, body, or attachments. Omit it, or send '*', to search by the other parameters only. The text must have balanced ( ) and an even number of \" — wrap a phrase in double quotes (e.g. '\"thanks :)\"') to search literal parentheses — unless it is sent with `folderName` or `mailboxOwnerEmail` and no `sender` or `recipient`; then it is not checked and its double quotes are removed. Refused with `order: \"oldest\"` (leave out `order`), with a date when `folderName` or `mailboxOwnerEmail` is set, and with `sender` when `mailboxOwnerEmail` is set; then leave out `query` in a shared mailbox, `folderName` in the user's own."
           },
           "folderName": {
             "type": "string",
-            "description": "Name of a specific Outlook mail folder to search in (case-insensitive). Common folders 'Inbox', 'Sent Items', 'Drafts', 'Deleted Items', 'Archive', 'Junk Email', 'Outbox' are recognized directly (locale-independent; works for delegated mailboxes). Any other name is looked up by enumerating the mailbox's folders. Use ONLY when the user explicitly names a mail folder. Do NOT use this to filter by a person's name — use 'sender' or 'recipient' instead, which search across all folders. Omit to search all folders. If set: use `query` OR sender/date filters, NOT both; when the user wants a topic plus a sender or date in this folder, omit folderName and search all folders instead (in a shared mailbox, keep folderName and send the sender/date filters without `query`). `recipient` NOT supported. To find emails the user sent to a particular person, use `recipient` rather than folderName 'Sent Items'."
+            "description": "Name of a specific Outlook mail folder to search in (case-insensitive). Common folders 'Inbox', 'Sent Items', 'Drafts', 'Deleted Items', 'Archive', 'Junk Email', 'Outbox' are recognized directly (locale-independent; works for delegated mailboxes). Any other name is looked up by enumerating the mailbox's folders. Use ONLY when the user explicitly names a mail folder. Do NOT use this to filter by a person's name — use 'sender' or 'recipient' instead. Omit to search all folders (with `order`, see its Inbox default). With it, a date (`afterDateTime`/`beforeDateTime`) is refused if `query` or `recipient` is also sent: in the user's own mailbox, leave out `folderName` then."
           },
           "mailboxOwnerEmail": {
             "type": "string",
             "format": "email",
-            "description": "Email address of a shared mailbox or another user's mailbox you have delegated access to. Omit to search your own mailbox. Requires Mail.Read.Shared permission. If set: use `query` OR sender/date filters, NOT both; when the request has a topic plus a sender or date, send the sender/date filters without `query` and check the returned subjects for the topic. `recipient` NOT supported."
+            "description": "Email address of a shared mailbox or another user's mailbox you have delegated access to. Omit to search your own mailbox. Requires Mail.Read.Shared permission. Refused with any `recipient`, and with `query` plus `sender` or a date: keep this and leave out `recipient`, and `query` when a `sender` or date is sent."
           },
           "sender": {
             "type": "string",
-            "description": "Email address (full or partial) of sender to filter by. Matches any part of the sender's email address. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+            "description": "Sender to filter by: an email address, a domain, or a full display name. With `folderName`, `mailboxOwnerEmail` or `order` and no `query` or `recipient`, it matches any part of the sender's email address and never a display name. Otherwise it goes to the search index, where a full address or the full display name is the safest form and a fragment such as the first letters of an address may not match. A full address can miss some mail from someone in the user's own organization. If results from the user's own mailbox look incomplete, also try the display name without `folderName` and `order`; in a shared mailbox only the address form works. With `mailboxOwnerEmail`, it is refused together with `query`: leave out `query`."
           },
           "recipient": {
             "type": "string",
-            "description": "Email address (full or partial) of recipient to filter by. Matches TO, CC, or BCC recipients; searches the whole mailbox, including Sent Items. Use it (optionally with `sender` set to the user's own address) for 'emails I sent to X'; narrow with `afterDateTime` if the page is full. NOT compatible with `folderName`/`mailboxOwnerEmail`/`order`."
+            "description": "Email address of a recipient to filter by. Matches TO, CC, or BCC recipients. Without `folderName` it searches every folder, including Sent Items. Refused with `mailboxOwnerEmail` (leave out `recipient`), with `order: \"oldest\"` (leave out `order`), and with a date when `folderName` is set (leave out `folderName`)."
           },
           "afterDateTime": {
             "type": "string",
-            "description": "Return emails received after this date/time. Accepts natural language: 'yesterday', 'last week', 'March 15 2024', ISO dates, etc. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+            "description": "Return emails received after this date/time. Accepts natural language: 'yesterday', 'last week', 'March 15 2024', ISO dates, etc. With `folderName` or `mailboxOwnerEmail`, it is refused together with `query` or `recipient`: keep the date and leave out `folderName` (own mailbox) or `query`/`recipient` (shared mailbox)."
           },
           "beforeDateTime": {
             "type": "string",
-            "description": "Return emails received before this date/time. Accepts natural language: 'today', 'next month', ISO dates, etc. Cannot be combined with `query` when `folderName` or `mailboxOwnerEmail` is set."
+            "description": "Return emails received before this date/time. Accepts natural language: 'today', 'next month', ISO dates, etc. With `folderName` or `mailboxOwnerEmail`, it is refused together with `query` or `recipient`: keep the date and leave out `folderName` (own mailbox) or `query`/`recipient` (shared mailbox)."
           },
           "order": {
             "type": "string",
@@ -173,17 +173,17 @@
               "newest",
               "oldest"
             ],
-            "description": "Sort results by received date: 'newest' (most recent first) or 'oldest' (earliest first). When omitted, results are newest-first for folder/mailbox listings and relevance-ranked for free-text query. When set without a `folderName`, the search is scoped to Inbox by default; pass a different `folderName` (e.g. 'Sent Items') to sort within that folder instead. Cannot be combined with `query` (for the latest emails about a topic, send `query` without `order`, adding `afterDateTime` only if the user gave a time window, then sort the returned dates yourself) or with `recipient`. Not for 'the last email I sent to X': use `recipient` without `order` and pick the newest returned date."
+            "description": "Sort results by received date: 'newest' (most recent first) or 'oldest' (earliest first). Without `query` or `recipient`, it sorts the Inbox unless `folderName` names another folder (e.g. 'Sent Items'); with them, see the tool description. When omitted, a `folderName` or `mailboxOwnerEmail` search without `query` or `recipient` returns newest first; other searches are not guaranteed to be in date order. `\"oldest\"` is refused with `query` or `recipient`: leave out `order` then."
           },
           "offset": {
             "type": "number",
             "minimum": 0,
             "maximum": 1000,
-            "description": "Number of results to skip for pagination. Start at 0 and pass the `nextOffset` value from the prior response to fetch the next page. Default: 0. Ignored when `cursor` is set. Free-text `query` searches in a folder or shared mailbox page by `cursor`, not `offset`."
+            "description": "Number of results to skip; see the paging note in the tool description. Default: 0. Ignored when `cursor` is set, and ignored by searches in a folder or shared mailbox that include `query` or `recipient`, which page by `cursor`."
           },
           "cursor": {
             "type": "string",
-            "description": "Opaque pagination cursor returned in a prior response as `nextCursor`. Pass it back unchanged to fetch the next page; other filter parameters are ignored when set. Used by free-text `query` searches in a folder or shared mailbox, where `offset` is not supported."
+            "description": "Opaque pagination cursor returned in a prior response as `nextCursor`. Pass it back unchanged to fetch the next page; other parameters, including `limit`, are ignored when set."
           },
           "limit": {
             "type": "number",
