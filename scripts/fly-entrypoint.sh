@@ -210,6 +210,7 @@ sed -e "s|__ZEROCLAW_WEBHOOK_SECRET__|$ZEROCLAW_WEBHOOK_SECRET|g" \
     -e "s|__ZEROCLAW_BEARER_TOKEN__|${ZEROCLAW_BEARER_TOKEN:-}|g" \
     -e "s|__CODEMAP_API_KEY__|${CODEMAP_API_KEY:-}|g" \
     -e "s|__CODEMAP_SEMANTIC_API_KEY__|${CODEMAP_SEMANTIC_API_KEY:-}|g" \
+    -e "s|__BRAVE_API_KEY__|${BRAVE_API_KEY:-}|g" \
     "$template_file" > "$config_file"
 chmod 0600 "$config_file"
 
