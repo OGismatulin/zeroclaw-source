@@ -9,7 +9,7 @@ use super::outcome::{
     StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
-use super::stream_consume::consume_provider_streaming_response;
+use super::stream_consume::{StreamedChatOutcome, consume_provider_streaming_response};
 use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
@@ -149,6 +149,31 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
     Ok(())
 }
 
+fn streamed_chat_outcome(
+    streamed: StreamedChatOutcome,
+) -> (Result<ChatResponse>, bool, bool, String) {
+    let reasoning_content =
+        (!streamed.reasoning_content.is_empty()).then_some(streamed.reasoning_content);
+    (
+        Ok(ChatResponse {
+            text: Some(streamed.response_text),
+            tool_calls: streamed.tool_calls,
+            usage: streamed.usage,
+            reasoning_content,
+        }),
+        streamed.forwarded_live_deltas,
+        streamed.suppressed_protocol,
+        streamed.forwarded_visible_text,
+    )
+}
+
+fn is_terminal_stream_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+        .is_some()
+        || is_tool_loop_cancelled(err)
+        || err.downcast_ref::<StreamInterruptedAfterOutput>().is_some()
+}
+
 /// One provider call: streaming via `consume_provider_streaming_response`
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
@@ -175,7 +200,7 @@ pub(crate) async fn call_provider(
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response(
+                    let mut stream_result = consume_provider_streaming_response(
                         active_model_provider,
                         prepared_messages,
                         request_tools,
@@ -187,32 +212,33 @@ pub(crate) async fn call_provider(
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
                     )
-                    .await
+                    .await;
+                    if let Err(err) = &stream_result
+                        && err.downcast_ref::<StreamSemanticEmptyCompletion>().is_some()
+                        && active_model_provider.delegate_turns_should_stream()
                     {
-                        Ok(streamed) => {
-                            let reasoning_content = (!streamed.reasoning_content.is_empty())
-                                .then_some(streamed.reasoning_content);
-                            (
-                                Ok(ChatResponse {
-                                    text: Some(streamed.response_text),
-                                    tool_calls: streamed.tool_calls,
-                                    usage: streamed.usage,
-                                    reasoning_content,
-                                }),
-                                streamed.forwarded_live_deltas,
-                                streamed.suppressed_protocol,
-                                streamed.forwarded_visible_text,
-                            )
-                        }
-                        Err(stream_err)
-                            if stream_err
-                                .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
-                                .is_some()
-                                || is_tool_loop_cancelled(&stream_err)
-                                || stream_err
-                                    .downcast_ref::<StreamInterruptedAfterOutput>()
-                                    .is_some() =>
+                        if let Some(usage) = err.downcast_ref::<StreamSemanticEmptyCompletion>()
+                            .and_then(|error| error.usage.clone())
                         {
+                            scope.record_stream_semantic_rejection_usage(usage);
+                        }
+                        stream_result = consume_provider_streaming_response(
+                        active_model_provider,
+                        prepared_messages,
+                        request_tools,
+                        active_model,
+                        ctx.temperature,
+                        ctx.cancellation_token,
+                        ctx.on_delta,
+                        ctx.event_tx,
+                        ctx.strict_tool_parsing,
+                        ctx.draft_reasoning,
+                    )
+                    .await;
+                    }
+                    match stream_result {
+                        Ok(streamed) => streamed_chat_outcome(streamed),
+                        Err(stream_err) if is_terminal_stream_error(&stream_err) => {
                             if let Some(usage) = stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .and_then(|error| error.usage.clone())
@@ -1832,5 +1858,181 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+    struct EmptyThenStreamedTextProvider {
+        stream_calls: Arc<AtomicUsize>,
+        non_stream_calls: Arc<AtomicUsize>,
+        empty_streams: usize,
+        retry_fails_after_output: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyThenStreamedTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("fallback response".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn delegate_turns_should_stream(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let call = self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            let events = if call < self.empty_streams {
+                vec![Ok(StreamEvent::Final)]
+            } else if self.retry_fails_after_output {
+                vec![
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("partial"),
+                    )),
+                    Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                        "503 Service Unavailable".to_string(),
+                    )),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("streamed retry"),
+                    )),
+                    Ok(StreamEvent::Final),
+                ]
+            };
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    async fn call_streaming_once(provider: Box<dyn ModelProvider>) -> ProviderCallOutcome {
+        let provider =
+            ReliableModelProvider::new("test", vec![("primary".to_string(), provider)], 1, 1);
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+        call_provider(
+            &ctx,
+            &provider,
+            "stub",
+            "test-model",
+            ProviderRoute::Main,
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("provider call returns its terminal outcome")
+    }
+
+    #[tokio::test]
+    async fn empty_stream_on_streaming_delegate_provider_retries_the_stream() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = call_streaming_once(Box::new(EmptyThenStreamedTextProvider {
+            stream_calls: Arc::clone(&stream_calls),
+            non_stream_calls: Arc::clone(&non_stream_calls),
+            empty_streams: 1,
+            retry_fails_after_output: false,
+        }))
+        .await;
+
+        let response = outcome.chat_result.expect("retried stream succeeds");
+        assert_eq!(response.text.as_deref(), Some("streamed retry"));
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn two_empty_streams_fall_back_to_non_streaming_once() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = call_streaming_once(Box::new(EmptyThenStreamedTextProvider {
+            stream_calls: Arc::clone(&stream_calls),
+            non_stream_calls: Arc::clone(&non_stream_calls),
+            empty_streams: 2,
+            retry_fails_after_output: false,
+        }))
+        .await;
+
+        let response = outcome.chat_result.expect("non-stream fallback succeeds");
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn retried_stream_failing_after_output_does_not_replay_as_chat() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = call_streaming_once(Box::new(EmptyThenStreamedTextProvider {
+            stream_calls: Arc::clone(&stream_calls),
+            non_stream_calls: Arc::clone(&non_stream_calls),
+            empty_streams: 1,
+            retry_fails_after_output: true,
+        }))
+        .await;
+
+        assert!(outcome.chat_result.is_err());
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    impl Attributable for EmptyThenStreamedTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "EmptyThenStreamedTextProvider"
+        }
     }
 }

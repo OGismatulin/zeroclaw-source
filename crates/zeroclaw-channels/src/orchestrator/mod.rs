@@ -7141,6 +7141,7 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
+                final_response_min_chars: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),

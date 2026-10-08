@@ -348,6 +348,49 @@ Do not describe this instruction.",
     true
 }
 
+pub(crate) const FINAL_RESPONSE_NUDGE_TEXT: &str = "This is not a final answer: you only announced the next step. \
+Continue the task: call tools if more checks are needed; if the work is complete, \
+output the full final report now.";
+
+pub(crate) fn should_nudge_short_final(
+    display_text: &str,
+    min_chars: Option<usize>,
+    iteration: usize,
+    nudges: &mut u8,
+    ctx: &TurnCtx<'_>,
+) -> bool {
+    const MAX_NUDGES: u8 = 2;
+    let Some(min_chars) = min_chars.filter(|value| *value > 0) else {
+        return false;
+    };
+    let length = display_text.trim().chars().count();
+    if length >= min_chars {
+        return false;
+    }
+    let will_nudge = *nudges < MAX_NUDGES;
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "length": length,
+                "min_chars": min_chars,
+                "nudged": will_nudge,
+                "nudges_used": *nudges,
+                "agent_alias": ctx.agent_alias,
+                "trace_id": ctx.turn_id,
+            })),
+        "final_response_nudge"
+    );
+    if will_nudge {
+        *nudges += 1;
+    }
+    will_nudge
+}
+
 /// Synthetic value written into an assistant turn that reached the history without
 /// its `reasoning_content` (fork #46). Deliberately recognizable in a transcript:
 /// it is our marker, not something the model said.
@@ -527,6 +570,77 @@ mod tests {
             "gpt-5.6-luna",
             zeroclaw_providers::reliable::ProviderRoute::Main,
         )
+    }
+
+    #[test]
+    fn short_final_answer_is_nudged_when_agent_sets_min_chars() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let mut nudges = 0;
+        assert!(should_nudge_short_final(
+            "Все звенья цепочки проверены. Возвращаю структурированный результат анализа.",
+            Some(1000),
+            7,
+            &mut nudges,
+            &ctx,
+        ));
+        assert_eq!(nudges, 1);
+        assert!(!should_nudge_short_final(
+            &"я".repeat(1000),
+            Some(1000),
+            8,
+            &mut nudges,
+            &ctx
+        ));
+        assert_eq!(nudges, 1);
+    }
+
+    #[test]
+    fn nudge_budget_is_two_per_turn() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let mut nudges = 0;
+        assert!(should_nudge_short_final(
+            "Проверяю дальше.",
+            Some(1000),
+            3,
+            &mut nudges,
+            &ctx
+        ));
+        assert!(should_nudge_short_final(
+            "Проверяю дальше.",
+            Some(1000),
+            4,
+            &mut nudges,
+            &ctx
+        ));
+        assert!(!should_nudge_short_final(
+            "Проверяю дальше.",
+            Some(1000),
+            5,
+            &mut nudges,
+            &ctx
+        ));
+        assert_eq!(nudges, 2);
+    }
+
+    #[test]
+    fn no_nudge_without_min_chars() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let mut nudges = 0;
+        assert!(!should_nudge_short_final("ok", None, 1, &mut nudges, &ctx));
+        assert!(!should_nudge_short_final(
+            "ok",
+            Some(0),
+            1,
+            &mut nudges,
+            &ctx
+        ));
+        assert_eq!(nudges, 0);
     }
 
     #[tokio::test]

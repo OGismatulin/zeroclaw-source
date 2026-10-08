@@ -465,6 +465,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        final_response_min_chars: None,
         parent_agent_alias: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
@@ -862,6 +863,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                final_response_min_chars: None,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {

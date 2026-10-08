@@ -200,6 +200,7 @@ pub struct ToolLoop<'a> {
     /// for every turn to this agent; built once and reused. See
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
+    pub final_response_min_chars: Option<usize>,
     pub history: &'a mut Vec<ChatMessage>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
@@ -390,6 +391,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     p.exec.model_switch_callback = Some(Arc::clone(&model_switch_state));
     let ToolLoop {
         exec,
+        final_response_min_chars,
         history: raw_history,
         channel_name,
         channel_reply_target,
@@ -568,6 +570,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // broken history must fail honestly instead of spinning the loop.
     let mut reasoning_roundtrip_repaired = false;
     let mut empty_completion_nudges: u8 = 0;
+    let mut final_response_nudges = 0u8;
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
     // `exec_cache` parameter on `drive_live_sop_actions`): a step agent's
     // MCP-connecting re-assembly runs at most once per turn even when queued
@@ -1164,6 +1167,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if tool_calls.is_empty() {
+            if context_recovery::should_nudge_short_final(
+                &display_text,
+                final_response_min_chars,
+                iteration,
+                &mut final_response_nudges,
+                &ctx,
+            ) {
+                turn_state.push_dual(ChatMessage::assistant(assistant_history_content.clone()));
+                turn_state.push_dual(ChatMessage::user(
+                    context_recovery::FINAL_RESPONSE_NUDGE_TEXT,
+                ));
+                continue;
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -2197,6 +2213,7 @@ async fn drive_live_sop_actions(
                             let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
+                                    final_response_min_chars: None,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,

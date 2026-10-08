@@ -972,6 +972,7 @@ mcp_bundles = ["all"]
 # (analyst_terra was the third until 2026-09-23) — a codex outage takes out
 # the judge and 1 of 5 analysts.
 [agents.analyst_luna]
+final_response_min_chars = 1000
 model_provider = "openai.codex_luna"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
@@ -985,6 +986,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 # analyst_mimo_pro = MiMo V2.6 Pro on the Go router (2026-09-23), replaced
 # analyst_deepseek_pro in the ensemble roster.
 [agents.analyst_mimo_pro]
+final_response_min_chars = 1000
 model_provider = "opencode.mimo_pro"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
@@ -998,6 +1000,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 # analyst_glm (zai.default = glm-5.3): different model id, different host,
 # different subscription.
 [agents.analyst_glm_flash]
+final_response_min_chars = 1000
 model_provider = "opencode.glm_flash"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
@@ -1006,6 +1009,7 @@ mcp_bundles = ["all"]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_glm]
+final_response_min_chars = 1000
 model_provider = "zai.default"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
@@ -1014,6 +1018,7 @@ mcp_bundles = ["all"]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 [agents.analyst_sol]
+final_response_min_chars = 1000
 model_provider = "openai.codex_sol"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
@@ -1024,6 +1029,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 # analyst_muse = Muse Spark 1.3 Contributor on the Go router (2026-09-23),
 # replaced analyst_terra (gpt-5.6-terra) in the ensemble roster.
 [agents.analyst_muse]
+final_response_min_chars = 1000
 model_provider = "opencode.muse"
 risk_profile = "default"
 runtime_profile = "jira_analysis"

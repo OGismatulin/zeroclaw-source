@@ -2555,6 +2555,7 @@ impl Agent {
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
                 crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    final_response_min_chars: None,
                     exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                         crate::agent::loop_::ResolvedModelAccess {
                             model_provider: self.model_provider.as_ref(),
@@ -2992,6 +2993,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        final_response_min_chars: None,
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
