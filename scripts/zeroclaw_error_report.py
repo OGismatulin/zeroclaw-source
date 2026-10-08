@@ -310,7 +310,7 @@ def assess_completeness(
 
     instances = {_instance_of(series) for series in snapshot_series}
     if len(instances) > 1:
-        result.note(f"несколько instance: {len(instances)} — не суммируются")
+        result.note(f"несколько instance: {len(instances)} — суммируются после проверки каждого")
 
     http_ok = True
     for series in snapshot_series:
@@ -1618,9 +1618,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(result.get("message", ""))
     print(f"-- state: {result.get('state')} {result.get('detail', '')}", flush=True)
+    if result.get("query_error"):
+        print(f"-- query_error: {result['query_error']}", flush=True)
     attachment = result.get("attachment")
     if attachment:
         print(f"-- attachment: {attachment['state']} {attachment['detail']}", flush=True)
+    if result.get("state") == "dry-run" and result.get("query_error"):
+        return 2
     return 0 if result.get("state") in ("dry-run", "accepted") else 1
 
 

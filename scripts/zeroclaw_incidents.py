@@ -168,6 +168,7 @@ _GUARD_DIRECT_CMD_RE = re.compile(
 # alias — an unknown/missing alias must never be assumed to be the
 # coordinator.
 _CRON_DB_RE = re.compile(r"\bcron/jobs\.db\b")
+_CANCELLED_BY_USER = "request cancelled by user"
 # Exact literal (fix round 1, F3): equality against the WHOLE stripped
 # error, never a substring — the same JSON embedded in a larger genuinely
 # broken message is a real defect, not the idempotency fence.
@@ -333,14 +334,35 @@ def _normalize_input_path(value: object) -> str | None:
     return _safe_clip(cleaned, MAX_DETAIL_CHARS)
 
 
-_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;]")
+_GREP_HEAD_RE = re.compile(r"(?:git(?:\s+-C\s+\S+)?\s+)?grep\s")
+
+
+def _last_segment(command: str) -> str:
+    quote = None
+    start = 0
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif command.startswith(("||", "&&"), i):
+            start = i + 2
+            i += 2
+            continue
+        elif ch in "|;":
+            start = i + 1
+        i += 1
+    return command[start:]
 
 
 def _is_grep_no_match(command: object, output: object, error: object) -> bool:
     if not isinstance(command, str):
         return False
-    last = _SEGMENT_SPLIT_RE.split(command)[-1].lstrip()
-    if not (last.startswith("grep ") or last.startswith("git grep ")):
+    last = _last_segment(command).lstrip()
+    if not _GREP_HEAD_RE.match(last):
         return False
     if "2>" in last:
         return False
@@ -409,6 +431,8 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         and _is_grep_no_match(command, attrs.get("output"), attrs.get("error"))
     ):
         gate, gate_reason = True, "no_match"
+    if not gate and kind == "provider_failure" and clipped_error.strip() == _CANCELLED_BY_USER:
+        gate, gate_reason = True, "cancelled"
     return Incident(
         id=ident,
         ts=ts,
@@ -1365,7 +1389,9 @@ def build_digest(
     """
     skip = test_users if test_users is not None else resolve_test_users()
     tz = ZoneInfo(timezone_name)
-    dates = {start_utc.astimezone(tz).date(), end_utc.astimezone(tz).date()}
+    first = start_utc.astimezone(tz).date()
+    last = end_utc.astimezone(tz).date()
+    dates = [first + timedelta(days=n) for n in range((last - first).days + 1)]
     rows: list[dict] = []
     for day in dates:
         path = snapshot_dir(data_root) / f"{day.isoformat()}.jsonl"
