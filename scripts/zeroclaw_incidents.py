@@ -144,7 +144,7 @@ def classify_channel(row: dict, zc: dict) -> tuple[str, str | None]:
     them happen inside a cron job, and a separate "provider" section would
     empty the section the operator actually looks at.
     """
-    if zc.get("runtime_profile") == "jira_analysis":
+    if zc.get("runtime_profile") in {"jira_analysis", "jira_research"}:
         return "jira", zc.get("agent_alias")
     if zc.get("cron_job_id"):
         return "cron", zc.get("cron_job_id")

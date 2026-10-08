@@ -906,6 +906,40 @@ protect_last_n = 10
 "gpt-6.1-sol"             = 353_000
 "gpt-6-luna"            = 353_000
 
+[runtime_profiles.jira_research]
+agentic = true
+compact_context = false
+max_tool_iterations = 200
+max_actions_per_hour = 1_000_000
+max_history_messages = 200
+max_context_tokens = 1_048_576
+agentic_timeout_secs = 4800
+parallel_tools = true
+tool_dispatcher = "native"
+shell_timeout_secs = 600
+
+[runtime_profiles.jira_research.context_compression]
+threshold_ratio = 0.70
+protect_last_n = 10
+
+[runtime_profiles.jira_research.context_compression.model_windows]
+"deepseek-v4-flash"       = 800_000
+"mimo-v2.6-pro"           = 1_000_000
+"muse-spark-1.3-contributor" = 1_000_000
+"deepseek-v4.1-flash"     = 1_000_000
+"glm-5.3-flash"           = 1_000_000
+"deepseek-v4-pro"         = 800_000
+"gemini-3-flash-preview"  = 800_000
+"qwen3.7-plus"            = 1_000_000
+"minimax-m3"              = 1_000_000
+"glm-5.3"                 = 200_000
+"kimi-k3"                 = 256_000
+"qwen3.8-max"             = 256_000
+"hy3"                     = 256_000
+"gpt-5.5"                 = 256_000
+"gpt-6.1-sol"             = 353_000
+"gpt-6-luna"            = 353_000
+
 # ── Agents ──────────────────────────────────────────────────────────────────
 # Each agent carries ONLY model_provider / risk_profile / runtime_profile. Dead
 # per-agent allowed_tools + system_prompt dropped (behavior-neutral: the main
@@ -1052,7 +1086,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_topology_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_topology_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -1060,7 +1094,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_contract_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_contract_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -1068,7 +1102,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_acceptance_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_acceptance_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -1076,7 +1110,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_gap_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_gap_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -1084,7 +1118,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_evidence_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_evidence_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
@@ -1092,7 +1126,7 @@ path = "/zeroclaw-data/template/workspace/personas/analyst"
 [agents.jira_impact_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
-runtime_profile = "jira_analysis"
+runtime_profile = "jira_research"
 mcp_bundles = ["all"]
 [agents.jira_impact_researcher.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
