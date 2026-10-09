@@ -887,12 +887,16 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 
 #[tokio::test]
 async fn turn_rejects_empty_text_response() {
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
-        text: Some(String::new()),
-        tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
-    }]));
+    let model_provider = Box::new(ScriptedModelProvider::new(
+        (0..3)
+            .map(|_| ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+            .collect(),
+    ));
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
@@ -908,12 +912,16 @@ async fn turn_rejects_empty_text_response() {
 
 #[tokio::test]
 async fn turn_rejects_none_text_response() {
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
-        text: None,
-        tool_calls: vec![],
-        usage: None,
-        reasoning_content: None,
-    }]));
+    let model_provider = Box::new(ScriptedModelProvider::new(
+        (0..3)
+            .map(|_| ChatResponse {
+                text: None,
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+            .collect(),
+    ));
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
@@ -934,16 +942,20 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         TurnUsage,
     };
 
-    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
-        text: Some("<think>internal reasoning</think>".to_string()),
-        tool_calls: vec![],
-        usage: Some(zeroclaw_providers::traits::TokenUsage {
-            input_tokens: Some(10),
-            output_tokens: Some(5),
-            cached_input_tokens: None,
-        }),
-        reasoning_content: None,
-    }]));
+    let model_provider = Box::new(ScriptedModelProvider::new(
+        (0..3)
+            .map(|_| ChatResponse {
+                text: Some("<think>internal reasoning</think>".to_string()),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+            .collect(),
+    ));
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
     let cost_context = ToolLoopCostTrackingContext::usage_only();
     let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
@@ -961,8 +973,8 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         "provider completed without final text or tool calls"
     );
     let recorded = *turn_usage.lock();
-    assert_eq!(recorded.input_tokens, 10);
-    assert_eq!(recorded.output_tokens, 5);
+    assert_eq!(recorded.input_tokens, 30);
+    assert_eq!(recorded.output_tokens, 15);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
