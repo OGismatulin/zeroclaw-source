@@ -957,6 +957,8 @@ class OperatorErrorNotifier:
         user_id: str | None,
         payload: dict[str, object],
         operator: dict[str, object] | None,
+        detail: str | None = None,
+        hint: str | None = None,
     ) -> str:
         incident_id = cls._escape(payload.get("incident_id"), limit=32) or "invalid"
         code = cls._escape(payload.get("error_code"), limit=80) or "upstream_error"
@@ -971,6 +973,8 @@ class OperatorErrorNotifier:
             ("User", user_id, 40),
             ("Provider", payload.get("provider"), 160),
             ("Model", payload.get("model"), 160),
+            ("Detail", detail, 300),
+            ("Hint", hint, 200),
         )
         for label, value, limit in optional_rows:
             escaped = cls._escape(value, limit=limit)
@@ -1009,6 +1013,8 @@ class OperatorErrorNotifier:
         user_id: str | None,
         payload: dict[str, object],
         operator: dict[str, object] | None,
+        detail: str | None = None,
+        hint: str | None = None,
     ) -> bool:
         with self._lifecycle:
             if (
@@ -1025,6 +1031,8 @@ class OperatorErrorNotifier:
                 user_id=user_id,
                 payload=payload,
                 operator=operator,
+                detail=detail,
+                hint=hint,
             )
         finally:
             with self._lifecycle:
@@ -1038,6 +1046,8 @@ class OperatorErrorNotifier:
         user_id: str | None,
         payload: dict[str, object],
         operator: dict[str, object] | None,
+        detail: str | None = None,
+        hint: str | None = None,
     ) -> bool:
         code = payload["error_code"]
         key: tuple[str, str, str, str] | None = None
@@ -1076,6 +1086,8 @@ class OperatorErrorNotifier:
                 user_id=user_id,
                 payload=payload,
                 operator=operator,
+                detail=detail,
+                hint=hint,
             )
             self._queue.put_nowait((self._operator_user_id, card))
         except queue.Full:
@@ -3911,15 +3923,39 @@ class M365Refresher:
         min_age_secs: float = 20 * 3600.0,
         tokens: object | None = None,
         alert: Callable[[str, str, str, str | None], bool] | None = None,
+        state_path: Path | None = None,
     ) -> None:
         self._tokens: Any = tokens if tokens is not None else m365_tokens
         self._interval = max(interval_secs, 60.0)
         self._initial_delay = max(initial_delay_secs, 0.0)
         self._min_age = min_age_secs
         self._alert = alert
-        self._last_drift: tuple[str, ...] = ()
+        self._state_path = state_path
+        self._last_drift: tuple[str, ...] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _load_drift(self) -> tuple[str, ...]:
+        if self._state_path is None:
+            return ()
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            if isinstance(data, list) and all(isinstance(i, str) for i in data):
+                return tuple(data)
+        except (OSError, ValueError):
+            pass
+        return ()
+
+    def _save_drift(self, drift: tuple[str, ...]) -> None:
+        if self._state_path is None:
+            return
+        tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(list(drift)), encoding="utf-8")
+            os.replace(tmp, self._state_path)
+        except OSError:
+            pass
 
     def start(self) -> None:
         if self._thread is not None:
@@ -3975,16 +4011,19 @@ class M365Refresher:
             drift = tuple(self._tokens.upstream_drift())
         except Exception:
             return
+        if self._last_drift is None:
+            self._last_drift = self._load_drift()
         if drift and drift != self._last_drift:
             self._emit(
                 "m365_snapshot_drift",
                 f"upstream Microsoft 365 connector drifted from the snapshot: {', '.join(drift)}",
                 "Re-run capture-snapshot (spec §4.3) and rebuild the image",
             )
+        if drift != self._last_drift:
+            self._save_drift(drift)
         self._last_drift = drift
 
     def _emit(self, code: str, error: str, hint: str, user_key: str | None = None) -> bool:
-        # The operator card does not render error/hint, so the details go to stdout.
         print(f"[gateway-manager] m365: alert {code} {error}", flush=True)
         if self._alert is None:
             return False
@@ -4252,6 +4291,8 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 hint=hint,
             ),
             operator={"scope": "volume-janitor"},
+            detail=error,
+            hint=hint,
         )
 
     def _incident_alert(code: str, error: str, hint: str) -> None:
@@ -4265,6 +4306,8 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 hint=hint,
             ),
             operator={"scope": "incident-sweeper"},
+            detail=error,
+            hint=hint,
         )
 
     janitor: VolumeJanitor | None = None
@@ -4320,6 +4363,8 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
                 hint=hint,
             ),
             operator={"scope": "m365-refresher"},
+            detail=error,
+            hint=hint,
         )
 
     m365_refresher: M365Refresher | None = None
@@ -4327,6 +4372,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         m365_refresher = M365Refresher(
             interval_secs=_env_float("ZEROCLAW_M365_REFRESH_INTERVAL_HOURS", 6.0) * 3600.0,
             alert=_m365_alert,
+            state_path=settings.data_root / "state" / "manager" / "m365_drift.json",
         )
         m365_refresher.start()
     else:
