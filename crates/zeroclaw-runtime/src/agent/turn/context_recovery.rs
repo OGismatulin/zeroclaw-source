@@ -277,6 +277,13 @@ fn assistant_shape(content: &str) -> (bool, bool, &'static str) {
     }
 }
 
+fn is_recoverable_empty_completion(e: &anyhow::Error) -> bool {
+    zeroclaw_providers::reliable::is_empty_completion_error(e)
+        || e.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        })
+}
+
 /// Reasoning-round-trip recovery (fork patch #33).
 ///
 /// Thinking-mode providers reject a request whose previous assistant turn lost
@@ -313,7 +320,7 @@ pub(crate) async fn try_recover_empty_completion(
 ) -> bool {
     const MAX_NUDGES: u8 = 2;
 
-    if !zeroclaw_providers::reliable::is_empty_completion_error(e) {
+    if !is_recoverable_empty_completion(e) {
         return false;
     }
 
@@ -669,6 +676,34 @@ mod tests {
         assert!(!try_recover_empty_completion(&mut history, &err, 5, &mut nudges, &ctx).await);
         assert_eq!(nudges, 2);
         assert_eq!(history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn semantic_empty_terminal_completion_is_nudged_twice_then_gives_up() {
+        use anyhow::Context as _;
+
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let exempt: Vec<String> = Vec::new();
+        let ctx = repair_ctx(&pacing, &exempt, None);
+        let bare =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let wrapped = Err::<(), _>(anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+        ))
+        .context("provider call")
+        .expect_err("context keeps the marker in the chain");
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("do the thing"),
+        ];
+        let mut nudges = 0u8;
+
+        assert!(try_recover_empty_completion(&mut history, &bare, 5, &mut nudges, &ctx).await);
+        assert!(try_recover_empty_completion(&mut history, &wrapped, 6, &mut nudges, &ctx).await);
+        assert!(!try_recover_empty_completion(&mut history, &bare, 7, &mut nudges, &ctx).await);
+        assert_eq!(nudges, 2);
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[3].role, "user");
     }
 
     #[tokio::test]

@@ -6076,6 +6076,111 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn vision_route_empty_completion_is_nudged_and_turn_completes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "the image shows a green square"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let main_provider = NonVisionModelProvider {
+            calls: Arc::clone(&calls),
+        };
+        let configured_vision_provider = format!("custom:{}/v1?api_key=secret", server.uri());
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            vision_model_provider: Some(configured_vision_provider),
+            vision_model: Some("configured-vision-model".to_string()),
+            ..Default::default()
+        };
+        let mut history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+
+        let answer =
+            run_terminal_test_turn_with_multimodal(&main_provider, &mut history, None, &multimodal)
+                .await
+                .expect("empty vision answer must be nudged");
+
+        assert_eq!(answer, "the image shows a green square");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = String::from_utf8_lossy(&requests[1].body);
+        assert!(second.contains("image_url"), "{second}");
+        assert!(second.contains("iVBORw0KGgo="), "{second}");
+        assert!(
+            second.contains("Your previous response carried no text"),
+            "{second}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn vision_route_persistent_empty_completion_exhausts_nudges() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let main_provider = NonVisionModelProvider {
+            calls: Arc::clone(&calls),
+        };
+        let configured_vision_provider = format!("custom:{}/v1?api_key=secret", server.uri());
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            vision_model_provider: Some(configured_vision_provider),
+            vision_model: Some("configured-vision-model".to_string()),
+            ..Default::default()
+        };
+        let mut history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+
+        let error =
+            run_terminal_test_turn_with_multimodal(&main_provider, &mut history, None, &multimodal)
+                .await
+                .expect_err("persistent empty vision answer must end the turn");
+
+        assert!(
+            error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }),
+            "{error:#}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn previous_turn_stuck_typed_marker_survives_anyhow_context() {
         use anyhow::Context as _;
