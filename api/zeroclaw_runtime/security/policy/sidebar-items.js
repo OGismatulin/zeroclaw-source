@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AutonomyLevel","CommandRiskLevel","EscalationViolation","PolicyDenialReason","ToolOperation"],"fn":["policy_denial_json"],"struct":["ActionReservation","ActionTracker","CommandDenial","PerSenderTracker","SecurityPolicy"]};
