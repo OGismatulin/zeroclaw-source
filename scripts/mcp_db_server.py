@@ -590,15 +590,76 @@ def check_ch_sql_safety(sql: str) -> None:
         )
 
 
+CH_NO_CREDENTIALS_MSG = (
+    "ClickHouse credentials are not configured (CH_USER/CH_PASSWORD are empty). "
+    "Every ClickHouse tool will fail the same way: stop retrying and tell the user "
+    "that the operator must run `make fly-ch-creds`."
+)
+CH_AUTH_REJECTED_MSG = (
+    "ClickHouse rejected the credentials (Code: 516 AUTHENTICATION_FAILED): the "
+    "account was rotated or the Fly secrets CH_USER/CH_PASSWORD are stale. Every "
+    "ClickHouse tool will fail the same way: stop retrying and tell the user that "
+    "the operator must run `make fly-ch-creds`."
+)
+CH_NO_GRANT_HINT = (
+    "Code 497 means this account has no grant on the object, not that the data is "
+    "missing. Do not retry the same object."
+)
+
+
 def _ch_connection_params() -> dict[str, str]:
+    user = os.environ.get("CH_USER", "").strip()
+    password = os.environ.get("CH_PASSWORD", "")
+    if not user or not password:
+        raise ValueError(CH_NO_CREDENTIALS_MSG)
     return {
         "host": os.environ.get("CH_HOST", "ch-prod.yallasvc.net"),
         "port": os.environ.get("CH_PORT", "8123"),
-        "user": os.environ.get("CH_USER", "app_data_uploader_20250626"),
-        "password": os.environ.get(
-            "CH_PASSWORD", "XTGBs7JjcCT5XiT3L8d8HYc7KQdpAk0t"
-        ),
+        "user": user,
+        "password": password,
     }
+
+
+def _ch_request(
+    sql: str, db: str | None, params: dict[str, str]
+) -> urllib.request.Request:
+    url = f"http://{params['host']}:{params['port']}/"
+    if db:
+        url += "?" + urllib.parse.urlencode({"database": db})
+    return urllib.request.Request(
+        url,
+        data=sql.encode("utf-8"),
+        method="POST",
+        headers={
+            "X-ClickHouse-User": params["user"],
+            "X-ClickHouse-Key": params["password"],
+        },
+    )
+
+
+def _ch_error_message(code: int, body: str) -> str:
+    if "Code: 516" in body:
+        return f"{CH_AUTH_REJECTED_MSG}\n{body}"
+    if "Code: 497" in body:
+        return f"ClickHouse error (HTTP {code}): {body}\n{CH_NO_GRANT_HINT}"
+    return f"ClickHouse error (HTTP {code}): {body}"
+
+
+def _ch_health_state() -> str:
+    try:
+        params = _ch_connection_params()
+    except ValueError:
+        return "no_credentials"
+    try:
+        req = _ch_request("SELECT 1", None, params)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return "auth_failed" if "Code: 516" in body else "unreachable"
+    except Exception:
+        return "unreachable"
+    return "reachable"
 
 
 def _validate_ch_identifier(name: str) -> str:
@@ -628,23 +689,12 @@ def execute_ch_query(sql: str, db: str | None = None) -> str:
     if not CH_FORMAT_RE.search(stripped):
         stripped += "\nFORMAT TSVWithNames"
 
-    params = _ch_connection_params()
-    qs_params: dict[str, str] = {
-        "user": params["user"],
-        "password": params["password"],
-    }
-    if db:
-        qs_params["database"] = db
-    url = f"http://{params['host']}:{params['port']}/?{urllib.parse.urlencode(qs_params)}"
-
-    req = urllib.request.Request(url, data=stripped.encode("utf-8"), method="POST")
+    req = _ch_request(stripped, db, _ch_connection_params())
     try:
         return _ch_post_with_retry(req, timeout=30).decode("utf-8")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise ValueError(
-            f"ClickHouse error (HTTP {e.code}): {body}"
-        ) from None
+        raise ValueError(_ch_error_message(e.code, body)) from None
 
 
 # ---------------------------------------------------------------------------
@@ -1062,14 +1112,7 @@ def execute_ch_query_to_file(
         f"\nFORMAT {ch_format}"
     )
 
-    params = _ch_connection_params()
-    qs: dict[str, str] = {"user": params["user"], "password": params["password"]}
-    if db:
-        qs["database"] = db
-    url = f"http://{params['host']}:{params['port']}/?{urllib.parse.urlencode(qs)}"
-    req = urllib.request.Request(
-        url, data=stripped.encode("utf-8"), method="POST"
-    )
+    req = _ch_request(stripped, db, _ch_connection_params())
 
     start = _time.monotonic()
     tmp_path = abs_path if fmt != "xlsx" else abs_path + ".tmp.csv"
@@ -1088,7 +1131,7 @@ def execute_ch_query_to_file(
                 close()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise ValueError(f"ClickHouse HTTP {e.code}: {body}") from None
+        raise ValueError(_ch_error_message(e.code, body)) from None
     except (OSError, socket.error):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1429,15 +1472,7 @@ def health() -> str:
     except Exception:
         result["prod_catalog"] = "unreachable"
 
-    # Check ClickHouse HTTP
-    ch_params = _ch_connection_params()
-    try:
-        ch_url = f"http://{ch_params['host']}:{ch_params['port']}/ping"
-        ch_req = urllib.request.Request(ch_url, method="GET")
-        with urllib.request.urlopen(ch_req, timeout=5):
-            result["clickhouse"] = "reachable"
-    except Exception:
-        result["clickhouse"] = "unreachable"
+    result["clickhouse"] = _ch_health_state()
 
     result["routes"] = {
         "prod": "tun0" if _route_uses_tun0(
