@@ -19,6 +19,7 @@ ignore = [
     # ── cargo-audit reads the full Cargo.lock, so it flags advisories for
     # crates that cargo-deny (graph-aware) does not pull into the resolved
     # dependency graph. These entries are needed only in audit.toml. ──
+    "RUSTSEC-2026-0344",  # ruzstd 0.8.3 decompression bomb; reached only via object 0.39 zstd feature, absent from the resolved build graph (cargo-deny clean); drop once object takes ruzstd >=0.9.1
     "RUSTSEC-2026-0253",  # lru 0.16; residual Nostr cache path is absent from cargo-deny's resolved graph; migration tracked in #9602
     "RUSTSEC-2026-0049",  # rustls-webpki CRL matching bug; 0.102.x in Cargo.lock but not in resolved graph; awaiting rumqttc upgrade
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; same as above
