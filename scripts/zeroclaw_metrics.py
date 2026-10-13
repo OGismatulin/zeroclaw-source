@@ -106,6 +106,7 @@ ERROR_CATALOG: dict[str, str] = {
     "upstream_error": "daemon",
     "upload_rejected": "request",
     "upload_failed": "manager",
+    "voice_transcription_failed": "manager",
     "manager_internal_error": "manager",
     "daemon_start_failed": "manager",
     "daemon_capacity_exceeded": "manager",

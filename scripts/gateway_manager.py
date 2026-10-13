@@ -7,11 +7,13 @@ import email.parser
 import email.policy
 import functools
 import html
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import mimetypes
 import os
 from pathlib import Path
 import queue
@@ -883,6 +885,9 @@ class PairingState:
 OperatorTransport = Callable[[int, str, float], None]
 
 
+_DEDUPED_ALERT_CODES = frozenset({"provider_rate_limited", "voice_transcription_failed"})
+
+
 class OperatorErrorNotifier:
     """Non-blocking, bounded operator delivery independent of turn progress."""
 
@@ -1053,7 +1058,7 @@ class OperatorErrorNotifier:
         key: tuple[str, str, str, str] | None = None
         reservation: object | None = None
         now = self._clock()
-        if code == "provider_rate_limited":
+        if code in _DEDUPED_ALERT_CODES:
             key = self._dedupe_key(user_id=user_id, payload=payload)
             reservation = object()
             with self._dedupe_lock:
@@ -2129,6 +2134,7 @@ class GatewayManagerServer:
         volume_janitor: object | None = None,
         incident_sweeper: object | None = None,
         m365_refresher: object | None = None,
+        transcribe_audio: Callable[[bytes, str], str] | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
@@ -2138,8 +2144,77 @@ class GatewayManagerServer:
         self.volume_janitor = volume_janitor
         self.incident_sweeper = incident_sweeper
         self.m365_refresher = m365_refresher
+        self.transcribe_audio = transcribe_audio
         self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
         self.error_report_worker: threading.Thread | None = None
+
+    def _transcribe_voice(
+        self,
+        *,
+        body: bytes,
+        payload: dict[str, object],
+        message: str,
+        user_key: str,
+        user_id: str,
+    ) -> bytes:
+        if self.transcribe_audio is None:
+            return body
+        started = time.monotonic()
+        try:
+            files = find_audio_attachments(message)
+            if not files:
+                return body
+            uploads_dir = self.settings.workspaces_root / user_key / "workspace" / "uploads"
+            new_message, ok, failures = apply_voice_transcription(
+                message, uploads_dir, self.transcribe_audio
+            )
+            new_body = json.dumps(
+                {**payload, "message": new_message}, ensure_ascii=False
+            ).encode()
+        except Exception as exc:
+            print(
+                f"[gateway-manager] voice: user={user_id} "
+                f"error={exc.__class__.__name__}: "
+                f"{_bounded_string(str(exc), limit=300) or ''}",
+                flush=True,
+            )
+            return body
+        detail = "; ".join(failures)
+        error_payload = (
+            build_error_payload(
+                code="voice_transcription_failed",
+                component="manager",
+                retryable=True,
+                error=detail,
+                hint=VOICE_FAILURE_HINT,
+            )
+            if failures
+            else None
+        )
+        incident = f" incident_id={error_payload['incident_id']}" if error_payload else ""
+        print(
+            f"[gateway-manager] voice: user={user_id} files={len(files)} ok={ok} "
+            f"failed={len(failures)} ms={int((time.monotonic() - started) * 1000)}"
+            f"{incident}",
+            flush=True,
+        )
+        notifier = self.operator_error_notifier
+        if error_payload and notifier is not None and hasattr(notifier, "notify"):
+            try:
+                notifier.notify(
+                    user_id=user_id,
+                    payload=error_payload,
+                    operator={"scope": "voice-transcription"},
+                    detail=detail,
+                    hint=VOICE_FAILURE_HINT,
+                )
+            except Exception as exc:
+                print(
+                    "[gateway-manager] voice: operator notify failed "
+                    f"error_class={exc.__class__.__name__}",
+                    flush=True,
+                )
+        return new_body
 
     def finalize_error(
         self,
@@ -2443,6 +2518,13 @@ class GatewayManagerServer:
             )
         except Exception as exc:
             return self.handle_internal_error("/webhook", exc)
+        body = self._transcribe_voice(
+            body=body,
+            payload=payload,
+            message=message,
+            user_key=user_key,
+            user_id=user_id,
+        )
         forwarded_headers: dict[str, str] = {}
         webhook_secret = headers.get("x-webhook-secret")
         if webhook_secret:
@@ -3636,6 +3718,113 @@ def _post_operator_telegram(
     return True
 
 
+VOICE_TRANSCRIPTION_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+VOICE_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
+VOICE_TRANSCRIPTION_LANGUAGE = "ru"
+VOICE_MAX_AUDIO_BYTES = 25 * 1024 * 1024
+VOICE_FAILURE_HINT = (
+    "Проверь баланс OpenRouter (аудио требует >= $0.50): "
+    "https://openrouter.ai/settings/credits; 401 - ключ OPENROUTER_API_KEY"
+)
+_AUDIO_SINGLE_RE = re.compile(r"^- path: (uploads/.+)\n- type: audio/", re.MULTILINE)
+_AUDIO_MULTI_RE = re.compile(r"^\d+\. (uploads/.+?) \(audio/[^,]*,", re.MULTILINE)
+_BRAND_RE = re.compile(r"\b(?:ла-?ла-?ф[еэоа]|лавафо)\b", re.IGNORECASE)
+
+
+_SDK_USER_MESSAGE_RE = re.compile(r"(?:^|\n)Current user message:\n")
+
+
+class VoiceTranscriptionError(Exception):
+    pass
+
+
+def find_audio_attachments(message: str) -> list[str]:
+    message = _SDK_USER_MESSAGE_RE.split(message, maxsplit=1)[0]
+    found = _AUDIO_SINGLE_RE.findall(message) + _AUDIO_MULTI_RE.findall(message)
+    return list(dict.fromkeys(path.strip() for path in found))
+
+
+def resolve_upload_path(uploads_dir: Path, rel_path: str) -> Path | None:
+    name = rel_path.removeprefix("uploads/")
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        return None
+    candidate = (uploads_dir / name).resolve()
+    if candidate.parent != uploads_dir.resolve() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def apply_voice_transcription(
+    message: str,
+    uploads_dir: Path,
+    transcribe: Callable[[bytes, str], str],
+) -> tuple[str, int, list[str]]:
+    lines: list[str] = []
+    failures: list[str] = []
+    ok = 0
+    for rel in find_audio_attachments(message):
+        path = resolve_upload_path(uploads_dir, rel)
+        if path is None:
+            lines.append(f"[Voice transcription failed: {rel} not found in uploads]")
+            continue
+        if path.stat().st_size > VOICE_MAX_AUDIO_BYTES:
+            lines.append(f"[Voice transcription skipped: {rel} is larger than 25 MB]")
+            continue
+        try:
+            text = transcribe(path.read_bytes(), path.name).strip()
+        except VoiceTranscriptionError as exc:
+            failures.append(f"{rel}: {exc}")
+            lines.append(f"[Voice transcription failed: {exc}]")
+            continue
+        ok += 1
+        lines.append(f"[Voice] {_BRAND_RE.sub('lalafo', text)}" if text else "[Voice] (empty)")
+    if not lines:
+        return message, ok, failures
+    return message + "\n\n" + "\n".join(lines), ok, failures
+
+
+def openrouter_transcribe(
+    audio: bytes, file_name: str, *, api_key: str, timeout: float = 60.0
+) -> str:
+    boundary = secrets.token_hex(16)
+    safe_name = file_name.replace('"', "_")
+    mime = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    fields = (
+        ("model", VOICE_TRANSCRIPTION_MODEL),
+        ("language", VOICE_TRANSCRIPTION_LANGUAGE),
+    )
+    head = "".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"'
+        f"\r\n\r\n{value}\r\n"
+        for key, value in fields
+    )
+    head += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{safe_name}"\r\nContent-Type: {mime}\r\n\r\n'
+    )
+    req = request.Request(
+        VOICE_TRANSCRIPTION_URL,
+        data=head.encode() + audio + f"\r\n--{boundary}--\r\n".encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+    except error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise VoiceTranscriptionError(f"HTTP {exc.code}: {detail}"[:300]) from exc
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        raise VoiceTranscriptionError(f"{exc.__class__.__name__}: {exc}"[:300]) from exc
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str):
+        raise VoiceTranscriptionError("response without text")
+    return text.strip()
+
+
 def forward_webhook_to_child(
     instance: DaemonInstance,
     *,
@@ -3724,6 +3913,13 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _voice_transcriber_from_env() -> Callable[[bytes, str], str] | None:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key or not _env_bool("ZEROCLAW_VOICE_TRANSCRIPTION_ENABLED", True):
+        return None
+    return functools.partial(openrouter_transcribe, api_key=api_key)
 
 
 class VolumeJanitor:
@@ -4382,6 +4578,12 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         data_root=settings.data_root, alert=_incident_alert
     )
 
+    transcribe_audio = _voice_transcriber_from_env()
+    print(
+        "[gateway-manager] voice: transcription "
+        + ("enabled" if transcribe_audio is not None else "disabled"),
+        flush=True,
+    )
     server = GatewayManagerServer(
         settings=settings,
         pairing_state=pairing_state,
@@ -4391,6 +4593,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         volume_janitor=janitor,
         incident_sweeper=incident_sweeper,
         m365_refresher=m365_refresher,
+        transcribe_audio=transcribe_audio,
     )
     server.metrics_exporter = _start_metrics_exporter(settings, registry)
     server.error_report_worker = _start_error_report_worker(
