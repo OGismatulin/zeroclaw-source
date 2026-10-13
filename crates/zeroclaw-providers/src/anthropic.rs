@@ -572,6 +572,21 @@ impl AnthropicBuilder {
     }
 }
 
+fn apply_opencode_headers(
+    request: reqwest::RequestBuilder,
+    session: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match session {
+        Some(session) => request
+            .header(crate::opencode_session::OPENCODE_SESSION_HEADER, session)
+            .header(
+                reqwest::header::USER_AGENT,
+                crate::opencode_session::OPENCODE_USER_AGENT,
+            ),
+        None => request,
+    }
+}
+
 impl AnthropicModelProvider {
     /// Entry point. Only `alias` is required; every other field is set
     /// via a labelled chain method on the returned [`AnthropicBuilder`].
@@ -583,6 +598,10 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
         }
+    }
+
+    fn opencode_session_value(&self) -> Option<String> {
+        crate::opencode_session::session_token(&self.base_url)
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -2459,6 +2478,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&request);
 
+        request = apply_opencode_headers(request, self.opencode_session_value().as_deref());
         request = self.apply_auth(request, credential, false);
 
         let response = request.send().await?;
@@ -2561,6 +2581,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&native_request);
+        let req = apply_opencode_headers(req, self.opencode_session_value().as_deref());
 
         let response = self
             .apply_auth(req, credential, thinking_display_beta)
@@ -2649,6 +2670,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
+            request = apply_opencode_headers(request, self.opencode_session_value().as_deref());
             request = self.apply_auth(request, credential, false);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
@@ -2757,6 +2779,7 @@ impl ModelProvider for AnthropicModelProvider {
             let client = self.http_client();
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
+            let opencode_session = self.opencode_session_value();
 
             return stream::once(async move {
                 let mut req = client
@@ -2764,6 +2787,7 @@ impl ModelProvider for AnthropicModelProvider {
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
                     .json(&body);
+                req = apply_opencode_headers(req, opencode_session.as_deref());
                 if is_oauth {
                     req = req
                         .header("Authorization", format!("Bearer {credential}"))
@@ -2878,6 +2902,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
+        let opencode_session = self.opencode_session_value();
         let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
@@ -2899,6 +2924,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
                 .json(&body);
+            req = apply_opencode_headers(req, opencode_session.as_deref());
 
             if is_oauth {
                 req = req
@@ -3573,6 +3599,61 @@ data: {\"type\":\"message_stop\"}\n\n";
             .build();
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
+    }
+
+    #[test]
+    fn opencode_base_url_yields_a_session_value() {
+        let provider = AnthropicModelProvider::builder("haiku")
+            .base_url("https://opencode.ai/zen/go")
+            .build();
+        assert!(provider.opencode_session_value().is_some());
+    }
+
+    #[test]
+    fn anthropic_and_mock_base_urls_yield_no_session_value() {
+        let published = AnthropicModelProvider::builder("default").build();
+        assert!(published.opencode_session_value().is_none());
+        let mock = AnthropicModelProvider::builder("default")
+            .base_url("http://127.0.0.1:9")
+            .build();
+        assert!(mock.opencode_session_value().is_none());
+    }
+
+    #[test]
+    fn opencode_headers_carry_session_and_user_agent() {
+        let client = reqwest::Client::new();
+        let request = apply_opencode_headers(
+            client.post("http://127.0.0.1:9/v1/messages"),
+            Some("abc123"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(crate::opencode_session::OPENCODE_SESSION_HEADER)
+                .unwrap(),
+            "abc123"
+        );
+        assert_eq!(
+            request.headers().get(reqwest::header::USER_AGENT).unwrap(),
+            crate::opencode_session::OPENCODE_USER_AGENT
+        );
+    }
+
+    #[test]
+    fn missing_session_leaves_request_untouched() {
+        let client = reqwest::Client::new();
+        let request = apply_opencode_headers(client.post("http://127.0.0.1:9/v1/messages"), None)
+            .build()
+            .unwrap();
+        assert!(
+            request
+                .headers()
+                .get(crate::opencode_session::OPENCODE_SESSION_HEADER)
+                .is_none()
+        );
+        assert!(request.headers().get(reqwest::header::USER_AGENT).is_none());
     }
 
     #[test]

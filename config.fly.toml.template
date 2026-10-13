@@ -229,6 +229,19 @@ wire_api = "responses"
 provider_extra = { reasoning_effort = "high" }
 timeout_secs = 300
 
+# /model button alias for Claude Haiku 5.5 (2026-10-13). The Go router serves this
+# model on the Anthropic Messages wire only (/zen/go/v1/messages; chat and responses
+# answer ModelProtocolUnsupported), so the alias belongs to the anthropic family:
+# uri is the router root without /v1 because that provider appends /v1/messages.
+# Credential: the opencode Go key (fork patch #61), session and User-Agent headers
+# are sent for opencode targets. NO fallback: the alias branch reads only a
+# per-alias `fallback`.
+[providers.models.anthropic.haiku]
+model = "claude-haiku-5-5"
+uri = "https://opencode.ai/zen/go"
+api_key = ""
+timeout_secs = 300
+
 # GLM via the z.ai Coding Plan subscription. The provider name decides the endpoint:
 # `zai` → https://api.z.ai/api/coding/paas/v4 (subscription, ZAI_API_KEY), while `glm`
 # → https://api.z.ai/api/paas/v4 (pay-per-use credits). Probing the pay-per-use path
