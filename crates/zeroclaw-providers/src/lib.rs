@@ -1701,6 +1701,7 @@ fn create_model_provider_inner(
         let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
         if !is_custom
             && !has_custom_url
+            && credential_kind == provider_kind
             && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
         {
             let visible = &key_value[..key_value.len().min(8)];
@@ -3105,6 +3106,39 @@ mod tests {
             credential_kind_for_endpoint("anthropic", Some(" https://opencode.ai/zen/go ")),
             "opencode"
         );
+    }
+
+    #[test]
+    fn anthropic_alias_on_opencode_accepts_the_go_key_despite_its_openai_prefix() {
+        use super::test_util::{EnvGuard, env_lock};
+        let _guard = env_lock();
+        let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+        let _key = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-go-router-key"));
+        let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+        let options = ModelProviderRuntimeOptions {
+            provider_kind: Some("anthropic".to_string()),
+            provider_api_url: Some("https://opencode.ai/zen/go".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let result = create_model_provider_inner(None, "anthropic", "haiku", None, None, &options);
+        assert!(result.is_ok(), "{}", result.err().unwrap());
+    }
+
+    #[test]
+    fn anthropic_without_opencode_endpoint_still_rejects_a_mismatched_key_prefix() {
+        let options = ModelProviderRuntimeOptions {
+            provider_kind: Some("anthropic".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let result = create_model_provider_inner(
+            None,
+            "anthropic",
+            "default",
+            Some("sk-or-v1-wrong"),
+            None,
+            &options,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
