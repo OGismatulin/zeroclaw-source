@@ -452,7 +452,7 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         error=clipped_error,
         detail=_safe_clip(command, MAX_DETAIL_CHARS) if command else None,
         location=location,
-        turn_id=row.get("turn_id") or row.get("trace_id"),
+        turn_id=_turn_key(row),
         gate=gate,
         gate_reason=gate_reason,
         tool_call_id=call_id or None,
@@ -770,6 +770,14 @@ def _line_label(line: str, index: int) -> str:
     return f"строка {index + 1}"
 
 
+def _turn_key(row: dict) -> str | None:
+    return row.get("trace_id") or row.get("turn_id")
+
+
+def _is_table_separator(line: str) -> bool:
+    return set(line.strip()) <= set("|:- ")
+
+
 class TurnTracker:
     def __init__(self) -> None:
         self._skill: dict[str, str] = {}
@@ -778,7 +786,7 @@ class TurnTracker:
     def observe(self, row: dict, user: str) -> Incident | None:
         attrs = row.get("attributes")
         attrs = attrs if isinstance(attrs, dict) else {}
-        turn = row.get("trace_id") or row.get("turn_id")
+        turn = _turn_key(row)
         if not turn:
             return None
         message = row.get("message")
@@ -811,7 +819,7 @@ class TurnTracker:
         missing = [
             _line_label(line, index)
             for index, line in enumerate(block)
-            if " ".join(line.split()) not in final
+            if not _is_table_separator(line) and " ".join(line.split()) not in final
         ]
         if not missing:
             return None

@@ -489,7 +489,7 @@ def main() -> int:
             "bootstrap_would_reinstall", args.user, template.name,
             error=(f"[auto_bootstrap] of this template installs it again for {args.user} "
                    f"on the next daemon spawn; add \"{args.user}\" to exclude in "
-                   "template.toml and sync the template first, or pass --force"),
+                   "template.toml and sync the template first"),
         )
         rc = 2
     elif args.uninstall:
