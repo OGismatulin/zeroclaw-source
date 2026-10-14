@@ -98,6 +98,7 @@ class Incident:
     input_path: str | None = None
     parent_tool: str | None = None
     gate_reason: str | None = None
+    skill: str | None = None
 
     def as_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -464,7 +465,9 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
 
 CRON_FAILURE_STATUSES = ("error", "degraded")
 CRON_OK_STATUS = "ok"
-CRON_DEGRADED_JOBS = frozenset({"lalafo-errors-digest", "lalafo-commits-digest"})
+CRON_DEGRADED_JOBS = frozenset(
+    {"lalafo-errors-digest", "lalafo-commits-digest", "reach-merch-daily-brief"}
+)
 
 
 def _is_degraded_output(output: object) -> bool:
@@ -724,6 +727,110 @@ def delegate_never_created(workspace: Path, name: str) -> bool:
     return name == "delegate"
 
 
+RESPONSE_DRIFT_KIND = "response_contract_drift"
+_UNKNOWN_SKILL_RE = re.compile(r"Unknown skill '([^']+)'")
+_BLOCK_BEGIN = "USER_RESPONSE_BEGIN"
+_BLOCK_END = "USER_RESPONSE_END"
+
+
+def _skill_name(arguments: object) -> str | None:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    if isinstance(arguments, dict) and isinstance(arguments.get("name"), str):
+        return arguments["name"]
+    return None
+
+
+def _response_block(output: object) -> list[str] | None:
+    if not isinstance(output, str):
+        return None
+    lines = output.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == _BLOCK_BEGIN]
+    if not starts:
+        return None
+    body: list[str] = []
+    for line in lines[starts[-1] + 1:]:
+        if line.strip() == _BLOCK_END:
+            return [item for item in body if item.strip()]
+        body.append(line)
+    return None
+
+
+def _line_label(line: str, index: int) -> str:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    label = cells[0]
+    is_row = line.lstrip().startswith("|") and len(cells) > 1
+    is_text = bool(label) and not set(label) <= set(":-")
+    is_value = len(label) > 40 or "`" in label or "@" in label or any(ch.isdigit() for ch in label)
+    if is_row and is_text and not is_value:
+        return label
+    return f"строка {index + 1}"
+
+
+class TurnTracker:
+    def __init__(self) -> None:
+        self._skill: dict[str, str] = {}
+        self._block: dict[str, list[str]] = {}
+
+    def observe(self, row: dict, user: str) -> Incident | None:
+        attrs = row.get("attributes")
+        attrs = attrs if isinstance(attrs, dict) else {}
+        turn = row.get("trace_id") or row.get("turn_id")
+        if not turn:
+            return None
+        message = row.get("message")
+        if message == "tool_call_start" and attrs.get("tool") == "read_skill":
+            name = _skill_name(attrs.get("arguments"))
+            if name:
+                self._skill[turn] = name
+        elif message == "tool_call_result" and attrs.get("tool") == "shell":
+            block = _response_block(attrs.get("output"))
+            if block is not None:
+                self._block[turn] = block
+        elif message == "turn_final_response" and turn in self._block:
+            return self._drift(row, user, turn, self._block.pop(turn), attrs)
+        return None
+
+    def annotate(self, incident: Incident) -> Incident:
+        if incident.kind != "tool_failure":
+            return incident
+        missing = _UNKNOWN_SKILL_RE.search(incident.error) if incident.tool == "read_skill" else None
+        if missing:
+            return replace(incident, skill=missing.group(1))
+        skill = self._skill.get(incident.turn_id or "")
+        return replace(incident, skill=skill) if skill else incident
+
+    @staticmethod
+    def _drift(row: dict, user: str, turn: str, block: list[str], attrs: dict) -> Incident | None:
+        final = " ".join(str(attrs.get("text") or "").split())
+        if not final:
+            return None
+        missing = [
+            _line_label(line, index)
+            for index, line in enumerate(block)
+            if " ".join(line.split()) not in final
+        ]
+        if not missing:
+            return None
+        zc = row.get("zeroclaw")
+        zc = zc if isinstance(zc, dict) else {}
+        channel, channel_ref = classify_channel(row, zc)
+        return Incident(
+            id=f"{turn}:{RESPONSE_DRIFT_KIND}",
+            ts=str(row.get("@timestamp") or row.get("timestamp") or ""),
+            user=user, source="trace", severity="WARN",
+            channel=channel, channel_ref=channel_ref, kind=RESPONSE_DRIFT_KIND,
+            tool="shell", agent_alias=zc.get("agent_alias"), model=attrs.get("model"),
+            provider=None, error_kind=None, error_disposition=None,
+            error=f"ответ без {len(missing)} из {len(block)} строк блока USER_RESPONSE",
+            detail=_safe_clip(", ".join(missing), MAX_DETAIL_CHARS),
+            location=None, turn_id=turn, gate=False,
+        )
+
+
 def sweep(
     data_root: Path,
     now: datetime,
@@ -808,6 +915,7 @@ def sweep(
             if trace.is_file():
                 malformed = 0
                 last_provider_failure: dict[tuple, datetime] = {}
+                turns = TurnTracker()
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
                         if not line.strip():
@@ -835,9 +943,13 @@ def sweep(
                             ):
                                 _sink_marker(marker)
                             continue
+                        drift = turns.observe(row, user)
+                        if drift is not None:
+                            _sink(drift)
                         incident = normalize_trace_row(row, user)
                         if incident is None:
                             continue
+                        incident = turns.annotate(incident)
                         if incident.kind.startswith("provider"):
                             failed_ts = _parse_ts(incident.ts)
                             if failed_ts:
@@ -908,6 +1020,11 @@ _NUM_RE = re.compile(r"\d+")
 MAX_SIGNATURE_CHARS = 120
 
 HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"Unknown skill '"),
+     "скилл не найден в воркспейсе пользователя — проверить доставку шаблона:"
+     " `fly_skill_inspect.py --skill <имя> --verify`"),
+    (re.compile(r"блока USER_RESPONSE"),
+     "агент пересказал отчёт скрипта вместо блока «байт-в-байт» — открыть ход по trace_id"),
     (re.compile(r"invalid_api_key|kind=auth|Insufficient balance"),
      "ключ провайдера отклонён — проверить слот (`make opencode-usage`), скилл zeroclaw-provider-triage"),
     (re.compile(r"kind=rate_limited|\b429\b"),
@@ -951,7 +1068,8 @@ def _subject(row: dict) -> str | None:
         if not provider and not model:
             return None  # never render the literal `None/None`
         return f"{provider or '?'}/{model or '?'}"
-    return row.get("tool")
+    tool, skill = row.get("tool"), row.get("skill")
+    return f"{skill}/{tool}" if skill and tool else tool
 
 
 HISTORY_DAYS = 7
@@ -1136,7 +1254,7 @@ def _completeness(
 
 _MERGE_FILL = (
     "parent_tool", "policy_reason", "task_ids", "input_path", "detail", "location",
-    "tool", "error", "channel_ref",
+    "tool", "error", "channel_ref", "skill",
 )
 _WAIT_KINDS = ("delegate_wait", "delegate_missing")
 

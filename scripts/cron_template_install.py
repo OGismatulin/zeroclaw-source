@@ -61,6 +61,7 @@ class CronTemplate:
     model_reasoning_effort: str = ""
     owner_agent: str = ""
     source_dir: Path | None = None
+    auto_bootstrap: bool = False
 
     @classmethod
     def load(cls, template_dir: Path) -> "CronTemplate":
@@ -105,7 +106,13 @@ class CronTemplate:
             model_reasoning_effort=data.get("model", {}).get("reasoning_effort", ""),
             owner_agent=data.get("owner_agent", ""),
             source_dir=template_dir,
+            auto_bootstrap="auto_bootstrap" in data,
         )
+
+    def bootstraps(self, user_id: str) -> bool:
+        if not self.auto_bootstrap or user_id in self.exclude:
+            return False
+        return self.audience_all or not self.audience or user_id in self.audience
 
     @staticmethod
     def _validate_schedule(expr: str, delete_after_run: bool) -> None:
@@ -141,7 +148,8 @@ class CronTemplate:
 @dataclass(frozen=True)
 class InstallResult:
     status: str   # "installed" | "existing" | "reinstalled" | "removed" |
-                  # "not_found" | "no_jobs_db" | "audience_skip" | "error"
+                  # "not_found" | "no_jobs_db" | "audience_skip" | "error" |
+                  # "bootstrap_would_reinstall"
     user_id: str
     template: str
     id: str | None = None
@@ -359,6 +367,7 @@ def format_text(result: InstallResult) -> str:
         "installed": "+", "existing": "✓", "reinstalled": "~",
         "removed": "-", "not_found": "⊘", "no_jobs_db": "⚠",
         "audience_skip": "⊘", "error": "✗", "owner_missing": "⚠",
+        "bootstrap_would_reinstall": "✗",
     }[result.status]
     parts = [f"{prefix} tg_{result.user_id}: {result.status} '{result.template}'"]
     if result.id:
@@ -441,7 +450,9 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--force", action="store_true",
-                        help="bypass audience whitelist (for smoke / emergency)")
+                        help="bypass audience whitelist (for smoke / emergency); with "
+                             "--uninstall: remove even though [auto_bootstrap] reinstalls "
+                             "it on the next daemon spawn")
     args = parser.parse_args()
 
     if args.list:
@@ -472,7 +483,16 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    if args.uninstall:
+    rc = 0
+    if args.uninstall and template.bootstraps(args.user) and not args.force:
+        result = InstallResult(
+            "bootstrap_would_reinstall", args.user, template.name,
+            error=(f"[auto_bootstrap] of this template installs it again for {args.user} "
+                   f"on the next daemon spawn; add \"{args.user}\" to exclude in "
+                   "template.toml and sync the template first, or pass --force"),
+        )
+        rc = 2
+    elif args.uninstall:
         result = uninstall_template(args.workspaces_root, args.user, template.name)
     else:
         cli_params = dict(p.split("=", 1) for p in args.param if "=" in p)
@@ -490,7 +510,7 @@ def main() -> int:
         print(json.dumps(result.__dict__, default=str))
     elif not args.quiet:
         print(format_text(result))
-    return 0
+    return rc
 
 
 def _do_list(args) -> int:
