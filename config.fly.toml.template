@@ -242,6 +242,13 @@ uri = "https://opencode.ai/zen/go"
 api_key = ""
 timeout_secs = 300
 
+[providers.models.opencode.argon]
+model = "gemini-4-argon-contributor"
+uri = "https://opencode.ai/inference/go/v1"
+api_key = ""
+wire_api = "gemini"
+timeout_secs = 300
+
 # GLM via the z.ai Coding Plan subscription. The provider name decides the endpoint:
 # `zai` → https://api.z.ai/api/coding/paas/v4 (subscription, ZAI_API_KEY), while `glm`
 # → https://api.z.ai/api/paas/v4 (pay-per-use credits). Probing the pay-per-use path
@@ -768,6 +775,7 @@ protect_last_n = 10
 "longcat-2.5-preview-free" = 128_000
 "step-5-preview-free"      = 1_000_000
 "claude-haiku-5-5"         = 1_000_000
+"gemini-4-argon-contributor" = 1_048_576
 
 [runtime_profiles.digest_cron]
 agentic = true
@@ -811,6 +819,7 @@ protect_last_n = 10
 "longcat-2.5-preview-free" = 128_000
 "step-5-preview-free"      = 1_000_000
 "claude-haiku-5-5"         = 1_000_000
+"gemini-4-argon-contributor" = 1_048_576
 
 # Subagent runtime profile. Shares default's context_compression + model_windows
 # so cross-model windows still resolve. Subagents do real work inside cron
@@ -878,6 +887,7 @@ protect_last_n = 10
 "longcat-2.5-preview-free" = 128_000
 "step-5-preview-free"      = 1_000_000
 "claude-haiku-5-5"         = 1_000_000
+"gemini-4-argon-contributor" = 1_048_576
 
 # Jira package runs load a large immutable source manifest and invoke the full
 # tool surface.  The measured system floor is already above 205k tokens, so
