@@ -152,15 +152,54 @@ pub fn session_token(base_url: &str) -> Option<String> {
     if !is_opencode_target(base_url) {
         return None;
     }
+    Some(scoped_token())
+}
+
+fn scoped_token() -> String {
     let scope = zeroclaw_api::TOOL_LOOP_SESSION_KEY
         .try_with(Clone::clone)
         .ok()
         .flatten()
         .filter(|key| !key.trim().is_empty());
-    Some(match scope {
+    match scope {
         Some(key) => digest_scope(&key),
         None => process_token().to_string(),
-    })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouterProfile {
+    pub session_header: bool,
+    pub user_agent: bool,
+    pub omit_tool_result_name: bool,
+}
+
+impl RouterProfile {
+    #[must_use]
+    pub fn opencode() -> Self {
+        Self {
+            session_header: true,
+            user_agent: true,
+            omit_tool_result_name: true,
+        }
+    }
+
+    #[must_use]
+    pub fn session_value(&self, _base_url: &str) -> Option<String> {
+        self.session_header.then(scoped_token)
+    }
+
+    #[must_use]
+    pub fn headers(&self, base_url: &str) -> Vec<(&'static str, String)> {
+        let mut headers = Vec::new();
+        if let Some(value) = self.session_value(base_url) {
+            headers.push((OPENCODE_SESSION_HEADER, value));
+        }
+        if self.user_agent {
+            headers.push(("User-Agent", OPENCODE_USER_AGENT.to_string()));
+        }
+        headers
+    }
 }
 
 #[cfg(test)]
@@ -326,5 +365,71 @@ mod tests {
     fn digest_is_domain_separated() {
         // A scope that reproduces the tag's bytes must not collide with it.
         assert_ne!(digest_scope(""), digest_scope(AFFINITY_DOMAIN));
+    }
+
+    #[test]
+    fn opencode_profile_enables_every_quirk() {
+        let profile = RouterProfile::opencode();
+        assert!(profile.session_header);
+        assert!(profile.user_agent);
+        assert!(profile.omit_tool_result_name);
+    }
+
+    #[tokio::test]
+    async fn profile_headers_carry_session_and_user_agent() {
+        for base_url in [
+            "https://opencode.ai/inference/go/v1",
+            "https://example.com/v1",
+        ] {
+            let headers = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .scope(Some("telegram_1001_alice".to_string()), async {
+                    RouterProfile::opencode().headers(base_url)
+                })
+                .await;
+            let session = headers
+                .iter()
+                .find(|(name, _)| *name == OPENCODE_SESSION_HEADER)
+                .map(|(_, value)| value.clone())
+                .expect("session header");
+            assert_eq!(session.len(), TOKEN_BYTES * 2, "{base_url}");
+            assert!(session.chars().all(|c| c.is_ascii_hexdigit()), "{base_url}");
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| *name == "User-Agent" && value == OPENCODE_USER_AGENT),
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_without_flags_emits_no_headers() {
+        let profile = RouterProfile::default();
+        assert!(profile.headers("https://opencode.ai/zen/go/v1").is_empty());
+        assert!(
+            profile
+                .session_value("https://opencode.ai/zen/go/v1")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_session_is_stable_for_one_scope_and_never_raw() {
+        let build = || {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                Some("telegram_1001_alice".to_string()),
+                async {
+                    RouterProfile::opencode()
+                        .session_value("https://example.com/v1")
+                        .expect("session value")
+                },
+            )
+        };
+        let first = build().await;
+        let again = build().await;
+        assert_eq!(first, again, "one scope must produce one token");
+        assert_eq!(first.len(), TOKEN_BYTES * 2);
+        assert!(!first.contains("alice") && !first.contains("1001"));
+        assert!(!first.contains("telegram_1001_alice"));
     }
 }
