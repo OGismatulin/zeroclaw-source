@@ -249,6 +249,13 @@ api_key = ""
 wire_api = "gemini"
 timeout_secs = 300
 
+[providers.models.opencode.haiku]
+model = "claude-haiku-5-5"
+uri = "https://opencode.ai/zen/go"
+api_key = ""
+wire_api = "messages"
+timeout_secs = 300
+
 # GLM via the z.ai Coding Plan subscription. The provider name decides the endpoint:
 # `zai` → https://api.z.ai/api/coding/paas/v4 (subscription, ZAI_API_KEY), while `glm`
 # → https://api.z.ai/api/paas/v4 (pay-per-use credits). Probing the pay-per-use path
