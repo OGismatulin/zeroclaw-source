@@ -176,6 +176,15 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         ) {
             return Ok(p);
         }
+        if let Some(p) = build_router_wire_provider_if_requested(
+            self.wire_api(),
+            alias,
+            api_url.or(Some(Self::DEFAULT_URL)),
+            key,
+            opts,
+        )? {
+            return Ok(p);
+        }
         Ok(apply_compat_options(
             self.build_compat(alias, key, api_url),
             opts,
@@ -344,6 +353,48 @@ fn build_responses_provider_if_requested(
         builder = builder.extra_headers(opts.extra_headers.clone());
     }
     Some(Box::new(builder.build()))
+}
+
+fn build_router_wire_provider_if_requested(
+    wire_api: Option<zeroclaw_config::schema::WireApi>,
+    alias: &str,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> Result<Option<Box<dyn ModelProvider>>> {
+    use zeroclaw_config::schema::WireApi;
+    match wire_api {
+        Some(WireApi::Messages) => {
+            let mut b = crate::anthropic::AnthropicModelProvider::builder(alias).credential(key);
+            if let Some(url) = base_url {
+                b = b.base_url(url);
+            }
+            if let Some(mt) = opts.provider_max_tokens {
+                b = b.max_tokens(mt);
+            }
+            if let Some(ts) = opts.provider_timeout_secs {
+                b = b.timeout_secs(ts);
+            }
+            Ok(Some(Box::new(b.build())))
+        }
+        Some(WireApi::Gemini) => {
+            let mut b = crate::gemini::GeminiModelProvider::builder(alias)
+                .api_key(key)
+                .router_profile(crate::opencode_session::RouterProfile::opencode())
+                .native_tools(opts.native_tools.unwrap_or(true));
+            if let Some(url) = base_url {
+                b = b.base_url(url);
+            }
+            if let Some(ts) = opts.provider_timeout_secs {
+                b = b.timeout_secs(ts);
+            }
+            if let Some(mt) = opts.provider_max_tokens {
+                b = b.max_output_tokens(mt);
+            }
+            Ok(Some(Box::new(b.try_build()?)))
+        }
+        Some(WireApi::Responses | WireApi::ChatCompletions) | None => Ok(None),
+    }
 }
 
 pub(crate) fn build_kimi_code_compat(
@@ -2968,5 +3019,397 @@ mod tests {
 
         let paths = capture.lock().expect("capture lock poisoned").clone();
         assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
+    }
+
+    const GO_GEMINI_BASE: &str = "https://opencode.ai/inference/go/v1";
+    const GO_MESSAGES_BASE: &str = "https://opencode.ai/zen/go";
+    const ARGON_MODEL: &str = "gemini-4-argon-contributor";
+
+    type Seen = std::sync::Arc<
+        std::sync::Mutex<Vec<(axum::http::Uri, axum::http::HeaderMap, serde_json::Value)>>,
+    >;
+
+    async fn capture_server(
+        delay: std::time::Duration,
+        response: serde_json::Value,
+    ) -> (String, Seen, tokio::task::JoinHandle<()>) {
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = sink.clone();
+                let response = response.to_string();
+                async move {
+                    let request = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    sink.lock().unwrap().push((uri, headers, request));
+                    tokio::time::sleep(delay).await;
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(response))
+                        .unwrap()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), seen, server)
+    }
+
+    fn gemini_text() -> serde_json::Value {
+        serde_json::json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}]})
+    }
+
+    fn anthropic_text() -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-haiku-5-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+    }
+
+    fn chat_text() -> serde_json::Value {
+        serde_json::json!({"choices": [{"message": {"content": "ok"}}]})
+    }
+
+    fn weather_tool_spec() -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Weather by city",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        )
+    }
+
+    fn is_gemini_payload(provider: &dyn ModelProvider) -> bool {
+        matches!(
+            provider.convert_tools(&[weather_tool_spec()]),
+            crate::traits::ToolsPayload::Gemini { .. }
+        )
+    }
+
+    fn opencode_cfg(wire_api: Option<WireApi>) -> OpencodeModelProviderConfig {
+        OpencodeModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn opencode_alias_with_gemini_wire_builds_a_gemini_provider() {
+        let provider = opencode_cfg(Some(WireApi::Gemini))
+            .create_provider(
+                "argon",
+                Some("router-key"),
+                Some(GO_GEMINI_BASE),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("gemini wire provider should build");
+        assert!(is_gemini_payload(provider.as_ref()));
+        assert!(provider.capabilities().native_tool_calling);
+        assert_eq!(provider.default_base_url(), Some(GO_GEMINI_BASE));
+    }
+
+    #[test]
+    fn opencode_gemini_alias_without_a_key_fails_to_build() {
+        let result = opencode_cfg(Some(WireApi::Gemini)).create_provider(
+            "argon",
+            None,
+            Some(GO_GEMINI_BASE),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn opencode_gemini_alias_with_native_tools_false_stays_prompt_guided() {
+        let opts = ModelProviderRuntimeOptions {
+            native_tools: Some(false),
+            ..Default::default()
+        };
+        let provider = opencode_cfg(Some(WireApi::Gemini))
+            .create_provider("argon", Some("router-key"), Some(GO_GEMINI_BASE), &opts)
+            .expect("gemini wire provider should build");
+        assert!(!provider.capabilities().native_tool_calling);
+        assert!(!is_gemini_payload(provider.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn opencode_gemini_alias_passes_timeout_and_output_limit() {
+        use tokio::time::{Duration, Instant};
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            provider_max_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        let (slow_base, _, slow) = capture_server(Duration::from_secs(3), gemini_text()).await;
+        let provider = opencode_cfg(Some(WireApi::Gemini))
+            .create_provider(
+                "argon",
+                Some("router-key"),
+                Some(&format!("{slow_base}/v1")),
+                &opts,
+            )
+            .expect("gemini wire provider should build");
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await;
+        let elapsed = started.elapsed();
+        slow.abort();
+        assert!(result.is_err(), "alias timeout_secs must reach the client");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+
+        let (fast_base, seen, fast) = capture_server(Duration::ZERO, gemini_text()).await;
+        let provider = opencode_cfg(Some(WireApi::Gemini))
+            .create_provider(
+                "argon",
+                Some("router-key"),
+                Some(&format!("{fast_base}/v1")),
+                &opts,
+            )
+            .expect("gemini wire provider should build");
+        provider
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await
+            .expect("fast server answers");
+        fast.abort();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].2["generationConfig"]["maxOutputTokens"], 4096);
+    }
+
+    #[tokio::test]
+    async fn opencode_alias_with_messages_wire_builds_an_anthropic_provider() {
+        use tokio::time::{Duration, Instant};
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            provider_max_tokens: Some(777),
+            ..Default::default()
+        };
+
+        let (slow_base, _, slow) = capture_server(Duration::from_secs(3), anthropic_text()).await;
+        let provider = opencode_cfg(Some(WireApi::Messages))
+            .create_provider("haiku", Some("router-key"), Some(&slow_base), &opts)
+            .expect("messages wire provider should build");
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hi", "claude-haiku-5-5", None)
+            .await;
+        let elapsed = started.elapsed();
+        slow.abort();
+        assert!(result.is_err(), "alias timeout_secs must reach the client");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+
+        let (base, seen, server) = capture_server(Duration::ZERO, anthropic_text()).await;
+        let provider = opencode_cfg(Some(WireApi::Messages))
+            .create_provider("haiku", Some("router-key"), Some(&base), &opts)
+            .expect("messages wire provider should build");
+        provider
+            .chat_with_system(None, "hi", "claude-haiku-5-5", None)
+            .await
+            .expect("fast server answers");
+        server.abort();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0.path(), "/v1/messages");
+        assert_eq!(seen[0].1.get("x-api-key").unwrap(), "router-key");
+        assert_eq!(seen[0].2["max_tokens"], 777);
+    }
+
+    static ROUTER_PROXY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn opencode_messages_alias_request_carries_session_and_user_agent() {
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+
+        let _serial = ROUTER_PROXY_LOCK.lock().await;
+        let (proxy, seen, server) =
+            capture_server(std::time::Duration::ZERO, anthropic_text()).await;
+        zeroclaw_config::schema::set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(proxy),
+            no_proxy: vec!["127.0.0.1".to_string()],
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.anthropic".to_string()],
+            ..Default::default()
+        });
+        scopeguard::defer! {
+            zeroclaw_config::schema::set_runtime_proxy_config(ProxyConfig::default());
+        }
+
+        let provider = opencode_cfg(Some(WireApi::Messages))
+            .create_provider(
+                "haiku",
+                Some("router-key"),
+                Some("http://opencode.ai/zen/go"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("messages wire provider should build");
+        provider
+            .chat_with_system(None, "hi", "claude-haiku-5-5", None)
+            .await
+            .expect("proxy answers");
+        server.abort();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.path(), "/zen/go/v1/messages");
+        let session = seen[0]
+            .1
+            .get(crate::opencode_session::OPENCODE_SESSION_HEADER)
+            .expect("session header");
+        assert!(!session.to_str().unwrap().is_empty());
+        assert_eq!(
+            seen[0].1.get(reqwest::header::USER_AGENT).unwrap(),
+            crate::opencode_session::OPENCODE_USER_AGENT
+        );
+    }
+
+    #[test]
+    fn opencode_alias_with_responses_wire_is_unchanged() {
+        let provider = opencode_cfg(Some(WireApi::Responses))
+            .create_provider(
+                "muse",
+                Some("router-key"),
+                Some("https://opencode.ai/zen/go/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("responses wire provider should build");
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert_eq!(
+            provider.default_base_url(),
+            Some("https://opencode.ai/zen/go/v1/responses")
+        );
+        assert!(!is_gemini_payload(provider.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn opencode_alias_without_wire_builds_the_compat_provider() {
+        for wire_api in [None, Some(WireApi::ChatCompletions)] {
+            let (base, seen, server) = capture_server(std::time::Duration::ZERO, chat_text()).await;
+            let provider = opencode_cfg(wire_api)
+                .create_provider(
+                    "flash",
+                    Some("router-key"),
+                    Some(&format!("{base}/zen/go/v1")),
+                    &ModelProviderRuntimeOptions::default(),
+                )
+                .expect("compat provider should build");
+            assert_ne!(provider.default_wire_api(), "responses");
+            assert!(!is_gemini_payload(provider.as_ref()));
+            let _ = provider
+                .chat_with_system(None, "hi", "deepseek-v4.1-flash", None)
+                .await;
+            server.abort();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].0.path(), "/zen/go/v1/chat/completions");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_alias_with_gemini_wire_keeps_the_compat_provider() {
+        let custom = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Gemini),
+                ..Default::default()
+            },
+        }
+        .create_provider(
+            "vllm",
+            Some("k"),
+            Some("http://10.0.0.15:8000/v1"),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("custom provider should build");
+        assert!(!is_gemini_payload(custom.as_ref()));
+
+        let doubao = DoubaoModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Gemini),
+                ..Default::default()
+            },
+        }
+        .create_provider(
+            "default",
+            Some("k"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("doubao provider should build");
+        assert!(!is_gemini_payload(doubao.as_ref()));
+
+        let (base, seen, server) = capture_server(std::time::Duration::ZERO, chat_text()).await;
+        let openai = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Messages),
+                ..Default::default()
+            },
+        }
+        .create_provider(
+            "default",
+            Some("sk-test"),
+            Some(&format!("{base}/v1")),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("openai provider should build");
+        let _ = openai.chat_with_system(None, "hi", "gpt-5", None).await;
+        server.abort();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].0.path(), "/v1/chat/completions");
+        assert!(
+            seen[0]
+                .1
+                .get(crate::opencode_session::OPENCODE_SESSION_HEADER)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn opencode_messages_alias_accepts_the_go_key_despite_its_prefix() {
+        use crate::test_util::{EnvGuard, env_lock};
+        let _guard = env_lock();
+        let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
+        let _key = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-go-router-key"));
+        let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.opencode.insert(
+            "haiku".to_string(),
+            OpencodeModelProviderConfig {
+                base: ModelProviderConfig {
+                    wire_api: Some(WireApi::Messages),
+                    uri: Some(GO_MESSAGES_BASE.to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(GO_MESSAGES_BASE.to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let result = crate::create_model_provider_inner(
+            Some(&config),
+            "opencode",
+            "haiku",
+            None,
+            None,
+            &options,
+        );
+        assert!(result.is_ok(), "{}", result.err().unwrap());
     }
 }
