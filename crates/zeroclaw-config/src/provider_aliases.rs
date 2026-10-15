@@ -135,6 +135,13 @@ pub fn family_honors_wire_api(family: &str) -> bool {
     matches!(family, "openai" | "llamacpp" | "custom" | "opencode")
 }
 
+pub fn family_honors_wire_value(family: &str, wire: crate::schema::WireApi) -> bool {
+    match wire {
+        crate::schema::WireApi::Messages | crate::schema::WireApi::Gemini => family == "opencode",
+        _ => family_honors_wire_api(family),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +343,17 @@ mod tests {
         ] {
             assert!(!family_honors_wire_api(family), "{family} ignores wire_api");
         }
+    }
+
+    #[test]
+    fn wire_value_messages_and_gemini_only_for_opencode() {
+        use crate::schema::WireApi;
+        for wire in [WireApi::Messages, WireApi::Gemini] {
+            assert!(family_honors_wire_value("opencode", wire));
+            for family in ["custom", "openai", "llamacpp"] {
+                assert!(!family_honors_wire_value(family, wire));
+            }
+        }
+        assert!(family_honors_wire_value("custom", WireApi::Responses));
     }
 }

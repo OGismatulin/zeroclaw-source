@@ -758,6 +758,8 @@ pub trait FamilyEndpoint {
 pub enum WireApi {
     Responses,
     ChatCompletions,
+    Messages,
+    Gemini,
 }
 
 impl WireApi {
@@ -766,6 +768,8 @@ impl WireApi {
         match self {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
+            Self::Messages => "messages",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -21091,7 +21095,9 @@ impl Config {
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
         // has no effect instead of debugging unexpected runtime behavior.
         for (family, alias, entry) in self.providers.models.iter_entries() {
-            if entry.wire_api.is_some() && !crate::provider_aliases::family_honors_wire_api(family)
+            if entry
+                .wire_api
+                .is_some_and(|w| !crate::provider_aliases::family_honors_wire_value(family, w))
             {
                 warnings.push(crate::validation_warnings::ValidationWarning::new(
                     "wire_api_not_supported_for_family",
@@ -32246,6 +32252,77 @@ wire_api = "ws"
             msg.contains("wire_api") || msg.contains("ws"),
             "error should reference the invalid wire_api value, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn deserialize_accepts_messages_and_gemini_wire_api() {
+        for (raw, expected) in [("messages", WireApi::Messages), ("gemini", WireApi::Gemini)] {
+            let toml = format!(
+                "schema_version = 3\n\n[providers.models.opencode.a]\nwire_api = \"{raw}\"\n"
+            );
+            let config = toml::from_str::<Config>(&toml).expect("wire_api should deserialize");
+            let entry = config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(family, alias, _)| *family == "opencode" && *alias == "a")
+                .map(|(_, _, entry)| entry)
+                .expect("opencode.a entry");
+            assert_eq!(entry.wire_api, Some(expected));
+        }
+    }
+
+    #[test]
+    async fn wire_api_as_str_round_trips() {
+        assert_eq!(WireApi::Messages.as_str(), "messages");
+        assert_eq!(WireApi::Gemini.as_str(), "gemini");
+    }
+
+    #[test]
+    async fn collect_warnings_flags_new_wires_outside_opencode() {
+        for wire in [WireApi::Messages, WireApi::Gemini] {
+            for family in ["mistral", "custom", "openai", "llamacpp"] {
+                let mut config = Config::default();
+                suppress_semantic_memory_warning(&mut config);
+                config
+                    .providers
+                    .models
+                    .ensure(family, "x")
+                    .unwrap()
+                    .wire_api = Some(wire);
+                let warnings = config.collect_warnings();
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.code == "wire_api_not_supported_for_family"
+                            && w.path == format!("providers.models.{family}.x.wire_api")),
+                    "{family} with {wire:?} must warn",
+                );
+            }
+
+            let mut config = Config::default();
+            suppress_semantic_memory_warning(&mut config);
+            config
+                .providers
+                .models
+                .ensure("opencode", "x")
+                .unwrap()
+                .wire_api = Some(wire);
+            assert!(
+                config.collect_warnings().is_empty(),
+                "opencode with {wire:?} must not warn",
+            );
+        }
+
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config
+            .providers
+            .models
+            .ensure("custom", "x")
+            .unwrap()
+            .wire_api = Some(WireApi::Responses);
+        assert!(config.collect_warnings().is_empty());
     }
 
     #[test]
