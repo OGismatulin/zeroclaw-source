@@ -5,7 +5,7 @@
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
-use crate::opencode_session::{OPENCODE_SESSION_HEADER, OPENCODE_USER_AGENT};
+use crate::opencode_session::{OPENCODE_SESSION_HEADER, OPENCODE_USER_AGENT, RouterProfile};
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -83,6 +83,7 @@ pub struct OpenAiCompatibleModelProvider {
     tls_ca_cert_pem: Option<Vec<u8>>,
     /// Extra JSON fields merged into every API request body.
     extra_body: Option<serde_json::Value>,
+    router_profile: Option<RouterProfile>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per strategy per provider instance and then `Arc`-shared into every
     /// request body instead of being deep-copied per request. `Arc` so
@@ -435,6 +436,7 @@ pub struct OpenAiCompatibleBuilder {
     public_model_listing: bool,
     tls_ca_cert_path: Option<String>,
     extra_body: Option<serde_json::Value>,
+    router_profile: Option<RouterProfile>,
     auth_model_provider: Option<String>,
     auth_service: Option<AuthService>,
     auth_profile_override: Option<String>,
@@ -498,6 +500,11 @@ impl OpenAiCompatibleBuilder {
     /// string (for example Kimi Code).
     pub fn user_agent(mut self, user_agent: &str) -> Self {
         self.user_agent = Some(user_agent.to_string());
+        self
+    }
+
+    pub fn router_profile(mut self, profile: RouterProfile) -> Self {
+        self.router_profile = Some(profile);
         self
     }
 
@@ -700,6 +707,7 @@ impl OpenAiCompatibleBuilder {
             public_model_listing: self.public_model_listing,
             tls_ca_cert_pem,
             extra_body: self.extra_body,
+            router_profile: self.router_profile,
             schema_cache: std::sync::Arc::new(zeroclaw_api::schema::SchemaCleanCache::new()),
         }
     }
@@ -739,6 +747,7 @@ impl OpenAiCompatibleModelProvider {
             public_model_listing: false,
             tls_ca_cert_path: None,
             extra_body: None,
+            router_profile: None,
             auth_model_provider: None,
             auth_service: None,
             auth_profile_override: None,
@@ -811,7 +820,7 @@ impl OpenAiCompatibleModelProvider {
 
     /// Default headers every request of this provider carries: the operator's
     /// `user_agent` field, then validated `extra_headers` (later entries win),
-    /// then — for an OpenCode host only — the fork's default `User-Agent` when
+    /// then the fork's default `User-Agent` when
     /// the operator did not pin one. Both HTTP clients and the OpenCode session
     /// decision read this one map, so a raw `extra_headers` key that fails
     /// header validation is never mistaken for a header on the wire.
@@ -843,7 +852,9 @@ impl OpenAiCompatibleModelProvider {
         }
         // fork(#41): OpenCode asks callers to identify the tool.
         if !headers.contains_key(USER_AGENT)
-            && crate::opencode_session::is_opencode_target(&self.base_url)
+            && self
+                .router_profile
+                .is_some_and(|profile| profile.user_agent)
             && let Ok(value) = HeaderValue::from_str(OPENCODE_USER_AGENT)
         {
             headers.insert(USER_AGENT, value);
@@ -2143,7 +2154,7 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
 
 /// Attach a pre-resolved OpenCode affinity token (see
 /// `OpenAiCompatibleModelProvider::opencode_session_value`). `None` leaves the
-/// request untouched — non-OpenCode hosts and operator-pinned headers.
+/// request untouched.
 fn apply_opencode_session_value(
     req: reqwest::RequestBuilder,
     session: Option<&str>,
@@ -2164,7 +2175,7 @@ impl OpenAiCompatibleModelProvider {
     }
 
     /// OpenCode affinity header value for the calling conversation, or `None`
-    /// when this provider does not target OpenCode (fork patch #41, ported
+    /// (fork patch #41, ported
     /// from upstream PR #10604).
     ///
     /// Returns `None` when the operator has already pinned a *valid* header
@@ -2176,7 +2187,7 @@ impl OpenAiCompatibleModelProvider {
         if self.default_headers().contains_key(OPENCODE_SESSION_HEADER) {
             return None;
         }
-        crate::opencode_session::session_token(&self.base_url)
+        self.router_profile?.session_value(&self.base_url)
     }
 
     /// Attach the OpenCode affinity header, for request paths that build in the
@@ -2786,7 +2797,8 @@ impl OpenAiCompatibleModelProvider {
     ///
     /// fork(#48)
     fn rejects_tool_result_name(&self) -> bool {
-        crate::opencode_session::is_opencode_target(&self.base_url)
+        self.router_profile
+            .is_some_and(|profile| profile.omit_tool_result_name)
     }
 
     fn targets_mistral_tool_call_contract(&self) -> bool {
@@ -4236,14 +4248,22 @@ mod tests {
     // plus the session appliers) and read the headers reqwest puts on the
     // wire. reqwest merges a client's `default_headers` at `execute`, not at
     // `RequestBuilder::build`, and only for names the request itself lacks
-    // (`Entry::Vacant`), so `wire_headers` reproduces exactly that merge. No
-    // local server: `127.0.0.1` is not an OpenCode host, so a server-side
-    // assertion would silently exercise the negative branch.
+    // (`Entry::Vacant`), so `wire_headers` reproduces exactly that merge.
 
     const OPENCODE_GO_URL: &str = "https://opencode.ai/zen/go/v1";
     const OPENCODE_ZEN_URL: &str = "https://opencode.ai/zen/v1";
 
     fn opencode_provider(base_url: &str) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode")
+            .base_url(base_url)
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .router_profile(RouterProfile::opencode())
+            .build()
+    }
+
+    fn profileless_provider(base_url: &str) -> OpenAiCompatibleModelProvider {
         OpenAiCompatibleModelProvider::builder("opencode")
             .display_name("OpenCode")
             .base_url(base_url)
@@ -4323,7 +4343,9 @@ mod tests {
         let scope = "telegram_1001_alice".to_string();
         let expected = zeroclaw_api::TOOL_LOOP_SESSION_KEY
             .scope(Some(scope.clone()), async {
-                crate::opencode_session::session_token(OPENCODE_GO_URL).expect("token")
+                RouterProfile::opencode()
+                    .session_value(OPENCODE_GO_URL)
+                    .expect("token")
             })
             .await;
 
@@ -4360,6 +4382,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_entry_points_send_the_token_captured_before_spawn() {
+        use axum::{Router, http::HeaderMap, routing::post};
+        use tokio::net::TcpListener;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: HeaderMap| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(
+                        headers
+                            .get(OPENCODE_SESSION_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    ([("content-type", "text/event-stream")], "data: [DONE]\n\n")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = opencode_provider(&format!("http://{addr}"));
+        let options = StreamOptions {
+            enabled: true,
+            count_tokens: false,
+        };
+
+        let expected = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("telegram_1001_alice".to_string()), async {
+                let mut event_stream = provider.stream_chat(
+                    ProviderChatRequest {
+                        messages: &[ChatMessage::user("hi")],
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                    options,
+                );
+                while event_stream.next().await.is_some() {}
+                let mut system_stream =
+                    provider.stream_chat_with_system(None, "hi", "test-model", None, options);
+                while system_stream.next().await.is_some() {}
+                let mut history_stream = provider.stream_chat_with_history(
+                    &[ChatMessage::user("hi")],
+                    "test-model",
+                    None,
+                    options,
+                );
+                while history_stream.next().await.is_some() {}
+                RouterProfile::opencode().session_value("").expect("token")
+            })
+            .await;
+        server.abort();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for session in seen.iter() {
+            assert_eq!(session.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[tokio::test]
     async fn opencode_session_is_stable_for_one_scope_and_never_raw() {
         let provider = opencode_provider(OPENCODE_GO_URL);
         let build = || {
@@ -4376,13 +4466,15 @@ mod tests {
     }
 
     #[test]
-    fn opencode_headers_absent_on_other_hosts() {
+    fn opencode_headers_absent_without_a_profile() {
         for base_url in [
             "https://api.openai.com/v1",
             "https://opencode.ai.example.com/zen/v1",
             "http://127.0.0.1:1/v1",
+            OPENCODE_GO_URL,
+            OPENCODE_ZEN_URL,
         ] {
-            let headers = built_chat_headers(&opencode_provider(base_url));
+            let headers = built_chat_headers(&profileless_provider(base_url));
             assert!(
                 header_values(&headers, OPENCODE_SESSION_HEADER).is_empty(),
                 "{base_url}: session header must not leak"
@@ -4407,6 +4499,7 @@ mod tests {
             .base_url(OPENCODE_GO_URL)
             .credential(Some("test-key"))
             .auth_style(AuthStyle::Bearer)
+            .router_profile(RouterProfile::opencode())
             .extra_headers(extra)
             .build();
         let headers = built_chat_headers(&provider);
@@ -4427,6 +4520,7 @@ mod tests {
             .credential(Some("test-key"))
             .auth_style(AuthStyle::Bearer)
             .user_agent("field-ua/2")
+            .router_profile(RouterProfile::opencode())
             .build();
         let headers = built_chat_headers(&provider);
         assert_eq!(
@@ -4449,6 +4543,7 @@ mod tests {
             .credential(Some("test-key"))
             .auth_style(AuthStyle::Bearer)
             .user_agent("also\nbad")
+            .router_profile(RouterProfile::opencode())
             .extra_headers(extra)
             .build();
         let headers = built_chat_headers(&provider);
@@ -7128,7 +7223,7 @@ mod tests {
         // this endpoint`, killing the turn (client_error is non-retryable and
         // a delegate has no fallback). Measured 2026-09-17: glm-5.3-flash
         // fails 5/5 with the field and passes 4/4 without it.
-        let provider = make_model_provider("opencode-go", OPENCODE_GO_URL, None);
+        let provider = opencode_provider(OPENCODE_GO_URL);
         let native = provider.convert_messages_for_native(&tool_result_history(), true);
 
         assert_eq!(native.len(), 2);
@@ -7154,19 +7249,26 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_omits_tool_result_name_for_opencode_zen() {
-        // Both relay endpoints share one backend pool, so the gate is on the
-        // host, not on the endpoint path.
-        let provider = make_model_provider("opencode", OPENCODE_ZEN_URL, None);
+        let provider = opencode_provider(OPENCODE_ZEN_URL);
         let native = provider.convert_messages_for_native(&tool_result_history(), true);
 
         assert_eq!(native[1].name, None);
     }
 
     #[test]
+    fn convert_messages_for_native_keeps_tool_result_name_on_a_router_host_without_a_profile() {
+        for base_url in [OPENCODE_GO_URL, OPENCODE_ZEN_URL] {
+            let provider = profileless_provider(base_url);
+            let native = provider.convert_messages_for_native(&tool_result_history(), true);
+
+            assert_eq!(native[1].name.as_deref(), Some("shell"), "{base_url}");
+        }
+    }
+
+    #[test]
     fn convert_messages_for_native_keeps_tool_result_name_for_non_opencode() {
         // Groq is why the field exists: without it the tool result is rejected
-        // with `400 Tools should have a name!` (upstream #7909). Every host
-        // that is not the OpenCode relay keeps byte-identical behavior.
+        // with `400 Tools should have a name!` (upstream #7909).
         let provider = make_model_provider("groq", "https://api.groq.com/openai/v1", None);
         let native = provider.convert_messages_for_native(&tool_result_history(), true);
 

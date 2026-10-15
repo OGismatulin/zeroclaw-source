@@ -109,6 +109,10 @@ pub(crate) trait CompatFamilySpec {
         None
     }
 
+    fn router_profile(&self) -> Option<crate::opencode_session::RouterProfile> {
+        None
+    }
+
     const PUBLIC_MODEL_LISTING: bool = false;
 
     /// Build the base compat provider with both catalog consts applied. Use
@@ -167,12 +171,14 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        if let Some(p) = build_responses_provider_if_requested(
+        let profile = self.router_profile();
+        if let Some(p) = build_responses_provider_with_profile(
             self.wire_api(),
             alias,
             api_url.or(Some(Self::DEFAULT_URL)),
             key,
             opts,
+            profile,
         ) {
             return Ok(p);
         }
@@ -182,13 +188,15 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
             api_url.or(Some(Self::DEFAULT_URL)),
             key,
             opts,
+            profile,
         )? {
             return Ok(p);
         }
-        Ok(apply_compat_options(
-            self.build_compat(alias, key, api_url),
-            opts,
-        ))
+        let mut b = self.build_compat(alias, key, api_url);
+        if let Some(profile) = profile {
+            b = b.router_profile(profile);
+        }
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -328,10 +336,23 @@ fn build_responses_provider_if_requested(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Option<Box<dyn ModelProvider>> {
+    build_responses_provider_with_profile(wire_api, alias, base_url, key, opts, None)
+}
+
+fn build_responses_provider_with_profile(
+    wire_api: Option<zeroclaw_config::schema::WireApi>,
+    alias: &str,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
+) -> Option<Box<dyn ModelProvider>> {
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias).credential(key);
+    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
+        .credential(key)
+        .router_profile(router_profile);
     if let Some(url) = base_url {
         builder = builder.api_url(url);
     }
@@ -361,11 +382,15 @@ fn build_router_wire_provider_if_requested(
     base_url: Option<&str>,
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
 ) -> Result<Option<Box<dyn ModelProvider>>> {
     use zeroclaw_config::schema::WireApi;
     match wire_api {
         Some(WireApi::Messages) => {
             let mut b = crate::anthropic::AnthropicModelProvider::builder(alias).credential(key);
+            if let Some(profile) = router_profile {
+                b = b.router_profile(profile);
+            }
             if let Some(url) = base_url {
                 b = b.base_url(url);
             }
@@ -642,6 +667,10 @@ impl CompatFamilySpec for OpencodeModelProviderConfig {
 
     fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
         self.base.wire_api
+    }
+
+    fn router_profile(&self) -> Option<crate::opencode_session::RouterProfile> {
+        Some(crate::opencode_session::RouterProfile::opencode())
     }
 }
 impl CompatFamilySpec for DoubaoModelProviderConfig {
@@ -3411,5 +3440,266 @@ mod tests {
             &options,
         );
         assert!(result.is_ok(), "{}", result.err().unwrap());
+    }
+
+    const ROUTER_PROXY_SERVICES: [&str; 4] = [
+        "model_provider.compatible",
+        "model_provider.openai",
+        "model_provider.gemini",
+        "model_provider.anthropic",
+    ];
+
+    const GO_CHAT_BASE: &str = "http://opencode.ai/zen/go/v1";
+    const ZEN_CHAT_BASE: &str = "http://opencode.ai/zen/v1";
+    const GO_MESSAGES_HTTP_BASE: &str = "http://opencode.ai/zen/go";
+    const GO_GEMINI_HTTP_BASE: &str = "http://opencode.ai/inference/go/v1";
+
+    type RouterWire = (bool, bool, Option<bool>);
+
+    const ROUTER_GOLDEN: [(&str, RouterWire); 6] = [
+        ("chat_completions", (true, true, Some(true))),
+        ("responses", (true, true, None)),
+        ("messages", (true, true, None)),
+        ("gemini", (true, true, None)),
+        ("zen_chat", (true, true, Some(true))),
+        ("legacy_opencode_go", (true, true, Some(true))),
+    ];
+
+    fn router_proxy_guard(proxy: String) -> impl Drop {
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+        zeroclaw_config::schema::set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(proxy),
+            no_proxy: vec!["127.0.0.1".to_string()],
+            scope: ProxyScope::Services,
+            services: ROUTER_PROXY_SERVICES.map(str::to_string).to_vec(),
+            ..Default::default()
+        });
+        scopeguard::guard((), |()| {
+            zeroclaw_config::schema::set_runtime_proxy_config(ProxyConfig::default());
+        })
+    }
+
+    fn is_session_token(value: &str) -> bool {
+        value.len() == 32
+            && value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    }
+
+    async fn router_wire(
+        provider: &dyn ModelProvider,
+        seen: &Seen,
+        with_tool_result: bool,
+    ) -> RouterWire {
+        use crate::traits::{ChatMessage, ChatRequest};
+
+        seen.lock().unwrap().clear();
+        let tools = [weather_tool_spec()];
+        let history = if with_tool_result {
+            vec![
+                ChatMessage::user("hi"),
+                ChatMessage::assistant(
+                    serde_json::json!({
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"x\"}"
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ChatMessage::tool(
+                    serde_json::json!({"tool_call_id": "call_abc", "content": "sunny"}).to_string(),
+                ),
+            ]
+        } else {
+            vec![ChatMessage::user("hi")]
+        };
+        let _ = provider
+            .chat(
+                ChatRequest {
+                    messages: &history,
+                    tools: with_tool_result.then_some(&tools[..]),
+                    thinking: None,
+                },
+                "router-model",
+                Some(0.0),
+            )
+            .await;
+        let seen = seen.lock().unwrap();
+        let (_, headers, body) = seen.first().expect("request must reach the capture proxy");
+        let session = headers
+            .get(crate::opencode_session::OPENCODE_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_session_token);
+        let user_agent = headers
+            .get(reqwest::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            == Some(crate::opencode_session::OPENCODE_USER_AGENT);
+        let name_omitted = with_tool_result.then(|| {
+            body["messages"]
+                .as_array()
+                .expect("chat body carries messages")
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .map(|m| m.get("name").is_none())
+                .expect("tool result must be on the wire")
+        });
+        (session, user_agent, name_omitted)
+    }
+
+    #[tokio::test]
+    async fn router_headers_golden_for_every_protocol() {
+        let _serial = ROUTER_PROXY_LOCK.lock().await;
+        let (proxy, seen, server) = capture_server(std::time::Duration::ZERO, chat_text()).await;
+        let _proxy = router_proxy_guard(proxy);
+        let opts = ModelProviderRuntimeOptions::default();
+
+        let chat = opencode_cfg(None)
+            .create_provider("flash", Some("router-key"), Some(GO_CHAT_BASE), &opts)
+            .unwrap();
+        let responses = opencode_cfg(Some(WireApi::Responses))
+            .create_provider("muse", Some("router-key"), Some(GO_CHAT_BASE), &opts)
+            .unwrap();
+        let messages = opencode_cfg(Some(WireApi::Messages))
+            .create_provider(
+                "haiku",
+                Some("router-key"),
+                Some(GO_MESSAGES_HTTP_BASE),
+                &opts,
+            )
+            .unwrap();
+        let gemini = opencode_cfg(Some(WireApi::Gemini))
+            .create_provider(
+                "argon",
+                Some("router-key"),
+                Some(GO_GEMINI_HTTP_BASE),
+                &opts,
+            )
+            .unwrap();
+        let zen = opencode_cfg(None)
+            .create_provider("zen", Some("router-key"), Some(ZEN_CHAT_BASE), &opts)
+            .unwrap();
+        let legacy = crate::create_model_provider_with_url(
+            "opencode-go",
+            Some("router-key"),
+            Some(GO_CHAT_BASE),
+        )
+        .unwrap();
+
+        let observed = [
+            (
+                "chat_completions",
+                router_wire(chat.as_ref(), &seen, true).await,
+            ),
+            (
+                "responses",
+                router_wire(responses.as_ref(), &seen, false).await,
+            ),
+            (
+                "messages",
+                router_wire(messages.as_ref(), &seen, false).await,
+            ),
+            ("gemini", router_wire(gemini.as_ref(), &seen, false).await),
+            ("zen_chat", router_wire(zen.as_ref(), &seen, true).await),
+            (
+                "legacy_opencode_go",
+                router_wire(legacy.as_ref(), &seen, true).await,
+            ),
+        ];
+        server.abort();
+        assert_eq!(observed, ROUTER_GOLDEN);
+    }
+
+    #[tokio::test]
+    async fn router_profile_comes_from_the_family() {
+        let _serial = ROUTER_PROXY_LOCK.lock().await;
+        let (proxy, seen, server) = capture_server(std::time::Duration::ZERO, chat_text()).await;
+        let _proxy = router_proxy_guard(proxy);
+        let opts = ModelProviderRuntimeOptions::default();
+
+        for (label, base) in [
+            ("go_chat", GO_CHAT_BASE),
+            ("zen_chat", ZEN_CHAT_BASE),
+            ("go_gemini_path", GO_GEMINI_HTTP_BASE),
+        ] {
+            let provider = opencode_cfg(None)
+                .create_provider("flash", Some("router-key"), Some(base), &opts)
+                .unwrap();
+            let wire = router_wire(provider.as_ref(), &seen, true).await;
+            assert_eq!(wire, (true, true, Some(true)), "{label}");
+        }
+
+        let foreign_chat = |base: &str| ModelProviderConfig {
+            uri: Some(base.to_string()),
+            ..Default::default()
+        };
+        let custom = CustomModelProviderConfig {
+            base: foreign_chat(GO_CHAT_BASE),
+        }
+        .create_provider(
+            "vllm",
+            Some("k"),
+            Some(GO_CHAT_BASE),
+            &ModelProviderRuntimeOptions {
+                native_tools: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            router_wire(custom.as_ref(), &seen, true).await,
+            (false, false, Some(false)),
+            "custom alias on a router address"
+        );
+
+        let generic_compat = DeepseekModelProviderConfig::default()
+            .create_provider("flash", Some("k"), Some(GO_CHAT_BASE), &opts)
+            .unwrap();
+        assert_eq!(
+            router_wire(generic_compat.as_ref(), &seen, true).await,
+            (false, false, Some(false)),
+            "generic compat family on a router address"
+        );
+
+        let openai_chat = OpenAIModelProviderConfig {
+            base: foreign_chat(GO_CHAT_BASE),
+        }
+        .create_provider("default", Some("sk-test"), Some(GO_CHAT_BASE), &opts)
+        .unwrap();
+        let wire = router_wire(openai_chat.as_ref(), &seen, false).await;
+        assert_eq!(
+            (wire.0, wire.1),
+            (false, false),
+            "openai chat on a router address"
+        );
+
+        let openai_responses = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..foreign_chat(GO_CHAT_BASE)
+            },
+        }
+        .create_provider("default", Some("sk-test"), Some(GO_CHAT_BASE), &opts)
+        .unwrap();
+        let wire = router_wire(openai_responses.as_ref(), &seen, false).await;
+        assert_eq!(
+            (wire.0, wire.1),
+            (false, false),
+            "openai responses on a router address"
+        );
+
+        let anthropic = AnthropicModelProviderConfig::default()
+            .create_provider("haiku", Some("k"), Some(GO_MESSAGES_HTTP_BASE), &opts)
+            .unwrap();
+        let wire = router_wire(anthropic.as_ref(), &seen, false).await;
+        assert_eq!(
+            (wire.0, wire.1),
+            (false, false),
+            "anthropic on a router address"
+        );
+        server.abort();
     }
 }

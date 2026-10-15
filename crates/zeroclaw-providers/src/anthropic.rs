@@ -84,6 +84,7 @@ pub struct AnthropicModelProvider {
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -521,6 +522,7 @@ pub struct AnthropicBuilder {
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
 }
 
 impl AnthropicBuilder {
@@ -556,6 +558,11 @@ impl AnthropicBuilder {
         self
     }
 
+    pub fn router_profile(mut self, profile: crate::opencode_session::RouterProfile) -> Self {
+        self.router_profile = Some(profile);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -567,6 +574,7 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            router_profile: self.router_profile,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -597,11 +605,12 @@ impl AnthropicModelProvider {
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
+            router_profile: None,
         }
     }
 
     fn opencode_session_value(&self) -> Option<String> {
-        crate::opencode_session::session_token(&self.base_url)
+        self.router_profile?.session_value(&self.base_url)
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -3602,21 +3611,26 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn opencode_base_url_yields_a_session_value() {
+    fn router_profile_yields_a_session_value() {
         let provider = AnthropicModelProvider::builder("haiku")
             .base_url("https://opencode.ai/zen/go")
+            .router_profile(crate::opencode_session::RouterProfile::opencode())
             .build();
         assert!(provider.opencode_session_value().is_some());
     }
 
     #[test]
-    fn anthropic_and_mock_base_urls_yield_no_session_value() {
-        let published = AnthropicModelProvider::builder("default").build();
-        assert!(published.opencode_session_value().is_none());
-        let mock = AnthropicModelProvider::builder("default")
-            .base_url("http://127.0.0.1:9")
-            .build();
-        assert!(mock.opencode_session_value().is_none());
+    fn without_a_profile_no_base_url_yields_a_session_value() {
+        for base_url in [
+            "https://api.anthropic.com",
+            "https://opencode.ai/zen/go",
+            "http://127.0.0.1:9",
+        ] {
+            let provider = AnthropicModelProvider::builder("default")
+                .base_url(base_url)
+                .build();
+            assert!(provider.opencode_session_value().is_none(), "{base_url}");
+        }
     }
 
     #[test]
@@ -4720,6 +4734,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,
+            router_profile: None,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         };
 
@@ -5518,6 +5533,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,
+            router_profile: None,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         };
 

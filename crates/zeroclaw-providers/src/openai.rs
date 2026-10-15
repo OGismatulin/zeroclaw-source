@@ -979,6 +979,7 @@ pub struct OpenAiResponsesModelProvider {
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
     extra_headers: std::collections::HashMap<String, String>,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
 }
 
 /// Typed builder for [`OpenAiResponsesModelProvider`].
@@ -999,6 +1000,7 @@ pub struct OpenAiResponsesBuilder {
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
+    router_profile: Option<crate::opencode_session::RouterProfile>,
 }
 
 impl OpenAiResponsesBuilder {
@@ -1050,6 +1052,14 @@ impl OpenAiResponsesBuilder {
         self
     }
 
+    pub fn router_profile(
+        mut self,
+        profile: Option<crate::opencode_session::RouterProfile>,
+    ) -> Self {
+        self.router_profile = profile;
+        self
+    }
+
     pub fn build(self) -> OpenAiResponsesModelProvider {
         let responses_url = self
             .api_url
@@ -1071,6 +1081,7 @@ impl OpenAiResponsesBuilder {
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
+            router_profile: self.router_profile,
         }
     }
 }
@@ -1087,6 +1098,7 @@ impl OpenAiResponsesModelProvider {
             reasoning_effort: None,
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
+            router_profile: None,
         }
     }
 
@@ -1156,7 +1168,9 @@ impl OpenAiResponsesModelProvider {
         }
         // fork(#41): OpenCode asks callers to identify the tool.
         if !headers.contains_key(reqwest::header::USER_AGENT)
-            && crate::opencode_session::is_opencode_target(&self.responses_url)
+            && self
+                .router_profile
+                .is_some_and(|profile| profile.user_agent)
             && let Ok(value) = HeaderValue::from_str(OPENCODE_USER_AGENT)
         {
             headers.insert(reqwest::header::USER_AGENT, value);
@@ -1165,11 +1179,10 @@ impl OpenAiResponsesModelProvider {
     }
 
     /// OpenCode affinity header value for the calling conversation, or `None`
-    /// when this provider does not target OpenCode (fork patch #41, ported
+    /// (fork patch #41, ported
     /// from upstream PR #10604).
     ///
-    /// `responses_url` is the full endpoint rather than a base URL; the target
-    /// test parses its host, so it matches either shape. Returns `None` when
+    /// Returns `None` when
     /// the operator already pinned a *valid* header through `extra_headers`,
     /// which `build_default_headers` puts on every request — a second value
     /// here would send the header twice. Reads the effective `HeaderMap`, so a
@@ -1181,7 +1194,7 @@ impl OpenAiResponsesModelProvider {
         {
             return None;
         }
-        crate::opencode_session::session_token(&self.responses_url)
+        self.router_profile?.session_value(&self.responses_url)
     }
 
     /// Attach the OpenCode affinity header, for request paths that build in the
@@ -1227,7 +1240,7 @@ impl OpenAiResponsesModelProvider {
 
 /// Attach a pre-resolved OpenCode affinity token (see
 /// `OpenAiResponsesModelProvider::opencode_session_value`). `None` leaves the
-/// request untouched — non-OpenCode hosts and operator-pinned headers.
+/// request untouched.
 fn apply_opencode_session_value(
     req: reqwest::RequestBuilder,
     session: Option<&str>,
@@ -1737,6 +1750,7 @@ mod tests {
         OpenAiResponsesModelProvider::builder("opencode")
             .api_url(base_url)
             .credential(Some("test-key"))
+            .router_profile(Some(crate::opencode_session::RouterProfile::opencode()))
             .build()
     }
 
@@ -1807,7 +1821,9 @@ mod tests {
         let scope = "telegram_1001_alice".to_string();
         let expected = zeroclaw_api::TOOL_LOOP_SESSION_KEY
             .scope(Some(scope.clone()), async {
-                crate::opencode_session::session_token(&provider.responses_url).expect("token")
+                crate::opencode_session::RouterProfile::opencode()
+                    .session_value(&provider.responses_url)
+                    .expect("token")
             })
             .await;
 
@@ -1844,9 +1860,17 @@ mod tests {
     }
 
     #[test]
-    fn opencode_responses_headers_absent_on_other_hosts() {
-        for base_url in ["https://api.openai.com/v1", "http://127.0.0.1:1/v1"] {
-            let headers = built_responses_headers(&opencode_responses_provider(base_url));
+    fn opencode_responses_headers_absent_without_a_profile() {
+        for base_url in [
+            "https://api.openai.com/v1",
+            "http://127.0.0.1:1/v1",
+            OPENCODE_GO_URL,
+        ] {
+            let provider = OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(base_url)
+                .credential(Some("test-key"))
+                .build();
+            let headers = built_responses_headers(&provider);
             assert!(
                 header_values(&headers, OPENCODE_SESSION_HEADER).is_empty(),
                 "{base_url}"
@@ -1869,6 +1893,7 @@ mod tests {
         let provider = OpenAiResponsesModelProvider::builder("opencode")
             .api_url(OPENCODE_GO_URL)
             .credential(Some("test-key"))
+            .router_profile(Some(crate::opencode_session::RouterProfile::opencode()))
             .extra_headers(extra)
             .build();
         let headers = built_responses_headers(&provider);
@@ -1889,6 +1914,7 @@ mod tests {
         let provider = OpenAiResponsesModelProvider::builder("opencode")
             .api_url(OPENCODE_GO_URL)
             .credential(Some("test-key"))
+            .router_profile(Some(crate::opencode_session::RouterProfile::opencode()))
             .extra_headers(extra)
             .build();
         let headers = built_responses_headers(&provider);
