@@ -1299,18 +1299,6 @@ fn credential_from_file_env(file_env_var: &str) -> Option<String> {
     }
 }
 
-fn credential_kind_for_endpoint<'a>(provider_kind: &'a str, endpoint: Option<&str>) -> &'a str {
-    if provider_kind == "anthropic"
-        && endpoint
-            .map(str::trim)
-            .is_some_and(opencode_session::is_opencode_target)
-    {
-        "opencode"
-    } else {
-        provider_kind
-    }
-}
-
 fn resolve_model_provider_credential(
     name: &str,
     credential_override: Option<&str>,
@@ -1685,11 +1673,7 @@ fn create_model_provider_inner(
             options.vision,
         ));
     }
-    let credential_kind = credential_kind_for_endpoint(
-        provider_kind,
-        api_url.or(options.provider_api_url.as_deref()),
-    );
-    let resolved_credential = resolve_model_provider_credential(credential_kind, api_key)
+    let resolved_credential = resolve_model_provider_credential(provider_kind, api_key)
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
@@ -1701,7 +1685,6 @@ fn create_model_provider_inner(
         let has_custom_url = api_url.map(str::trim).filter(|u| !u.is_empty()).is_some();
         if !is_custom
             && !has_custom_url
-            && credential_kind == provider_kind
             && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
         {
             let visible = &key_value[..key_value.len().min(8)];
@@ -3093,35 +3076,23 @@ mod tests {
         assert!(create_model_provider("opencode-go", Some("key")).is_ok());
     }
 
-    // fork: regression for the env-candidates credential patch (upstream V3
-    // dropped env lookup; we keep a minimal table — see
-    // resolve_model_provider_credential).
     #[test]
-    fn anthropic_family_pointed_at_opencode_resolves_the_opencode_credential() {
-        assert_eq!(
-            credential_kind_for_endpoint("anthropic", Some("https://opencode.ai/zen/go")),
-            "opencode"
-        );
-        assert_eq!(
-            credential_kind_for_endpoint("anthropic", Some(" https://opencode.ai/zen/go ")),
-            "opencode"
-        );
-    }
-
-    #[test]
-    fn anthropic_alias_on_opencode_accepts_the_go_key_despite_its_openai_prefix() {
+    fn anthropic_family_never_resolves_the_opencode_credential() {
         use super::test_util::{EnvGuard, env_lock};
         let _guard = env_lock();
         let _file = EnvGuard::set("OPENCODE_GO_API_KEY_FILE", None);
-        let _key = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-go-router-key"));
+        let _go = EnvGuard::set("OPENCODE_GO_API_KEY", Some("sk-go-router-key"));
         let _open = EnvGuard::set("OPENCODE_API_KEY", None);
+        let _generic = EnvGuard::set("ZEROCLAW_API_KEY", Some("sk-or-v1-generic"));
         let options = ModelProviderRuntimeOptions {
             provider_kind: Some("anthropic".to_string()),
             provider_api_url: Some("https://opencode.ai/zen/go".to_string()),
             ..ModelProviderRuntimeOptions::default()
         };
-        let result = create_model_provider_inner(None, "anthropic", "haiku", None, None, &options);
-        assert!(result.is_ok(), "{}", result.err().unwrap());
+        let err = create_model_provider_inner(None, "anthropic", "haiku", None, None, &options)
+            .err()
+            .expect("the generic key must be resolved, not the Go key");
+        assert!(err.to_string().contains("sk-or-v1"), "{err}");
     }
 
     #[test]
@@ -3141,27 +3112,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn anthropic_family_keeps_its_own_credential_elsewhere() {
-        assert_eq!(credential_kind_for_endpoint("anthropic", None), "anthropic");
-        assert_eq!(
-            credential_kind_for_endpoint("anthropic", Some("https://api.anthropic.com")),
-            "anthropic"
-        );
-        assert_eq!(
-            credential_kind_for_endpoint("anthropic", Some("https://opencode.ai.example.com")),
-            "anthropic"
-        );
-    }
-
-    #[test]
-    fn other_families_never_switch_credential_kind() {
-        assert_eq!(
-            credential_kind_for_endpoint("openrouter", Some("https://opencode.ai/zen/go")),
-            "openrouter"
-        );
-    }
-
+    // fork: regression for the env-candidates credential patch (upstream V3
+    // dropped env lookup; we keep a minimal table — see
+    // resolve_model_provider_credential).
     #[test]
     fn resolve_model_provider_credential_opencode_go_env() {
         let _env_lock = env_lock();
