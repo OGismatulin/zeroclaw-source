@@ -4,9 +4,10 @@
 //! - ZeroClaw auth-profiles OAuth tokens
 
 use crate::auth::AuthService;
+use crate::opencode_session::RouterProfile;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, TokenUsage, ToolsPayload,
+    ModelProvider, TokenUsage, ToolCall, ToolsPayload,
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -15,7 +16,12 @@ use reqwest::{Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanCache};
+use zeroclaw_api::tool::ToolSpec;
 
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+const SYNTHETIC_CALL_ID_PREFIX: &str = "gemini-call-";
 const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
 /// Gemini model_provider supporting multiple authentication methods.
@@ -37,6 +43,12 @@ pub struct GeminiModelProvider {
     /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    base_url: Option<String>,
+    router_profile: Option<RouterProfile>,
+    timeout_secs: u64,
+    max_output_tokens: u32,
+    native_tools: bool,
+    schema_cache: SchemaCleanCache,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -80,6 +92,8 @@ struct GenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig")]
     generation_config: GenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +114,8 @@ struct InternalGenerateContentRequest {
     system_instruction: Option<Content>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,8 +128,38 @@ struct Content {
 #[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 enum Part {
-    Text { text: String },
-    Inline { inline_data: InlineData },
+    Text {
+        text: String,
+    },
+    Inline {
+        inline_data: InlineData,
+    },
+    FunctionCall {
+        #[serde(rename = "functionCall")]
+        function_call: FunctionCallPart,
+        #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: FunctionResponsePart,
+    },
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FunctionCallPart {
+    name: String,
+    args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct FunctionResponsePart {
+    name: String,
+    response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 impl Part {
@@ -204,6 +250,19 @@ struct ResponsePart {
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    #[serde(default, rename = "functionCall")]
+    function_call: Option<ResponseFunctionCall>,
+    #[serde(default, rename = "thoughtSignature")]
+    thought_signature: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 impl CandidateContent {
@@ -534,9 +593,52 @@ pub struct GeminiBuilder {
     oauth_project_seed: Option<String>,
     oauth_client_id: Option<String>,
     oauth_client_secret: Option<String>,
+    base_url: Option<String>,
+    router_profile: Option<RouterProfile>,
+    timeout_secs: Option<u64>,
+    max_output_tokens: Option<u32>,
+    native_tools: bool,
 }
 
 impl GeminiBuilder {
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub fn router_profile(mut self, profile: RouterProfile) -> Self {
+        self.router_profile = Some(profile);
+        self
+    }
+
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    pub fn max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    pub fn native_tools(mut self, native_tools: bool) -> Self {
+        self.native_tools = native_tools;
+        self
+    }
+
+    pub fn try_build(self) -> anyhow::Result<GeminiModelProvider> {
+        if self.router_profile.is_some()
+            && self
+                .api_key
+                .as_deref()
+                .and_then(GeminiModelProvider::normalize_non_empty)
+                .is_none()
+        {
+            anyhow::bail!("gemini router mode requires an explicit API key");
+        }
+        Ok(self.build())
+    }
+
     /// Explicit API key (from `[providers.models.gemini.<alias>] api_key`).
     /// When set (and non-empty after trimming), takes precedence over every
     /// OAuth path.
@@ -601,6 +703,7 @@ impl GeminiBuilder {
         // and no explicit key beat it).
         let (auth, use_managed) = match (explicit_key, self.auth_service.as_ref()) {
             (Some(a), _) => (Some(a), false),
+            (None, _) if self.router_profile.is_some() => (None, false),
             (None, Some(service)) => {
                 let profile = self.profile_override.clone();
                 let has_managed = std::thread::scope(|s| {
@@ -643,6 +746,12 @@ impl GeminiBuilder {
             auth_profile_override: self.profile_override,
             oauth_client_id: self.oauth_client_id,
             oauth_client_secret: self.oauth_client_secret,
+            base_url: self.base_url,
+            router_profile: self.router_profile,
+            timeout_secs: self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            max_output_tokens: self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+            native_tools: self.native_tools,
+            schema_cache: SchemaCleanCache::new(),
         }
     }
 }
@@ -667,6 +776,11 @@ impl GeminiModelProvider {
             oauth_project_seed: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            base_url: None,
+            router_profile: None,
+            timeout_secs: None,
+            max_output_tokens: None,
+            native_tools: false,
         }
     }
 
@@ -912,12 +1026,33 @@ impl GeminiModelProvider {
         }
     }
 
+    fn generate_content_url(&self, model: &str, auth: &GeminiAuth) -> String {
+        match (auth, self.base_url.as_deref()) {
+            (GeminiAuth::ExplicitKey(_), Some(base)) => {
+                format!("{base}/{}:generateContent", Self::format_model_name(model))
+            }
+            _ => Self::build_generate_content_url(model, auth),
+        }
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.gemini",
-            120,
+            self.timeout_secs,
             10,
         )
+    }
+
+    fn with_router_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let Some(profile) = self.router_profile else {
+            return request;
+        };
+        profile
+            .headers(self.base_url.as_deref().unwrap_or(BASE_URL))
+            .into_iter()
+            .fold(request, |request, (name, value)| {
+                request.header(name, value)
+            })
     }
 
     /// Resolve the GCP project ID for OAuth by calling the loadCodeAssist endpoint.
@@ -1008,7 +1143,7 @@ impl GeminiModelProvider {
         oauth_token: Option<&str>,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
         let req = self.http_client().post(url).json(request);
-        Ok(match auth {
+        Ok(self.with_router_headers(match auth {
             GeminiAuth::ExplicitKey(key) => {
                 req.header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?)
             }
@@ -1028,6 +1163,7 @@ impl GeminiModelProvider {
                         } else {
                             None
                         },
+                        tools: request.tools.clone(),
                     },
                 };
                 self.http_client()
@@ -1035,7 +1171,7 @@ impl GeminiModelProvider {
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-        })
+        }))
     }
 
     fn sensitive_api_key_header(key: &str) -> anyhow::Result<HeaderValue> {
@@ -1074,29 +1210,7 @@ impl GeminiModelProvider {
 }
 
 impl GeminiModelProvider {
-    fn build_chat_contents(
-        messages: &[ChatMessage],
-        tool_instructions: Option<&str>,
-    ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut contents: Vec<Content> = Vec::new();
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => system_parts.push(&msg.content),
-                "user" => contents.push(Content {
-                    role: Some("user".to_string()),
-                    parts: build_parts(&msg.content),
-                }),
-                "assistant" => contents.push(Content {
-                    role: Some("model".to_string()),
-                    parts: vec![Part::text(&msg.content)],
-                }),
-                _ => {}
-            }
-        }
-        if let Some(instructions) = tool_instructions {
-            system_parts.push(instructions);
-        }
+    fn anchor_on_user_turn(contents: &mut Vec<Content>) -> anyhow::Result<()> {
         // Gemini rejects a request whose last turn is a model turn. History
         // trims, session restores, and steering continuations can all leave
         // the history ending on the model's own output. Those model turns are
@@ -1136,6 +1250,33 @@ impl GeminiModelProvider {
                 });
             }
         }
+        Ok(())
+    }
+
+    fn build_chat_contents(
+        messages: &[ChatMessage],
+        tool_instructions: Option<&str>,
+    ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: build_parts(&msg.content),
+                }),
+                "assistant" => contents.push(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part::text(&msg.content)],
+                }),
+                _ => {}
+            }
+        }
+        if let Some(instructions) = tool_instructions {
+            system_parts.push(instructions);
+        }
+        Self::anchor_on_user_turn(&mut contents)?;
         let system_instruction = if system_parts.is_empty() {
             None
         } else {
@@ -1247,9 +1388,15 @@ impl GeminiModelProvider {
             system_instruction,
             generation_config: GenerationConfig {
                 temperature,
-                max_output_tokens: 8192,
+                max_output_tokens: self.max_output_tokens,
             },
+            tools: None,
         };
+
+        if self.router_profile.is_some() {
+            let result = self.post_explicit_key_request(&request, model).await?;
+            return Self::text_from_response(result);
+        }
 
         let url = Self::build_generate_content_url(model, auth);
 
@@ -1417,6 +1564,12 @@ impl GeminiModelProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
+        Self::text_from_response(result)
+    }
+
+    fn text_from_response(
+        result: GenerateContentResponse,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let usage = result
             .usage_metadata
             .and_then(Self::token_usage_from_metadata);
@@ -1440,17 +1593,326 @@ impl GeminiModelProvider {
     }
 }
 
+impl GeminiModelProvider {
+    async fn post_explicit_key_request(
+        &self,
+        request: &GenerateContentRequest,
+        model: &str,
+    ) -> anyhow::Result<GenerateContentResponse> {
+        let auth = self
+            .auth
+            .as_ref()
+            .filter(|auth| matches!(auth, GeminiAuth::ExplicitKey(_)))
+            .ok_or_else(|| {
+                anyhow::Error::msg("gemini router requests require an explicit API key")
+            })?;
+        let url = self.generate_content_url(model, auth);
+        let response = self
+            .build_generate_content_request(auth, &url, request, model, true, None, None)?
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(crate::api_error("gemini", response).await);
+        }
+        let result: GenerateContentResponse = response.json().await?;
+        if let Some(err) = &result.error {
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
+        let result = result.into_effective_response();
+        if let Some(err) = &result.error {
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
+        Ok(result)
+    }
+
+    async fn chat_native(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let (contents, system_instruction) = Self::build_native_contents(request.messages)?;
+        let tools = match request.tools.filter(|tools| !tools.is_empty()) {
+            Some(tools) => match self.convert_tools(tools) {
+                ToolsPayload::Gemini {
+                    function_declarations,
+                } => Some(vec![serde_json::json!({
+                    "functionDeclarations": function_declarations
+                })]),
+                payload => {
+                    anyhow::bail!(
+                        "gemini native mode produced a non-Gemini tools payload ({payload:?})"
+                    )
+                }
+            },
+            None => None,
+        };
+        let body = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: self.max_output_tokens,
+            },
+            tools,
+        };
+        let result = self.post_explicit_key_request(&body, model).await?;
+        Self::chat_response_from_native(result)
+    }
+
+    fn chat_response_from_native(
+        result: GenerateContentResponse,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let usage = result
+            .usage_metadata
+            .and_then(Self::token_usage_from_metadata);
+        let parts = result
+            .candidates
+            .and_then(|candidates| candidates.into_iter().next())
+            .and_then(|candidate| candidate.content)
+            .map(|content| content.parts)
+            .unwrap_or_default();
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut used_ids = std::collections::HashSet::new();
+        for part in parts {
+            if let Some(call) = part.function_call {
+                let id = call
+                    .id
+                    .filter(|id| !id.is_empty() && used_ids.insert(id.clone()))
+                    .unwrap_or_else(|| {
+                        format!("{SYNTHETIC_CALL_ID_PREFIX}{}", uuid::Uuid::new_v4())
+                    });
+                tool_calls.push(ToolCall {
+                    id,
+                    name: call.name,
+                    arguments: call
+                        .args
+                        .unwrap_or_else(|| serde_json::json!({}))
+                        .to_string(),
+                    extra_content: part
+                        .thought_signature
+                        .filter(|signature| !signature.is_empty())
+                        .map(|signature| {
+                            serde_json::json!({"google": {"thought_signature": signature}})
+                        }),
+                });
+            } else if !part.thought
+                && let Some(chunk) = part.text
+            {
+                text.push_str(&chunk);
+            }
+        }
+
+        if text.is_empty() && tool_calls.is_empty() {
+            return Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ));
+        }
+        Ok(ProviderChatResponse {
+            text: (!text.is_empty()).then_some(text),
+            tool_calls,
+            usage,
+            reasoning_content: None,
+        })
+    }
+
+    fn parse_assistant_tool_calls(content: &str) -> Option<(Option<String>, Vec<ToolCall>)> {
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        let calls =
+            serde_json::from_value::<Vec<ToolCall>>(value.get("tool_calls")?.clone()).ok()?;
+        let text = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        Some((text, calls))
+    }
+
+    fn wire_call_id(id: &str) -> Option<String> {
+        (!id.starts_with(SYNTHETIC_CALL_ID_PREFIX)).then(|| id.to_string())
+    }
+
+    fn model_parts_for_calls(text: Option<String>, calls: &[ToolCall]) -> Vec<Part> {
+        let mut parts: Vec<Part> = text.into_iter().map(Part::text).collect();
+        for call in calls {
+            parts.push(Part::FunctionCall {
+                function_call: FunctionCallPart {
+                    name: call.name.clone(),
+                    args: serde_json::from_str(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    id: Self::wire_call_id(&call.id),
+                },
+                thought_signature: call
+                    .extra_content
+                    .as_ref()
+                    .and_then(|extra| extra.pointer("/google/thought_signature"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+        parts
+    }
+
+    fn parse_tool_result(content: &str) -> Option<(String, String)> {
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        let object = value.as_object()?;
+        let id = object.get("tool_call_id")?.as_str()?.to_string();
+        let result = match object.get("content") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+        };
+        Some((id, result))
+    }
+
+    fn flush_tool_results(
+        contents: &mut Vec<Content>,
+        pending: &mut Vec<(String, Part)>,
+        call_order: &[String],
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        pending.sort_by_key(|(id, _)| {
+            call_order
+                .iter()
+                .position(|candidate| candidate == id)
+                .unwrap_or(usize::MAX)
+        });
+        contents.push(Content {
+            role: Some("user".to_string()),
+            parts: pending.drain(..).map(|(_, part)| part).collect(),
+        });
+    }
+
+    fn build_native_contents(
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+        let mut call_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut call_order: Vec<String> = Vec::new();
+        let mut pending: Vec<(String, Part)> = Vec::new();
+
+        for (index, msg) in messages.iter().enumerate() {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
+                continue;
+            }
+            if !matches!(msg.role.as_str(), "tool" | "system") {
+                Self::flush_tool_results(&mut contents, &mut pending, &call_order);
+            }
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: build_parts(&msg.content),
+                }),
+                "assistant" => {
+                    let parts = match Self::parse_assistant_tool_calls(&msg.content) {
+                        Some((text, calls)) => {
+                            call_order = calls.iter().map(|call| call.id.clone()).collect();
+                            for call in &calls {
+                                call_names.insert(call.id.clone(), call.name.clone());
+                            }
+                            Self::model_parts_for_calls(text, &calls)
+                        }
+                        None => {
+                            call_order.clear();
+                            if msg.content.trim().is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![Part::text(&msg.content)]
+                            }
+                        }
+                    };
+                    if !parts.is_empty() {
+                        contents.push(Content {
+                            role: Some("model".to_string()),
+                            parts,
+                        });
+                    }
+                }
+                "tool" => match Self::parse_tool_result(&msg.content) {
+                    Some((id, result)) if call_names.contains_key(&id) => {
+                        let name = call_names[&id].clone();
+                        pending.push((
+                            id.clone(),
+                            Part::FunctionResponse {
+                                function_response: FunctionResponsePart {
+                                    name,
+                                    response: serde_json::json!({ "result": result }),
+                                    id: Self::wire_call_id(&id),
+                                },
+                            },
+                        ));
+                    }
+                    _ => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            "gemini: tool result without a matching function call dropped"
+                        );
+                    }
+                },
+                _ => {}
+            }
+        }
+        Self::flush_tool_results(&mut contents, &mut pending, &call_order);
+        Self::anchor_on_user_turn(&mut contents)?;
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+        Ok((contents, system_instruction))
+    }
+}
+
 #[async_trait]
 impl ModelProvider for GeminiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.base_url.as_deref().unwrap_or(BASE_URL))
+    }
+
+    fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
+        if !self.native_tools {
+            return ToolsPayload::PromptGuided {
+                instructions: zeroclaw_api::model_provider::build_tool_instructions_text(tools),
+            };
+        }
+        ToolsPayload::Gemini {
+            function_declarations: tools
+                .iter()
+                .map(|tool| {
+                    let parameters = self
+                        .schema_cache
+                        .clean_shared(&tool.parameters, CleaningStrategy::Gemini);
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": (*parameters).clone(),
+                    })
+                })
+                .collect(),
+        }
     }
 
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
         zeroclaw_api::model_provider::ProviderCapabilities {
             vision: true,
-            native_tool_calling: false,
+            native_tool_calling: self.native_tools,
             prompt_caching: false,
             extended_thinking: false,
         }
@@ -1497,6 +1959,9 @@ impl ModelProvider for GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        if self.native_tools {
+            return self.chat_native(request, model, temperature).await;
+        }
         let tool_instructions = if let Some(tools) = request.tools
             && !tools.is_empty()
             && !self.supports_native_tools()
@@ -1526,6 +1991,9 @@ impl ModelProvider for GeminiModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
+        if self.router_profile.is_some() {
+            return Ok(());
+        }
         if let Some(auth) = self.auth.as_ref() {
             match auth {
                 GeminiAuth::ManagedOAuth => {
@@ -1632,6 +2100,12 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            base_url: None,
+            router_profile: None,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            native_tools: false,
+            schema_cache: SchemaCleanCache::new(),
         }
     }
 
@@ -1901,6 +2375,7 @@ mod tests {
                 temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = model_provider
@@ -1941,6 +2416,7 @@ mod tests {
                 temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = model_provider
@@ -1985,6 +2461,7 @@ mod tests {
                 temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let request = model_provider
@@ -2077,6 +2554,7 @@ mod tests {
                 temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
+            tools: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -2104,6 +2582,7 @@ mod tests {
                     temperature: Some(0.7),
                     max_output_tokens: 8192,
                 }),
+                tools: None,
             },
         };
 
@@ -2131,6 +2610,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
@@ -2152,6 +2632,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: None,
+                tools: None,
             },
         };
 
@@ -2552,6 +3033,12 @@ mod tests {
             auth_profile_override: None,
             oauth_client_id: None,
             oauth_client_secret: None,
+            base_url: None,
+            router_profile: None,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            native_tools: false,
+            schema_cache: SchemaCleanCache::new(),
         };
 
         let result = model_provider.warmup().await;
@@ -2837,5 +3324,659 @@ mod tests {
         assert!(
             matches!(&system_instruction.parts[0], Part::Text { text } if text == "Use tools carefully")
         );
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use crate::opencode_session::{OPENCODE_SESSION_HEADER, RouterProfile};
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    use zeroclaw_api::tool::ToolSpec;
+
+    const ARGON_BASE: &str = "https://opencode.ai/inference/go/v1";
+    const ARGON_MODEL: &str = "gemini-4-argon-contributor";
+
+    type Captured = Arc<Mutex<Vec<(axum::http::HeaderMap, Value)>>>;
+
+    async fn serve(
+        status: u16,
+        body: Value,
+        extra_headers: Vec<(&'static str, &'static str)>,
+    ) -> (String, Captured, tokio::task::JoinHandle<()>) {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let seen = captured.clone();
+        let app = axum::Router::new().fallback(
+            move |headers: axum::http::HeaderMap, axum::Json(request): axum::Json<Value>| {
+                let seen = seen.clone();
+                let body = body.to_string();
+                let extra_headers = extra_headers.clone();
+                async move {
+                    seen.lock().unwrap().push((headers, request));
+                    let mut response = axum::http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json");
+                    for (name, value) in extra_headers {
+                        response = response.header(name, value);
+                    }
+                    response.body(axum::body::Body::from(body)).unwrap()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/inference/go/v1"), captured, server)
+    }
+
+    fn router_builder(base: &str) -> GeminiBuilder {
+        GeminiModelProvider::builder("argon")
+            .api_key(Some("router-key"))
+            .base_url(base)
+            .router_profile(RouterProfile::opencode())
+    }
+
+    fn router_provider(base: &str) -> GeminiModelProvider {
+        router_builder(base).native_tools(true).try_build().unwrap()
+    }
+
+    fn sample_request() -> GenerateContentRequest {
+        GenerateContentRequest {
+            contents: vec![Content {
+                role: Some("user".into()),
+                parts: vec![Part::text("hello")],
+            }],
+            system_instruction: None,
+            generation_config: GenerationConfig {
+                temperature: None,
+                max_output_tokens: 8192,
+            },
+            tools: None,
+        }
+    }
+
+    fn built_request(provider: &GeminiModelProvider) -> reqwest::Request {
+        let auth = provider.auth.as_ref().unwrap();
+        let url = provider.generate_content_url(ARGON_MODEL, auth);
+        provider
+            .build_generate_content_request(
+                auth,
+                &url,
+                &sample_request(),
+                ARGON_MODEL,
+                true,
+                None,
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn weather_tool() -> ToolSpec {
+        ToolSpec::new(
+            "get_weather",
+            "Weather by city",
+            json!({
+                "type": "object",
+                "properties": {"city": {"type": "string", "minLength": 1}},
+                "required": ["city"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }),
+        )
+    }
+
+    fn function_call_response() -> Value {
+        json!({
+            "candidates": [{"content": {"role": "model", "parts": [{
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}, "id": "call-1"},
+                "thoughtSignature": "SIG-ONE"
+            }]}}],
+            "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 3}
+        })
+    }
+
+    fn text_response(text: &str) -> Value {
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]})
+    }
+
+    async fn native_chat(
+        provider: &GeminiModelProvider,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> anyhow::Result<ProviderChatResponse> {
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages,
+                    tools: Some(tools),
+                    thinking: None,
+                },
+                ARGON_MODEL,
+                None,
+            )
+            .await
+    }
+
+    fn assistant_history(response: &ProviderChatResponse) -> ChatMessage {
+        ChatMessage::assistant(
+            json!({"content": response.text, "tool_calls": response.tool_calls}).to_string(),
+        )
+    }
+
+    fn tool_result(id: &str, content: &str) -> ChatMessage {
+        ChatMessage::tool(json!({"tool_call_id": id, "content": content}).to_string())
+    }
+
+    #[test]
+    fn generate_content_url_uses_the_builder_base_url() {
+        let provider = router_builder(ARGON_BASE).try_build().unwrap();
+        let url = provider.generate_content_url(ARGON_MODEL, provider.auth.as_ref().unwrap());
+        assert_eq!(
+            url,
+            "https://opencode.ai/inference/go/v1/models/gemini-4-argon-contributor:generateContent"
+        );
+        assert_eq!(provider.default_base_url(), Some(ARGON_BASE));
+    }
+
+    #[test]
+    fn generate_content_url_defaults_to_ai_studio() {
+        let provider = GeminiModelProvider::builder("plain")
+            .api_key(Some("k"))
+            .build();
+        let url =
+            provider.generate_content_url("gemini-2.0-flash", provider.auth.as_ref().unwrap());
+        assert_eq!(
+            url,
+            format!("{BASE_URL}/models/gemini-2.0-flash:generateContent")
+        );
+        assert_eq!(provider.default_base_url(), Some(BASE_URL));
+    }
+
+    #[test]
+    fn request_carries_session_and_user_agent_with_a_profile() {
+        let request = built_request(&router_builder(ARGON_BASE).try_build().unwrap());
+        let session = request.headers().get(OPENCODE_SESSION_HEADER).unwrap();
+        assert!(!session.to_str().unwrap().is_empty());
+        assert_eq!(
+            request.headers().get(reqwest::header::USER_AGENT).unwrap(),
+            crate::opencode_session::OPENCODE_USER_AGENT
+        );
+    }
+
+    #[test]
+    fn request_has_no_router_headers_without_a_profile() {
+        let provider = GeminiModelProvider::builder("plain")
+            .api_key(Some("k"))
+            .build();
+        let request = built_request(&provider);
+        assert!(request.headers().get(OPENCODE_SESSION_HEADER).is_none());
+        assert!(request.headers().get(reqwest::header::USER_AGENT).is_none());
+    }
+
+    #[test]
+    fn request_sends_the_api_key_in_the_goog_header() {
+        let request = built_request(&router_builder(ARGON_BASE).try_build().unwrap());
+        let key = request.headers().get(GOOGLE_API_KEY_HEADER).unwrap();
+        assert_eq!(key, "router-key");
+        assert!(key.is_sensitive());
+        assert!(request.headers().get(AUTHORIZATION_HEADER).is_none());
+    }
+
+    const AUTHORIZATION_HEADER: &str = "authorization";
+
+    #[tokio::test]
+    async fn warmup_sends_nothing_in_router_mode() {
+        let (base, captured, server) = serve(200, text_response("x"), vec![]).await;
+        let provider = router_provider(&base);
+        provider.warmup().await.expect("router warmup is a no-op");
+        server.abort();
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn router_mode_without_a_key_fails_instead_of_google_oauth() {
+        for key in [None, Some(""), Some("  ")] {
+            let result = GeminiModelProvider::builder("argon")
+                .api_key(key)
+                .base_url(ARGON_BASE)
+                .router_profile(RouterProfile::opencode())
+                .try_build();
+            let Err(error) = result else {
+                panic!("no key in router mode must fail");
+            };
+            assert!(!error.to_string().contains("oauth_creds"));
+        }
+        let built = GeminiModelProvider::builder("argon")
+            .router_profile(RouterProfile::opencode())
+            .build();
+        assert!(built.auth.is_none());
+    }
+
+    #[tokio::test]
+    async fn client_timeout_comes_from_the_builder() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+        let provider = router_builder(&format!("http://{addr}/v1"))
+            .timeout_secs(1)
+            .try_build()
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.chat_with_system(None, "hi", ARGON_MODEL, None),
+        )
+        .await;
+        server.abort();
+        assert!(outcome.expect("client timeout must fire first").is_err());
+    }
+
+    #[tokio::test]
+    async fn generation_config_uses_the_builder_output_limit() {
+        let (base, captured, server) = serve(200, text_response("ok"), vec![]).await;
+        let limited = router_builder(&base)
+            .max_output_tokens(4096)
+            .try_build()
+            .unwrap();
+        limited
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await
+            .unwrap();
+        let default = router_builder(&base).try_build().unwrap();
+        default
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await
+            .unwrap();
+        server.abort();
+        let seen = captured.lock().unwrap();
+        assert_eq!(seen[0].1["generationConfig"]["maxOutputTokens"], 4096);
+        assert_eq!(seen[1].1["generationConfig"]["maxOutputTokens"], 8192);
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_still_returns_text_in_router_mode() {
+        let (base, captured, server) = serve(200, text_response("plain answer"), vec![]).await;
+        let provider = router_provider(&base);
+        let text = provider
+            .chat_with_system(Some("sys"), "hi", ARGON_MODEL, None)
+            .await
+            .unwrap();
+        let history = provider
+            .chat_with_history(&[ChatMessage::user("hi")], ARGON_MODEL, None)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(text, "plain answer");
+        assert_eq!(history, "plain answer");
+        let seen = captured.lock().unwrap();
+        assert!(seen[0].0.get(OPENCODE_SESSION_HEADER).is_some());
+        assert!(seen[0].1.get("tools").is_none());
+    }
+
+    #[test]
+    fn native_tools_flag_switches_capabilities() {
+        let on = router_builder(ARGON_BASE)
+            .native_tools(true)
+            .try_build()
+            .unwrap();
+        assert!(on.capabilities().native_tool_calling);
+        assert!(on.supports_native_tools());
+        let off = router_builder(ARGON_BASE).try_build().unwrap();
+        assert!(!off.capabilities().native_tool_calling);
+        assert!(!off.supports_native_tools());
+        assert!(matches!(
+            off.convert_tools(&[weather_tool()]),
+            ToolsPayload::PromptGuided { .. }
+        ));
+    }
+
+    #[test]
+    fn tools_serialize_as_function_declarations() {
+        let provider = router_provider(ARGON_BASE);
+        let ToolsPayload::Gemini {
+            function_declarations,
+        } = provider.convert_tools(&[weather_tool()])
+        else {
+            panic!("native mode must produce the Gemini payload");
+        };
+        assert_eq!(function_declarations.len(), 1);
+        let declaration = &function_declarations[0];
+        assert_eq!(declaration["name"], "get_weather");
+        assert_eq!(declaration["description"], "Weather by city");
+        assert_eq!(declaration["parameters"]["required"], json!(["city"]));
+        let text = declaration["parameters"].to_string();
+        assert!(!text.contains("additionalProperties"));
+        assert!(!text.contains("$schema"));
+        assert!(!text.contains("minLength"));
+    }
+
+    #[test]
+    fn part_variants_serialize_to_the_router_json() {
+        let call = serde_json::to_value(Part::FunctionCall {
+            function_call: FunctionCallPart {
+                name: "get_weather".into(),
+                args: json!({"city": "Paris"}),
+                id: Some("call-1".into()),
+            },
+            thought_signature: Some("SIG-ONE".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            call,
+            json!({
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}, "id": "call-1"},
+                "thoughtSignature": "SIG-ONE"
+            })
+        );
+        let bare = serde_json::to_value(Part::FunctionCall {
+            function_call: FunctionCallPart {
+                name: "f".into(),
+                args: json!({}),
+                id: None,
+            },
+            thought_signature: None,
+        })
+        .unwrap();
+        assert_eq!(bare, json!({"functionCall": {"name": "f", "args": {}}}));
+        let response = serde_json::to_value(Part::FunctionResponse {
+            function_response: FunctionResponsePart {
+                name: "get_weather".into(),
+                response: json!({"result": "sunny"}),
+                id: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            response,
+            json!({"functionResponse": {"name": "get_weather", "response": {"result": "sunny"}}})
+        );
+    }
+
+    #[test]
+    fn response_function_call_becomes_tool_call_with_signature() {
+        let result: GenerateContentResponse =
+            serde_json::from_value(function_call_response()).unwrap();
+        let response = GeminiModelProvider::chat_response_from_native(result).unwrap();
+        assert_eq!(response.text, None);
+        assert_eq!(response.tool_calls.len(), 1);
+        let call = &response.tool_calls[0];
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments, r#"{"city":"Paris"}"#);
+        assert_eq!(
+            call.extra_content,
+            Some(json!({"google": {"thought_signature": "SIG-ONE"}}))
+        );
+        assert_eq!(response.usage.unwrap().input_tokens, Some(11));
+    }
+
+    #[test]
+    fn response_function_call_without_id_gets_a_unique_synthetic_id() {
+        let result: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "f", "args": {"a": 1}}},
+                {"functionCall": {"name": "f", "args": {"a": 2}}}
+            ]}}]
+        }))
+        .unwrap();
+        let response = GeminiModelProvider::chat_response_from_native(result).unwrap();
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_ne!(response.tool_calls[0].id, response.tool_calls[1].id);
+        assert!(
+            response
+                .tool_calls
+                .iter()
+                .all(|c| c.extra_content.is_none())
+        );
+    }
+
+    #[test]
+    fn parallel_function_calls_keep_every_signature_found() {
+        let result: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}, "id": "a"},
+                 "thoughtSignature": "SIG-FIRST"},
+                {"functionCall": {"name": "get_weather", "args": {"city": "Rome"}, "id": "b"}}
+            ]}}]
+        }))
+        .unwrap();
+        let response = GeminiModelProvider::chat_response_from_native(result).unwrap();
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].id, "a");
+        assert_eq!(response.tool_calls[1].id, "b");
+        assert_eq!(
+            response.tool_calls[0].extra_content,
+            Some(json!({"google": {"thought_signature": "SIG-FIRST"}}))
+        );
+        assert_eq!(response.tool_calls[1].extra_content, None);
+        assert_eq!(response.tool_calls[1].arguments, r#"{"city":"Rome"}"#);
+    }
+
+    #[tokio::test]
+    async fn chat_sends_tools_and_returns_a_function_call_only_response() {
+        let (base, captured, server) = serve(200, function_call_response(), vec![]).await;
+        let provider = router_provider(&base);
+        let response = native_chat(
+            &provider,
+            &[ChatMessage::user("weather?")],
+            &[weather_tool()],
+        )
+        .await
+        .expect("a function call without text is a normal response");
+        server.abort();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "get_weather");
+        let seen = captured.lock().unwrap();
+        let declarations = &seen[0].1["tools"][0]["functionDeclarations"];
+        assert_eq!(declarations[0]["name"], "get_weather");
+        assert!(
+            !declarations[0]["parameters"]
+                .to_string()
+                .contains("additionalProperties")
+        );
+        assert!(seen[0].0.get(GOOGLE_API_KEY_HEADER).is_some());
+    }
+
+    #[tokio::test]
+    async fn history_round_trip_returns_the_signature() {
+        let (base, captured, server) = serve(200, function_call_response(), vec![]).await;
+        let provider = router_provider(&base);
+        let first = native_chat(
+            &provider,
+            &[ChatMessage::user("weather?")],
+            &[weather_tool()],
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let (base, captured_two, server) = serve(200, text_response("sunny"), vec![]).await;
+        let provider = router_provider(&base);
+        let history = vec![
+            ChatMessage::user("weather?"),
+            assistant_history(&first),
+            tool_result("call-1", "sunny, 21C"),
+        ];
+        let second = native_chat(&provider, &history, &[weather_tool()])
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(second.text.as_deref(), Some("sunny"));
+        drop(captured);
+        let seen = captured_two.lock().unwrap();
+        let contents = &seen[0].1["contents"];
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(
+            contents[1]["parts"][0],
+            json!({
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}, "id": "call-1"},
+                "thoughtSignature": "SIG-ONE"
+            })
+        );
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["response"],
+            json!({"result": "sunny, 21C"})
+        );
+    }
+
+    #[test]
+    fn history_without_a_signature_sends_no_signature() {
+        let call = ToolCall {
+            id: "b".into(),
+            name: "get_weather".into(),
+            arguments: r#"{"city":"Rome"}"#.into(),
+            extra_content: None,
+        };
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(json!({"content": null, "tool_calls": [call]}).to_string()),
+            tool_result("b", "rainy"),
+        ];
+        let (contents, _) = GeminiModelProvider::build_native_contents(&messages).unwrap();
+        let part = serde_json::to_value(&contents[1].parts[0]).unwrap();
+        assert!(part.get("thoughtSignature").is_none());
+        assert!(part.get("functionCall").is_some());
+    }
+
+    #[test]
+    fn tool_result_message_maps_to_function_response() {
+        let calls: Vec<ToolCall> = ["a", "b"]
+            .iter()
+            .map(|id| ToolCall {
+                id: (*id).into(),
+                name: format!("tool_{id}"),
+                arguments: "{}".into(),
+                extra_content: None,
+            })
+            .collect();
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(json!({"content": "working", "tool_calls": calls}).to_string()),
+            tool_result("b", "result-b"),
+            tool_result("a", "result-a"),
+        ];
+        let (contents, _) = GeminiModelProvider::build_native_contents(&messages).unwrap();
+        assert_eq!(contents.len(), 3);
+        let model = serde_json::to_value(&contents[1]).unwrap();
+        assert_eq!(model["parts"][0], json!({"text": "working"}));
+        assert_eq!(model["parts"][1]["functionCall"]["name"], "tool_a");
+        let user = serde_json::to_value(&contents[2]).unwrap();
+        assert_eq!(user["role"], "user");
+        assert_eq!(user["parts"][0]["functionResponse"]["name"], "tool_a");
+        assert_eq!(
+            user["parts"][0]["functionResponse"]["response"],
+            json!({"result": "result-a"})
+        );
+        assert_eq!(user["parts"][1]["functionResponse"]["name"], "tool_b");
+        assert_eq!(
+            user["parts"][1]["functionResponse"]["response"],
+            json!({"result": "result-b"})
+        );
+    }
+
+    #[test]
+    fn native_history_still_ends_on_a_user_turn() {
+        let call = ToolCall {
+            id: "a".into(),
+            name: "f".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        };
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant(json!({"content": null, "tool_calls": [call]}).to_string()),
+        ];
+        let (contents, _) = GeminiModelProvider::build_native_contents(&messages).unwrap();
+        assert_eq!(contents.last().unwrap().role.as_deref(), Some("user"));
+    }
+
+    #[tokio::test]
+    async fn text_only_response_still_returns_text() {
+        let (base, _captured, server) = serve(200, text_response("just text"), vec![]).await;
+        let provider = router_provider(&base);
+        let response = native_chat(&provider, &[ChatMessage::user("hi")], &[weather_tool()])
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(response.text.as_deref(), Some("just text"));
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn thought_only_response_is_not_shown_in_native_mode() {
+        let body = json!({"candidates": [{"content": {"parts": [
+            {"text": "private reasoning", "thought": true}
+        ]}}]});
+        let (base, _captured, server) = serve(200, body.clone(), vec![]).await;
+        let native = router_provider(&base);
+        let error = native_chat(&native, &[ChatMessage::user("hi")], &[weather_tool()])
+            .await
+            .expect_err("thought-only must not become visible text");
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+                .is_some()
+        );
+        let prompt_guided = router_builder(&base).try_build().unwrap();
+        let text = prompt_guided
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(text, "private reasoning");
+    }
+
+    #[test]
+    fn mixed_thought_and_answer_parts_keep_only_the_answer() {
+        let result: GenerateContentResponse = serde_json::from_value(json!({
+            "candidates": [{"content": {"parts": [
+                {"text": "hidden", "thought": true},
+                {"text": "shown"}
+            ]}}]
+        }))
+        .unwrap();
+        let response = GeminiModelProvider::chat_response_from_native(result).unwrap();
+        assert_eq!(response.text.as_deref(), Some("shown"));
+    }
+
+    #[tokio::test]
+    async fn router_http_error_keeps_status_and_retry_after() {
+        let (base, _captured, server) = serve(
+            429,
+            json!({"error": {"message": "slow down for user-secret-detail"}}),
+            vec![("retry-after", "17")],
+        )
+        .await;
+        let provider = router_provider(&base);
+        let error = native_chat(&provider, &[ChatMessage::user("hi")], &[weather_tool()])
+            .await
+            .expect_err("429 must fail");
+        let plain = provider
+            .chat_with_system(None, "hi", ARGON_MODEL, None)
+            .await
+            .expect_err("429 must fail on the text path too");
+        server.abort();
+        for error in [error, plain] {
+            let typed = error
+                .downcast_ref::<crate::ProviderHttpError>()
+                .expect("router errors keep the typed HTTP boundary");
+            assert_eq!(typed.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(typed.retry_after_secs(), Some(17));
+        }
     }
 }
