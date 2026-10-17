@@ -3722,12 +3722,14 @@ VOICE_TRANSCRIPTION_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 VOICE_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
 VOICE_TRANSCRIPTION_LANGUAGE = "ru"
 VOICE_MAX_AUDIO_BYTES = 25 * 1024 * 1024
+VOICE_FFMPEG_TIMEOUT_SECS = 120
 VOICE_FAILURE_HINT = (
     "Проверь баланс OpenRouter (аудио требует >= $0.50): "
-    "https://openrouter.ai/settings/credits; 401 - ключ OPENROUTER_API_KEY"
+    "https://openrouter.ai/settings/credits; 401 - ключ OPENROUTER_API_KEY; "
+    "ffmpeg - битое видео или нет ffmpeg/ffprobe в образе"
 )
-_AUDIO_SINGLE_RE = re.compile(r"^- path: (uploads/.+)\n- type: audio/", re.MULTILINE)
-_AUDIO_MULTI_RE = re.compile(r"^\d+\. (uploads/.+?) \(audio/[^,]*,", re.MULTILINE)
+_ATTACHMENT_SINGLE_RE = re.compile(r"^- path: (uploads/.+)\n- type: (\S+)", re.MULTILINE)
+_ATTACHMENT_MULTI_RE = re.compile(r"^\d+\. (uploads/.+?) \(([^,]+),", re.MULTILINE)
 _BRAND_RE = re.compile(r"\b(?:ла-?ла-?ф[еэоа]|лавафо)\b", re.IGNORECASE)
 
 
@@ -3738,10 +3740,40 @@ class VoiceTranscriptionError(Exception):
     pass
 
 
-def find_audio_attachments(message: str) -> list[str]:
+def find_audio_attachments(message: str) -> list[tuple[str, str]]:
     message = _SDK_USER_MESSAGE_RE.split(message, maxsplit=1)[0]
-    found = _AUDIO_SINGLE_RE.findall(message) + _AUDIO_MULTI_RE.findall(message)
-    return list(dict.fromkeys(path.strip() for path in found))
+    found = _ATTACHMENT_SINGLE_RE.findall(message) + _ATTACHMENT_MULTI_RE.findall(message)
+    media = (
+        (path.strip(), mime)
+        for path, mime in found
+        if mime.startswith(("audio/", "video/"))
+    )
+    return list(dict.fromkeys(media))
+
+
+def extract_audio_track(path: Path) -> bytes | None:
+    probe = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+    ]
+    extract = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:a:0", "-vn",
+        "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1",
+    ]
+    try:
+        streams = subprocess.run(
+            probe, capture_output=True, timeout=VOICE_FFMPEG_TIMEOUT_SECS, check=True
+        ).stdout
+        if not streams.strip():
+            return None
+        return subprocess.run(
+            extract, capture_output=True, timeout=VOICE_FFMPEG_TIMEOUT_SECS, check=True
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode(errors="replace").strip()
+        raise VoiceTranscriptionError(f"ffmpeg exit {exc.returncode}: {stderr}"[:300]) from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise VoiceTranscriptionError(f"ffmpeg {exc.__class__.__name__}: {exc}"[:300]) from exc
 
 
 def resolve_upload_path(uploads_dir: Path, rel_path: str) -> Path | None:
@@ -3758,11 +3790,13 @@ def apply_voice_transcription(
     message: str,
     uploads_dir: Path,
     transcribe: Callable[[bytes, str], str],
+    extract_audio: Callable[[Path], bytes | None] | None = None,
 ) -> tuple[str, int, list[str]]:
+    extract = extract_audio or extract_audio_track
     lines: list[str] = []
     failures: list[str] = []
     ok = 0
-    for rel in find_audio_attachments(message):
+    for rel, mime in find_audio_attachments(message):
         path = resolve_upload_path(uploads_dir, rel)
         if path is None:
             lines.append(f"[Voice transcription failed: {rel} not found in uploads]")
@@ -3771,7 +3805,14 @@ def apply_voice_transcription(
             lines.append(f"[Voice transcription skipped: {rel} is larger than 25 MB]")
             continue
         try:
-            text = transcribe(path.read_bytes(), path.name).strip()
+            if mime.startswith("video/"):
+                audio = extract(path)
+                if audio is None:
+                    lines.append(f"[Voice transcription skipped: {rel} has no audio track]")
+                    continue
+                text = transcribe(audio, f"{path.stem}.ogg").strip()
+            else:
+                text = transcribe(path.read_bytes(), path.name).strip()
         except VoiceTranscriptionError as exc:
             failures.append(f"{rel}: {exc}")
             lines.append(f"[Voice transcription failed: {exc}]")
