@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn tool_error_text_keeps_the_cause_chain() {
-        let error = anyhow::anyhow!("tcp connect error: Connection refused")
+        let error = anyhow::Error::msg("tcp connect error: Connection refused")
             .context("MCP server `lalafo-db` error during tool call `ch_query`");
         let text = tool_error_text(&error);
         assert!(text.contains("error during tool call `ch_query`"), "{text}");
