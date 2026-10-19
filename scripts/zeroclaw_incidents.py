@@ -916,6 +916,9 @@ class EpisodeTracker:
             and incident.kind == "tool_failure" and incident.gate
         ):
             self._twin_gates.add(incident.tool_call_id)
+        if row.get("event_type") == "turn_final_response" and not _turn_key(row):
+            self._legacy_final(row)
+            return
         turn = _turn_key(row)
         if not turn or stamp is None:
             return
@@ -926,7 +929,7 @@ class EpisodeTracker:
                 "session_key": None, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
                 "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
-                "failed_calls": [], "final": None, "cancelled": False,
+                "failed_calls": [], "final": None, "legacy_final": None, "cancelled": False,
                 "error": False, "drift": False,
             }
         ep["first"] = min(ep["first"], stamp)
@@ -959,6 +962,23 @@ class EpisodeTracker:
             self._incident(ep, incident)
         if drift is not None and drift.turn_id == turn:
             ep["drift"] = True
+
+    def _legacy_final(self, row: dict) -> None:
+        payload = row.get("payload")
+        session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        if not session_id:
+            return
+        flag = str(row.get("success")).lower()
+        if flag not in ("true", "false"):
+            return
+        candidates = [
+            ep for ep in self._open.values()
+            if ep["session_key"] == session_id and ep["final"] is None
+            and ep["legacy_final"] is None
+        ]
+        if candidates:
+            target = max(candidates, key=lambda ep: (ep["last"], ep["first"]))
+            target["legacy_final"] = "answered" if flag == "true" else "error"
 
     @staticmethod
     def _tool_start(ep: dict, attrs: dict) -> None:
@@ -1026,6 +1046,8 @@ class EpisodeTracker:
             outcome = "cancelled"
         elif ep["final"] is not None:
             outcome = "answered" if ep["final"] > 0 else "empty"
+        elif ep["legacy_final"]:
+            outcome = ep["legacy_final"]
         elif ep["error"]:
             outcome = "error"
         else:
