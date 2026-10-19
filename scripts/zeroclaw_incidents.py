@@ -866,7 +866,7 @@ def command_head(command: object) -> str | None:
     first = _WORKSPACE_ABS_RE.sub("", parts[0])
     if first in ("python3", "python") and len(parts) > 1:
         head = _WORKSPACE_ABS_RE.sub("", parts[1])
-        if len(parts) > 2 and _SUBCOMMAND_RE.match(parts[2]):
+        if len(parts) > 2 and len(parts[2]) <= 24 and _SUBCOMMAND_RE.match(parts[2]):
             head = f"{head} {parts[2]}"
         return head[:MAX_DETAIL_CHARS]
     return first[:MAX_DETAIL_CHARS]
@@ -902,6 +902,7 @@ class EpisodeTracker:
         self._names = cron_names
         self._open: dict[str, dict] = {}
         self._commands: dict[str, str] = {}
+        self._twin_gates: set[str] = set()
         self._earliest: datetime | None = None
 
     def observe(self, row: dict, incident: Incident | None, drift: Incident | None) -> None:
@@ -910,6 +911,11 @@ class EpisodeTracker:
             self._earliest = stamp
         if incident is not None and not incident.turn_id and incident.tool_call_id and incident.detail:
             self._commands.setdefault(incident.tool_call_id, incident.detail)
+        if (
+            incident is not None and not incident.turn_id and incident.tool_call_id
+            and incident.kind == "tool_failure" and incident.gate
+        ):
+            self._twin_gates.add(incident.tool_call_id)
         turn = _turn_key(row)
         if not turn or stamp is None:
             return
@@ -920,7 +926,7 @@ class EpisodeTracker:
                 "session_key": None, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
                 "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
-                "failure_count": 0, "gate_count": 0, "final": None, "cancelled": False,
+                "failed_calls": [], "final": None, "cancelled": False,
                 "error": False, "drift": False,
             }
         ep["first"] = min(ep["first"], stamp)
@@ -982,10 +988,7 @@ class EpisodeTracker:
     @staticmethod
     def _incident(ep: dict, incident: Incident) -> None:
         if incident.kind == "tool_failure":
-            if incident.gate:
-                ep["gate_count"] += 1
-            else:
-                ep["failure_count"] += 1
+            ep["failed_calls"].append((incident.tool_call_id, incident.gate))
             if len(ep["failures"]) < EPISODE_MAX_FAILURES:
                 ep["failures"].append({
                     "tool": incident.tool, "call_id": incident.tool_call_id,
@@ -1027,9 +1030,15 @@ class EpisodeTracker:
             outcome = "error"
         else:
             outcome = "no_final"
+        gated = [
+            bool(gate or (call_id and call_id in self._twin_gates))
+            for call_id, gate in ep["failed_calls"]
+        ]
+        gate_count = sum(gated)
         failures = [
             {
-                **{key: value for key, value in item.items() if key != "call_id"},
+                **{key: value for key, value in item.items() if key not in ("call_id", "gate")},
+                "gate": bool(item["gate"] or (item.get("call_id") in self._twin_gates)),
                 "command": command_head(self._commands.get(item.get("call_id") or "")),
             }
             for item in ep["failures"]
@@ -1046,7 +1055,7 @@ class EpisodeTracker:
             "output_tokens": ep["output_tokens"], "models": sorted(ep["models"]),
             "tools": dict(ep["tools"]), "skills": sorted(ep["skills"]),
             "commands": ep["commands"], "adhoc_scripts": ep["adhoc_scripts"],
-            "failure_count": ep["failure_count"], "gate_count": ep["gate_count"],
+            "failure_count": len(gated) - gate_count, "gate_count": gate_count,
             "failures": failures, "outcome": outcome,
             "final_chars": ep["final"] or 0, "drift": ep["drift"],
             "start_maybe_evicted": evicted,
@@ -1120,22 +1129,28 @@ def sweep(
     episode_known: dict[str, set[str]] = {}
     episodes_appended = 0
 
+    def _episode_ids(day: str) -> set[str]:
+        if day not in episode_known:
+            episode_known[day] = _known_ids(episodes_dir(data_root) / f"{day}.jsonl")
+        return episode_known[day]
+
     def _sink_episode(record: dict) -> None:
         nonlocal episodes_appended
         stamp = _parse_ts(record["start"]) or now
         episode_day = stamp.astimezone(tz).date().isoformat()
         path = episodes_dir(data_root) / f"{episode_day}.jsonl"
-        if episode_day not in episode_known:
-            episode_known[episode_day] = _known_ids(path)
+        previous_day = (stamp.astimezone(tz).date() - timedelta(days=1)).isoformat()
+        if record["id"] in _episode_ids(previous_day):
+            return
+        _episode_ids(episode_day)
         if record["id"] in episode_known[episode_day]:
             return
+        if apply:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         episode_known[episode_day].add(record["id"])
         episodes_appended += 1
-        if not apply:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
     try:
         workspaces = volume_janitor.workspace_dirs(data_root)
@@ -1158,7 +1173,18 @@ def sweep(
                 malformed = 0
                 last_provider_failure: dict[tuple, datetime] = {}
                 turns = TurnTracker()
-                episodes = EpisodeTracker(user, names)
+                episodes: EpisodeTracker | None = EpisodeTracker(user, names)
+
+                def _observe_episode(row: dict, incident: Incident | None, drift: Incident | None) -> None:
+                    nonlocal episodes
+                    if episodes is None:
+                        return
+                    try:
+                        episodes.observe(row, incident, drift)
+                    except Exception as exc:
+                        errors.append(f"{user} episodes: {type(exc).__name__}")
+                        episodes = None
+
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
                         if not line.strip():
@@ -1176,6 +1202,7 @@ def sweep(
                             state["earliest_trace_ts"] = str(stamp)
                         marker = recovery_marker(row, user)
                         if marker is not None:
+                            _observe_episode(row, None, None)
                             failed_at = last_provider_failure.get(
                                 (marker["agent_alias"], marker["model"]))
                             stamp_ok = _parse_ts(marker["ts"])
@@ -1192,7 +1219,7 @@ def sweep(
                         incident = normalize_trace_row(row, user)
                         if incident is not None:
                             incident = turns.annotate(incident)
-                        episodes.observe(row, incident, drift)
+                        _observe_episode(row, incident, drift)
                         if incident is None:
                             continue
                         if incident.kind.startswith("provider"):
@@ -1207,8 +1234,12 @@ def sweep(
                             )
                         _sink(incident)
                 state["trace_malformed_lines"] = malformed
-                for record in episodes.closed(now):
-                    _sink_episode(record)
+                if episodes is not None:
+                    try:
+                        for record in episodes.closed(now):
+                            _sink_episode(record)
+                    except Exception as exc:
+                        errors.append(f"{user} episodes: {type(exc).__name__}")
                 # Set only once the file has been read to the end: a source
                 # that threw halfway must never advertise itself as healthy.
                 state["trace"] = True
