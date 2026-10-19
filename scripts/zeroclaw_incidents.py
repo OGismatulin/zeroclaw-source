@@ -896,6 +896,27 @@ def _utc_iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _legacy_final_parts(row: dict) -> tuple[str, str] | None:
+    if _turn_key(row):
+        return None
+    if row.get("event_type") == "turn_final_response":
+        payload = row.get("payload")
+        session_id = payload.get("session_id") if isinstance(payload, dict) else None
+        flag = str(row.get("success")).lower()
+    else:
+        event = row.get("event")
+        attrs = row.get("attributes")
+        if row.get("message") is not None or not isinstance(event, dict):
+            return None
+        if event.get("action") != "turn_final_response" or not isinstance(attrs, dict):
+            return None
+        session_id = attrs.get("session_id")
+        flag = {"success": "true", "failure": "false"}.get(str(event.get("outcome")), "")
+    if not session_id or flag not in ("true", "false"):
+        return None
+    return str(session_id), flag
+
+
 class EpisodeTracker:
     def __init__(self, user: str, cron_names: Mapping[str, str]) -> None:
         self._user = user
@@ -916,8 +937,9 @@ class EpisodeTracker:
             and incident.kind == "tool_failure" and incident.gate
         ):
             self._twin_gates.add(incident.tool_call_id)
-        if row.get("event_type") == "turn_final_response" and not _turn_key(row):
-            self._legacy_final(row)
+        legacy = _legacy_final_parts(row)
+        if legacy is not None:
+            self._legacy_final(*legacy)
             return
         turn = _turn_key(row)
         if not turn or stamp is None:
@@ -963,14 +985,7 @@ class EpisodeTracker:
         if drift is not None and drift.turn_id == turn:
             ep["drift"] = True
 
-    def _legacy_final(self, row: dict) -> None:
-        payload = row.get("payload")
-        session_id = payload.get("session_id") if isinstance(payload, dict) else None
-        if not session_id:
-            return
-        flag = str(row.get("success")).lower()
-        if flag not in ("true", "false"):
-            return
+    def _legacy_final(self, session_id: str, flag: str) -> None:
         candidates = [
             ep for ep in self._open.values()
             if ep["session_key"] == session_id and ep["final"] is None
