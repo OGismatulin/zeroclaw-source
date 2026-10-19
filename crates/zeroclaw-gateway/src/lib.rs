@@ -3301,11 +3301,14 @@ async fn run_gateway_webhook_agentic(
     // Scope the session_id into TOOL_LOOP_SESSION_KEY so sessions_current
     // tool can identify the active session from inside the loop.
     let session_key_for_scope = session_id.map(str::to_owned);
-    let session_scope = ::zeroclaw_log::info_span!(
-        target: "zeroclaw_log_internal_scope",
-        "zeroclaw_scope",
-        session_key = %session_id.unwrap_or_default(),
-    );
+    let session_scope = match session_id {
+        Some(sid) => ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %sid,
+        ),
+        None => ::zeroclaw_log::Span::none(),
+    };
     let cancellation_token = cancel_handle.as_ref().map(|(_, t)| t.clone());
     let (result, provider_fallback) =
         zeroclaw_providers::reliable::scope_provider_fallback(async {
@@ -11657,6 +11660,45 @@ path = "{trigger_path}"
             keys.iter().any(|key| key == "tg_user_scope_probe"),
             "llm_request records of the webhook turn: {keys:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_turn_without_session_id_records_no_session_key() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = make_test_state(provider.clone(), memory);
+
+        run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "mock",
+            "test-model",
+            None,
+            "hello",
+            None,
+            None,
+        )
+        .await
+        .expect("function-level Result<>");
+
+        let events: Vec<serde_json::Value> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| event["message"] == "llm_request")
+            .collect();
+        zeroclaw_log::clear_broadcast_hook();
+        assert!(!events.is_empty(), "no llm_request records captured");
+        for event in &events {
+            assert!(
+                event["zeroclaw"].get("session_key").is_none(),
+                "llm_request carries a session_key without a session id: {event}"
+            );
+        }
     }
 
     /// Cross-model detection: if a turn for the same session_id runs with a
