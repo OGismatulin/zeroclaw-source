@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import http.client
 import os
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import anyio
 import psycopg2
 from psycopg2 import errors as pg_errors
 
@@ -160,6 +162,7 @@ def resolve_connection_params(env: str, db: str) -> dict:
 
 MAX_RESULT_CHARS = 50_000
 STATEMENT_TIMEOUT_MS = 30_000
+CH_QUERY_TIMEOUT_SECS = 30
 ALLOWED_PATH_ROOT = "/zeroclaw-data/workspaces/"
 ALLOWED_PATH_SEGMENT = "/workspace/state/sql/"
 
@@ -434,7 +437,6 @@ def _execute_pg_with_retry(
 
 _RETRYABLE_CH_EXC = (
     urllib.error.URLError,
-    socket.timeout,
     http.client.RemoteDisconnected,
 )
 
@@ -568,7 +570,7 @@ def execute_query(env: str, db: str, sql: str) -> dict:
 
 CH_DML_BLOCKLIST_RE = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|"
-    r"OPTIMIZE|SYSTEM|ATTACH|DETACH)\b",
+    r"OPTIMIZE|SYSTEM(?!\s*\.)|ATTACH|DETACH)\b",
     re.IGNORECASE,
 )
 
@@ -605,6 +607,21 @@ CH_NO_GRANT_HINT = (
     "Code 497 means this account has no grant on the object, not that the data is "
     "missing. Do not retry the same object."
 )
+CH_NARROW_SAMPLE_HINT = (
+    "Do not resend the same query: narrow the sample first. Filter by the event "
+    "creation date column (for example the last 5 days) or by specific ids. pg_* "
+    "databases are live PostgreSQL proxies, not ClickHouse copies: put a created_at "
+    "or id filter inside a subquery of every pg_* table before any JOIN. Widen the "
+    "window step by step only after the narrow query succeeded."
+)
+CH_HEAVY_QUERY_CODES = ("Code: 158", "Code: 159", "Code: 160", "Code: 241", "Code: 307")
+
+
+def _ch_timeout_message(timeout_secs: int) -> str:
+    return (
+        f"ClickHouse did not answer within {timeout_secs}s, the query is too wide. "
+        f"{CH_NARROW_SAMPLE_HINT}"
+    )
 
 
 def _ch_connection_params() -> dict[str, str]:
@@ -642,6 +659,8 @@ def _ch_error_message(code: int, body: str) -> str:
         return f"{CH_AUTH_REJECTED_MSG}\n{body}"
     if "Code: 497" in body:
         return f"ClickHouse error (HTTP {code}): {body}\n{CH_NO_GRANT_HINT}"
+    if any(marker in body for marker in CH_HEAVY_QUERY_CODES):
+        return f"ClickHouse error (HTTP {code}): {body}\n{CH_NARROW_SAMPLE_HINT}"
     return f"ClickHouse error (HTTP {code}): {body}"
 
 
@@ -691,10 +710,12 @@ def execute_ch_query(sql: str, db: str | None = None) -> str:
 
     req = _ch_request(stripped, db, _ch_connection_params())
     try:
-        return _ch_post_with_retry(req, timeout=30).decode("utf-8")
+        return _ch_post_with_retry(req, timeout=CH_QUERY_TIMEOUT_SECS).decode("utf-8")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise ValueError(_ch_error_message(e.code, body)) from None
+    except TimeoutError:
+        raise ValueError(_ch_timeout_message(CH_QUERY_TIMEOUT_SECS)) from None
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1153,10 @@ def execute_ch_query_to_file(
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise ValueError(_ch_error_message(e.code, body)) from None
+    except TimeoutError:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise ValueError(_ch_timeout_message(timeout_secs)) from None
     except (OSError, socket.error):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1235,8 +1260,31 @@ mcp = FastMCP(
     streamable_http_path="/",
 )
 
+HEALTH_THREADS = 2
+_health_limiter: anyio.CapacityLimiter | None = None
 
-@mcp.tool()
+
+def _off_loop(fn):
+    @functools.wraps(fn)
+    async def runner(*args, **kwargs):
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+    return runner
+
+
+def _tool(fn):
+    mcp.add_tool(_off_loop(fn), name=fn.__name__, description=fn.__doc__)
+    return fn
+
+
+async def _health_off_loop() -> str:
+    global _health_limiter
+    if _health_limiter is None:
+        _health_limiter = anyio.CapacityLimiter(HEALTH_THREADS)
+    return await anyio.to_thread.run_sync(health, limiter=_health_limiter)
+
+
+@_tool
 def query(env: str, db: str, sql: str) -> str:
     """Execute a SQL query against a Lalafo PostgreSQL database.
 
@@ -1254,7 +1302,7 @@ def query(env: str, db: str, sql: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def query_file(env: str, db: str, sql_file: str) -> str:
     """Execute SQL from a file against a Lalafo PostgreSQL database.
 
@@ -1279,7 +1327,7 @@ def query_file(env: str, db: str, sql_file: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def databases(env: str) -> str:
     """List available PostgreSQL databases and their descriptions.
 
@@ -1295,13 +1343,21 @@ def databases(env: str) -> str:
     return json.dumps(db_list, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def ch_query(sql: str, db: str = "analytics") -> str:
     """Execute a read-only SQL query against Lalafo ClickHouse (prod).
 
-    ClickHouse contains analytics tables and pg_* replicas of all PostgreSQL
-    microservices. Cross-service JOINs are possible using full db.table names
-    (e.g. pg_catalog_microservice.ad JOIN pg_user_microservice.user).
+    ClickHouse holds analytics tables and pg_* databases. Every pg_* table is a
+    live proxy to the prod PostgreSQL of that microservice (engine PostgreSQL),
+    not a copy: a query reads the rows from PostgreSQL at query time.
+
+    Measure narrow first. Start with a small sample: filter ClickHouse tables by
+    the event creation date column (for example the last 5 days) or by specific
+    ids; filter every pg_* table by created_at or id inside its own subquery
+    before any JOIN (a JOIN condition does not limit what is read from the
+    proxy). Widen the window step by step only after the narrow query worked.
+    A timeout means the query was too wide: narrow it, do not resend it.
+    Engines and columns: SELECT database, name, engine FROM system.tables.
 
     Args:
         sql: SQL query. Only SELECT allowed. Auto-limited to 1000 rows.
@@ -1317,7 +1373,7 @@ def ch_query(sql: str, db: str = "analytics") -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def ch_databases() -> str:
     """List available ClickHouse databases (analytics, pg_* replicas, etc.)."""
     try:
@@ -1327,7 +1383,7 @@ def ch_databases() -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def ch_tables(db: str) -> str:
     """List tables in a ClickHouse database.
 
@@ -1342,7 +1398,7 @@ def ch_tables(db: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def query_to_file(
     env: str,
     db: str,
@@ -1384,7 +1440,7 @@ def query_to_file(
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def ch_query_to_file(
     sql: str,
     workspace: str,
@@ -1396,8 +1452,10 @@ def ch_query_to_file(
 ) -> str:
     """Execute ClickHouse SELECT and stream results to a file in workspace/uploads/.
 
-    See `query_to_file` for usage. ClickHouse supports cross-service JOINs via
-    pg_* replicas (e.g. pg_catalog_microservice.ad JOIN pg_user_microservice.user).
+    See `query_to_file` for usage and `ch_query` for how to bound the sample:
+    pg_* tables are live PostgreSQL proxies, so filter each by created_at or id
+    in its own subquery before a JOIN, and filter ClickHouse tables by the event
+    creation date column.
 
     Args:
         sql: SELECT/WITH query. DDL/DML blocked.
@@ -1421,7 +1479,7 @@ def ch_query_to_file(
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-@mcp.tool()
+@_tool
 def health() -> str:
     """Check VPN connectivity, PostgreSQL and ClickHouse reachability."""
     result: dict = {
@@ -1520,7 +1578,7 @@ def create_app():
     from starlette.routing import Mount, Route
 
     async def health_handler(request):
-        result = json.loads(health())
+        result = json.loads(await _health_off_loop())
         status = 200 if result.get("status") == "ok" else 503
         return JSONResponse(result, status_code=status)
 
