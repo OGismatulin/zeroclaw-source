@@ -111,16 +111,29 @@ impl Tool for McpToolWrapper {
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(e.to_string()),
+                error: Some(tool_error_text(&e)),
             }),
         }
     }
+}
+
+fn tool_error_text(error: &anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tool_error_text_keeps_the_cause_chain() {
+        let error = anyhow::anyhow!("tcp connect error: Connection refused")
+            .context("MCP server `lalafo-db` error during tool call `ch_query`");
+        let text = tool_error_text(&error);
+        assert!(text.contains("error during tool call `ch_query`"), "{text}");
+        assert!(text.contains("Connection refused"), "{text}");
+    }
 
     fn make_def(name: &str, description: Option<&str>, schema: serde_json::Value) -> McpToolDef {
         McpToolDef {
