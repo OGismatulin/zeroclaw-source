@@ -1375,7 +1375,7 @@ def ch_query(sql: str, db: str = "analytics") -> str:
 
 @_tool
 def ch_databases() -> str:
-    """List available ClickHouse databases (analytics, pg_* replicas, etc.)."""
+    """List available ClickHouse databases (analytics, pg_* live PostgreSQL proxies, etc.)."""
     try:
         result = execute_ch_query("SHOW DATABASES")
         return result
