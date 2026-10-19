@@ -3301,6 +3301,11 @@ async fn run_gateway_webhook_agentic(
     // Scope the session_id into TOOL_LOOP_SESSION_KEY so sessions_current
     // tool can identify the active session from inside the loop.
     let session_key_for_scope = session_id.map(str::to_owned);
+    let session_scope = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        session_key = %session_id.unwrap_or_default(),
+    );
     let cancellation_token = cancel_handle.as_ref().map(|(_, t)| t.clone());
     let (result, provider_fallback) =
         zeroclaw_providers::reliable::scope_provider_fallback(async {
@@ -3309,6 +3314,7 @@ async fn run_gateway_webhook_agentic(
             // call inside it (mirrors orchestrator/mod.rs:4476,4622). take_last_*
             // MUST be called inside this same scope. See spec Risk #1 — holds
             // only if LLM calls stay in the awaited chain (verified by GA1).
+            use ::zeroclaw_log::Instrument as _;
             let result = zeroclaw_runtime::agent::loop_::scope_session_key(
                 session_key_for_scope,
                 zeroclaw_runtime::agent::loop_::agent_turn(
@@ -3347,7 +3353,8 @@ async fn run_gateway_webhook_agentic(
                     None,
                     Some(&agent_alias),
                     None, // turn_id: self-minted
-                ),
+                )
+                .instrument(session_scope),
             )
             .await;
             let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
@@ -11608,6 +11615,48 @@ path = "{trigger_path}"
         assert_eq!(ws.last_provider, "mimo");
         assert_eq!(ws.last_model, "mimo-v2.5-pro");
         assert_eq!(ws.session_id, "tg_user_99999");
+    }
+
+    #[tokio::test]
+    async fn webhook_turn_records_carry_the_session_key() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = make_test_state(provider.clone(), memory);
+
+        run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "mock",
+            "test-model",
+            None,
+            "hello",
+            Some("tg_user_scope_probe"),
+            None,
+        )
+        .await
+        .expect("function-level Result<>");
+
+        let keys: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|event| event["message"] == "llm_request")
+            .map(|event| {
+                event["zeroclaw"]["session_key"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        zeroclaw_log::clear_broadcast_hook();
+        assert!(
+            keys.iter().any(|key| key == "tg_user_scope_probe"),
+            "llm_request records of the webhook turn: {keys:?}"
+        );
     }
 
     /// Cross-model detection: if a turn for the same session_id runs with a
