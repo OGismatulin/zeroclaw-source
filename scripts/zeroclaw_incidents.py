@@ -175,7 +175,6 @@ _CANCELLED_BY_USER = "request cancelled by user"
 # broken message is a real defect, not the idempotency fence.
 _VIS_WORKER_BOUND = '{"error": "visualization worker is already bound"}'
 _TIMEOUT_RE = re.compile(r"tim(ed|e) ?out", re.IGNORECASE)
-# Mirrors extract_day.py: a bare `analyst` alias must disqualify too.
 _ANALYST_ALIAS_RE = re.compile(r"^analyst(_|$)")
 # Whitelists only the two ported actions (fix round 1, F5) — the old
 # pattern silenced EVERY disabled jira action, including a genuinely
