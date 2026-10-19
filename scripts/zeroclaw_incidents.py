@@ -839,6 +839,220 @@ class TurnTracker:
         )
 
 
+EPISODES_DIRNAME = "episodes"
+EPISODE_IDLE_SECS = 1800.0
+EPISODE_RETENTION_DAYS = 30
+EPISODE_MAX_COMMANDS = 20
+EPISODE_MAX_FAILURES = 10
+EPISODE_EVICTION_SLACK_SECS = 60.0
+_SKILL_PATH_RE = re.compile(r"(?:^|/)skills/([A-Za-z0-9_.-]+)/")
+_SUBCOMMAND_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\|")
+
+
+def episodes_dir(data_root: Path) -> Path:
+    return data_root / "observability" / EPISODES_DIRNAME
+
+
+def command_head(command: object) -> str | None:
+    if not isinstance(command, str):
+        return None
+    parts = _SEGMENT_SPLIT_RE.split(command, maxsplit=1)[0].split()
+    while parts and _ENV_ASSIGNMENT_RE.match(parts[0]):
+        parts.pop(0)
+    if not parts:
+        return None
+    first = _WORKSPACE_ABS_RE.sub("", parts[0])
+    if first in ("python3", "python") and len(parts) > 1:
+        head = _WORKSPACE_ABS_RE.sub("", parts[1])
+        if len(parts) > 2 and _SUBCOMMAND_RE.match(parts[2]):
+            head = f"{head} {parts[2]}"
+        return head[:MAX_DETAIL_CHARS]
+    return first[:MAX_DETAIL_CHARS]
+
+
+def _tool_arguments(attrs: dict) -> dict:
+    raw = attrs.get("arguments")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except ValueError:
+        return 0
+
+
+def _utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class EpisodeTracker:
+    def __init__(self, user: str, cron_names: Mapping[str, str]) -> None:
+        self._user = user
+        self._names = cron_names
+        self._open: dict[str, dict] = {}
+        self._commands: dict[str, str] = {}
+        self._earliest: datetime | None = None
+
+    def observe(self, row: dict, incident: Incident | None, drift: Incident | None) -> None:
+        stamp = _parse_ts(row.get("@timestamp") or row.get("timestamp"))
+        if stamp is not None and self._earliest is None:
+            self._earliest = stamp
+        if incident is not None and not incident.turn_id and incident.tool_call_id and incident.detail:
+            self._commands.setdefault(incident.tool_call_id, incident.detail)
+        turn = _turn_key(row)
+        if not turn or stamp is None:
+            return
+        ep = self._open.get(turn)
+        if ep is None:
+            ep = self._open[turn] = {
+                "id": turn, "first": stamp, "last": stamp, "jira": False, "cron": None,
+                "session_key": None, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
+                "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
+                "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
+                "failure_count": 0, "gate_count": 0, "final": None, "cancelled": False,
+                "error": False, "drift": False,
+            }
+        ep["first"] = min(ep["first"], stamp)
+        ep["last"] = max(ep["last"], stamp)
+        zc = row.get("zeroclaw")
+        zc = zc if isinstance(zc, dict) else {}
+        if str(zc.get("runtime_profile") or "").startswith("jira_"):
+            ep["jira"] = True
+        if zc.get("cron_job_id"):
+            ep["cron"] = str(zc["cron_job_id"])
+        if zc.get("session_key"):
+            ep["session_key"] = str(zc["session_key"])
+        if zc.get("agent_alias"):
+            ep["aliases"].add(str(zc["agent_alias"]))
+        attrs = row.get("attributes")
+        attrs = attrs if isinstance(attrs, dict) else {}
+        message = row.get("message")
+        if message == "llm_request":
+            ep["llm_calls"] += 1
+            if attrs.get("model"):
+                ep["models"].add(str(attrs["model"]))
+        elif message == "llm_response":
+            ep["input_tokens"] += _as_int(attrs.get("input_tokens"))
+            ep["output_tokens"] += _as_int(attrs.get("output_tokens"))
+        elif message == "tool_call_start":
+            self._tool_start(ep, attrs)
+        elif message == "turn_final_response":
+            ep["final"] = len(str(attrs.get("text") or "").strip())
+        if incident is not None and incident.turn_id == turn:
+            self._incident(ep, incident)
+        if drift is not None and drift.turn_id == turn:
+            ep["drift"] = True
+
+    @staticmethod
+    def _tool_start(ep: dict, attrs: dict) -> None:
+        tool = str(attrs.get("tool") or "")
+        if not tool:
+            return
+        ep["tools"][tool] += 1
+        args = _tool_arguments(attrs)
+        if tool == "read_skill" and isinstance(args.get("name"), str):
+            ep["skills"].add(args["name"])
+        elif tool == "file_write" and isinstance(args.get("path"), str):
+            path = _WORKSPACE_ABS_RE.sub("", args["path"]).removeprefix("./")
+            if path.endswith(".py") and not path.startswith(("skills/", "scripts/")):
+                ep["adhoc_paths"].add(path)
+        elif tool == "shell":
+            head = command_head(args.get("command"))
+            if not head:
+                return
+            skill = _SKILL_PATH_RE.search(head)
+            if skill:
+                ep["skills"].add(skill.group(1))
+            if head.split()[0] in ep["adhoc_paths"]:
+                ep["adhoc_scripts"] += 1
+            if head not in ep["commands"] and len(ep["commands"]) < EPISODE_MAX_COMMANDS:
+                ep["commands"].append(head)
+
+    @staticmethod
+    def _incident(ep: dict, incident: Incident) -> None:
+        if incident.kind == "tool_failure":
+            if incident.gate:
+                ep["gate_count"] += 1
+            else:
+                ep["failure_count"] += 1
+            if len(ep["failures"]) < EPISODE_MAX_FAILURES:
+                ep["failures"].append({
+                    "tool": incident.tool, "call_id": incident.tool_call_id,
+                    "error": incident.error, "gate": incident.gate,
+                    "near_skill": incident.skill, "incident_id": incident.id,
+                })
+        elif incident.kind.startswith("provider") and incident.gate_reason == "cancelled":
+            ep["cancelled"] = True
+        elif incident.kind in ("provider_failure", "runtime_error") and not incident.gate:
+            ep["error"] = True
+
+    def closed(self, now: datetime, idle_secs: float = EPISODE_IDLE_SECS) -> list[dict]:
+        records = []
+        for ep in self._open.values():
+            if (now - ep["last"]).total_seconds() < idle_secs:
+                continue
+            records.append(self._record(ep))
+        return records
+
+    def _origin(self, ep: dict) -> tuple[str, str | None]:
+        aliases = sorted(ep["aliases"])
+        if ep["jira"]:
+            return "jira", aliases[0] if aliases else None
+        if ep["cron"]:
+            return "cron", self._names.get(ep["cron"], ep["cron"])
+        if ep["session_key"]:
+            return "chat", None
+        if aliases:
+            return "delegate", aliases[0]
+        return "background", None
+
+    def _record(self, ep: dict) -> dict:
+        origin, ref = self._origin(ep)
+        if ep["cancelled"]:
+            outcome = "cancelled"
+        elif ep["final"] is not None:
+            outcome = "answered" if ep["final"] > 0 else "empty"
+        elif ep["error"]:
+            outcome = "error"
+        else:
+            outcome = "no_final"
+        failures = [
+            {
+                **{key: value for key, value in item.items() if key != "call_id"},
+                "command": command_head(self._commands.get(item.get("call_id") or "")),
+            }
+            for item in ep["failures"]
+        ]
+        evicted = self._earliest is not None and (
+            ep["first"] - self._earliest
+        ).total_seconds() <= EPISODE_EVICTION_SLACK_SECS
+        return {
+            "kind": "episode", "id": ep["id"], "user": self._user,
+            "origin": origin, "origin_ref": ref, "session_key": ep["session_key"],
+            "start": _utc_iso(ep["first"]), "end": _utc_iso(ep["last"]),
+            "duration_s": round((ep["last"] - ep["first"]).total_seconds(), 1),
+            "llm_calls": ep["llm_calls"], "input_tokens": ep["input_tokens"],
+            "output_tokens": ep["output_tokens"], "models": sorted(ep["models"]),
+            "tools": dict(ep["tools"]), "skills": sorted(ep["skills"]),
+            "commands": ep["commands"], "adhoc_scripts": ep["adhoc_scripts"],
+            "failure_count": ep["failure_count"], "gate_count": ep["gate_count"],
+            "failures": failures, "outcome": outcome,
+            "final_chars": ep["final"] or 0, "drift": ep["drift"],
+            "start_maybe_evicted": evicted,
+        }
+
+
 def sweep(
     data_root: Path,
     now: datetime,
@@ -903,6 +1117,26 @@ def sweep(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n")
 
+    episode_known: dict[str, set[str]] = {}
+    episodes_appended = 0
+
+    def _sink_episode(record: dict) -> None:
+        nonlocal episodes_appended
+        stamp = _parse_ts(record["start"]) or now
+        episode_day = stamp.astimezone(tz).date().isoformat()
+        path = episodes_dir(data_root) / f"{episode_day}.jsonl"
+        if episode_day not in episode_known:
+            episode_known[episode_day] = _known_ids(path)
+        if record["id"] in episode_known[episode_day]:
+            return
+        episode_known[episode_day].add(record["id"])
+        episodes_appended += 1
+        if not apply:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
     try:
         workspaces = volume_janitor.workspace_dirs(data_root)
     except OSError as exc:  # never let enumeration escape into the caller
@@ -924,6 +1158,7 @@ def sweep(
                 malformed = 0
                 last_provider_failure: dict[tuple, datetime] = {}
                 turns = TurnTracker()
+                episodes = EpisodeTracker(user, names)
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
                     for line in handle:
                         if not line.strip():
@@ -955,9 +1190,11 @@ def sweep(
                         if drift is not None:
                             _sink(drift)
                         incident = normalize_trace_row(row, user)
+                        if incident is not None:
+                            incident = turns.annotate(incident)
+                        episodes.observe(row, incident, drift)
                         if incident is None:
                             continue
-                        incident = turns.annotate(incident)
                         if incident.kind.startswith("provider"):
                             failed_ts = _parse_ts(incident.ts)
                             if failed_ts:
@@ -970,6 +1207,8 @@ def sweep(
                             )
                         _sink(incident)
                 state["trace_malformed_lines"] = malformed
+                for record in episodes.closed(now):
+                    _sink_episode(record)
                 # Set only once the file has been read to the end: a source
                 # that threw halfway must never advertise itself as healthy.
                 state["trace"] = True
@@ -996,6 +1235,7 @@ def sweep(
         "scanned": len(workspaces),
         "appended": appended,
         "truncated": truncated,
+        "episodes_appended": episodes_appended,
         "errors": errors,
         "sources": sources,
     }
@@ -1015,6 +1255,21 @@ def sweep(
                         path.unlink()
                     except OSError:
                         errors.append(f"prune {path.name}")
+            episode_cutoff = (
+                now.astimezone(tz).date() - timedelta(days=EPISODE_RETENTION_DAYS)
+            ).isoformat()
+            for path in episodes_dir(data_root).glob("*"):
+                if path.name[:10] < episode_cutoff:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        errors.append(f"prune {path.name}")
+            today = now.astimezone(tz).date()
+            for day in (today - timedelta(days=1), today):
+                try:
+                    write_episode_coverage(data_root, day, now, timezone_name=timezone_name)
+                except Exception as exc:
+                    errors.append(f"coverage {day.isoformat()}: {type(exc).__name__}")
         except OSError as exc:  # e.g. out_dir exists as a non-directory
             errors.append(f"mkdir: {type(exc).__name__}")
     return receipt
@@ -1610,6 +1865,29 @@ def build_digest(
         by_channel=by_channel, state=state, reasons=reasons, counters=counters,
         test_groups=test_groups,
     )
+
+
+def write_episode_coverage(
+    data_root: Path, day, now: datetime, *, timezone_name: str = DEFAULT_TIMEZONE
+) -> dict:
+    tz = ZoneInfo(timezone_name)
+    start = datetime(day.year, day.month, day.day, tzinfo=tz).astimezone(timezone.utc)
+    digest = build_digest(
+        data_root, start, start + timedelta(days=1), timezone_name=timezone_name, now=now
+    )
+    payload = {
+        "day": day.isoformat(),
+        "state": digest.state,
+        "reasons": digest.reasons,
+        "computed_at": _utc_iso(now),
+    }
+    out = episodes_dir(data_root)
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / f"{day.isoformat()}.coverage.json"
+    tmp = out / f"{day.isoformat()}.coverage.json.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+    return payload
 
 
 # --- Rendering: channel sections within an explicit character budget ---
