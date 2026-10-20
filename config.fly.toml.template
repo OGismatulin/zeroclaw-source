@@ -614,6 +614,7 @@ allowed_commands = [
     "base64",
     "which",
     "printf",
+    "sed",
 ]
 forbidden_paths = [
     "/etc",
