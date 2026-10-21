@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_api::model_provider::StreamEvent;
+use zeroclaw_api::model_provider::{StreamError, StreamEvent};
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
@@ -169,6 +169,13 @@ pub(crate) async fn consume_provider_streaming_response(
                 return Err(StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
+                    replay_safe: !outcome.saw_pre_executed_tool_activity
+                        && (matches!(err, StreamError::Http(_) | StreamError::Io(_))
+                            || zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                                &provider_error,
+                            )
+                            .kind()
+                                == zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer),
                 }
                 .into());
             }

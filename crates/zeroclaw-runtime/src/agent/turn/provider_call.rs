@@ -167,6 +167,28 @@ fn streamed_chat_outcome(
     )
 }
 
+fn admit_one_stream_retry(
+    scope: &zeroclaw_providers::dispatch::AccountedChatScope,
+    err: &anyhow::Error,
+) -> bool {
+    if let Some(error) = err.downcast_ref::<StreamSemanticEmptyCompletion>() {
+        if let Some(usage) = error.usage.clone() {
+            scope.record_stream_semantic_rejection_usage(usage);
+        }
+        return true;
+    }
+    if let Some(error) = err
+        .downcast_ref::<StreamErrorWithUsage>()
+        .filter(|error| error.replay_safe && scope.failed_stream_entry_may_retry())
+    {
+        if let Some(usage) = error.usage.clone() {
+            scope.record_stream_interruption_usage(usage);
+        }
+        return true;
+    }
+    false
+}
+
 fn is_terminal_stream_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
         .is_some()
@@ -200,41 +222,26 @@ pub(crate) async fn call_provider(
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    let mut stream_result = consume_provider_streaming_response(
-                        active_model_provider,
-                        prepared_messages,
-                        request_tools,
-                        active_model,
-                        ctx.temperature,
-                        ctx.cancellation_token,
-                        ctx.on_delta,
-                        ctx.event_tx,
-                        ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
-                    )
-                    .await;
+                    let consume_stream = || {
+                        consume_provider_streaming_response(
+                            active_model_provider,
+                            prepared_messages,
+                            request_tools,
+                            active_model,
+                            ctx.temperature,
+                            ctx.cancellation_token,
+                            ctx.on_delta,
+                            ctx.event_tx,
+                            ctx.strict_tool_parsing,
+                            ctx.draft_reasoning,
+                        )
+                    };
+                    let mut stream_result = consume_stream().await;
                     if let Err(err) = &stream_result
-                        && err.downcast_ref::<StreamSemanticEmptyCompletion>().is_some()
                         && active_model_provider.delegate_turns_should_stream()
+                        && admit_one_stream_retry(&scope, err)
                     {
-                        if let Some(usage) = err.downcast_ref::<StreamSemanticEmptyCompletion>()
-                            .and_then(|error| error.usage.clone())
-                        {
-                            scope.record_stream_semantic_rejection_usage(usage);
-                        }
-                        stream_result = consume_provider_streaming_response(
-                        active_model_provider,
-                        prepared_messages,
-                        request_tools,
-                        active_model,
-                        ctx.temperature,
-                        ctx.cancellation_token,
-                        ctx.on_delta,
-                        ctx.event_tx,
-                        ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
-                    )
-                    .await;
+                        stream_result = consume_stream().await;
                     }
                     match stream_result {
                         Ok(streamed) => streamed_chat_outcome(streamed),
@@ -1933,8 +1940,16 @@ mod streaming_fallback_tests {
     }
 
     async fn call_streaming_once(provider: Box<dyn ModelProvider>) -> ProviderCallOutcome {
+        call_streaming(provider, true, 1).await
+    }
+
+    async fn call_streaming(
+        provider: Box<dyn ModelProvider>,
+        with_event_tx: bool,
+        retries: u32,
+    ) -> ProviderCallOutcome {
         let provider =
-            ReliableModelProvider::new("test", vec![("primary".to_string(), provider)], 1, 1);
+            ReliableModelProvider::new("test", vec![("primary".to_string(), provider)], retries, 1);
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
@@ -1948,7 +1963,7 @@ mod streaming_fallback_tests {
             channel_reply_target: None,
             cancellation_token: None,
             on_delta: None,
-            event_tx: Some(&event_tx),
+            event_tx: with_event_tx.then_some(&event_tx),
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
@@ -2034,5 +2049,240 @@ mod streaming_fallback_tests {
         fn alias(&self) -> &str {
             "EmptyThenStreamedTextProvider"
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum BeforeTransportFailure {
+        Nothing,
+        VisibleText,
+        PreExecutedTool,
+    }
+
+    struct TransportFailureThenTextProvider {
+        stream_calls: Arc<AtomicUsize>,
+        non_stream_calls: Arc<AtomicUsize>,
+        failing_streams: usize,
+        before_failure: BeforeTransportFailure,
+        failure: fn() -> zeroclaw_providers::traits::StreamError,
+    }
+
+    fn connection_reset() -> zeroclaw_providers::traits::StreamError {
+        zeroclaw_providers::traits::StreamError::Http(
+            "error decoding response body: request or response body error: \
+             error reading a body from connection: Connection reset by peer (os error 104)"
+                .to_string(),
+        )
+    }
+
+    fn service_unavailable() -> zeroclaw_providers::traits::StreamError {
+        zeroclaw_providers::traits::StreamError::ModelProvider(
+            "503 Service Unavailable: Endpoint is unavailable".to_string(),
+        )
+    }
+
+    #[async_trait]
+    impl ModelProvider for TransportFailureThenTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay as chat".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn delegate_turns_should_stream(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let call = self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            let events = if call < self.failing_streams {
+                let mut events = match self.before_failure {
+                    BeforeTransportFailure::Nothing => Vec::new(),
+                    BeforeTransportFailure::VisibleText => vec![Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("partial"),
+                    ))],
+                    BeforeTransportFailure::PreExecutedTool => {
+                        vec![Ok(StreamEvent::PreExecutedToolCall {
+                            name: "provider_tool".to_string(),
+                            args: "{}".to_string(),
+                        })]
+                    }
+                };
+                events.push(Err((self.failure)()));
+                events
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("streamed retry"),
+                    )),
+                    Ok(StreamEvent::Final),
+                ]
+            };
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    impl Attributable for TransportFailureThenTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "TransportFailureThenTextProvider"
+        }
+    }
+
+    async fn call_after_transport_failure(
+        failing_streams: usize,
+        before_failure: BeforeTransportFailure,
+        with_event_tx: bool,
+    ) -> (ProviderCallOutcome, usize, usize) {
+        call_after_stream_failure(
+            failing_streams,
+            before_failure,
+            with_event_tx,
+            connection_reset,
+            1,
+        )
+        .await
+    }
+
+    async fn call_after_stream_failure(
+        failing_streams: usize,
+        before_failure: BeforeTransportFailure,
+        with_event_tx: bool,
+        failure: fn() -> zeroclaw_providers::traits::StreamError,
+        retries: u32,
+    ) -> (ProviderCallOutcome, usize, usize) {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = call_streaming(
+            Box::new(TransportFailureThenTextProvider {
+                stream_calls: Arc::clone(&stream_calls),
+                non_stream_calls: Arc::clone(&non_stream_calls),
+                failing_streams,
+                before_failure,
+                failure,
+            }),
+            with_event_tx,
+            retries,
+        )
+        .await;
+        (
+            outcome,
+            stream_calls.load(Ordering::Relaxed),
+            non_stream_calls.load(Ordering::Relaxed),
+        )
+    }
+
+    #[tokio::test]
+    async fn transport_failure_before_output_retries_the_same_stream_request() {
+        let (outcome, stream_calls, non_stream_calls) =
+            call_after_transport_failure(1, BeforeTransportFailure::Nothing, false).await;
+
+        let response = outcome.chat_result.expect("retried stream succeeds");
+        assert_eq!(response.text.as_deref(), Some("streamed retry"));
+        assert_eq!(stream_calls, 2);
+        assert_eq!(non_stream_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn server_error_before_output_retries_the_same_stream_request() {
+        let (outcome, stream_calls, non_stream_calls) = call_after_stream_failure(
+            1,
+            BeforeTransportFailure::Nothing,
+            false,
+            service_unavailable,
+            1,
+        )
+        .await;
+
+        let response = outcome.chat_result.expect("retried stream succeeds");
+        assert_eq!(response.text.as_deref(), Some("streamed retry"));
+        assert_eq!(stream_calls, 2);
+        assert_eq!(non_stream_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_is_not_retried_when_the_entry_has_no_retry_budget() {
+        let (outcome, stream_calls, non_stream_calls) = call_after_stream_failure(
+            1,
+            BeforeTransportFailure::Nothing,
+            false,
+            connection_reset,
+            0,
+        )
+        .await;
+
+        assert!(outcome.chat_result.is_err());
+        assert_eq!(stream_calls, 1);
+        assert_eq!(non_stream_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn second_transport_failure_stops_after_one_retry() {
+        let (outcome, stream_calls, non_stream_calls) =
+            call_after_transport_failure(2, BeforeTransportFailure::Nothing, false).await;
+
+        let error = outcome
+            .chat_result
+            .expect_err("two transport failures must stay terminal");
+        assert!(terminal_provider_failure(&error).is_some());
+        assert_eq!(stream_calls, 2);
+        assert_eq!(non_stream_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_pre_executed_tool_is_not_retried_without_event_sink() {
+        let (outcome, stream_calls, non_stream_calls) =
+            call_after_transport_failure(1, BeforeTransportFailure::PreExecutedTool, false).await;
+
+        assert!(outcome.chat_result.is_err());
+        assert_eq!(stream_calls, 1);
+        assert_eq!(non_stream_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_failure_after_visible_text_is_not_retried() {
+        let (outcome, stream_calls, non_stream_calls) =
+            call_after_transport_failure(1, BeforeTransportFailure::VisibleText, true).await;
+
+        let error = outcome
+            .chat_result
+            .expect_err("visible output keeps the interruption terminal");
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_some()
+        );
+        assert_eq!(stream_calls, 1);
+        assert_eq!(non_stream_calls, 0);
     }
 }

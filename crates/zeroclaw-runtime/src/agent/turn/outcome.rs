@@ -67,6 +67,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) replay_safe: bool,
 }
 
 impl std::fmt::Display for StreamErrorWithUsage {

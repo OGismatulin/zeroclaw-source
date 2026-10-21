@@ -403,6 +403,10 @@ impl AccountedChatScope {
         crate::reliable::record_stream_recovery_failure(error);
     }
 
+    pub fn failed_stream_entry_may_retry(&self) -> bool {
+        crate::reliable::failed_stream_entry_may_retry()
+    }
+
     /// Clear a provisional route before an in-scope recovery replaces it.
     ///
     /// This has no presentation effect until [`commit_accepted_provider_route`]

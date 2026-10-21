@@ -70,6 +70,7 @@ struct ReliableEntryId {
 pub(crate) struct ReliableCallAccounting {
     accepted_route: Option<AcceptedRoute>,
     stream_resume_after: Option<ReliableEntryId>,
+    stream_entry_retry_budget: u32,
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
@@ -122,19 +123,35 @@ fn accounted_rejected_attempt_usage() -> Option<TokenUsage> {
 /// Preserve Reliable's exact-entry recovery policy, but only once the selected
 /// stream has actually been polled.  Billing ownership belongs to dispatch;
 /// this is continuation state, not an attempt record.
-fn activate_stream_recovery_after_first_poll(model_slot: usize, entry_index: usize) {
+fn activate_stream_recovery_after_first_poll(
+    model_slot: usize,
+    entry_index: usize,
+    retry_budget: u32,
+) {
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
-        accounting.lock().stream_resume_after = Some(ReliableEntryId {
+        let mut accounting = accounting.lock();
+        accounting.stream_resume_after = Some(ReliableEntryId {
             model_slot,
             entry_index,
         });
+        accounting.stream_entry_retry_budget = retry_budget;
     });
+}
+
+pub(crate) fn failed_stream_entry_may_retry() -> bool {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| {
+            let accounting = accounting.lock();
+            accounting.stream_resume_after.is_some() && accounting.stream_entry_retry_budget > 0
+        })
+        .unwrap_or(false)
 }
 
 fn stream_with_recovery_identity<T>(
     stream: stream::BoxStream<'static, StreamResult<T>>,
     model_slot: usize,
     entry_index: usize,
+    retry_budget: u32,
 ) -> stream::BoxStream<'static, StreamResult<T>>
 where
     T: Send + 'static,
@@ -144,7 +161,7 @@ where
     stream::poll_fn(move |cx| {
         if !started {
             started = true;
-            activate_stream_recovery_after_first_poll(model_slot, entry_index);
+            activate_stream_recovery_after_first_poll(model_slot, entry_index, retry_budget);
         }
         stream.as_mut().poll_next(cx)
     })
@@ -3963,7 +3980,7 @@ impl ModelProvider for ReliableModelProvider {
                     options,
                 ),
             );
-            let stream = stream_with_recovery_identity(stream, 0, entry_index);
+            let stream = stream_with_recovery_identity(stream, 0, entry_index, self.max_retries);
             let accepted_route = AcceptedRoute::new(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
@@ -10604,7 +10621,7 @@ mod tests {
         let zero_budget = ReliableModelProvider::new("test", Vec::new(), 0, 1);
 
         scope_reliable_call_accounting(async {
-            activate_stream_recovery_after_first_poll(3, 4);
+            activate_stream_recovery_after_first_poll(3, 4, 2);
             mark_stream_recovery_semantic_empty();
 
             assert_eq!(provider.effective_retry_limit(3, 3), Some(2));
@@ -10612,7 +10629,7 @@ mod tests {
             assert_eq!(provider.effective_retry_limit(3, 4), Some(0));
             assert_eq!(provider.effective_retry_limit(3, 4), None);
 
-            activate_stream_recovery_after_first_poll(5, 6);
+            activate_stream_recovery_after_first_poll(5, 6, 0);
             mark_stream_recovery_semantic_empty();
             assert_eq!(zero_budget.effective_retry_limit(5, 6), None);
             assert!(stream_recovery_was_semantic_empty());
