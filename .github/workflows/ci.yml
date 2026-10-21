@@ -290,7 +290,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh mold libasound2-dev
+        run: |
+          bash scripts/ci/apt_install.sh libasound2-dev
+          bash scripts/ci/install_mold.sh
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -497,7 +499,9 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install test system dependencies
-        run: bash scripts/ci/apt_install.sh mold expect python3
+        run: |
+          bash scripts/ci/apt_install.sh expect python3
+          bash scripts/ci/install_mold.sh
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -615,7 +619,7 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: bash scripts/ci/apt_install.sh mold
+        run: bash scripts/ci/install_mold.sh
       - name: Repeat parallel runtime tests
         run: ./scripts/ci/parallel_runtime_test_gate.sh
         env:
@@ -641,7 +645,7 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: bash scripts/ci/apt_install.sh mold
+        run: bash scripts/ci/install_mold.sh
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run Landlock tests
