@@ -158,6 +158,15 @@ class InstallResult:
     error: str | None = None
 
 
+DEFAULT_WORKSPACES_ROOT = Path("/zeroclaw-data/workspaces")
+
+
+def default_workspaces_root() -> Path:
+    if DEFAULT_WORKSPACES_ROOT.is_dir():
+        return DEFAULT_WORKSPACES_ROOT
+    return Path(__file__).resolve().parents[1] / "workspaces"
+
+
 def resolve_templates_root(
     explicit: Path | None,
     workspaces_root: Path,
@@ -518,7 +527,7 @@ def _do_list(args) -> int:
     try:
         templates_root = resolve_templates_root(
             args.templates_root,
-            args.workspaces_root or Path("workspaces"),
+            args.workspaces_root or default_workspaces_root(),
             args.user,
         )
     except FileNotFoundError as exc:

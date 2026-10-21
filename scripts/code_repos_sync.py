@@ -283,7 +283,7 @@ def render_repos_md(projects: list[dict], repos_dir: Path, now: str) -> str:
         "# Lalafo GitLab Repositories",
         "",
         f"Snapshot of https://{GITLAB_HOST}/{GITLAB_GROUP} — refreshed {now}.",
-        "Refresh command: `python3 scripts/code_repos_sync.py list-remote`",
+        "Refresh command: `code_repos_sync.py list-remote`",
         "",
         (
             f"Total: {len(rows)} repos. "
