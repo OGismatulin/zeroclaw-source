@@ -56,6 +56,7 @@ ignore = [
     # transitive via zeroclaw-desktop (tauri -> webkit2gtk); glib 0.18.5 is the
     # latest compatible version with the GTK3 stack; fix requires gtk-rs series bump
     { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
+    { id = "RUSTSEC-2026-0381", reason = "distrusted emSign roots; flagged copy is the webpki-roots 0.26.11 semver shim (via tokio-tungstenite 0.29) that re-exports webpki-roots 1.x, which is locked at the fixed 1.0.10" },
     # audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.

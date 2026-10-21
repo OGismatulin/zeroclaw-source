@@ -25,6 +25,8 @@ ignore = [
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; same as above
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraints; same as above
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parsing panic; same as above
+    "RUSTSEC-2026-0382",  # rustls-webpki distrusted intermediates; same as above (0.103.x copy bumped to 0.103.16)
+    "RUSTSEC-2026-0381",  # emSign roots; webpki-roots 0.26.11 is a shim re-exporting webpki-roots 1.x, locked at fixed 1.0.10
 
     # ── audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519 ──
     # cargo-audit reads the whole Cargo.lock, so it flags advisories cargo-deny
