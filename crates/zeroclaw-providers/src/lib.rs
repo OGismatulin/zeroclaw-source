@@ -897,8 +897,9 @@ fn scrub_url_queries(input: &str) -> String {
 /// are removed from embedded HTTP(S) URLs because query parameters may carry
 /// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 8] = [
+    const PREFIXES: [&str; 9] = [
         "sk-",
+        "sk_",
         "xoxb-",
         "xoxp-",
         "ghp_",
@@ -953,6 +954,56 @@ pub fn sanitize_api_error(input: &str) -> String {
     }
 
     format!("{}...", &scrubbed[..end])
+}
+
+pub fn sanitize_provider_error_detail(input: &str) -> Option<String> {
+    use std::sync::LazyLock;
+    static PRIVATE_CONTEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]").unwrap()
+    });
+    static CREDENTIALS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bauthorization\s*[:=]\s*[^;\n]*|\bcookie\s*[:=][^\n]*|\b(?:api[ _-]?key|token|secret|password|credential|bearer)(?:\s+provided)?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+"#).unwrap()
+    });
+    static URL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)https?://[^\s]+").unwrap());
+    static CONTROL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[\p{Cc}\p{Cf}]").unwrap());
+    let input = PRIVATE_CONTEXT.split(input).next().unwrap_or_default();
+    let scrubbed = scrub_secret_patterns(&CREDENTIALS.replace_all(input, "[REDACTED]"));
+    let scrubbed = URL.replace_all(&scrubbed, |capture: &regex::Captures<'_>| {
+        reqwest::Url::parse(&capture[0]).map_or_else(
+            |_| "[REDACTED]".to_string(),
+            |mut url| {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url.to_string()
+            },
+        )
+    });
+    static PRIVATE_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"/(?:private|tmp|home|Users|zeroclaw-data)/[^;\s]+").unwrap()
+    });
+    let scrubbed = PRIVATE_PATH.replace_all(&scrubbed, "[REDACTED]");
+    let detail = CONTROL.replace_all(&scrubbed, " ");
+    let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail = detail.trim_matches([' ', ';']);
+    if detail.is_empty() || detail == "[REDACTED]" {
+        return None;
+    }
+    Some(if detail.chars().count() > 600 {
+        format!("{}…", detail.chars().take(599).collect::<String>())
+    } else {
+        detail.to_string()
+    })
+}
+
+fn provider_http_error_detail(input: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(input).ok()?;
+    body.pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .and_then(sanitize_provider_error_detail)
 }
 
 /// Whether `message` mentions tools as a standalone word rather than as a
@@ -1100,6 +1151,7 @@ pub(crate) struct ProviderHttpError {
     status: reqwest::StatusCode,
     retry_after_secs: Option<u64>,
     detail: String,
+    safe_detail: Option<String>,
 }
 
 impl ProviderHttpError {
@@ -1113,6 +1165,7 @@ impl ProviderHttpError {
             model_provider: model_provider.to_string(),
             status,
             retry_after_secs,
+            safe_detail: provider_http_error_detail(&detail),
             detail: sanitize_api_error(&detail),
         }
     }
@@ -1123,6 +1176,10 @@ impl ProviderHttpError {
 
     pub(crate) const fn retry_after_secs(&self) -> Option<u64> {
         self.retry_after_secs
+    }
+
+    pub(crate) fn safe_detail(&self) -> Option<&str> {
+        self.safe_detail.as_deref()
     }
 
     pub(crate) fn detail(&self) -> &str {
@@ -1186,7 +1243,7 @@ fn provider_http_error(
             .with_attrs(::serde_json::json!({
                 "model_provider": model_provider,
                 "status": status.as_u16(),
-                "body": error.detail,
+                "error_detail": error.safe_detail,
             })),
         "providers: API error"
     );

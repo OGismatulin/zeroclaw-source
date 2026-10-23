@@ -1019,6 +1019,7 @@ cli-agent-error-provider-client-request = 所选模型提供商拒绝了请求�
 cli-agent-error-provider-connection-local = {$endpoint} 上的本地模型服务器不可用。请启动它或更新端点。
 cli-agent-error-provider-connection-remote = 无法连接到 {$endpoint} 上的模型提供商。请检查网络访问或选择其他提供商。
 cli-agent-error-provider-connection = 无法连接到所选模型提供商。请检查网络访问或选择其他提供商。
+cli-agent-error-provider-connection-lost = 读取响应时与提供商的连接中断。请重试或选择其他提供商。
 cli-agent-error-provider-timeout = 所选模型提供商超时。请重试或选择其他提供商。
 cli-agent-error-provider-generic = 所选模型提供商失败。请检查提供商配置或选择其他提供商。
 cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌

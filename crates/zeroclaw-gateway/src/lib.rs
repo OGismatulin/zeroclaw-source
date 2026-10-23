@@ -3862,6 +3862,8 @@ pub struct WebhookQuery {
 struct StructuredErrorEnvelope {
     error: &'static str,
     error_code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
     component: &'static str,
     retryable: bool,
     hint: String,
@@ -3933,6 +3935,7 @@ enum GatewayEarlyFailure {
 
 #[derive(Debug)]
 struct SafeTerminalProviderFailure {
+    error_detail: Option<String>,
     provider: String,
     model: String,
     kind: &'static str,
@@ -3953,6 +3956,7 @@ impl From<&zeroclaw_providers::TerminalProviderFailure> for SafeTerminalProvider
             provider: bounded_error_identity(failure.actual_provider()),
             model: bounded_error_identity(failure.actual_model()),
             kind: diagnostic.kind(),
+            error_detail: diagnostic.detail().map(str::to_owned),
             disposition: diagnostic.disposition(),
             phase: diagnostic.phase(),
             hint: diagnostic.hint(),
@@ -3986,6 +3990,7 @@ fn base_structured_error(
         envelope: StructuredErrorEnvelope {
             error,
             error_code,
+            error_detail: None,
             component,
             retryable,
             hint: hint.into(),
@@ -4193,7 +4198,7 @@ fn terminal_error_contract(
             "provider_timeout",
             true,
         ),
-        ("connect" | "dns" | "provider_server" | "http_error", Retryable) => (
+        ("connect" | "dns" | "connection_read" | "provider_server" | "http_error", Retryable) => (
             StatusCode::BAD_GATEWAY,
             "Provider is unavailable",
             "provider_unavailable",
@@ -4241,6 +4246,7 @@ fn build_structured_terminal_error(
     response.envelope.provider = Some(failure.provider.clone());
     response.envelope.model = Some(failure.model.clone());
     response.envelope.retry_after = failure.retry_after;
+    response.envelope.error_detail = failure.error_detail.clone();
     response.envelope.operator = Some(StructuredErrorOperator {
         phase: failure.phase,
         endpoint: failure.endpoint.clone(),
@@ -6147,6 +6153,7 @@ mod tests {
 
         for (kind, disposition, code, expected_status, retryable) in cases {
             let failure = SafeTerminalProviderFailure {
+                error_detail: None,
                 provider: "actual-provider".into(),
                 model: "actual-model".into(),
                 kind,
@@ -6168,8 +6175,42 @@ mod tests {
     }
 
     #[test]
+    fn structured_body_disconnect_preserves_detail_and_execution_identity() {
+        let reason =
+            "error reading a body from connection: Connection reset by peer (os error 104)";
+        for route in [
+            zeroclaw_providers::ProviderRoute::Main,
+            zeroclaw_providers::ProviderRoute::Vision,
+        ] {
+            let error = zeroclaw_providers::ensure_terminal_provider_failure(
+                anyhow::Error::msg(reason),
+                "actual-provider",
+                "actual-model",
+                route,
+            );
+            let response = build_structured_runtime_error(&error);
+            let body = serde_json::to_value(&response.envelope).unwrap();
+            assert_structured_error_shape(
+                response.status,
+                StatusCode::BAD_GATEWAY,
+                &body,
+                "provider_unavailable",
+                true,
+            );
+            assert_eq!(body["error_detail"], reason);
+            assert_eq!(body["provider"], "actual-provider");
+            assert_eq!(body["model"], "actual-model");
+            assert_eq!(body["operator"]["phase"], "response_body");
+            if let Ok(path) = std::env::var("ZEROCLAW_TEST_ERROR_ENVELOPE") {
+                std::fs::write(path, serde_json::to_vec(&body).unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn structured_error_terminal_metadata_is_safe_and_typed() {
         let failure = SafeTerminalProviderFailure {
+            error_detail: None,
             provider: "backup-alias".into(),
             model: "effective-private-model".into(),
             kind: "rate_limited",

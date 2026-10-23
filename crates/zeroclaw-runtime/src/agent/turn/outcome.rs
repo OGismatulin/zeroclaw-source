@@ -207,6 +207,9 @@ fn reliable_provider_terminal_failure_message_with_renderer(
             ),
             None => render("cli-agent-error-provider-connection", &[]),
         },
+        ReliableProviderTerminalFailureKind::ConnectionRead => {
+            render("cli-agent-error-provider-connection-lost", &[])
+        }
         ReliableProviderTerminalFailureKind::Timeout => {
             render("cli-agent-error-provider-timeout", &[])
         }
@@ -509,6 +512,10 @@ mod tests {
             (
                 ReliableProviderTerminalFailureKind::Connection,
                 "cli-agent-error-provider-connection",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ConnectionRead,
+                "cli-agent-error-provider-connection-lost",
             ),
             (
                 ReliableProviderTerminalFailureKind::Timeout,

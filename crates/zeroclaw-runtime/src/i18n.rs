@@ -1612,6 +1612,7 @@ mod tests {
             for key in [
                 "cli-agent-error-invalid-semantic-completion",
                 "cli-agent-error-incomplete-after-provider-tools",
+                "cli-agent-error-provider-connection-lost",
             ] {
                 let formatted = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{locale}: {key} should format"));
