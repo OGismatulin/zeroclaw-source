@@ -950,9 +950,14 @@ pub struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
     status: Option<u16>,
     retry_after_secs: Option<u64>,
+    detail: Option<String>,
 }
 
 impl ProviderErrorDiagnostic {
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
     pub fn kind(&self) -> &'static str {
         self.kind
     }
@@ -1108,6 +1113,7 @@ pub fn runtime_step_timeout_failure(
             endpoint: None,
             status: None,
             retry_after_secs: None,
+            detail: None,
         },
     )
     .into()
@@ -1122,6 +1128,7 @@ fn empty_completion_diagnostic() -> ProviderErrorDiagnostic {
         endpoint: None,
         status: None,
         retry_after_secs: None,
+        detail: None,
     }
 }
 
@@ -1220,6 +1227,7 @@ pub enum ReliableProviderTerminalFailureKind {
     ModelNotFound,
     ClientRequest,
     Connection,
+    ConnectionRead,
     Timeout,
     Other,
 }
@@ -1235,6 +1243,7 @@ impl ReliableProviderTerminalFailureKind {
             "model_not_found" => Self::ModelNotFound,
             "client_error" => Self::ClientRequest,
             "connect" | "connect_timeout" | "dns" => Self::Connection,
+            "connection_read" => Self::ConnectionRead,
             "timeout" => Self::Timeout,
             _ => Self::Other,
         }
@@ -1253,6 +1262,7 @@ pub struct ReliableProviderTerminalFailure {
     endpoint: Option<String>,
     diagnostic: String,
     terminal_cause: Option<anyhow::Error>,
+    detail: Option<String>,
 }
 
 impl ReliableProviderTerminalFailure {
@@ -1267,7 +1277,17 @@ impl ReliableProviderTerminalFailure {
             endpoint,
             diagnostic,
             terminal_cause: None,
+            detail: None,
         }
+    }
+
+    pub fn with_detail(mut self, detail: Option<&str>) -> Self {
+        self.detail = detail.and_then(super::sanitize_provider_error_detail);
+        self
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
     }
 
     /// Classify a provider error into a safe terminal presentation cause.
@@ -1275,12 +1295,13 @@ impl ReliableProviderTerminalFailure {
         let diagnostic = provider_error_diagnostic(error);
         Self::new(
             ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
-            diagnostic.endpoint,
+            diagnostic.endpoint.clone(),
             format!(
                 "provider error: kind={}; phase={}; hint={}",
                 diagnostic.kind, diagnostic.phase, diagnostic.hint
             ),
         )
+        .with_detail(diagnostic.detail())
     }
 
     fn with_cause(
@@ -1297,6 +1318,7 @@ impl ReliableProviderTerminalFailure {
             endpoint: diagnostic.endpoint,
             diagnostic: failure_aggregate,
             terminal_cause: Some(terminal_cause),
+            detail: diagnostic.detail,
         }
     }
 
@@ -1400,6 +1422,58 @@ fn has_model_not_found_hint(message: &str) -> bool {
 }
 
 pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
+    if let Some(terminal) = terminal_provider_failure(err) {
+        return terminal.diagnostic().clone();
+    }
+    let detail = if let Some(http) = typed_provider_http_error(err) {
+        http.safe_detail().map(str::to_owned)
+    } else if let Some(failure) = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+    {
+        failure.detail().map(str::to_owned)
+    } else if let Some(reqwest) = typed_reqwest_error(err) {
+        super::sanitize_provider_error_detail(&super::format_error_chain(reqwest))
+    } else {
+        err.chain().last().and_then(|source| {
+            let message = source.to_string();
+            if let Some(start) = message.find('{') {
+                return super::provider_http_error_detail(&message[start..]);
+            }
+            let lower = message.to_lowercase();
+            if http_status_from_error_text(&lower)
+                .or_else(|| legacy_http_status_for_classification(&lower))
+                .is_some()
+            {
+                return None;
+            }
+            let legacy_transport_cause = !message.trim_start().starts_with(['<', '['])
+                && (err
+                    .chain()
+                    .any(|source| source.downcast_ref::<std::io::Error>().is_some())
+                    || [
+                        "connection",
+                        "dns",
+                        "resolve",
+                        "timeout",
+                        "timed out",
+                        "unexpected eof",
+                        "incomplete message",
+                        "socket",
+                        "response stream",
+                    ]
+                    .iter()
+                    .any(|marker| lower.contains(marker)));
+            if !legacy_transport_cause {
+                return None;
+            }
+            super::sanitize_provider_error_detail(
+                message
+                    .strip_prefix("error decoding response body: ")
+                    .unwrap_or(&message),
+            )
+        })
+    };
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
     let endpoint = typed_reqwest_error(err)
@@ -1428,6 +1502,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1446,6 +1521,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1460,6 +1536,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1489,6 +1566,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1501,6 +1579,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1513,6 +1592,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1525,6 +1605,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1555,6 +1636,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1587,6 +1669,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
                 endpoint,
                 status: Some(code),
                 retry_after_secs,
+                detail,
             };
         }
 
@@ -1599,6 +1682,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
                 endpoint,
                 status,
                 retry_after_secs,
+                detail,
             };
         }
 
@@ -1611,6 +1695,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
                 endpoint,
                 status,
                 retry_after_secs,
+                detail,
             };
         }
 
@@ -1623,6 +1708,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
                 endpoint,
                 status,
                 retry_after_secs,
+                detail,
             };
         }
     }
@@ -1639,6 +1725,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1651,6 +1738,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1663,6 +1751,49 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
+        };
+    }
+
+    let body_disconnect = err.chain().any(|source| {
+        source
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+            || source
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_incomplete_message)
+            || source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                    )
+                })
+            || source
+                .downcast_ref::<ReliableProviderTerminalFailure>()
+                .is_some_and(|failure| {
+                    failure.kind() == ReliableProviderTerminalFailureKind::ConnectionRead
+                })
+    }) || [
+        "connection reset",
+        "error reading a body from connection",
+        "unexpected eof",
+        "incomplete message",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        && !lower.contains("eof while parsing");
+    if body_disconnect {
+        return ProviderErrorDiagnostic {
+            kind: "connection_read",
+            disposition,
+            phase: "response_body",
+            hint: "provider connection closed while reading the response; retry or switch provider",
+            endpoint,
+            status,
+            retry_after_secs,
+            detail,
         };
     }
 
@@ -1675,6 +1806,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1687,6 +1819,7 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
             endpoint,
             status,
             retry_after_secs,
+            detail,
         };
     }
 
@@ -1698,19 +1831,19 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
         endpoint,
         status,
         retry_after_secs,
+        detail,
     }
 }
 
 fn provider_failure_attrs(
     provider_name: &str,
     model: &str,
-    error_detail: &str,
     diagnostic: &ProviderErrorDiagnostic,
 ) -> serde_json::Value {
     serde_json::json!({
         "model_provider": provider_name,
         "model": model,
-        "error": error_detail,
+        "error": diagnostic.detail.as_deref(),
         "error_kind": diagnostic.kind,
         "error_disposition": diagnostic.disposition.as_str(),
         "error_phase": diagnostic.phase,
@@ -1727,7 +1860,6 @@ fn provider_retry_attrs(
     attempt: u32,
     backoff_ms: u64,
     reason: &str,
-    error_detail: &str,
     diagnostic: &ProviderErrorDiagnostic,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -1736,7 +1868,7 @@ fn provider_retry_attrs(
         "attempt": attempt,
         "backoff_ms": backoff_ms,
         "reason": reason,
-        "error": error_detail,
+        "error": diagnostic.detail.as_deref(),
         "error_kind": diagnostic.kind,
         "error_disposition": diagnostic.disposition.as_str(),
         "error_phase": diagnostic.phase,
@@ -2023,9 +2155,10 @@ fn reliable_terminal_error_with_cause(
         let terminal_failure = anyhow::Error::new(
             ReliableProviderTerminalFailure::new(
                 ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
-                diagnostic.endpoint,
+                diagnostic.endpoint.clone(),
                 failure_aggregate(&failures),
             )
+            .with_detail(diagnostic.detail())
             .with_provider(provider.unwrap_or_default()),
         );
         if let Some(usage) = rejected_attempt_usage {
@@ -2074,6 +2207,7 @@ fn fork_terminal_error(
             diagnostic.endpoint().map(str::to_owned),
             failure_aggregate(&failures),
         )
+        .with_detail(diagnostic.detail())
         .with_provider(provider.unwrap_or_default()),
     );
     let inner = match rejected_attempt_usage.or_else(accounted_rejected_attempt_usage) {
@@ -2432,6 +2566,7 @@ impl ReliableModelProvider {
             endpoint: None,
             status: None,
             retry_after_secs: None,
+            detail: None,
         };
         push_failure(
             failures,
@@ -2772,8 +2907,9 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
-                            let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
+                            let error_detail =
+                                diagnostic.detail().unwrap_or(diagnostic.kind()).to_string();
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
                             terminal_failure = Some(TerminalProviderFailure::new(
@@ -2815,7 +2951,6 @@ impl ModelProvider for ReliableModelProvider {
                                         provider_failure_attrs(
                                             provider_name,
                                             served_model,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -2847,7 +2982,6 @@ impl ModelProvider for ReliableModelProvider {
                                             attempt + 1,
                                             wait,
                                             failure_reason,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3066,8 +3200,9 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
-                            let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
+                            let error_detail =
+                                diagnostic.detail().unwrap_or(diagnostic.kind()).to_string();
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
                             terminal_failure = Some(TerminalProviderFailure::new(
@@ -3107,7 +3242,6 @@ impl ModelProvider for ReliableModelProvider {
                                         provider_failure_attrs(
                                             provider_name,
                                             served_model,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3139,7 +3273,6 @@ impl ModelProvider for ReliableModelProvider {
                                             attempt + 1,
                                             wait,
                                             failure_reason,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3481,8 +3614,9 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
-                            let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
+                            let error_detail =
+                                diagnostic.detail().unwrap_or(diagnostic.kind()).to_string();
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
                             terminal_failure = Some(TerminalProviderFailure::new(
@@ -3522,7 +3656,6 @@ impl ModelProvider for ReliableModelProvider {
                                         provider_failure_attrs(
                                             provider_name,
                                             served_model,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3554,7 +3687,6 @@ impl ModelProvider for ReliableModelProvider {
                                             attempt + 1,
                                             wait,
                                             failure_reason,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3788,8 +3920,9 @@ impl ModelProvider for ReliableModelProvider {
                             let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
-                            let error_detail = compact_error_detail(&e);
                             let diagnostic = provider_error_diagnostic(&e);
+                            let error_detail =
+                                diagnostic.detail().unwrap_or(diagnostic.kind()).to_string();
                             last_error_detail = Some(error_detail.clone());
                             last_diagnostic = Some(diagnostic.clone());
                             terminal_failure = Some(TerminalProviderFailure::new(
@@ -3829,7 +3962,6 @@ impl ModelProvider for ReliableModelProvider {
                                         provider_failure_attrs(
                                             provider_name,
                                             served_model,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -3861,7 +3993,6 @@ impl ModelProvider for ReliableModelProvider {
                                             attempt + 1,
                                             wait,
                                             failure_reason,
-                                            &error_detail,
                                             &diagnostic,
                                         )
                                     ),
@@ -7573,6 +7704,308 @@ mod tests {
     }
 
     #[test]
+    fn provider_body_disconnect_keeps_priority_and_parser_negatives() {
+        let cases = [
+            (
+                "error decoding response body: expected value at line 1",
+                "provider_error",
+            ),
+            (
+                "EOF while parsing a value at line 1 column 0",
+                "provider_error",
+            ),
+            (
+                "unexpected EOF while parsing a string at line 1",
+                "provider_error",
+            ),
+            (
+                "reasoning_content must be passed back; connection reset",
+                "reasoning_roundtrip",
+            ),
+            (
+                "error reading a body from connection: operation timed out",
+                "timeout",
+            ),
+            ("Test API error (429): connection reset", "rate_limited"),
+            ("Test API error (401): unexpected eof", "auth"),
+            (
+                "Test API error (503): incomplete message",
+                "provider_server",
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                provider_error_diagnostic(&anyhow::Error::msg(message)).kind(),
+                expected,
+                "{message}"
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let diagnostic =
+                provider_error_diagnostic(&std::io::Error::new(kind, "socket closed").into());
+            assert_eq!(diagnostic.kind(), "connection_read");
+            assert_eq!(diagnostic.phase(), "response_body");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_body_disconnect_preserves_terminal_constructors_and_detail() {
+        let reason =
+            "error reading a body from connection: Connection reset by peer (os error 104)";
+        let error = anyhow::Error::msg(reason);
+        let from_error = ReliableProviderTerminalFailure::from_error(&error);
+        assert_eq!(
+            from_error.kind(),
+            ReliableProviderTerminalFailureKind::ConnectionRead
+        );
+        assert_eq!(from_error.detail(), Some(reason));
+        let with_cause = reliable_terminal_error_with_cause(
+            Some("actual"),
+            FailureEvents::default(),
+            None,
+            false,
+            Some(error),
+        );
+        let failure = with_cause
+            .downcast_ref::<ReliableProviderTerminalFailure>()
+            .unwrap();
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::ConnectionRead
+        );
+        assert_eq!(failure.detail(), Some(reason));
+        let ((stream_failure, terminal), _) = scope_reliable_call_accounting(async {
+            record_stream_recovery_failure(&anyhow::Error::msg(reason));
+            let stream_failure = reliable_terminal_error_with_cause(
+                Some("actual"),
+                FailureEvents::default(),
+                None,
+                false,
+                None,
+            );
+            let diagnostic = provider_error_diagnostic(&anyhow::Error::msg(reason));
+            let terminal = TerminalProviderFailure::new(
+                &ProviderCandidateDescriptor::requested("actual", None),
+                "model",
+                ProviderRoute::Main,
+                1,
+                diagnostic,
+            );
+            let terminal = fork_terminal_error(
+                Some(terminal),
+                Some("actual"),
+                FailureEvents::default(),
+                None,
+                false,
+            );
+            (stream_failure, terminal)
+        })
+        .await;
+        let stream = stream_failure
+            .downcast_ref::<ReliableProviderTerminalFailure>()
+            .unwrap();
+        assert_eq!(
+            stream.kind(),
+            ReliableProviderTerminalFailureKind::ConnectionRead
+        );
+        assert_eq!(stream.detail(), Some(reason));
+        let typed = terminal_provider_failure(&terminal).unwrap();
+        assert_eq!(typed.diagnostic().detail(), Some(reason));
+        let companion = terminal
+            .chain()
+            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+            .unwrap();
+        assert_eq!(
+            companion.kind(),
+            ReliableProviderTerminalFailureKind::ConnectionRead
+        );
+        assert_eq!(companion.detail(), Some(reason));
+        for route in [ProviderRoute::Main, ProviderRoute::Vision] {
+            let typed = ensure_terminal_provider_failure(
+                anyhow::Error::msg(reason),
+                "actual",
+                "model",
+                route,
+            );
+            assert_eq!(
+                terminal_provider_failure(&typed)
+                    .unwrap()
+                    .diagnostic()
+                    .detail(),
+                Some(reason)
+            );
+        }
+        for reason in ["connection refused", "dns resolution failed"] {
+            assert_eq!(
+                ReliableProviderTerminalFailure::from_error(&anyhow::Error::msg(reason)).kind(),
+                ReliableProviderTerminalFailureKind::Connection
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_body_disconnect_reads_typed_reqwest_chain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let error = response.bytes().await.unwrap_err();
+        assert!(error.is_decode(), "{error:?}");
+        let diagnostic = provider_error_diagnostic(
+            &anyhow::Error::new(error).context("outer context must not become detail"),
+        );
+        assert_eq!(diagnostic.kind(), "connection_read");
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(!diagnostic.detail().unwrap().contains("outer context"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn provider_error_detail_uses_http_message_and_scrubs_before_limit() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+        let message = "Authorization: Bearer AUTH_SENTINEL; Connection reset by peer https://user:PASS_SENTINEL@example.com/v1?key=QUERY_SENTINEL";
+        let message = format!(
+            "{message} {} sk-TAIL_SENTINEL; prompt=PROMPT_SENTINEL",
+            "я".repeat(650)
+        );
+        let body = serde_json::json!({"error": {"message": message}, "request": "REQUEST_SENTINEL", "reasoning": "REASONING_SENTINEL"}).to_string();
+        let error = super::super::api_error_from_parts(
+            "test",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            &body,
+        );
+        let diagnostic = provider_error_diagnostic(&error);
+        assert_eq!(diagnostic.kind(), "provider_server");
+        assert!(
+            diagnostic.detail().is_some(),
+            "HTTP message detail must survive classification"
+        );
+        let detail = diagnostic.detail().unwrap();
+        assert!(detail.contains("Connection reset by peer"));
+        assert_eq!(detail.chars().count(), 600);
+        assert!(detail.ends_with('…'));
+        for sentinel in [
+            "AUTH_SENTINEL",
+            "PASS_SENTINEL",
+            "QUERY_SENTINEL",
+            "TAIL_SENTINEL",
+            "PROMPT_SENTINEL",
+            "REQUEST_SENTINEL",
+            "REASONING_SENTINEL",
+        ] {
+            assert!(!detail.contains(sentinel));
+        }
+        assert_eq!(
+            super::super::sanitize_provider_error_detail("Connection reset sk_KEY_SENTINEL"),
+            Some("Connection reset [REDACTED]".into())
+        );
+        for private in [
+            "prompt text PROMPT_SENTINEL",
+            "reasoning text REASONING_SENTINEL",
+            "api key provided: \"KEY SENTINEL\"",
+            "password='PASS SENTINEL'",
+            "/private/user/FILE_SENTINEL",
+        ] {
+            let detail = super::super::sanitize_provider_error_detail(&format!(
+                "Connection reset; {private}"
+            ))
+            .unwrap();
+            assert!(detail.starts_with("Connection reset"));
+            assert!(!detail.contains("SENTINEL"));
+        }
+        let events: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            !events.is_empty(),
+            "provider HTTP error must emit its native event"
+        );
+        let logged = serde_json::to_string(&events).unwrap();
+        for sentinel in [
+            "AUTH_SENTINEL",
+            "PASS_SENTINEL",
+            "QUERY_SENTINEL",
+            "TAIL_SENTINEL",
+            "PROMPT_SENTINEL",
+            "REQUEST_SENTINEL",
+            "REASONING_SENTINEL",
+        ] {
+            assert!(!logged.contains(sentinel), "{sentinel}");
+        }
+        let body = r#"{"error":{"message":{"request":"unsafe"}},"request":"REQUEST_SENTINEL"}"#;
+        assert_eq!(
+            provider_error_diagnostic(&super::super::api_error_from_parts(
+                "test",
+                reqwest::StatusCode::BAD_REQUEST,
+                body
+            ))
+            .detail(),
+            None
+        );
+        assert_eq!(
+            provider_error_diagnostic(&anyhow::Error::msg(
+                "503 Service Unavailable: RAW_TERMINAL_SENTINEL"
+            ))
+            .detail(),
+            None
+        );
+        assert_eq!(
+            super::super::sanitize_provider_error_detail(
+                "Traceback (most recent call last): PROMPT_SENTINEL"
+            ),
+            None
+        );
+        assert_eq!(
+            super::super::sanitize_provider_error_detail(
+                "Connection reset; Cookie: SESSION_SENTINEL; more=OTHER_SENTINEL"
+            ),
+            Some("Connection reset; [REDACTED]".into())
+        );
+    }
+
+    #[test]
+    fn provider_error_detail_unstructured_dumps_are_not_public() {
+        for dump in [
+            "RAW_PROVIDER_BODY",
+            "<html>RAW_PROVIDER_BODY</html>",
+            "RAW_PROVIDER_BODY [messages]",
+        ] {
+            let diagnostic = provider_error_diagnostic(&anyhow::Error::msg(dump));
+            assert!(
+                diagnostic.detail().is_none(),
+                "unstructured provider dump must not become detail: {dump}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_diagnostic_classifies_body_disconnect() {
+        let error = anyhow::Error::msg(
+            "error decoding response body: error reading a body from connection: Connection reset by peer (os error 104)",
+        );
+        let diagnostic = provider_error_diagnostic(&error);
+        assert_eq!(diagnostic.kind(), "connection_read");
+        assert_eq!(diagnostic.phase(), "response_body");
+    }
+
+    #[test]
     fn provider_error_diagnostic_identifies_connect_timeout_endpoint() {
         let err = anyhow::Error::msg(
             "error sending request for url (https://api.deepseek.com/chat/completions): \
@@ -7959,6 +8392,7 @@ mod tests {
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
             status: None,
             retry_after_secs: None,
+            detail: None,
         };
         let mut failures = FailureEvents::default();
 

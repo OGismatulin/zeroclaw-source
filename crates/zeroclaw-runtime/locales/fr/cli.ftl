@@ -1023,6 +1023,7 @@ cli-agent-error-provider-client-request = Le fournisseur de modèle sélectionn�
 cli-agent-error-provider-connection-local = Le serveur de modèle local à {$endpoint} est indisponible. Démarrez-le ou mettez à jour le point de terminaison.
 cli-agent-error-provider-connection-remote = Impossible d'atteindre le fournisseur de modèle à {$endpoint}. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
 cli-agent-error-provider-connection = Impossible d'atteindre le fournisseur de modèle sélectionné. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-connection-lost = La connexion au fournisseur a été perdue pendant la lecture de la réponse. Réessayez ou choisissez un autre fournisseur.
 cli-agent-error-provider-timeout = Le fournisseur de modèle sélectionné a expiré. Réessayez ou choisissez un autre fournisseur.
 cli-agent-error-provider-generic = Le fournisseur de modèle sélectionné a échoué. Vérifiez la configuration du fournisseur ou choisissez un autre fournisseur.
 cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons

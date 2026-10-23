@@ -1020,6 +1020,7 @@ cli-agent-error-provider-client-request = El proveedor de modelo seleccionado re
 cli-agent-error-provider-connection-local = El servidor de modelo local en {$endpoint} no está disponible. Inícialo o actualiza el endpoint.
 cli-agent-error-provider-connection-remote = No se puede alcanzar el proveedor de modelo en {$endpoint}. Revisa el acceso de red o elige otro proveedor.
 cli-agent-error-provider-connection = No se puede alcanzar el proveedor de modelo seleccionado. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-connection-lost = Se perdió la conexión con el proveedor mientras se leía la respuesta. Reintenta o elige otro proveedor.
 cli-agent-error-provider-timeout = El proveedor de modelo seleccionado agotó el tiempo de espera. Inténtalo de nuevo o elige otro proveedor.
 cli-agent-error-provider-generic = El proveedor de modelo seleccionado falló. Revisa la configuración del proveedor o elige otro proveedor.
 cli-doctor-context-window-ok = {$provider_ref}: ventana de contexto: {$context_window} tokens

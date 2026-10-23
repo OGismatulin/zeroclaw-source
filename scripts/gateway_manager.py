@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import unicodedata
 import secrets
 import signal
 import shutil
@@ -335,6 +336,50 @@ def _bounded_string_list(value: object) -> list[str] | None:
     return result
 
 
+def safe_error_detail(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = re.split(
+        r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]",
+        value,
+        maxsplit=1,
+    )[0]
+    value = re.sub(r"(?i)\bauthorization\s*[:=]\s*[^;\n]*", "[REDACTED]", value)
+    value = re.sub(r"(?i)\bcookie\s*[:=].*", "[REDACTED]", value)
+    value = re.sub(
+        r"(?i)\b(?:api[ _-]?key|token|secret|password|credential|bearer)(?:\s+provided)?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+|(?:sk-|sk_|xoxb-|xoxp-|ghp_|gho_|ghu_|github_pat_|AIza)[A-Za-z0-9_.:-]+",
+        "[REDACTED]",
+        value,
+    )
+
+    def clean_url(match: re.Match[str]) -> str:
+        try:
+            url = urlsplit(match.group())
+            host = url.netloc.rsplit("@", 1)[-1]
+            return urlunsplit((url.scheme, host, url.path, "", ""))
+        except ValueError:
+            return "[REDACTED]"
+
+    value = re.sub(r"https?://[^\s]+", clean_url, value, flags=re.IGNORECASE)
+    if re.search(r"(?i)\bsecret(?:\b|_)", value):
+        return None
+    value = re.sub(
+        r"(?<!:)\B/(?:private|tmp|home|Users|zeroclaw-data)/[^;\s]+",
+        "[REDACTED]",
+        value,
+    )
+    value = " ".join(
+        "".join(
+            c
+            for c in value
+            if not unicodedata.category(c).startswith("C") or c.isspace()
+        ).split()
+    ).strip(" ;")
+    if not value or value == "[REDACTED]":
+        return None
+    return value if len(value) <= 600 else value[:599] + "…"
+
+
 def build_error_payload(
     *,
     code: str,
@@ -368,6 +413,9 @@ def build_error_payload(
         bounded_list = _bounded_string_list(optional.get(key))
         if bounded_list is not None:
             payload[key] = bounded_list
+    detail = safe_error_detail(optional.get("error_detail"))
+    if detail is not None:
+        payload["error_detail"] = detail
     retry_after = optional.get("retry_after")
     if (
         isinstance(retry_after, int)
@@ -456,6 +504,7 @@ def normalize_child_error(
             **{key: payload.get(key) for key in _PUBLIC_ERROR_STRING_FIELDS},
             **{key: payload.get(key) for key in _PUBLIC_ERROR_LIST_FIELDS},
             retry_after=payload.get("retry_after"),
+            error_detail=payload.get("error_detail"),
         )
         return status, public, _safe_operator_fields(payload.get("operator"))
 
@@ -2307,6 +2356,7 @@ class GatewayManagerServer:
         user_id: str | None = None,
         **optional: object,
     ) -> tuple[int, dict[str, object]]:
+        optional.setdefault("error_detail", error_message)
         return self.finalize_error(
             status_code=status_code,
             payload=build_error_payload(
@@ -2402,6 +2452,7 @@ class GatewayManagerServer:
             component="manager",
             retryable=True,
             error_message="Lalafo upstream did not answer",
+            error_detail=str(exc),
             hint="Check the VPN tunnel and the upstream service, then retry",
         )
         self._log_internal_error_diagnostic(payload, exc)
@@ -2439,6 +2490,7 @@ class GatewayManagerServer:
                 component="manager",
                 retryable=True,
                 error_message="Upload failed",
+                error_detail=str(exc),
                 hint="Retry the upload or contact support with the incident ID",
             )
         else:
@@ -2448,6 +2500,7 @@ class GatewayManagerServer:
                 component="manager",
                 retryable=False,
                 error_message="Gateway Manager failed",
+                error_detail=str(exc),
                 hint="Contact support with the incident ID",
             )
         self._log_internal_error_diagnostic(payload, exc)
@@ -2457,26 +2510,13 @@ class GatewayManagerServer:
     def _log_internal_error_diagnostic(
         payload: dict[str, object], exc: Exception
     ) -> None:
-        """Log the exception behind a manager 500, keyed by its incident id.
-
-        Without this the public envelope is all that survives: an incident id
-        with nothing behind it. `finalize_error` logs only the classification
-        (role/code/component/user), and the Fly log window holds roughly ten
-        minutes, so a manager-internal 500 used to be unattributable the moment
-        it rotated out.
-
-        The traceback is folded onto one line so the aggregator keeps it as a
-        single record next to the id. Frames carry file/line/function only, not
-        variable values; the exception message is bounded because it is the one
-        part that can quote arbitrary upstream text.
-        """
         incident_id = _bounded_string(payload.get("incident_id"), limit=64) or ""
         error_code = _bounded_string(payload.get("error_code"), limit=64) or ""
-        message = _bounded_string(str(exc), limit=300) or ""
-        frames = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        message = safe_error_detail(str(exc)) or ""
+        folded = " | ".join(
+            f"in {frame.name}:{frame.lineno}"
+            for frame in traceback.extract_tb(exc.__traceback__)
         )
-        folded = " | ".join(line.strip() for line in frames.splitlines() if line.strip())
         print(
             "[gateway-manager] internal error diagnostic "
             f"incident_id={incident_id} "
@@ -2585,23 +2625,25 @@ class GatewayManagerServer:
 
         try:
             instance = self.registry.ensure_instance(user_key)
-        except DaemonSpawnError:
+        except DaemonSpawnError as exc:
             return self._manager_error(
                 status_code=503,
                 code="daemon_start_failed",
                 component="manager",
                 retryable=True,
                 error_message="Personal daemon failed to start",
+                error_detail=str(exc),
                 hint="Retry shortly or contact support with the incident ID",
                 user_id=user_id,
             )
-        except DaemonCapacityError:
+        except DaemonCapacityError as exc:
             return self._manager_error(
                 status_code=503,
                 code="daemon_capacity_exceeded",
                 component="manager",
                 retryable=True,
                 error_message="max instances reached",
+                error_detail=str(exc),
                 hint="Retry shortly",
                 user_id=user_id,
             )
@@ -3988,6 +4030,7 @@ def forward_webhook_to_child(
                 component="manager",
                 retryable=True,
                 error="gateway timeout forwarding to child daemon",
+                error_detail=str(exc.reason) or type(exc.reason).__name__,
                 hint="Retry the request",
             )
         return 502, build_error_payload(
@@ -3995,14 +4038,16 @@ def forward_webhook_to_child(
             component="manager",
             retryable=True,
             error="Child daemon is unreachable",
+            error_detail=str(exc.reason),
             hint="Retry shortly",
         )
-    except TimeoutError:
+    except TimeoutError as exc:
         return 504, build_error_payload(
             code="gateway_timeout",
             component="manager",
             retryable=True,
             error="gateway timeout forwarding to child daemon",
+            error_detail=str(exc) or type(exc).__name__,
             hint="Retry the request",
         )
 

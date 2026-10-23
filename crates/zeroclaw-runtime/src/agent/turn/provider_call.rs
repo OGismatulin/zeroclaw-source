@@ -468,6 +468,7 @@ fn safe_terminal_companion(err: &anyhow::Error) -> Option<ReliableProviderTermin
             failure.endpoint().map(str::to_owned),
             failure.to_string(),
         )
+        .with_detail(failure.detail())
         .with_provider(failure.provider().unwrap_or_default()),
     )
 }
@@ -1480,6 +1481,18 @@ mod streaming_fallback_tests {
             ReliableProviderTerminalFailureKind::Connection
         );
         assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+    }
+
+    #[test]
+    fn body_disconnect_safe_terminal_companion_preserves_kind_and_detail() {
+        let reason = "error reading a body from connection: Connection reset by peer";
+        let original = ReliableProviderTerminalFailure::from_error(&anyhow::Error::msg(reason));
+        let companion = super::safe_terminal_companion(&anyhow::Error::new(original)).unwrap();
+        assert_eq!(
+            companion.kind(),
+            ReliableProviderTerminalFailureKind::ConnectionRead
+        );
+        assert_eq!(companion.detail(), Some(reason));
     }
 
     #[tokio::test]

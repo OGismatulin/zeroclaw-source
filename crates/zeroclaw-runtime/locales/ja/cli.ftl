@@ -1018,6 +1018,7 @@ cli-agent-error-provider-client-request = 選択したモデルプロバイダ�
 cli-agent-error-provider-connection-local = {$endpoint} のローカルモデルサーバーを利用できません。起動するか、エンドポイントを更新してください。
 cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-connection-lost = 応答の読み取り中にプロバイダーとの接続が切れました。再試行するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
 cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン

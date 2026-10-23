@@ -1154,6 +1154,7 @@ cli-agent-error-provider-client-request = The selected model provider rejected t
 cli-agent-error-provider-connection-local = The local model server at {$endpoint} is unavailable. Start it or update the endpoint.
 cli-agent-error-provider-connection-remote = Cannot reach the model provider at {$endpoint}. Check network access or choose another provider.
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
+cli-agent-error-provider-connection-lost = The provider connection was lost while reading the response. Retry or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
