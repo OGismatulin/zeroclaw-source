@@ -695,19 +695,21 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
 /// outright — a 429 is never fixed by dropping a history message, so letting it
 /// through would mutate history for nothing.
 pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
+    if let Some(error) = typed_provider_http_error(err) {
+        return error.reasoning_roundtrip_rejected();
+    }
     // Already classified at the provider boundary: the summary Display of a
     // TerminalProviderFailure drops the provider body, so the kind is the only
     // surviving evidence by the time the turn engine sees the error.
-    if terminal_provider_failure(err)
-        .is_some_and(|failure| failure.diagnostic().kind() == "reasoning_roundtrip")
+    if typed_provider_error_diagnostic(err)
+        .is_some_and(|diagnostic| diagnostic.kind() == "reasoning_roundtrip")
     {
         return true;
     }
     if is_rate_limited(err) {
         return false;
     }
-    let lower = error_chain_text(err).to_lowercase();
-    lower.contains("reasoning_content") && lower.contains("passed back")
+    super::reasoning_roundtrip_rejection_message(&error_chain_text(err))
 }
 
 /// True when the provider finished a turn that carried no usable content.
@@ -1499,15 +1501,20 @@ fn has_model_not_found_hint(message: &str) -> bool {
     })
 }
 
+fn typed_provider_error_diagnostic(err: &anyhow::Error) -> Option<&ProviderErrorDiagnostic> {
+    terminal_provider_failure(err)
+        .map(TerminalProviderFailure::diagnostic)
+        .or_else(|| {
+            err.chain().find_map(|source| {
+                source
+                    .downcast_ref::<ReliableProviderTerminalFailure>()
+                    .and_then(|failure| failure.typed_diagnostic.as_ref())
+            })
+        })
+}
+
 pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
-    if let Some(terminal) = terminal_provider_failure(err) {
-        return terminal.diagnostic().clone();
-    }
-    if let Some(diagnostic) = err.chain().find_map(|source| {
-        source
-            .downcast_ref::<ReliableProviderTerminalFailure>()
-            .and_then(|failure| failure.typed_diagnostic.as_ref())
-    }) {
+    if let Some(diagnostic) = typed_provider_error_diagnostic(err) {
         return diagnostic.clone();
     }
     let detail = if let Some(http) = typed_provider_http_error(err) {

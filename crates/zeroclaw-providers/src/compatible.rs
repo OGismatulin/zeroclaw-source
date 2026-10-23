@@ -1649,7 +1649,11 @@ fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
         return Ok(None);
     }
 
-    serde_json::from_str(data)
+    let value: serde_json::Value = serde_json::from_str(data).map_err(StreamError::Json)?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(streaming_api_error(reqwest::StatusCode::OK, data));
+    }
+    serde_json::from_value(value)
         .map(Some)
         .map_err(StreamError::Json)
 }
@@ -3494,7 +3498,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 &self.name,
                 status,
                 retry_after_secs,
-                sanitized,
+                error,
             ));
         };
 
@@ -10171,5 +10175,21 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
+    }
+
+    #[tokio::test]
+    async fn sse_in_band_reasoning_rejection_keeps_typed_cause() {
+        let events = collect_stream_events("data: {\"error\":{\"message\":\"The reasoning_content must be passed back to the API.\"}}\n\ndata: [DONE]\n\n").await;
+        let error = events
+            .into_iter()
+            .find_map(Result::err)
+            .expect("in-band provider error must fail the stream");
+        let error = anyhow::Error::new(error);
+        assert!(crate::reliable::is_reasoning_roundtrip_rejected(&error));
+        assert_eq!(
+            crate::reliable::provider_error_diagnostic(&error).kind(),
+            "reasoning_roundtrip"
+        );
+        assert!(!format!("{error:#}").contains("must be passed back"));
     }
 }

@@ -1200,7 +1200,11 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     sanitize_api_error(&formatted)
 }
 
-/// Safe, typed response metadata retained across the provider/reliability boundary.
+fn reasoning_roundtrip_rejection_message(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    lower.contains("reasoning_content") && lower.contains("passed back")
+}
+
 #[derive(Debug)]
 pub(crate) struct ProviderHttpError {
     model_provider: String,
@@ -1208,6 +1212,7 @@ pub(crate) struct ProviderHttpError {
     retry_after_secs: Option<u64>,
     detail: String,
     safe_detail: Option<String>,
+    reasoning_roundtrip_rejected: bool,
 }
 
 impl ProviderHttpError {
@@ -1222,6 +1227,8 @@ impl ProviderHttpError {
             status,
             retry_after_secs,
             safe_detail: provider_http_error_detail(&detail),
+            reasoning_roundtrip_rejected: !matches!(status.as_u16(), 401 | 403 | 429)
+                && reasoning_roundtrip_rejection_message(&detail),
             detail: sanitize_api_error(&detail),
         }
     }
@@ -1240,6 +1247,10 @@ impl ProviderHttpError {
 
     pub(crate) fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub(crate) const fn reasoning_roundtrip_rejected(&self) -> bool {
+        self.reasoning_roundtrip_rejected
     }
 }
 

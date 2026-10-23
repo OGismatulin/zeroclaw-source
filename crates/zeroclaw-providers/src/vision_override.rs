@@ -118,6 +118,10 @@ impl ModelProvider for VisionOverrideProvider {
             .unwrap_or_else(|| self.inner.supports_vision())
     }
 
+    fn supports_reasoning_only_history(&self) -> bool {
+        self.inner.supports_reasoning_only_history()
+    }
+
     fn supports_streaming(&self) -> bool {
         self.inner.supports_streaming()
     }
