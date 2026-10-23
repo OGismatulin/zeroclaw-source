@@ -11825,6 +11825,7 @@ command = "rm independent-delegate-marker"
             "non-OAuth target without api_key must fall back to global credential"
         );
     }
+    include!("delegate_reasoning_tests.rs");
 }
 
 #[cfg(test)]
