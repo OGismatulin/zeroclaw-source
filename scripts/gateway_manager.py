@@ -21,6 +21,7 @@ import re
 import secrets
 import signal
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -2135,6 +2136,7 @@ class GatewayManagerServer:
         incident_sweeper: object | None = None,
         m365_refresher: object | None = None,
         transcribe_audio: Callable[[bytes, str], str] | None = None,
+        lalafo_relay: LalafoRelay | None = None,
     ) -> None:
         self.settings = settings
         self.pairing_state = pairing_state
@@ -2145,6 +2147,7 @@ class GatewayManagerServer:
         self.incident_sweeper = incident_sweeper
         self.m365_refresher = m365_refresher
         self.transcribe_audio = transcribe_audio
+        self.lalafo_relay = lalafo_relay
         self.metrics_exporter: "zeroclaw_metrics.MetricsExporter | None" = None
         self.error_report_worker: threading.Thread | None = None
 
@@ -2317,6 +2320,92 @@ class GatewayManagerServer:
             user_id=user_id,
             manager_classified=True,
         )
+
+    def handle_lalafo_relay(
+        self,
+        *,
+        method: str,
+        path: str,
+        authorization: str,
+        read_body: Callable[[], bytes | None],
+    ) -> tuple[int, str, bytes, dict[str, object]]:
+        relay = self.lalafo_relay
+        if relay is None or not path.startswith(LALAFO_RELAY_PREFIX):
+            return self._lalafo_relay_refusal(
+                404, "invalid_request", "Route not found", "Check the request path"
+            )
+        if not secrets.compare_digest(
+            authorization.encode("utf-8"), f"Bearer {relay.token}".encode("utf-8")
+        ):
+            return self._lalafo_relay_refusal(
+                401,
+                "relay_unauthorized",
+                "Relay token is missing or wrong",
+                "Send Authorization: Bearer with ZEROCLAW_RELAY_TOKEN",
+            )
+        target = _lalafo_relay_route(method, path)
+        if target is None:
+            return self._lalafo_relay_refusal(
+                404,
+                "relay_route_not_allowed",
+                "Relay route is not allowed",
+                "Only catalog update-by-fraud PUT and search to-actualize POST pass",
+            )
+        route, upstream_path, ad_id = target
+        body = read_body()
+        if not _lalafo_relay_body_ok(route, body):
+            return self._lalafo_relay_refusal(
+                400,
+                "relay_body_rejected",
+                "Relay body is not allowed",
+                "Catalog takes updated_time/last_push_up integers, search an empty body",
+            )
+        started = time.monotonic()
+        try:
+            status, content_type, data = relay.send(
+                route.method, route.host, upstream_path, body or b""
+            )
+        except TimeoutError as exc:
+            return self._lalafo_relay_upstream_failure(504, "relay_upstream_timeout", exc)
+        except (OSError, http.client.HTTPException) as exc:
+            return self._lalafo_relay_upstream_failure(
+                502, "relay_upstream_unreachable", exc
+            )
+        print(
+            "[gateway-manager] lalafo-relay "
+            f"method={route.method} route={route.name} ad_id={ad_id} "
+            f"upstream_status={status} "
+            f"duration_ms={int((time.monotonic() - started) * 1000)}",
+            flush=True,
+        )
+        return status, content_type, data, {}
+
+    def _lalafo_relay_refusal(
+        self, status_code: int, code: str, message: str, hint: str
+    ) -> tuple[int, str, bytes, dict[str, object]]:
+        status, payload = self._manager_error(
+            status_code=status_code,
+            code=code,
+            component="request",
+            retryable=False,
+            error_message=message,
+            hint=hint,
+        )
+        return status, "application/json", json.dumps(payload).encode("utf-8"), payload
+
+    def _lalafo_relay_upstream_failure(
+        self, status_code: int, code: str, exc: Exception
+    ) -> tuple[int, str, bytes, dict[str, object]]:
+        status, payload = self._manager_error(
+            status_code=status_code,
+            code=code,
+            component="manager",
+            retryable=True,
+            error_message="Lalafo upstream did not answer",
+            hint="Check the VPN tunnel and the upstream service, then retry",
+        )
+        self._log_internal_error_diagnostic(payload, exc)
+        return status, "application/json", json.dumps(payload).encode("utf-8"), payload
 
     def handle_upload_rejection(
         self, *, status_code: int
@@ -3963,6 +4052,104 @@ def _voice_transcriber_from_env() -> Callable[[bytes, str], str] | None:
     return functools.partial(openrouter_transcribe, api_key=api_key)
 
 
+LALAFO_RELAY_PREFIX = "/lalafo-relay/"
+LALAFO_RELAY_TOKEN_ENV = "ZEROCLAW_RELAY_TOKEN"
+LALAFO_RELAY_MAX_BODY = 1024
+LALAFO_RELAY_MAX_RESPONSE = 64 * 1024
+LALAFO_RELAY_TIMEOUT_SECS = 12.0
+LALAFO_RELAY_PUSH_UP_KEYS = frozenset({"updated_time", "last_push_up"})
+
+
+@dataclass(frozen=True, slots=True)
+class LalafoRelayRoute:
+    method: str
+    name: str
+    pattern: re.Pattern[str]
+    host: str
+    takes_body: bool
+
+
+LALAFO_RELAY_ROUTES = (
+    LalafoRelayRoute(
+        method="PUT",
+        name="catalog",
+        pattern=re.compile(r"/lalafo-relay/catalog(/v2/ads/update-by-fraud/([0-9]{1,12}))"),
+        host="catalog-prod.kube-four.yallasvc.net",
+        takes_body=True,
+    ),
+    LalafoRelayRoute(
+        method="POST",
+        name="search",
+        pattern=re.compile(r"/lalafo-relay/search(/v0/ads/to-actualize/([0-9]{1,12}))"),
+        host="search-prod.kube-four.yallasvc.net",
+        takes_body=False,
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LalafoRelay:
+    token: str
+    send: Callable[[str, str, str, bytes], tuple[int, str, bytes]]
+
+
+def _lalafo_relay_route(
+    method: str, path: str
+) -> tuple[LalafoRelayRoute, str, str] | None:
+    for route in LALAFO_RELAY_ROUTES:
+        match = route.pattern.fullmatch(path)
+        if match is not None and route.method == method:
+            return route, match.group(1), match.group(2)
+    return None
+
+
+def _lalafo_relay_body_ok(route: LalafoRelayRoute, body: bytes | None) -> bool:
+    if body is None:
+        return False
+    if not route.takes_body:
+        return body == b""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return False
+    return (
+        isinstance(data, dict)
+        and bool(data)
+        and set(data) <= LALAFO_RELAY_PUSH_UP_KEYS
+        and all(type(value) is int and 0 <= value < 10**14 for value in data.values())
+    )
+
+
+def _lalafo_relay_send(
+    method: str, host: str, path: str, body: bytes
+) -> tuple[int, str, bytes]:
+    headers = {"Accept": "*/*", "User-Agent": "zeroclaw-lalafo-relay"}
+    if body:
+        headers["Content-Type"] = "application/json"
+    connection = http.client.HTTPSConnection(
+        host, timeout=LALAFO_RELAY_TIMEOUT_SECS, context=ssl.create_default_context()
+    )
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        data = response.read(LALAFO_RELAY_MAX_RESPONSE + 1)
+        if len(data) > LALAFO_RELAY_MAX_RESPONSE:
+            raise http.client.HTTPException("upstream response exceeds the relay cap")
+        if response.length:
+            raise http.client.IncompleteRead(data, response.length)
+        content_type = response.getheader("Content-Type") or "application/octet-stream"
+        return response.status, content_type, data
+    finally:
+        connection.close()
+
+
+def _lalafo_relay_from_env() -> LalafoRelay | None:
+    token = os.environ.get(LALAFO_RELAY_TOKEN_ENV, "").strip()
+    if not token:
+        return None
+    return LalafoRelay(token=token, send=_lalafo_relay_send)
+
+
 class VolumeJanitor:
     """Periodic retention sweep over the data volume. Never raises into the manager."""
 
@@ -4625,6 +4812,12 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         + ("enabled" if transcribe_audio is not None else "disabled"),
         flush=True,
     )
+    lalafo_relay = _lalafo_relay_from_env()
+    print(
+        "[gateway-manager] lalafo-relay: "
+        + ("enabled" if lalafo_relay is not None else "disabled"),
+        flush=True,
+    )
     server = GatewayManagerServer(
         settings=settings,
         pairing_state=pairing_state,
@@ -4635,6 +4828,7 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         incident_sweeper=incident_sweeper,
         m365_refresher=m365_refresher,
         transcribe_audio=transcribe_audio,
+        lalafo_relay=lalafo_relay,
     )
     server.metrics_exporter = _start_metrics_exporter(settings, registry)
     server.error_report_worker = _start_error_report_worker(
@@ -4780,7 +4974,13 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             )
         return self.server.app.handle_health()
 
+    def do_PUT(self) -> None:
+        self._serve_lalafo_relay("PUT")
+
     def do_POST(self) -> None:
+        if self.path.startswith(LALAFO_RELAY_PREFIX):
+            self._serve_lalafo_relay("POST")
+            return
         try:
             status_code, payload = self._dispatch_post()
         except Exception as exc:
@@ -4811,6 +5011,41 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             )
         except Exception:
             return
+
+    def _serve_lalafo_relay(self, method: str) -> None:
+        try:
+            status_code, content_type, body, payload = self._dispatch_lalafo_relay(
+                method
+            )
+        except Exception as exc:
+            status_code, payload = self.server.app.handle_internal_error(self.path, exc)
+            content_type = "application/json"
+            body = json.dumps(payload).encode("utf-8")
+        self._record_outcome(status_code, payload)
+        self._write_safely(lambda: self._write_bytes(status_code, content_type, body))
+
+    def _dispatch_lalafo_relay(
+        self, method: str
+    ) -> tuple[int, str, bytes, dict[str, object]]:
+        return self.server.app.handle_lalafo_relay(
+            method=method,
+            path=self.path,
+            authorization=self.headers.get("Authorization", ""),
+            read_body=self._read_lalafo_relay_body,
+        )
+
+    def _read_lalafo_relay_body(self) -> bytes | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= length <= LALAFO_RELAY_MAX_BODY:
+            return None
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            return None
+        return body if len(body) == length else None
 
     def _dispatch_post(self) -> tuple[int, dict[str, object]]:
         raw_content_length = self.headers.get("Content-Length", "0")
@@ -4862,19 +5097,26 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
         return
 
-    def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
-        encoded = json.dumps(payload).encode("utf-8")
+    def _write_bytes(self, status_code: int, content_type: str, body: bytes) -> None:
         self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(encoded)
+        self.wfile.write(body)
+
+    def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
+        self._write_bytes(
+            status_code, "application/json", json.dumps(payload).encode("utf-8")
+        )
 
     def _write_json_safely(
         self, status_code: int, payload: dict[str, object]
     ) -> None:
+        self._write_safely(lambda: self._write_json(status_code, payload))
+
+    def _write_safely(self, write: Callable[[], None]) -> None:
         try:
-            self._write_json(status_code, payload)
+            write()
         except Exception as exc:
             path = _safe_log_identity(self.path, limit=160) or "unknown"
             exporter = getattr(self.server.app, "metrics_exporter", None)
