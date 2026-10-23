@@ -428,6 +428,12 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    #[error("ModelProvider error: {0}")]
+    ModelProviderFailure(#[source] anyhow::Error),
+
+    #[error("Transport error: {0}")]
+    TransportFailure(#[source] anyhow::Error),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

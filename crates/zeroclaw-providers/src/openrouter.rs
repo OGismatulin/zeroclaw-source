@@ -916,9 +916,11 @@ impl ModelProvider for OpenRouterModelProvider {
                     .await
                     .unwrap_or_else(|_| format!("HTTP error: {status}"));
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{status}: {error}"
-                    ))))
+                    .send(Err(super::streaming_api_error(
+                        "openrouter",
+                        status,
+                        &error,
+                    )))
                     .await;
                 return;
             }

@@ -462,15 +462,7 @@ fn safe_terminal_companion(err: &anyhow::Error) -> Option<ReliableProviderTermin
     let failure = err
         .chain()
         .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())?;
-    Some(
-        ReliableProviderTerminalFailure::new(
-            failure.kind(),
-            failure.endpoint().map(str::to_owned),
-            failure.to_string(),
-        )
-        .with_detail(failure.detail())
-        .with_provider(failure.provider().unwrap_or_default()),
-    )
+    Some(failure.clone_without_cause())
 }
 
 #[cfg(test)]
@@ -1483,8 +1475,8 @@ mod streaming_fallback_tests {
         assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
     }
 
-    #[test]
-    fn body_disconnect_safe_terminal_companion_preserves_kind_and_detail() {
+    #[tokio::test]
+    async fn body_disconnect_safe_terminal_companion_preserves_kind_and_detail() {
         let reason = "error reading a body from connection: Connection reset by peer";
         let original = ReliableProviderTerminalFailure::from_error(&anyhow::Error::msg(reason));
         let companion = super::safe_terminal_companion(&anyhow::Error::new(original)).unwrap();
@@ -1493,6 +1485,47 @@ mod streaming_fallback_tests {
             ReliableProviderTerminalFailureKind::ConnectionRead
         );
         assert_eq!(companion.detail(), Some(reason));
+        let terminal = ensure_terminal_provider_failure(
+            companion.into(),
+            "actual-alias",
+            "actual-model",
+            ProviderRoute::Main,
+        );
+        assert_eq!(
+            terminal_provider_failure(&terminal)
+                .unwrap()
+                .diagnostic()
+                .kind(),
+            "connection_read"
+        );
+        let app = Router::new().route("/", axum::routing::get(|| async { StatusCode::FORBIDDEN }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = reqwest::get(format!("http://{address}/"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        let original = ReliableProviderTerminalFailure::from_error(&anyhow::Error::new(error));
+        let companion = super::safe_terminal_companion(&original.into()).unwrap();
+        let terminal = ensure_terminal_provider_failure(
+            companion.into(),
+            "actual-alias",
+            "actual-model",
+            ProviderRoute::Main,
+        );
+        assert_eq!(
+            terminal_provider_failure(&terminal)
+                .unwrap()
+                .diagnostic()
+                .status(),
+            Some(403),
+            "cause-free clone must preserve typed HTTP status"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1556,7 +1589,7 @@ mod streaming_fallback_tests {
         assert_eq!(interrupted.partial_text, "visible");
         assert_eq!(
             interrupted.to_string(),
-            "model_provider stream error: ModelProvider error: 503 Service Unavailable"
+            "model_provider stream error: provider stream failed"
         );
 
         let terminal = error
@@ -1578,6 +1611,11 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let cases = [
@@ -1608,7 +1646,7 @@ mod streaming_fallback_tests {
                     let request_count = Arc::clone(&request_count_for_route);
                     async move {
                         request_count.fetch_add(1, Ordering::Relaxed);
-                        (status, "upstream failure")
+                        (status, axum::Json(serde_json::json!({"error": {"message": "upstream connection failed; access_token=ACCESS_SENTINEL; <think>PRIVATE_SENTINEL</think>"}, "request": "REQUEST_SENTINEL"})))
                     }
                 }),
             );
@@ -1683,9 +1721,26 @@ mod streaming_fallback_tests {
                 expected_kind,
                 "{status} must retain its compatible streaming classification"
             );
+            assert_eq!(
+                terminal.detail(),
+                Some("upstream connection failed; [REDACTED]"),
+                "HTTP streaming detail must survive consumption and recovery: {status}"
+            );
+            let typed = terminal_provider_failure(&error)
+                .expect("stream recovery must preserve full typed terminal metadata");
+            assert_eq!(typed.diagnostic().status(), Some(status.as_u16()));
+            assert_eq!(typed.actual_provider(), "primary");
+            assert_eq!(typed.actual_model(), "test-model");
+            assert!(!format!("{error:#}").contains("SENTINEL"));
             assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
             server.abort();
         }
+        let events: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let logged = serde_json::to_string(&events).unwrap();
+        assert!(logged.contains("model_provider stream emitted an error event"));
+        assert!(logged.contains("upstream connection failed"));
+        assert!(!logged.contains("SENTINEL"));
     }
 
     #[tokio::test]
@@ -2213,6 +2268,36 @@ mod streaming_fallback_tests {
             stream_calls.load(Ordering::Relaxed),
             non_stream_calls.load(Ordering::Relaxed),
         )
+    }
+
+    fn model_provider_body_failure() -> zeroclaw_providers::traits::StreamError {
+        let cause = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "body reader disconnected",
+        ));
+        zeroclaw_providers::traits::StreamError::ModelProviderFailure(
+            ReliableProviderTerminalFailure::from_error(&cause).into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn typed_model_provider_body_failure_does_not_expand_transport_replay() {
+        let (outcome, stream_calls, non_stream_calls) = call_after_stream_failure(
+            1,
+            BeforeTransportFailure::Nothing,
+            false,
+            model_provider_body_failure,
+            1,
+        )
+        .await;
+        let error = outcome.chat_result.unwrap_err();
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error).unwrap();
+        assert_eq!(terminal.diagnostic().kind(), "connection_read");
+        assert_eq!(
+            stream_calls, 1,
+            "new classification must not admit a ModelProvider-origin replay"
+        );
+        assert_eq!(non_stream_calls, 0);
     }
 
     #[tokio::test]

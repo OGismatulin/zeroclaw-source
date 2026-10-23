@@ -141,16 +141,30 @@ pub(crate) async fn consume_provider_streaming_response(
         let event = match event_result {
             Ok(event) => event,
             Err(err) => {
+                let transport_replayable = matches!(
+                    err,
+                    StreamError::Http(_) | StreamError::Io(_) | StreamError::TransportFailure(_)
+                );
+                let provider_error = anyhow::Error::new(err);
+                let terminal = zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                    &provider_error,
+                );
+                let replay_safe = !outcome.saw_pre_executed_tool_activity
+                    && (transport_replayable
+                        || terminal.kind()
+                            == zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer);
+                let message = format!(
+                    "model_provider stream error: {}",
+                    terminal.detail().unwrap_or("provider stream failed")
+                );
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_category(::zeroclaw_log::EventCategory::Provider)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                        .with_attrs(::serde_json::json!({"error": message})),
                     "model_provider stream emitted an error event"
                 );
-                let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -160,22 +174,15 @@ pub(crate) async fn consume_provider_streaming_response(
                         partial_text: forwarded_text,
                         message,
                         usage: outcome.usage,
-                        cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
-                            &provider_error,
-                        ),
+                        cause: terminal,
                     }
                     .into());
                 }
                 return Err(StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
-                    replay_safe: !outcome.saw_pre_executed_tool_activity
-                        && (matches!(err, StreamError::Http(_) | StreamError::Io(_))
-                            || zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
-                                &provider_error,
-                            )
-                            .kind()
-                                == zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer),
+                    replay_safe,
+                    cause: terminal,
                 }
                 .into());
             }
@@ -1305,7 +1312,7 @@ mod tests {
              non-streaming fallback; got StreamInterruptedAfterOutput instead"
         );
         assert!(
-            err.to_string().contains("provider exploded"),
+            err.to_string().contains("provider stream failed"),
             "the underlying provider error must be surfaced: {err}"
         );
     }

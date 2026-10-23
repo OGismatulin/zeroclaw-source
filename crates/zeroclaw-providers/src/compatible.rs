@@ -247,45 +247,8 @@ fn apply_auth_to_request(
     }
 }
 
-fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
-    let object = value.as_object()?;
-
-    let nested_message = object.get("error").and_then(|error| match error {
-        serde_json::Value::Object(_) => structured_api_error_message(error),
-        serde_json::Value::String(error) => serde_json::from_str(error)
-            .ok()
-            .and_then(|nested| structured_api_error_message(&nested)),
-        _ => None,
-    });
-    if let Some(message) = nested_message {
-        return Some(message);
-    }
-
-    for key in ["message", "detail"] {
-        if let Some(message) = object
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|message| !message.is_empty())
-        {
-            return Some(message.to_string());
-        }
-    }
-
-    object
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .map(str::to_string)
-}
-
 fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
-    let message = serde_json::from_str(body)
-        .ok()
-        .and_then(|value| structured_api_error_message(&value));
-    let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
-    StreamError::ModelProvider(format!("{status}: {sanitized}"))
+    super::streaming_api_error("compatible", status, body)
 }
 
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
@@ -4193,12 +4156,8 @@ mod tests {
     fn streaming_api_error_sanitizes_and_bounds_upstream_body() {
         let secret = "sk-test-streaming-secret";
         let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
-        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
-
-        assert!(error.starts_with("ModelProvider error: 401 Unauthorized:"));
-        assert!(error.contains("[REDACTED]"));
-        assert!(!error.contains(secret));
-        assert!(error.chars().count() <= 550);
+        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body);
+        assert_sanitized_streaming_error(error, secret);
     }
 
     #[test]
@@ -4219,13 +4178,15 @@ mod tests {
         })
         .to_string();
 
-        let error =
-            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
-
-        assert_eq!(
-            error,
-            format!("ModelProvider error: 500 Internal Server Error: {message}")
-        );
+        let error = anyhow::Error::new(streaming_api_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &body,
+        ));
+        let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+        assert_eq!(diagnostic.kind(), "provider_server");
+        assert_eq!(diagnostic.status(), Some(500));
+        assert_eq!(diagnostic.detail(), Some(message));
+        assert!(!format!("{error:#}").contains(message));
     }
 
     fn make_model_provider(
@@ -6595,13 +6556,15 @@ mod tests {
     }
 
     fn assert_sanitized_streaming_error(error: StreamError, secret: &str) {
-        let StreamError::ModelProvider(message) = error else {
-            panic!("expected model-provider error, got {error}");
-        };
-        assert!(message.contains("401 Unauthorized"));
-        assert!(message.contains("[REDACTED]"));
-        assert!(!message.contains(secret));
-        assert!(message.chars().count() <= 525);
+        assert!(matches!(error, StreamError::ModelProviderFailure(_)));
+        assert!(!error.to_string().contains(secret));
+        let error = anyhow::Error::new(error);
+        let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+        assert_eq!(diagnostic.status(), Some(401));
+        let detail = diagnostic.detail().unwrap();
+        assert!(detail.contains("[REDACTED]"));
+        assert!(!detail.contains(secret));
+        assert!(detail.chars().count() <= 600);
     }
 
     #[test]
