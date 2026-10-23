@@ -465,7 +465,8 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
 CRON_FAILURE_STATUSES = ("error", "degraded")
 CRON_OK_STATUS = "ok"
 CRON_DEGRADED_JOBS = frozenset(
-    {"lalafo-errors-digest", "lalafo-commits-digest", "reach-merch-daily-brief"}
+    {"lalafo-errors-digest", "lalafo-commits-digest", "reach-merch-daily-brief",
+     "reach-merch-weekly-brief"}
 )
 
 
