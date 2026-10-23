@@ -339,15 +339,20 @@ def _bounded_string_list(value: object) -> list[str] | None:
 def safe_error_detail(value: object) -> str | None:
     if not isinstance(value, str):
         return None
+    value = "".join(
+        c
+        for c in value
+        if not unicodedata.category(c).startswith("C") or c.isspace()
+    )
     value = re.split(
-        r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]",
+        r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]|<\s*/?\s*[a-z!]",
         value,
         maxsplit=1,
     )[0]
     value = re.sub(r"(?i)\bauthorization\s*[:=]\s*[^;\n]*", "[REDACTED]", value)
     value = re.sub(r"(?i)\bcookie\s*[:=].*", "[REDACTED]", value)
     value = re.sub(
-        r"(?i)\b(?:api[ _-]?key|token|secret|password|credential|bearer)(?:\s+provided)?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+|(?:sk-|sk_|xoxb-|xoxp-|ghp_|gho_|ghu_|github_pat_|AIza)[A-Za-z0-9_.:-]+",
+        r"(?i)\b(?:[a-z0-9_-]*(?:api[ _-]?key|token|secret|password|credential)|bearer)(?:\s+provided)?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+|(?:sk-|sk_|xoxb-|xoxp-|ghp_|gho_|ghu_|github_pat_|AIza)[A-Za-z0-9_.:-]+",
         "[REDACTED]",
         value,
     )

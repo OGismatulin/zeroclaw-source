@@ -6207,6 +6207,239 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn structured_body_disconnect_stream_preserves_pinned_execution_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+        use zeroclaw_runtime::agent::loop_::{
+            LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+            ResolvedRuntimeKnobs, ToolLoop, run_tool_call_loop,
+        };
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let size = socket.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(index) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..index]);
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= index + 4 + length {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&request[index + 4..index + 4 + length])
+                                .unwrap();
+                        assert_eq!(body["model"], "stream-model");
+                        assert_eq!(body["stream"], true);
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n: REQUEST_SENTINEL\n\n").await.unwrap();
+        });
+        let compatible = OpenAiCompatibleModelProvider::builder("stream-primary")
+            .display_name("Stream fixture")
+            .base_url(&format!("http://{address}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let descriptor = zeroclaw_providers::ProviderCandidateDescriptor::pinned(
+            "compatible",
+            Some("stream-primary"),
+            "stream-model",
+        );
+        let pinned = zeroclaw_providers::model_pin::ModelPinnedProvider::new(
+            descriptor.clone(),
+            Box::new(compatible),
+        );
+        let provider = ReliableModelProvider::new_with_candidates(
+            "configured-main",
+            vec![(descriptor, Box::new(pinned) as Box<dyn ModelProvider>)],
+            0,
+            1,
+        );
+        let tools =
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = zeroclaw_runtime::observability::NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history = vec![zeroclaw_providers::ChatMessage::user("go")];
+        let (events, _receiver) = tokio::sync::mpsc::channel(16);
+        let error = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "configured-main",
+                    model: "requested-model",
+                    temperature: None,
+                },
+                ResolvedIo {
+                    tools_registry: &tools,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal,
+                    config: None,
+                    hooks: None,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: 1,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    knobs: &knobs,
+                },
+            ),
+            final_response_min_chars: None,
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(events),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+            memory: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: "stream-test",
+            sop_reassembly: None,
+        })
+        .await
+        .unwrap_err();
+        let response = build_structured_runtime_error(&error);
+        let envelope = serde_json::to_value(response.envelope).unwrap();
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(envelope["error_code"], "provider_unavailable");
+        assert_eq!(envelope["operator"]["phase"], "response_body");
+        assert_eq!(
+            envelope["provider"], "stream-primary",
+            "body disconnect must report the selected alias"
+        );
+        assert_eq!(
+            envelope["model"], "stream-model",
+            "body disconnect must report the served model"
+        );
+        let terminal = zeroclaw_providers::terminal_provider_failure(&error).unwrap();
+        assert_eq!(terminal.actual_provider(), "stream-primary");
+        assert_eq!(terminal.actual_model(), "stream-model");
+        assert!(
+            envelope["error_detail"]
+                .as_str()
+                .unwrap()
+                .contains("end of file before message length reached")
+        );
+        assert!(!format!("{error:#}").contains("SENTINEL"));
+        assert!(!envelope.to_string().contains("SENTINEL"));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_http_stream_error_runs_runtime_and_preserves_private_boundary() {
+        use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+        use zeroclaw_runtime::agent::loop_::{
+            LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+            ResolvedRuntimeKnobs, ToolLoop, run_tool_call_loop,
+        };
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+        let mut envelopes = Vec::new();
+        for (body, expected) in [
+            (serde_json::json!({"error": {"message": "upstream connection failed; access_token=ACCESS_SENTINEL; <think>PRIVATE_SENTINEL</think>"}, "request": "REQUEST_SENTINEL"}).to_string(), Some("upstream connection failed; [REDACTED]")),
+            ("upstream connection failed: <html>RAW_BODY_SENTINEL</html>".to_string(), None),
+        ] {
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count_handler = Arc::clone(&count);
+            let app = Router::new().route("/chat/completions", post(move |Json(request): Json<serde_json::Value>| {
+                let body = body.clone();
+                let count = Arc::clone(&count_handler);
+                async move {
+                    assert_eq!(request["stream"], true);
+                    assert_eq!(request["model"], "stream-model");
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, body)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap(); });
+            let compatible = OpenAiCompatibleModelProvider::builder("stream-primary").display_name("Stream fixture").base_url(&format!("http://{address}")).credential(None).auth_style(AuthStyle::Bearer).build();
+            let descriptor = zeroclaw_providers::ProviderCandidateDescriptor::pinned("compatible", Some("stream-primary"), "stream-model");
+            let pinned = zeroclaw_providers::model_pin::ModelPinnedProvider::new(descriptor.clone(), Box::new(compatible));
+            let provider = ReliableModelProvider::new_with_candidates("configured-main", vec![(descriptor, Box::new(pinned) as Box<dyn ModelProvider>)], 0, 1);
+            let tools = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let observer = zeroclaw_runtime::observability::NoopObserver;
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut history = vec![zeroclaw_providers::ChatMessage::user("go")];
+            let (events, _receiver) = tokio::sync::mpsc::channel(16);
+            let error = run_tool_call_loop(ToolLoop {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess { model_provider: &provider, provider_name: "configured-main", model: "requested-model", temperature: None },
+                    ResolvedIo { tools_registry: &tools, observer: &observer, silent: true, approval: None, multimodal_config: &multimodal, config: None, hooks: None, activated_tools: None, model_switch_callback: None, receipt_generator: None },
+                    ResolvedRuntimeKnobs { max_tool_iterations: 1, excluded_tools: &[], dedup_exempt_tools: &[], pacing: &pacing, strict_tool_parsing: false, parallel_tools: false, max_tool_result_chars: 0, context_token_budget: 0, knobs: &knobs },
+                ),
+                final_response_min_chars: None, history: &mut history, channel_name: "test", channel_reply_target: None, cancellation_token: None, on_delta: None, shared_budget: None, channel: None, collected_receipts: None, event_tx: Some(events), steering: None, new_messages_out: None, image_cache: None, ingress: zeroclaw_api::ingress::IngressContext::sub_turn(), memory: None, agent_alias: None, parent_agent_alias: None, turn_id: "stream-test", sop_reassembly: None,
+            }).await.unwrap_err();
+            let response = build_structured_runtime_error(&error);
+            let envelope = serde_json::to_value(response.envelope).unwrap();
+            assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(envelope["error_code"], "provider_unavailable");
+            assert_eq!(envelope["provider"], "stream-primary");
+            assert_eq!(envelope["model"], "stream-model");
+            assert_eq!(envelope["operator"]["phase"], "http_response");
+            assert_eq!(envelope.get("error_detail").and_then(serde_json::Value::as_str), expected, "HTTP stream detail must reach gateway");
+            assert!(!format!("{error:#}").contains("SENTINEL"));
+            assert!(!envelope.to_string().contains("SENTINEL"));
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            envelopes.push(envelope);
+            server.abort();
+        }
+        let events: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let logged = serde_json::to_string(&events).unwrap();
+        assert!(logged.contains("model_provider stream emitted an error event"));
+        assert!(!logged.contains("SENTINEL"));
+        if let Ok(path) = std::env::var("ZEROCLAW_TEST_STREAM_ENVELOPES") {
+            std::fs::write(path, serde_json::to_vec_pretty(&envelopes).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn structured_error_terminal_metadata_is_safe_and_typed() {
         let failure = SafeTerminalProviderFailure {

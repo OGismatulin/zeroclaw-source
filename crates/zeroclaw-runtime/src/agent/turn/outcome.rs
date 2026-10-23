@@ -68,6 +68,7 @@ pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) replay_safe: bool,
+    pub(crate) cause: zeroclaw_providers::ReliableProviderTerminalFailure,
 }
 
 impl std::fmt::Display for StreamErrorWithUsage {
@@ -76,7 +77,11 @@ impl std::fmt::Display for StreamErrorWithUsage {
     }
 }
 
-impl std::error::Error for StreamErrorWithUsage {}
+impl std::error::Error for StreamErrorWithUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those

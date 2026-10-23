@@ -10026,9 +10026,7 @@ mod tests {
             .expect("turn task should finish")
             .expect_err("post-output stream failure should return an error with partial output");
         assert!(
-            err.error
-                .to_string()
-                .contains("synthetic provider failure after delta"),
+            err.error.to_string().contains("provider stream failed"),
             "unexpected error: {}",
             err.error
         );

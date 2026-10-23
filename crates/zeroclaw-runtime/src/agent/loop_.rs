@@ -10073,7 +10073,7 @@ mod tests {
         assert_eq!(interrupted.partial_text, "visible");
         assert_eq!(
             interrupted.to_string(),
-            "model_provider stream error: ModelProvider error: 503 Service Unavailable"
+            "model_provider stream error: provider stream failed"
         );
 
         let mut events = Vec::new();

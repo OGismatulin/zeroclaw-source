@@ -2120,18 +2120,19 @@ impl AnthropicModelProvider {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(err) => {
+                    let failure = super::ReliableProviderTerminalFailure::from_error(&err.into());
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_category(::zeroclaw_log::EventCategory::Provider)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{err}"),
+                                "error": failure.detail(),
                             })),
                         "stream: SSE read error — aborting stream"
                     );
                     let _ = tx
-                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                        .send(Err(StreamError::TransportFailure(failure.into())))
                         .await;
                     return;
                 }
@@ -2819,12 +2820,13 @@ impl ModelProvider for AnthropicModelProvider {
                         .text()
                         .await
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
-                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                    return Err(super::streaming_api_error("anthropic", status, &body));
                 }
-                let parsed: NativeChatResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                let parsed: NativeChatResponse = response.json().await.map_err(|error| {
+                    StreamError::ModelProviderFailure(
+                        super::ReliableProviderTerminalFailure::from_error(&error.into()).into(),
+                    )
+                })?;
                 Ok(Self::parse_native_response(parsed))
             })
             .flat_map(|result| match result {
@@ -2976,9 +2978,7 @@ impl ModelProvider for AnthropicModelProvider {
                     ),
                 };
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{status}: {error}"
-                    ))))
+                    .send(Err(super::streaming_api_error("anthropic", status, &error)))
                     .await;
                 return;
             }
@@ -3506,6 +3506,144 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         server.abort();
         assert_eq!(text, "hi");
         assert!(saw_final, "message_stop must emit Final");
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_body_disconnect_keeps_typed_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n: REQUEST_SENTINEL\n\n").await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/messages"))
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        AnthropicModelProvider::parse_anthropic_sse(response, &tx).await;
+        drop(tx);
+        let error = rx.recv().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, StreamError::TransportFailure(_)),
+            "Anthropic SSE preserves its previous Http eligibility"
+        );
+        let error = anyhow::Error::new(error);
+        let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+        assert_eq!(
+            diagnostic.kind(),
+            "connection_read",
+            "Anthropic SSE reader must preserve its transport source"
+        );
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(
+            diagnostic
+                .detail()
+                .unwrap()
+                .contains("end of file before message length reached"),
+            "{:?}",
+            diagnostic.detail()
+        );
+        assert!(!format!("{error:#}").contains("SENTINEL"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thinking_body_disconnect_keeps_typed_cause_and_json_negative() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for truncated in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let size = socket.read(&mut chunk).await.unwrap();
+                    assert!(size > 0);
+                    request.extend_from_slice(&chunk[..size]);
+                    if let Some(index) = request.windows(4).position(|x| x == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..index]);
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= index + 4 + length {
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&request[index + 4..index + 4 + length])
+                                    .unwrap();
+                            assert_eq!(body["thinking"]["type"], "enabled");
+                            assert!(body.get("stream").is_none());
+                            break;
+                        }
+                    }
+                }
+                let body = "{\"content\":[";
+                let length = if truncated {
+                    body.len() + 4096
+                } else {
+                    body.len()
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+            });
+            let provider = AnthropicModelProvider::builder("thinking-fixture")
+                .credential(Some("fake-key"))
+                .base_url(&format!("http://{address}"))
+                .build();
+            let messages = [ChatMessage::user("test")];
+            let mut stream = provider.stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                        budget_tokens: 1024,
+                        display: None,
+                    }),
+                },
+                "claude-sonnet-4-5",
+                None,
+                StreamOptions::new(true),
+            );
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(
+                matches!(&error, StreamError::ModelProviderFailure(_)),
+                "thinking decode keeps its original ModelProvider eligibility"
+            );
+            let error = anyhow::Error::new(error);
+            let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+            if truncated {
+                assert_eq!(
+                    diagnostic.kind(),
+                    "connection_read",
+                    "Anthropic thinking reader must preserve transport separately from malformed JSON"
+                );
+                assert_eq!(diagnostic.phase(), "response_body");
+                assert!(
+                    diagnostic
+                        .detail()
+                        .unwrap()
+                        .contains("end of file before message length reached"),
+                    "{:?}",
+                    diagnostic.detail()
+                );
+            } else {
+                assert_eq!(
+                    diagnostic.kind(),
+                    "provider_error",
+                    "complete malformed JSON is not a transport disconnect"
+                );
+                assert_ne!(diagnostic.phase(), "response_body");
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

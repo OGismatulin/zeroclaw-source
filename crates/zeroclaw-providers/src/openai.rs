@@ -866,11 +866,8 @@ pub(crate) async fn run_responses_sse(
     if !http_response.status().is_success() {
         let status = http_response.status();
         let body = http_response.text().await.unwrap_or_default();
-        let sanitized = super::sanitize_api_error(&body);
         let _ = tx
-            .send(Err(StreamError::ModelProvider(format!(
-                "OpenAI API error ({status}): {sanitized}"
-            ))))
+            .send(Err(super::streaming_api_error("openai", status, &body)))
             .await;
         return;
     }
@@ -893,8 +890,9 @@ pub(crate) async fn run_responses_sse(
                 }
             }
             Some(Err(err)) => {
+                let failure = super::ReliableProviderTerminalFailure::from_error(&err.into());
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(err.to_string())))
+                    .send(Err(StreamError::ModelProviderFailure(failure.into())))
                     .await;
                 return;
             }
@@ -1497,6 +1495,50 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_sse_body_disconnect_keeps_typed_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n: REQUEST_SENTINEL\n\n").await.unwrap();
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        run_responses_sse(
+            reqwest::Client::new().post(format!("http://{address}/responses")),
+            &tx,
+            false,
+        )
+        .await;
+        drop(tx);
+        let error = rx.recv().await.unwrap().unwrap_err();
+        assert!(
+            matches!(&error, StreamError::ModelProviderFailure(_)),
+            "Responses body failure keeps its original non-transport stream eligibility"
+        );
+        let error = anyhow::Error::new(error);
+        let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+        assert_eq!(
+            diagnostic.kind(),
+            "connection_read",
+            "Responses reader must preserve its transport source"
+        );
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(
+            diagnostic
+                .detail()
+                .unwrap()
+                .contains("end of file before message length reached"),
+            "{:?}",
+            diagnostic.detail()
+        );
+        assert!(!format!("{error:#}").contains("SENTINEL"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn responses_completed_ignores_trailing_events_without_eof() {

@@ -1412,17 +1412,18 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|err| {
+            let failure = super::ReliableProviderTerminalFailure::from_error(&err.into());
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "phase": "stream_read",
-                        "error": format!("{}", err),
+                        "error": failure.detail(),
                     })),
                 "openai_codex: error reading response stream"
             );
-            anyhow::Error::msg(format!("error reading OpenAI Codex response stream: {err}"))
+            anyhow::Error::new(failure).context("error reading OpenAI Codex response stream")
         })?;
         append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
     }
@@ -1730,6 +1731,13 @@ impl OpenAiCodexModelProvider {
                             .with_attrs(::serde_json::json!({"error": format!("{}", stream_err)})),
                         "OpenAI Codex streaming decode failed on streaming-mandatory endpoint; surfacing as retryable (non-streaming retry skipped)"
                     );
+                    if let Some(failure) =
+                        stream_err.downcast_ref::<super::ReliableProviderTerminalFailure>()
+                    {
+                        return Err(anyhow::Error::new(failure.clone_without_cause()).context(
+                            "OpenAI Codex streaming response decode failed on streaming-mandatory endpoint; retrying",
+                        ));
+                    }
                     return Err(anyhow::Error::msg(
                         "OpenAI Codex streaming response decode failed on streaming-mandatory endpoint; retrying",
                     ));
@@ -1773,6 +1781,13 @@ impl OpenAiCodexModelProvider {
                                 })),
                             "openai_codex: stream + non-stream fallback both failed"
                         );
+                        if let Some(failure) =
+                            fallback_err.downcast_ref::<super::ReliableProviderTerminalFailure>()
+                        {
+                            return anyhow::Error::new(failure.clone_without_cause()).context(
+                                "OpenAI Codex non-streaming retry response decode failed",
+                            );
+                        }
                         anyhow::Error::msg(format!(
                             "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
                         ))
@@ -3309,11 +3324,9 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             .expect_err("unparseable SSE data must still error");
 
         assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
-        assert_ne!(
-            crate::reliable::provider_error_diagnostic(&err).kind(),
-            "empty_completion",
-            "got: {err}"
-        );
+        let diagnostic = crate::reliable::provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "provider_error", "{err:#}");
+        assert_ne!(diagnostic.phase(), "response_body");
 
         server_handle.abort();
     }
@@ -3343,11 +3356,9 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             .expect_err("a truncated frame must still error");
 
         assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
-        assert_ne!(
-            crate::reliable::provider_error_diagnostic(&err).kind(),
-            "empty_completion",
-            "got: {err}"
-        );
+        let diagnostic = crate::reliable::provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "provider_error", "{err:#}");
+        assert_ne!(diagnostic.phase(), "response_body");
 
         server_handle.abort();
     }
@@ -3379,13 +3390,45 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             .expect_err("an incomplete UTF-8 sequence must still error");
 
         assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
-        assert_ne!(
-            crate::reliable::provider_error_diagnostic(&err).kind(),
-            "empty_completion",
-            "got: {err}"
-        );
+        let diagnostic = crate::reliable::provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "provider_error", "{err:#}");
+        assert_ne!(diagnostic.phase(), "response_body");
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_body_disconnect_keeps_typed_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 4096\r\nconnection: close\r\n\r\n: REQUEST_SENTINEL\n\n").await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/responses"))
+            .await
+            .unwrap();
+        let error = decode_responses_body(response).await.unwrap_err();
+        let diagnostic = crate::reliable::provider_error_diagnostic(&error);
+        assert_eq!(
+            diagnostic.kind(),
+            "connection_read",
+            "Codex buffered reader must preserve its transport source"
+        );
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(
+            diagnostic
+                .detail()
+                .unwrap()
+                .contains("end of file before message length reached"),
+            "{:?}",
+            diagnostic.detail()
+        );
+        assert!(!format!("{error:#}").contains("SENTINEL"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -3397,9 +3440,9 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
         // be classified as an empty completion: nudging the model in reply to a
         // dropped connection is exactly what minting the marker at the exit
         // branch would have caused.
-        let (mut provider, _captured, server_handle, _temp_dir, _proxy_guard) =
+        let (mut provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::SseStreamThenError(
-                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial REQUEST_SENTINEL\"}\n\n",
             )])
             .await;
         provider.streaming_mandatory_endpoint = true;
@@ -3419,13 +3462,60 @@ data: {\"type\":\"a\",\"partial_image_b64\":\"ZZZZ\n\n";
             .expect_err("a stream read failure must surface as an error");
 
         assert!(!crate::reliable::is_empty_completion_error(&err), "{err}");
-        assert_ne!(
-            crate::reliable::provider_error_diagnostic(&err).kind(),
-            "empty_completion",
-            "got: {err}"
+        let diagnostic = crate::reliable::provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "connection_read", "{err:#}");
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(
+            diagnostic.detail().unwrap().contains("unexpected EOF"),
+            "{:?}",
+            diagnostic.detail()
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["stream"], true);
+        drop(requests);
+        assert!(!crate::reliable::is_non_retryable(&err), "{err}");
+        assert!(!format!("{err:#}").contains("SENTINEL"));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_custom_endpoint_fallback_body_disconnect_keeps_typed_cause() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::SseStreamThenError(": REQUEST_SENTINEL\n\n"),
+            ])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("custom endpoint fallback body failure must surface");
+        let diagnostic = crate::reliable::provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind(), "connection_read", "{err:#}");
+        assert_eq!(diagnostic.phase(), "response_body");
+        assert!(
+            diagnostic.detail().unwrap().contains("unexpected EOF"),
+            "{:?}",
+            diagnostic.detail()
         );
         assert!(!crate::reliable::is_non_retryable(&err), "{err}");
-
+        assert!(!format!("{err:#}").contains("SENTINEL"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+        drop(requests);
         server_handle.abort();
     }
 

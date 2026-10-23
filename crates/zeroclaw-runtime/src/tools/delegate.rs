@@ -11266,6 +11266,65 @@ command = "rm independent-delegate-marker"
     }
 
     #[tokio::test]
+    async fn delegate_http_stream_error_keeps_private_context_out_of_native_logs() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let previous_hook = zeroclaw_log::current_broadcast_hook();
+        let _restore_hook = scopeguard::guard(previous_hook, |hook| match hook {
+            Some(hook) => zeroclaw_log::set_broadcast_hook(hook),
+            None => zeroclaw_log::clear_broadcast_hook(),
+        });
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(65_536);
+        zeroclaw_log::set_broadcast_hook(sender);
+        let (primary, primary_requests) = start_failing_chat_server_with_error(503, "upstream connection failed; access_token=ACCESS_SENTINEL; <think>PRIVATE_SENTINEL</think>").await;
+        let (backup, backup_requests) = start_failing_chat_server_with_error(
+            503,
+            "upstream connection failed; client_secret=CLIENT_SENTINEL",
+        )
+        .await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        assert!(!serde_json::to_string(&result).unwrap().contains("SENTINEL"));
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(backup_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let queued_events = receiver.len();
+        let mut events = Vec::new();
+        let receive_status = loop {
+            match receiver.try_recv() {
+                Ok(event) => events.push(event),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(
+                receive_status,
+                tokio::sync::broadcast::error::TryRecvError::Empty
+            ),
+            "delegate log receiver must be fully observed: {receive_status:?}"
+        );
+        let same_hook = zeroclaw_log::current_broadcast_hook()
+            .is_some_and(|hook| receiver.same_channel(&hook.subscribe()));
+        let logged = serde_json::to_string(&events).unwrap();
+        assert!(
+            logged.contains("model_provider stream emitted an error event"),
+            "delegate native stream event missing; receiver={receive_status:?}; queued={queued_events}; hook_unchanged={same_hook}; events={logged}"
+        );
+        assert!(logged.contains("upstream connection failed"));
+        assert!(!logged.contains("SENTINEL"));
+    }
+
+    #[tokio::test]
     async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
         let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
         let (backup, backup_requests) = start_failing_chat_server(503).await;

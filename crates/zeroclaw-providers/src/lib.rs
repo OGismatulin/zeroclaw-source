@@ -959,16 +959,23 @@ pub fn sanitize_api_error(input: &str) -> String {
 pub fn sanitize_provider_error_detail(input: &str) -> Option<String> {
     use std::sync::LazyLock;
     static PRIVATE_CONTEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]").unwrap()
+        regex::Regex::new(r"(?i)\b(?:prompt|reasoning(?:_content)?|conversation|messages|request body)\b|\b(?:request|stderr|headers)\s*[:=]|\btraceback\b|\bstack trace\b|[{}]|<\s*/?\s*[a-z!]").unwrap()
     });
     static CREDENTIALS: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)\bauthorization\s*[:=]\s*[^;\n]*|\bcookie\s*[:=][^\n]*|\b(?:api[ _-]?key|token|secret|password|credential|bearer)(?:\s+provided)?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+"#).unwrap()
+        regex::Regex::new(r#"(?i)\bauthorization\s*[:=]\s*[^;\n]*|\bcookie\s*[:=][^\n]*|\b(?:[a-z0-9_-]*(?:api[ _-]?key|token|secret|password|credential)|bearer)(?:\s+provided)?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^;\s]+)|\bbearer\s+[^;\s]+"#).unwrap()
     });
     static URL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"(?i)https?://[^\s]+").unwrap());
     static CONTROL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"[\p{Cc}\p{Cf}]").unwrap());
-    let input = PRIVATE_CONTEXT.split(input).next().unwrap_or_default();
+    let input = CONTROL.replace_all(input, |capture: &regex::Captures<'_>| {
+        if capture[0].chars().all(char::is_whitespace) {
+            " "
+        } else {
+            ""
+        }
+    });
+    let input = PRIVATE_CONTEXT.split(&input).next().unwrap_or_default();
     let scrubbed = scrub_secret_patterns(&CREDENTIALS.replace_all(input, "[REDACTED]"));
     let scrubbed = URL.replace_all(&scrubbed, |capture: &regex::Captures<'_>| {
         reqwest::Url::parse(&capture[0]).map_or_else(
@@ -1004,6 +1011,55 @@ fn provider_http_error_detail(input: &str) -> Option<String> {
     body.pointer("/error/message")
         .and_then(serde_json::Value::as_str)
         .and_then(sanitize_provider_error_detail)
+}
+
+fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+
+    let nested_message = object.get("error").and_then(|error| match error {
+        serde_json::Value::Object(_) => structured_api_error_message(error),
+        serde_json::Value::String(error) => serde_json::from_str(error)
+            .ok()
+            .and_then(|nested| structured_api_error_message(&nested)),
+        _ => None,
+    });
+    if let Some(message) = nested_message {
+        return Some(message);
+    }
+
+    for key in ["message", "detail"] {
+        if let Some(message) = object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return Some(message.to_string());
+        }
+    }
+
+    object
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn streaming_api_error(
+    model_provider: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> traits::StreamError {
+    let message = serde_json::from_str(body)
+        .ok()
+        .and_then(|value| structured_api_error_message(&value));
+    let mut error = ProviderHttpError::new(model_provider, status, None, body.to_string());
+    error.detail = sanitize_api_error(message.as_deref().unwrap_or(body));
+    error.safe_detail = message.as_deref().and_then(sanitize_provider_error_detail);
+    traits::StreamError::ModelProviderFailure(
+        ReliableProviderTerminalFailure::from_error(&anyhow::Error::new(error)).into(),
+    )
 }
 
 /// Whether `message` mentions tools as a standalone word rather than as a
@@ -4606,6 +4662,85 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
         ));
+    }
+
+    #[tokio::test]
+    async fn streaming_http_adapters_preserve_typed_safe_detail() {
+        use axum::{Router, routing::post};
+        use futures_util::StreamExt;
+        let message = "upstream connection failed; access_token=ACCESS_SENTINEL; <think>PRIVATE_SENTINEL</think>";
+        let body =
+            serde_json::json!({"error": {"message": message}, "request": "REQUEST_SENTINEL"})
+                .to_string();
+        let body_handler = body.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || {
+                let body = body_handler.clone();
+                async move { (axum::http::StatusCode::SERVICE_UNAVAILABLE, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        openai::run_responses_sse(
+            reqwest::Client::new().post(format!("http://{address}/responses")),
+            &tx,
+            false,
+        )
+        .await;
+        let responses_error = rx.recv().await.unwrap().unwrap_err();
+        let anthropic = anthropic::AnthropicModelProvider::builder("actual-alias")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{address}"))
+            .build();
+        let messages = [ChatMessage::user("test")];
+        let mut stream = anthropic.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "actual-model",
+            None,
+            traits::StreamOptions::new(true),
+        );
+        let anthropic_error = stream.next().await.unwrap().unwrap_err();
+        for error in [
+            responses_error,
+            anthropic_error,
+            streaming_api_error(
+                "openrouter",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                &body,
+            ),
+        ] {
+            let error = anyhow::Error::new(error);
+            let diagnostic = reliable::provider_error_diagnostic(&error);
+            assert_eq!(diagnostic.kind(), "provider_server");
+            assert_eq!(diagnostic.status(), Some(503));
+            assert_eq!(
+                diagnostic.detail(),
+                Some("upstream connection failed; [REDACTED]")
+            );
+            assert!(!format!("{error:#}").contains("SENTINEL"));
+        }
+        for body in [
+            "RAW_BODY_SENTINEL",
+            "upstream connection failed: <html>RAW_BODY_SENTINEL</html>",
+        ] {
+            let error = anyhow::Error::new(streaming_api_error(
+                "openrouter",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                body,
+            ));
+            assert_eq!(reliable::provider_error_diagnostic(&error).detail(), None);
+            assert!(!format!("{error:#}").contains("SENTINEL"));
+        }
+        server.abort();
     }
 
     #[test]

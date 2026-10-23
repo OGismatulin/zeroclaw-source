@@ -74,6 +74,7 @@ pub(crate) struct ReliableCallAccounting {
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
+    stream_recovery_terminal: Option<TerminalProviderFailure>,
 }
 
 impl ReliableCallAccounting {
@@ -204,8 +205,54 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
 /// non-streaming recovery candidates.
 pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
-        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+        let mut accounting = accounting.lock();
+        accounting.stream_recovery_failure = Some(provider_error_diagnostic(error));
+        accounting.stream_recovery_terminal = terminal_provider_failure(error).cloned();
     });
+}
+
+fn stream_recovery_terminal_failure() -> Option<TerminalProviderFailure> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_terminal.clone())
+        .ok()
+        .flatten()
+}
+
+fn stream_with_terminal_metadata<T: Send + 'static>(
+    stream: stream::BoxStream<'static, StreamResult<T>>,
+    candidate: ProviderCandidateDescriptor,
+    model: String,
+    route: ProviderRoute,
+) -> stream::BoxStream<'static, StreamResult<T>> {
+    stream
+        .map(move |result| {
+            result.map_err(|error| {
+                let transport_replayable = matches!(
+                    error,
+                    super::traits::StreamError::Http(_)
+                        | super::traits::StreamError::Io(_)
+                        | super::traits::StreamError::TransportFailure(_)
+                );
+                let cause = anyhow::Error::new(error);
+                let terminal = terminal_provider_failure(&cause)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        TerminalProviderFailure::new(
+                            &candidate,
+                            &model,
+                            route,
+                            1,
+                            provider_error_diagnostic(&cause),
+                        )
+                    });
+                if transport_replayable {
+                    super::traits::StreamError::TransportFailure(terminal.into())
+                } else {
+                    super::traits::StreamError::ModelProviderFailure(terminal.into())
+                }
+            })
+        })
+        .boxed()
 }
 
 fn stream_recovery_was_semantic_empty() -> bool {
@@ -1061,7 +1108,10 @@ impl std::fmt::Display for TerminalProviderFailure {
 impl std::error::Error for TerminalProviderFailure {}
 
 pub fn terminal_provider_failure(err: &anyhow::Error) -> Option<&TerminalProviderFailure> {
-    err.downcast_ref::<TerminalProviderFailure>()
+    err.downcast_ref::<TerminalProviderFailure>().or_else(|| {
+        err.chain()
+            .find_map(|source| source.downcast_ref::<TerminalProviderFailure>())
+    })
 }
 
 /// Preserve an existing terminal provider record, or classify one bare error
@@ -1263,6 +1313,7 @@ pub struct ReliableProviderTerminalFailure {
     diagnostic: String,
     terminal_cause: Option<anyhow::Error>,
     detail: Option<String>,
+    typed_diagnostic: Option<ProviderErrorDiagnostic>,
 }
 
 impl ReliableProviderTerminalFailure {
@@ -1278,11 +1329,15 @@ impl ReliableProviderTerminalFailure {
             diagnostic,
             terminal_cause: None,
             detail: None,
+            typed_diagnostic: None,
         }
     }
 
     pub fn with_detail(mut self, detail: Option<&str>) -> Self {
         self.detail = detail.and_then(super::sanitize_provider_error_detail);
+        if let Some(diagnostic) = self.typed_diagnostic.as_mut() {
+            diagnostic.detail = self.detail.clone();
+        }
         self
     }
 
@@ -1290,10 +1345,27 @@ impl ReliableProviderTerminalFailure {
         self.detail.as_deref()
     }
 
+    pub fn clone_without_cause(&self) -> Self {
+        Self {
+            kind: self.kind,
+            provider: self.provider.clone(),
+            endpoint: self.endpoint.clone(),
+            diagnostic: self.diagnostic.clone(),
+            terminal_cause: self
+                .terminal_cause
+                .as_ref()
+                .and_then(terminal_provider_failure)
+                .cloned()
+                .map(Into::into),
+            detail: self.detail.clone(),
+            typed_diagnostic: self.typed_diagnostic.clone(),
+        }
+    }
+
     /// Classify a provider error into a safe terminal presentation cause.
     pub fn from_error(error: &anyhow::Error) -> Self {
         let diagnostic = provider_error_diagnostic(error);
-        Self::new(
+        let failure = Self::new(
             ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
             diagnostic.endpoint.clone(),
             format!(
@@ -1301,7 +1373,12 @@ impl ReliableProviderTerminalFailure {
                 diagnostic.kind, diagnostic.phase, diagnostic.hint
             ),
         )
-        .with_detail(diagnostic.detail())
+        .with_detail(diagnostic.detail());
+        Self {
+            typed_diagnostic: Some(diagnostic),
+            terminal_cause: terminal_provider_failure(error).cloned().map(Into::into),
+            ..failure
+        }
     }
 
     fn with_cause(
@@ -1311,6 +1388,7 @@ impl ReliableProviderTerminalFailure {
         terminal_cause: anyhow::Error,
     ) -> Self {
         Self {
+            typed_diagnostic: Some(diagnostic.clone()),
             kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
             provider: provider
                 .filter(|provider| !provider.is_empty())
@@ -1425,6 +1503,13 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
     if let Some(terminal) = terminal_provider_failure(err) {
         return terminal.diagnostic().clone();
     }
+    if let Some(diagnostic) = err.chain().find_map(|source| {
+        source
+            .downcast_ref::<ReliableProviderTerminalFailure>()
+            .and_then(|failure| failure.typed_diagnostic.as_ref())
+    }) {
+        return diagnostic.clone();
+    }
     let detail = if let Some(http) = typed_provider_http_error(err) {
         http.safe_detail().map(str::to_owned)
     } else if let Some(failure) = err
@@ -1433,7 +1518,14 @@ pub(crate) fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDia
     {
         failure.detail().map(str::to_owned)
     } else if let Some(reqwest) = typed_reqwest_error(err) {
-        super::sanitize_provider_error_detail(&super::format_error_chain(reqwest))
+        let mut chain = Vec::new();
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(reqwest);
+        while let Some(source) = current {
+            chain.push(source.to_string());
+            current = source.source();
+        }
+        chain.reverse();
+        super::sanitize_provider_error_detail(&chain.join(": "))
     } else {
         err.chain().last().and_then(|source| {
             let message = source.to_string();
@@ -2152,15 +2244,16 @@ fn reliable_terminal_error_with_cause(
     }
     if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
     {
-        let terminal_failure = anyhow::Error::new(
-            ReliableProviderTerminalFailure::new(
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure {
+            typed_diagnostic: Some(diagnostic.clone()),
+            ..ReliableProviderTerminalFailure::new(
                 ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
                 diagnostic.endpoint.clone(),
                 failure_aggregate(&failures),
             )
             .with_detail(diagnostic.detail())
-            .with_provider(provider.unwrap_or_default()),
-        );
+            .with_provider(provider.unwrap_or_default())
+        });
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
                 usage,
@@ -2187,6 +2280,7 @@ fn fork_terminal_error(
     rejected_attempt_usage: Option<TokenUsage>,
     final_cause_is_semantic_empty: bool,
 ) -> anyhow::Error {
+    let terminal_failure = terminal_failure.or_else(stream_recovery_terminal_failure);
     let Some(terminal_failure) = terminal_failure else {
         return reliable_terminal_error_with_cause(
             provider,
@@ -4112,6 +4206,12 @@ impl ModelProvider for ReliableModelProvider {
                 ),
             );
             let stream = stream_with_recovery_identity(stream, 0, entry_index, self.max_retries);
+            let stream = stream_with_terminal_metadata(
+                stream,
+                entry.descriptor.clone(),
+                served_model.clone(),
+                self.route,
+            );
             let accepted_route = AcceptedRoute::new(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
@@ -4201,6 +4301,12 @@ impl ModelProvider for ReliableModelProvider {
                     options,
                 ),
             );
+            let stream = stream_with_terminal_metadata(
+                stream,
+                entry.descriptor.clone(),
+                served_model.clone(),
+                self.route,
+            );
             let accepted_route = AcceptedRoute::new(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
@@ -4281,6 +4387,12 @@ impl ModelProvider for ReliableModelProvider {
                     temperature,
                     options,
                 ),
+            );
+            let stream = stream_with_terminal_metadata(
+                stream,
+                entry.descriptor.clone(),
+                served_model.clone(),
+                self.route,
             );
             let accepted_route = AcceptedRoute::new(
                 entry.cooldown_key.clone(),
@@ -7980,6 +8092,133 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_http_diagnostic_survives_stream_recovery_copy() {
+        let (error, _) = scope_reliable_call_accounting(async {
+            let error = super::super::api_error_from_parts(
+                "compatible",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":{"message":"upstream closed"}}"#,
+            );
+            record_stream_recovery_failure(&error);
+            reliable_terminal_error_with_cause(
+                Some("actual"),
+                FailureEvents::default(),
+                None,
+                false,
+                None,
+            )
+        })
+        .await;
+        let diagnostic = provider_error_diagnostic(&error);
+        assert_eq!(diagnostic.kind(), "provider_server");
+        assert_eq!(diagnostic.status(), Some(503));
+        assert_eq!(diagnostic.detail(), Some("upstream closed"));
+    }
+
+    #[tokio::test]
+    async fn reliable_http_stream_entry_points_preserve_pinned_terminal_identity() {
+        use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({"error": {"message": "upstream closed"}})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        for route in [ProviderRoute::Main, ProviderRoute::Vision] {
+            let compatible = OpenAiCompatibleModelProvider::builder("actual")
+                .display_name("Fixture")
+                .base_url(&format!("http://{address}"))
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let descriptor = ProviderCandidateDescriptor::pinned(
+                "compatible",
+                Some("actual-alias"),
+                "actual-model",
+            );
+            let pinned = crate::model_pin::ModelPinnedProvider::new(
+                descriptor.clone(),
+                Box::new(compatible),
+            );
+            let provider = ReliableModelProvider::new_with_candidates(
+                "requested",
+                vec![(descriptor, Box::new(pinned) as Box<dyn ModelProvider>)],
+                0,
+                1,
+            )
+            .with_route(route);
+            let messages = [ChatMessage::user("test")];
+            let event_error = provider
+                .stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "requested-model",
+                    None,
+                    StreamOptions::new(true),
+                )
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err();
+            let system_error = provider
+                .stream_chat_with_system(
+                    None,
+                    "test",
+                    "requested-model",
+                    None,
+                    StreamOptions::new(true),
+                )
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err();
+            let history_error = provider
+                .stream_chat_with_history(
+                    &messages,
+                    "requested-model",
+                    None,
+                    StreamOptions::new(true),
+                )
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err();
+            for error in [event_error, system_error, history_error] {
+                let error = anyhow::Error::new(error);
+                let terminal = terminal_provider_failure(&error)
+                    .expect("selected stream entry must preserve its typed terminal record");
+                assert_eq!(terminal.actual_provider(), "actual-alias");
+                assert_eq!(terminal.provider_family(), "compatible");
+                assert_eq!(terminal.actual_model(), "actual-model");
+                assert_eq!(terminal.route(), route);
+                assert_eq!(terminal.diagnostic().status(), Some(503));
+                assert_eq!(terminal.diagnostic().detail(), Some("upstream closed"));
+                let companion =
+                    ReliableProviderTerminalFailure::from_error(&error).clone_without_cause();
+                let copied = anyhow::Error::new(companion);
+                let copied_terminal = terminal_provider_failure(&copied)
+                    .expect("safe clone must retain full terminal identity");
+                assert_eq!(copied_terminal.actual_provider(), "actual-alias");
+                assert_eq!(copied_terminal.actual_model(), "actual-model");
+                assert_eq!(copied_terminal.route(), route);
+            }
+        }
+        server.abort();
+    }
+
     #[test]
     fn provider_error_detail_unstructured_dumps_are_not_public() {
         for dump in [
@@ -7992,6 +8231,113 @@ mod tests {
                 diagnostic.detail().is_none(),
                 "unstructured provider dump must not become detail: {dump}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_detail_long_reqwest_cause_is_scrubbed_before_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!(
+            "http://{address}/{}?access_token=ACCESS_SENTINEL",
+            "a".repeat(650)
+        );
+        let error = reqwest::get(url).await.unwrap_err();
+        let diagnostic = provider_error_diagnostic(&anyhow::Error::new(error));
+        let detail = diagnostic.detail().unwrap();
+        assert!(
+            detail.contains("Connection refused"),
+            "concrete transport cause must survive long URL: {detail}"
+        );
+        assert!(!detail.contains("SENTINEL"));
+        assert!(detail.chars().count() <= 600);
+    }
+
+    #[test]
+    fn provider_error_detail_review_privacy_at_native_boundary() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+        for (input, expected) in [
+            (
+                "Connection reset; access_token=ACCESS_SENTINEL refresh_token=REFRESH_SENTINEL client_secret=CLIENT_SENTINEL",
+                "Connection reset; [REDACTED] [REDACTED] [REDACTED]",
+            ),
+            (
+                "Connection reset; Authorization\u{200b}: Basic AUTH_SENTINEL",
+                "Connection reset; [REDACTED]",
+            ),
+            (
+                "upstream connection failed: <html>RAW_BODY_SENTINEL</html>",
+                "upstream connection failed:",
+            ),
+            (
+                "Connection reset; <think>PRIVATE_SENTINEL</think>",
+                "Connection reset",
+            ),
+            (
+                "Connection reset <104> \"socket\" `read`",
+                "Connection reset <104> \"socket\" `read`",
+            ),
+        ] {
+            let body =
+                serde_json::json!({"error": {"message": input}, "request": "REQUEST_SENTINEL"})
+                    .to_string();
+            let error =
+                super::super::api_error_from_parts("test", reqwest::StatusCode::BAD_GATEWAY, &body);
+            assert_eq!(
+                provider_error_diagnostic(&error).detail(),
+                Some(expected),
+                "{input}"
+            );
+            assert!(
+                !provider_error_diagnostic(&anyhow::Error::msg(input))
+                    .detail()
+                    .unwrap_or_default()
+                    .contains("SENTINEL")
+            );
+        }
+        let events: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(!events.is_empty());
+        assert!(!serde_json::to_string(&events).unwrap().contains("SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn reliable_body_disconnect_parser_negatives_keep_selected_identity() {
+        for parser in [
+            super::super::traits::StreamError::Json(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            super::super::traits::StreamError::InvalidSse("malformed SSE frame".to_string()),
+        ] {
+            let stream = futures_util::stream::once(async move { Err::<(), _>(parser) }).boxed();
+            let descriptor = ProviderCandidateDescriptor::pinned(
+                "compatible",
+                Some("parser-alias"),
+                "parser-model",
+            );
+            let mut stream = stream_with_terminal_metadata(
+                stream,
+                descriptor,
+                "parser-model".to_string(),
+                ProviderRoute::Vision,
+            );
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(matches!(
+                &error,
+                super::super::traits::StreamError::ModelProviderFailure(_)
+            ));
+            let error = anyhow::Error::new(error);
+            let terminal = terminal_provider_failure(&error).unwrap();
+            assert_eq!(terminal.actual_provider(), "parser-alias");
+            assert_eq!(terminal.actual_model(), "parser-model");
+            assert_eq!(terminal.route(), ProviderRoute::Vision);
+            assert_eq!(terminal.diagnostic().kind(), "provider_error");
+            assert_ne!(terminal.diagnostic().phase(), "response_body");
         }
     }
 
