@@ -691,9 +691,7 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
 /// The HTTP status is deliberately NOT required to be 4xx: three of the four
 /// production occurrences arrived wrapped in Console Go's own envelope, whose
 /// status belongs to the router rather than to DeepSeek, so a 5xx can carry a
-/// genuine round-trip rejection. Rate limits are the one class excluded
-/// outright — a 429 is never fixed by dropping a history message, so letting it
-/// through would mutate history for nothing.
+/// genuine round-trip rejection.
 pub fn is_reasoning_roundtrip_rejected(err: &anyhow::Error) -> bool {
     if let Some(error) = typed_provider_http_error(err) {
         return error.reasoning_roundtrip_rejected();
