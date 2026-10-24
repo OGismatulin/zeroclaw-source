@@ -19727,14 +19727,15 @@ Pin 13: LED
         let observer = RecallCountingObserver::default();
         let context = build_context(&memory, &observer, "uncached context", 0.0, None, false).await;
         assert!(context.is_empty());
-        let recalls = observer.recalls.lock();
-        assert_eq!(recalls.len(), 1);
-        assert!(!recalls[0].success);
-        assert_eq!(
-            recalls[0].query_summary.as_deref(),
-            Some("uncached context")
-        );
-        drop(recalls);
+        {
+            let recalls = observer.recalls.lock();
+            assert_eq!(recalls.len(), 1);
+            assert!(!recalls[0].success);
+            assert_eq!(
+                recalls[0].query_summary.as_deref(),
+                Some("uncached context")
+            );
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
 
         let bm25 = SqliteMemory::with_embedder(
