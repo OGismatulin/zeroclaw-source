@@ -296,9 +296,13 @@ pub(crate) async fn execute_one_tool(
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+            if token.is_cancelled() {
+                Err::<_, anyhow::Error>(ToolLoopCancelled.into())
+            } else {
+                tokio::select! {
+                    () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                    result = tool_future => Ok(result),
+                }
             }
         } else {
             Ok(tool_future.await)
@@ -707,6 +711,110 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_first_poll_never_invokes_tool() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            CountingTool::new("counter", invocations.clone()),
+        )]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "cancel-first-poll",
+            channel_name: "delegate",
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        let future = execute_one_tool(
+            "counter",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            Some(&token),
+            None,
+            None,
+        );
+        token.cancel();
+        let _ = future.await;
+        for _ in 0..128 {
+            let _ = execute_one_tool(
+                "counter",
+                serde_json::json!({}),
+                None,
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                Some(&token),
+                None,
+                None,
+            )
+            .await;
+        }
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "cancelled tool must never receive its first poll"
+        );
+        let calls = vec![
+            zeroclaw_tool_call_parser::ParsedToolCall {
+                name: "counter".into(),
+                arguments: serde_json::json!({}),
+                tool_call_id: None,
+            };
+            128
+        ];
+        for parallel in [false, true] {
+            let dispatch = ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            };
+            let slots = if parallel {
+                super::execute_tools_parallel(
+                    &calls,
+                    dispatch,
+                    &meta,
+                    &NoopObserver,
+                    Some(&token),
+                    None,
+                    None,
+                )
+                .await
+            } else {
+                super::execute_tools_sequential(
+                    &calls,
+                    dispatch,
+                    &meta,
+                    &NoopObserver,
+                    Some(&token),
+                    None,
+                    None,
+                )
+                .await
+            }
+            .unwrap();
+            assert_eq!(slots.len(), calls.len());
+            assert!(slots.iter().all(Option::is_none));
+        }
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "cancelled batch must start zero tools"
+        );
     }
 
     #[tokio::test]

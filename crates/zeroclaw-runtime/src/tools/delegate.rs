@@ -3303,7 +3303,7 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, BlockingCancellationTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -5969,6 +5969,89 @@ mod tests {
         let error = result.error.as_deref().unwrap_or_default();
         assert_eq!(error, invalid_semantic_completion_error("agentic"));
         assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    struct BlockingCancellationTool {
+        started: Arc<tokio::sync::Semaphore>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct NestedCancellationDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for NestedCancellationDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BlockingCancellationTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+        fn description(&self) -> &str {
+            "Cancellation barrier"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let _drop = NestedCancellationDrop(self.dropped.clone());
+            self.started.add_permits(1);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_delegate_drops_started_nested_tool_on_cancel_and_parent_drop() {
+        for cancel_token in [true, false] {
+            let started = Arc::new(tokio::sync::Semaphore::new(0));
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let token = CancellationToken::new();
+            let tool = DelegateTool::new(HashMap::new(), None, test_security())
+                .with_runtime_profiles(agentic_runtime_profiles(10))
+                .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".into()]))
+                .with_cancellation_token(token.clone())
+                .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                    BlockingCancellationTool {
+                        started: started.clone(),
+                        dropped: dropped.clone(),
+                    },
+                )])));
+            let provider = EchoToolResultThenFinalModelProvider::new();
+            let config = agentic_agent_config();
+            let mut future = Box::pin(tool.execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &provider,
+                "run",
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    permit = started.acquire() => permit.unwrap().forget(),
+                    result = &mut future => panic!("delegate completed before nested barrier: {result:?}"),
+                }
+            }).await.expect("nested tool must start");
+            if cancel_token {
+                token.cancel();
+                let result = tokio::time::timeout(Duration::from_secs(1), &mut future)
+                    .await
+                    .expect("nested cancellation must not wait for timeout")
+                    .unwrap();
+                assert!(!result.success);
+            }
+            drop(future);
+            assert!(
+                dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "parent drop must drop the running nested tool"
+            );
+            assert!(
+                provider.tool_message().is_none(),
+                "cancelled delegate must not invoke its next provider step"
+            );
+        }
     }
 
     #[tokio::test]

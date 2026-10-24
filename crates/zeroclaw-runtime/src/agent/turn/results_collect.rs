@@ -66,12 +66,9 @@ pub(crate) struct CollectedResults {
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
+    pub(crate) loop_error: Option<anyhow::Error>,
 }
 
-/// Collect this round's tool results (upstream loop body, results-collection
-/// section): feed the loop detector (Warning/Block append system messages;
-/// Break bails), canonicalize media markers, truncate, append receipts, and
-/// build the per-call and XML result forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
     ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
@@ -88,6 +85,7 @@ pub(crate) fn collect_tool_results(
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
     let mut detection_relevant_output = String::new();
+    let mut loop_error = None;
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -181,7 +179,9 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    loop_error.get_or_insert_with(|| {
+                        anyhow::Error::msg(format!("Agent loop aborted by loop detector: {msg}"))
+                    });
                 }
             }
         }
@@ -232,6 +232,7 @@ pub(crate) fn collect_tool_results(
         individual_results,
         tool_results,
         detection_relevant_output,
+        loop_error,
     })
 }
 
@@ -406,7 +407,7 @@ mod tests {
             0,
             "test-turn",
         )
-        .map(|_| ())
+        .and_then(|results| results.loop_error.map_or(Ok(()), Err))
     }
 
     #[test]
@@ -610,7 +611,7 @@ mod tests {
                 outcome(output, success),
             )));
         }
-        collect_tool_results(
+        let results = collect_tool_results(
             ordered,
             &tool_calls,
             &mut history,
@@ -621,7 +622,12 @@ mod tests {
             "test-model",
             0,
             "turn-test",
-        )
+        )?;
+        if let Some(error) = results.loop_error {
+            Err(error)
+        } else {
+            Ok(results)
+        }
     }
 
     #[test]
@@ -679,6 +685,9 @@ mod tests {
                 iteration,
                 "turn-test",
             )?;
+            if let Some(error) = collected.loop_error {
+                return Err(error);
+            }
             check_identical_output_abort(
                 &collected.detection_relevant_output,
                 loop_started_at,

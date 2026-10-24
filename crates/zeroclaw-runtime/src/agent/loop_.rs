@@ -8081,6 +8081,184 @@ mod tests {
         }
     }
 
+    struct CancelAfterCompletedTools {
+        token: CancellationToken,
+        remaining: AtomicUsize,
+    }
+
+    impl crate::observability::traits::Observer for CancelAfterCompletedTools {
+        fn record_event(&self, event: &crate::observability::traits::ObserverEvent) {
+            if matches!(
+                event,
+                crate::observability::traits::ObserverEvent::ToolCall { success: true, .. }
+            ) && self.remaining.fetch_sub(1, Ordering::SeqCst) == 1
+            {
+                self.token.cancel();
+            }
+        }
+        fn record_metric(&self, _: &crate::observability::traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "cancel-after-tools"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    async fn assert_cancelled_completed_batch(hash_abort: bool) {
+        let count = if hash_abort { 4 } else { 24 };
+        let turn_id = "cancel-completed-batch";
+        let args: Vec<String> = (0..count)
+            .map(|i| format!(r#"{{"value":"same","index":{i}}}"#))
+            .collect();
+        let ids: Vec<String> = (0..count).map(|i| format!("completed-{i}")).collect();
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            ids.iter()
+                .zip(&args)
+                .map(|(id, args)| (id.as_str(), "counter", args.as_str()))
+                .collect(),
+            "unexpected-next-provider",
+        );
+        if hash_abort {
+            let mut responses = model_provider.responses.lock().unwrap();
+            let batch = responses.pop_front().unwrap();
+            for call in batch.tool_calls.into_iter().rev() {
+                responses.push_front(ChatResponse {
+                    text: None,
+                    tool_calls: vec![call],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+        }
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("counter", invocations.clone()),
+            )]);
+        let token = CancellationToken::new();
+        let observer = CancelAfterCompletedTools {
+            token: token.clone(),
+            remaining: AtomicUsize::new(count),
+        };
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..Default::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+        let receipts = crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![7; 32]);
+        let collected = std::sync::Mutex::new(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("execute batch"),
+        ];
+        let result = run_tool_call_loop(ToolLoop {
+            final_response_min_chars: None,
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig {
+                    loop_detection_enabled: !hash_abort,
+                    loop_detection_min_elapsed_secs: Some(0),
+                    ..Default::default()
+                },
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: Some(&receipts),
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: Some(token.clone()),
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: Some(&collected),
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+        })
+        .await;
+
+        assert_eq!(invocations.load(Ordering::SeqCst), count);
+        assert!(
+            result.as_ref().is_err_and(is_tool_loop_cancelled),
+            "completed cancelled batch must return typed cancellation: {result:?}"
+        );
+        let results: Vec<_> = history.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(
+            results.len(),
+            count,
+            "completed slots must commit before cancellation"
+        );
+        assert_eq!(
+            collected.lock().unwrap().len(),
+            count,
+            "every completed receipt must survive cancellation"
+        );
+        for (index, message) in results.iter().enumerate() {
+            assert!(
+                message.content.contains(&ids[index]),
+                "native tool result must preserve its call ID"
+            );
+            let receipt = message
+                .content
+                .split("[receipt: ")
+                .nth(1)
+                .unwrap()
+                .split(']')
+                .next()
+                .unwrap();
+            assert!(receipts.verify(
+                receipt,
+                "counter",
+                &serde_json::from_str(&args[index]).unwrap(),
+                "counted:same"
+            ));
+        }
+        assert_eq!(
+            model_provider.responses.lock().unwrap().len(),
+            1,
+            "cancelled turn must not call its provider again"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_completed_batch_commits_receipts_before_loop_error() {
+        assert_cancelled_completed_batch(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_completed_batch_commits_before_identical_output_abort() {
+        assert_cancelled_completed_batch(true).await;
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -8118,7 +8296,9 @@ mod tests {
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
-        let _ = run_tool_call_loop(ToolLoop {
+        let receipts = crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![9; 32]);
+        let collected = std::sync::Mutex::new(Vec::new());
+        let result = run_tool_call_loop(ToolLoop {
             final_response_min_chars: None,
             parent_agent_alias: None,
             sop_reassembly: None,
@@ -8146,7 +8326,7 @@ mod tests {
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
-                receipt_generator: None,
+                receipt_generator: Some(&receipts),
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
@@ -8156,7 +8336,7 @@ mod tests {
             on_delta: None,
             shared_budget: None,
             channel: None,
-            collected_receipts: None,
+            collected_receipts: Some(&collected),
             event_tx: Some(event_tx),
             steering: None,
             new_messages_out: None,
@@ -8169,6 +8349,38 @@ mod tests {
             turn_id: &turn_id,
         })
         .await;
+
+        assert!(result.as_ref().is_err_and(is_tool_loop_cancelled));
+        let results: Vec<_> = history
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "every interrupted slot must remain in history"
+        );
+        assert!(results[0].content.contains("call_fast"));
+        assert!(results[1].content.contains("call_cancel"));
+        assert!(
+            results[1]
+                .content
+                .contains(&crate::i18n::get_required_cli_string(
+                    "turn-tool-interrupted-before-result"
+                )),
+            "every interrupted slot must remain in history"
+        );
+        let receipt = results[0]
+            .content
+            .split("[receipt: ")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        assert!(receipts.verify(receipt, "fast_tool", &serde_json::json!({}), "fast-done"));
+        assert_eq!(collected.lock().unwrap().len(), 1);
+        assert_eq!(model_provider.responses.lock().unwrap().len(), 1);
 
         drop(tools_registry);
         let mut results_by_id: std::collections::HashMap<String, Vec<String>> =

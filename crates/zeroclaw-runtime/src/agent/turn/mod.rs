@@ -1411,6 +1411,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             individual_results,
             tool_results,
             detection_relevant_output,
+            loop_error,
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
@@ -1424,19 +1425,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_id,
         )?;
 
-        if !cancelled_mid_batch {
-            check_identical_output_abort(
-                &detection_relevant_output,
-                loop_started_at,
-                pacing,
-                &mut consecutive_identical_outputs,
-                &mut last_tool_output_hash,
-                model,
-                iteration,
-                turn_id,
-            )?;
-        }
-
         turn_state.append_tool_round(
             assistant_history_content,
             &native_tool_calls,
@@ -1445,9 +1433,26 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
         );
 
-        if cancelled_mid_batch {
+        if cancelled_mid_batch
+            || cancellation_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
             return Err(ToolLoopCancelled.into());
         }
+        if let Some(error) = loop_error {
+            return Err(error);
+        }
+        check_identical_output_abort(
+            &detection_relevant_output,
+            loop_started_at,
+            pacing,
+            &mut consecutive_identical_outputs,
+            &mut last_tool_output_hash,
+            model,
+            iteration,
+            turn_id,
+        )?;
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {

@@ -2906,8 +2906,30 @@ fn emit_mcp_connect_failure_event(
     );
 }
 
-/// Agentic webhook chat that preserves gateway auth/idempotency flow while
-/// executing the full tool loop with persistent per-session history.
+async fn compress_webhook_history(
+    compressor: &zeroclaw_runtime::agent::context_compressor::ContextCompressor,
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn ModelProvider,
+    model: &str,
+    temperature: Option<f64>,
+    token: Option<&tokio_util::sync::CancellationToken>,
+) -> anyhow::Result<zeroclaw_runtime::agent::context_compressor::CompressionResult> {
+    if let Some(token) = token {
+        if token.is_cancelled() {
+            return Err(zeroclaw_runtime::agent::loop_::ToolLoopCancelled.into());
+        }
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(zeroclaw_runtime::agent::loop_::ToolLoopCancelled.into()),
+            result = compressor.compress_if_needed(history, provider, model, temperature) => result,
+        }
+    } else {
+        compressor
+            .compress_if_needed(history, provider, model, temperature)
+            .await
+    }
+}
+
 async fn run_gateway_webhook_agentic(
     state: &AppState,
     provider: &dyn ModelProvider,
@@ -3231,6 +3253,9 @@ async fn run_gateway_webhook_agentic(
         _ => vec![ChatMessage::system(&system_prompt)],
     };
 
+    let cancellation_token = cancel_handle.as_ref().map(|(_, token)| token.clone());
+    let mut pre_turn_cancelled = false;
+
     // Pre-turn compaction protection: if (provider, model) changed since the
     // last turn for this same session_id, compact existing history against the
     // new model's window before running agent_turn. Without this, switching
@@ -3248,9 +3273,15 @@ async fn run_gateway_webhook_agentic(
         .with_memory(state.mem.clone())
         .with_session_id(session_id);
 
-        match compressor
-            .compress_if_needed(&mut history, provider, model_name, temperature)
-            .await
+        match compress_webhook_history(
+            &compressor,
+            &mut history,
+            provider,
+            model_name,
+            temperature,
+            cancellation_token.as_ref(),
+        )
+        .await
         {
             Ok(result) if result.compressed => {
                 ::zeroclaw_log::record!(
@@ -3269,6 +3300,9 @@ async fn run_gateway_webhook_agentic(
                 );
             }
             Ok(_) => {}
+            Err(error) if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&error) => {
+                pre_turn_cancelled = true;
+            }
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -3309,9 +3343,13 @@ async fn run_gateway_webhook_agentic(
         ),
         None => ::zeroclaw_log::Span::none(),
     };
-    let cancellation_token = cancel_handle.as_ref().map(|(_, t)| t.clone());
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let (result, provider_fallback) =
+    let (mut result, provider_fallback) = if pre_turn_cancelled {
+        (
+            Err(zeroclaw_runtime::agent::loop_::ToolLoopCancelled.into()),
+            None,
+        )
+    } else {
         zeroclaw_providers::reliable::scope_provider_fallback(async {
             // fork(stabilization): wrap the whole agent_turn(...).await so the
             // task-local fallback scope covers run_tool_call_loop and every LLM
@@ -3345,7 +3383,7 @@ async fn run_gateway_webhook_agentic(
                     0,    // max_tool_result_chars: disabled — external ContextCompressor trims
                     0,    // context_token_budget: disabled — external ContextCompressor trims
                     None, // channel: Option<&dyn Channel> — webhook path has no channel
-                    cancellation_token,
+                    cancellation_token.clone(),
                     state.hooks.as_deref(),
                     // fork: origin drives IngressContext only. memory: None is
                     // deliberate — the fork already injected the memory preamble
@@ -3364,11 +3402,103 @@ async fn run_gateway_webhook_agentic(
             let fb = zeroclaw_providers::reliable::take_last_provider_fallback();
             (result, fb)
         })
-        .await;
+        .await
+    };
 
     // fork(stabilization): if the reliability layer fell back, make it observable.
     if let Some(fb) = provider_fallback.as_ref() {
         emit_provider_fallback_event(fb, session_id);
+    }
+
+    let context_window = agent.resolved.context_window_for_model(model_name);
+    let threshold =
+        (context_window as f64 * agent.resolved.context_compression.threshold_ratio) as usize;
+    let tokens_before_for_event =
+        zeroclaw_runtime::agent::context_compressor::estimate_tokens(&history);
+    let mut compressed_for_event: bool = false;
+    let mut passes_for_event: u32 = 0;
+    let mut compression_succeeded: bool = false;
+
+    if !result
+        .as_ref()
+        .is_err_and(zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled)
+    {
+        let history_len = history.len();
+        let registry_hit = agent
+            .resolved
+            .context_compression
+            .model_windows
+            .contains_key(model_name);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "history_len": history_len,
+                    "context_window": context_window,
+                    "threshold": threshold,
+                    "threshold_ratio": agent.resolved.context_compression.threshold_ratio,
+                    "enabled": agent.resolved.context_compression.enabled,
+                    "registry_hit": registry_hit,
+                    "model": model_name,
+                    "session_id": session_id.unwrap_or_default(),
+                })
+            ),
+            "Webhook post-turn compaction check (pre-call)"
+        );
+
+        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
+            agent.resolved.context_compression.clone(),
+            context_window,
+        )
+        .with_memory(state.mem.clone())
+        .with_session_id(session_id);
+
+        match compress_webhook_history(
+            &compressor,
+            &mut history,
+            provider,
+            model_name,
+            temperature,
+            cancellation_token.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                compressed_for_event = result.compressed;
+                passes_for_event = result.passes_used;
+                compression_succeeded = true;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "compressed": result.compressed,
+                            "passes": result.passes_used,
+                            "before": result.tokens_before,
+                            "after": result.tokens_after,
+                            "threshold": threshold,
+                            "context_window": context_window,
+                            "model": model_name,
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
+                    "Webhook post-turn compaction result"
+                );
+            }
+            Err(error) if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&error) => {
+                result = Err(error);
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "session_id": session_id.unwrap_or_default(),
+                        })),
+                    "Webhook post-turn context compression failed, falling back to history trim"
+                );
+            }
+        }
     }
 
     // Branch on cancellation: a `ToolLoopCancelled` error means a follow-up
@@ -3445,90 +3575,6 @@ async fn run_gateway_webhook_agentic(
             Err(err)
         }
     };
-
-    // Post-turn context compression: if the history grew past threshold for
-    // this model, run the LLM summarizer + fast-trim before the dumb
-    // trim_history below. Symmetric with trim_history — runs on any outcome
-    // (Ok / Cancelled / Err). On failure we fall through silently and let
-    // trim_history clamp the message count.
-    let context_window = agent.resolved.context_window_for_model(model_name);
-    let threshold =
-        (context_window as f64 * agent.resolved.context_compression.threshold_ratio) as usize;
-    let tokens_before_for_event =
-        zeroclaw_runtime::agent::context_compressor::estimate_tokens(&history);
-    let mut compressed_for_event: bool = false;
-    let mut passes_for_event: u32 = 0;
-    let mut compression_succeeded: bool = false;
-
-    {
-        let history_len = history.len();
-        let registry_hit = agent
-            .resolved
-            .context_compression
-            .model_windows
-            .contains_key(model_name);
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "history_len": history_len,
-                    "context_window": context_window,
-                    "threshold": threshold,
-                    "threshold_ratio": agent.resolved.context_compression.threshold_ratio,
-                    "enabled": agent.resolved.context_compression.enabled,
-                    "registry_hit": registry_hit,
-                    "model": model_name,
-                    "session_id": session_id.unwrap_or_default(),
-                })
-            ),
-            "Webhook post-turn compaction check (pre-call)"
-        );
-
-        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
-            agent.resolved.context_compression.clone(),
-            context_window,
-        )
-        .with_memory(state.mem.clone())
-        .with_session_id(session_id);
-
-        match compressor
-            .compress_if_needed(&mut history, provider, model_name, temperature)
-            .await
-        {
-            Ok(result) => {
-                compressed_for_event = result.compressed;
-                passes_for_event = result.passes_used;
-                compression_succeeded = true;
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "compressed": result.compressed,
-                            "passes": result.passes_used,
-                            "before": result.tokens_before,
-                            "after": result.tokens_after,
-                            "threshold": threshold,
-                            "context_window": context_window,
-                            "model": model_name,
-                            "session_id": session_id.unwrap_or_default(),
-                        })),
-                    "Webhook post-turn compaction result"
-                );
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error": format!("{e}"),
-                            "session_id": session_id.unwrap_or_default(),
-                        })),
-                    "Webhook post-turn context compression failed, falling back to history trim"
-                );
-            }
-        }
-    }
 
     // Trim history regardless of outcome — partial context after a non-cancel
     // error is still useful for the next turn's recall.
@@ -12504,6 +12550,78 @@ path = "{trigger_path}"
     /// need a custom config.
     fn make_test_state(provider: Arc<dyn ModelProvider>, memory: Arc<dyn Memory>) -> AppState {
         fresh_model_test_state(provider, memory, "mock", "test-model")
+    }
+
+    include!("cancellation_tests.rs");
+
+    async fn seed_cancellation_history(state: &AppState, previous_model: &str) {
+        {
+            let mut config = state.config.write();
+            config.runtime_profiles.insert(
+                "cancellation".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_context_tokens: Some(1000),
+                    ..Default::default()
+                },
+            );
+            config.agents.get_mut("default").unwrap().runtime_profile = "cancellation".into();
+        }
+        let mut history = vec![ChatMessage::system("test")];
+        for _ in 0..12 {
+            history.push(ChatMessage::user("retained-question"));
+            history.push(ChatMessage::assistant("a".repeat(10000)));
+        }
+        *state.webhook_session.lock().await = Some(WebhookSessionState {
+            session_id: "tg_cancel".into(),
+            history,
+            last_provider: "mock".into(),
+            last_model: previous_model.into(),
+        });
+    }
+
+    #[tokio::test]
+    async fn webhook_cancelled_history_skips_llm_compression() {
+        let provider = Arc::new(MockModelProvider::default());
+        let state = make_test_state(provider.clone(), Arc::new(MockMemory));
+        seed_cancellation_history(&state, "test-model").await;
+        let handle = register_cancel_token(&state, "tg_cancel");
+        handle.1.cancel();
+        let outcome = run_gateway_webhook_agentic(
+            &state,
+            provider.as_ref(),
+            "mock",
+            "test-model",
+            None,
+            "stop",
+            Some("tg_cancel"),
+            Some(handle),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "cancelled history must never invoke LLM compression"
+        );
+        assert!(
+            state
+                .webhook_session
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .history
+                .iter()
+                .any(|m| m.content.contains("[turn cancelled]"))
+        );
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .contains_key("tg_cancel")
+        );
     }
 
     #[tokio::test]
