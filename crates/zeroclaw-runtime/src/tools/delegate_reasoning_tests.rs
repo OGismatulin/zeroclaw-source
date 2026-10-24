@@ -137,6 +137,15 @@ async fn check_delegate_reasoning_mode(
     expected_success: bool,
     expected_repairs: usize,
 ) {
+    check_delegate_reasoning_mode_capture(mode, expected_success, expected_repairs, false).await;
+}
+
+async fn check_delegate_reasoning_mode_capture(
+    mode: &'static str,
+    expected_success: bool,
+    expected_repairs: usize,
+    inject_foreign_request: bool,
+) {
     let _writer_guard = zeroclaw_log::__private_test_writer_lock();
     let _hook_guard = zeroclaw_log::__private_test_hook_lock();
     zeroclaw_log::try_install_capture_subscriber();
@@ -147,6 +156,22 @@ async fn check_delegate_reasoning_mode(
     });
     let (sender, mut receiver) = tokio::sync::broadcast::channel(65_536);
     zeroclaw_log::set_broadcast_hook(sender);
+    let foreign_turn_id = uuid::Uuid::new_v4().to_string();
+    if inject_foreign_request {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_attrs(json!({
+                    "model": "foreign-fixture-model",
+                    "trace_id": foreign_turn_id,
+                    "agent_alias": "foreign-fixture-agent",
+                    "iteration": 1,
+                    "messages_count": 1,
+                })),
+            "llm_request"
+        );
+    }
     let (server, captured) = start_reasoning_delegate_server(mode).await;
     let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
         server.uri.clone(),
@@ -156,15 +181,24 @@ async fn check_delegate_reasoning_mode(
         Some(true),
     );
     let mut config = (*config).clone();
+    let fixture_id = uuid::Uuid::new_v4().simple().to_string();
+    let delegate_alias = format!("reasoning_{mode}_{fixture_id}");
+    let fixture_model = format!("reasoning-model-{fixture_id}");
+    let target = config.agents.remove("target").unwrap();
+    config.agents.insert(delegate_alias.clone(), target);
+    if mode == "h2_fallback" {
+        config.reliability.provider_retries = 1;
+    }
     let primary = config.providers.models.custom.get_mut("primary").unwrap();
     primary.base.fallback.clear();
+    primary.base.model = Some(fixture_model.clone());
     primary.base.provider_extra = Some(json!({"reasoning_effort": "high"}));
     let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tool = fallback_delegate_tool(Arc::new(config), None).with_parent_tools(Arc::new(
         RwLock::new(vec![Arc::new(CountingReasoningEcho(executions.clone()))]),
     ));
     let result = tool
-        .execute(json!({"agent": "target", "prompt": "Use echo once and return the result"}))
+        .execute(json!({"agent": delegate_alias, "prompt": "Use echo once and return the result"}))
         .await
         .unwrap();
     let bodies = captured.lock().unwrap().clone();
@@ -187,6 +221,7 @@ async fn check_delegate_reasoning_mode(
     );
     assert!(!bodies.is_empty());
     for body in &bodies {
+        assert_eq!(body["model"], fixture_model);
         let messages = body["messages"].as_array().unwrap();
         for result in messages.iter().filter(|message| message["role"] == "tool") {
             assert!(
@@ -206,10 +241,58 @@ async fn check_delegate_reasoning_mode(
             Err(error) => panic!("log capture lost events: {error:?}"),
         }
     }
+    if inject_foreign_request {
+        assert!(events.iter().any(|event| {
+            event["message"] == "llm_request"
+                && event["attributes"]["trace_id"] == foreign_turn_id
+                && event["attributes"]["model"] == "foreign-fixture-model"
+        }));
+    }
+    let requests = events
+        .iter()
+        .filter(|event| {
+            event["message"] == "llm_request"
+                && (event["attributes"]["model"] == fixture_model
+                    || event["zeroclaw"]["agent_alias"] == delegate_alias)
+        })
+        .collect::<Vec<_>>();
+    assert!(!requests.is_empty(), "mode={mode}; missing owned request");
+    assert_eq!(requests[0]["attributes"]["iteration"], 1);
+    let original_turn_id = requests[0]["attributes"]["trace_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(original_turn_id).is_ok());
+    assert!(requests.iter().all(|event| {
+        event["attributes"]["model"] == fixture_model
+            && event["zeroclaw"]["agent_alias"] == delegate_alias
+            && event["attributes"]["trace_id"] == original_turn_id
+    }));
+    if inject_foreign_request {
+        let foreign_position = events
+            .iter()
+            .position(|event| {
+                event["message"] == "llm_request"
+                    && event["attributes"]["trace_id"] == foreign_turn_id
+            })
+            .unwrap();
+        let owned_position = events
+            .iter()
+            .position(|event| event["id"] == requests[0]["id"])
+            .unwrap();
+        assert!(foreign_position < owned_position);
+        assert_ne!(foreign_turn_id, original_turn_id);
+    }
     let rejects = events
         .iter()
-        .filter(|event| event["message"].as_str() == Some("reasoning_roundtrip_rejected"))
+        .filter(|event| {
+            event["message"].as_str() == Some("reasoning_roundtrip_rejected")
+                && (event["attributes"]["agent_alias"] == delegate_alias
+                    || event["attributes"]["model"] == fixture_model)
+        })
         .collect::<Vec<_>>();
+    assert!(rejects.iter().all(|event| {
+        event["attributes"]["agent_alias"] == delegate_alias
+            && event["attributes"]["model"] == fixture_model
+            && event["attributes"]["trace_id"] == original_turn_id
+    }));
     let repairs = rejects
         .iter()
         .filter(|event| event["attributes"]["repaired"] == true)
@@ -229,12 +312,6 @@ async fn check_delegate_reasoning_mode(
         .map(|event| event["attributes"]["trace_id"].as_str().unwrap())
         .collect::<std::collections::HashSet<_>>();
     if expected_repairs > 0 {
-        let original_turn_id = events
-            .iter()
-            .find(|event| event["message"] == "llm_request")
-            .unwrap()["attributes"]["trace_id"]
-            .as_str()
-            .unwrap();
         assert!(turn_ids.contains(original_turn_id));
         assert_eq!(
             turn_ids.len(),
@@ -244,7 +321,7 @@ async fn check_delegate_reasoning_mode(
         assert!(
             rejects
                 .iter()
-                .all(|event| event["attributes"]["agent_alias"] == "target")
+                .all(|event| event["attributes"]["agent_alias"] == delegate_alias)
         );
         assert!(
             bodies.last().unwrap()["messages"]
@@ -273,6 +350,28 @@ async fn check_delegate_reasoning_mode(
     }
     if mode == "h3" {
         assert!(bodies.iter().any(|body| body["reasoning_effort"] == "none"));
+    }
+    if mode == "h2_stream" || mode == "h2_fallback" {
+        let stream_flags = bodies
+            .iter()
+            .map(|body| body["stream"] == true)
+            .collect::<Vec<_>>();
+        let expected_stream_flags = if mode == "h2_stream" {
+            vec![true, true, true, true]
+        } else {
+            vec![true, true, true, false, true]
+        };
+        assert_eq!(stream_flags, expected_stream_flags, "mode={mode}");
+        assert!(
+            bodies[1]["messages"] == bodies[2]["messages"],
+            "mode={mode}; the stream retry must retain the same history"
+        );
+        if mode == "h2_fallback" {
+            assert!(
+                bodies[2]["messages"] == bodies[3]["messages"],
+                "the JSON fallback must retain the same history"
+            );
+        }
     }
     if mode == "persistent400" {
         assert_eq!(rejects.len(), 2);
@@ -306,6 +405,10 @@ async fn delegate_stream_roundtrip_h2_json_fallback_repairs_once() {
 #[tokio::test]
 async fn delegate_stream_roundtrip_h3_capability_retry_repairs_once() {
     check_delegate_reasoning_mode("h3", true, 1).await;
+}
+#[tokio::test]
+async fn delegate_stream_repair_joins_owned_request_amid_foreign_events() {
+    check_delegate_reasoning_mode_capture("h3", true, 1, true).await;
 }
 #[tokio::test]
 async fn delegate_stream_roundtrip_h4_router_envelope_repairs_once() {
