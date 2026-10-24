@@ -19653,4 +19653,151 @@ Pin 13: LED
             other => panic!("expected Line, got {other:?}"),
         }
     }
+    #[tokio::test]
+    async fn embedding_402_memory_and_build_context_contract() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::SearchMode;
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::embeddings::OpenAiEmbedding;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"embedding":[1.0,0.0]}]})),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::TempDir::new().unwrap();
+        let adapter = Arc::new(OpenAiEmbedding::new(
+            &server.uri(),
+            "fixture-key",
+            "fixture-embedding",
+            2,
+        ));
+        let memory = SqliteMemory::with_embedder(
+            "fixture",
+            root.path(),
+            adapter.clone(),
+            0.7,
+            0.3,
+            100,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        memory
+            .store(
+                "fixture",
+                "alpha retained fixture",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let healthy_observer = RecallCountingObserver::default();
+        let healthy_context =
+            build_context(&memory, &healthy_observer, "alpha", 0.0, None, false).await;
+        assert!(healthy_context.contains("alpha retained fixture"));
+        assert_eq!(healthy_observer.recalls.lock().len(), 1);
+        assert!(healthy_observer.recalls.lock()[0].success);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("SECRET_EMBEDDING_BODY"))
+            .mount(&server)
+            .await;
+        let cached = memory.recall("alpha", 5, None, None, None).await.unwrap();
+        assert!(cached.iter().any(|entry| entry.key == "fixture"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let error = memory
+            .recall("uncached failure", 5, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("402"));
+        assert!(
+            !error.to_string().contains("SECRET_EMBEDDING_BODY"),
+            "embedding errors must not carry raw provider bodies into store logs"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let observer = RecallCountingObserver::default();
+        let context = build_context(&memory, &observer, "uncached context", 0.0, None, false).await;
+        assert!(context.is_empty());
+        {
+            let recalls = observer.recalls.lock();
+            assert_eq!(recalls.len(), 1);
+            assert!(!recalls[0].success);
+            assert_eq!(
+                recalls[0].query_summary.as_deref(),
+                Some("uncached context")
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        let bm25 = SqliteMemory::with_embedder(
+            "fixture",
+            root.path(),
+            adapter,
+            0.7,
+            0.3,
+            100,
+            None,
+            SearchMode::Bm25,
+        )
+        .unwrap();
+        assert!(
+            bm25.recall("alpha", 5, None, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.key == "fixture")
+        );
+        assert!(
+            memory
+                .recall("*", 5, None, None, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.key == "fixture")
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        memory
+            .store(
+                "without_vector",
+                "beta novel payload",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored = memory.get("without_vector").await.unwrap().unwrap();
+        assert_eq!(stored.content, "beta novel payload");
+        let missing: bool = memory
+            .connection()
+            .lock()
+            .query_row(
+                "SELECT embedding IS NULL FROM memories WHERE key='without_vector'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(missing);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert_eq!(memory.reindex().await.unwrap(), 0);
+        let missing: bool = memory
+            .connection()
+            .lock()
+            .query_row(
+                "SELECT embedding IS NULL FROM memories WHERE key='without_vector'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(missing);
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
 }

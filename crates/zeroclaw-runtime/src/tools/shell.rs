@@ -190,6 +190,66 @@ fn decode_output(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+fn recovery_hint(
+    command: &str,
+    denial: &zeroclaw_config::policy::CommandDenial,
+    dialect: crate::platform::ShellDialect,
+) -> Option<String> {
+    use zeroclaw_config::policy::PolicyDenialReason;
+    if dialect != crate::platform::ShellDialect::Posix {
+        return None;
+    }
+    let blocked = denial.blocked_command.as_deref()?;
+    let safe_sed = blocked != "sed" || {
+        let mut args = command
+            .split_whitespace()
+            .skip_while(|word| word.trim_matches(['\'', '"']).rsplit('/').next() != Some("sed"))
+            .skip(1);
+        let write_option = args.clone().any(|word| {
+            word.starts_with("--in")
+                || word.starts_with("--file")
+                || word.starts_with("--expression")
+                || (word.starts_with('-')
+                    && !word.starts_with("--")
+                    && word.contains(['i', 'f', 'e']))
+        });
+        !write_option
+            && args
+                .find(|word| !word.starts_with('-'))
+                .is_some_and(|word| {
+                    let quoted = word.starts_with(['\'', '"']);
+                    (!quoted || word.len() > 1 && word.chars().next() == word.chars().last())
+                        && !word.trim_matches(['\'', '"']).contains(['w', 'e'])
+                })
+    };
+    if blocked == "tee" || !safe_sed {
+        return None;
+    }
+    let hint = match (denial.reason, blocked) {
+        (PolicyDenialReason::CommandNotAllowed, "cd") => {
+            "Передайте путь аргументом команды; для git используйте `git -C <path>`"
+        }
+        (PolicyDenialReason::CommandNotAllowed, "awk")
+        | (PolicyDenialReason::ArgumentNotAllowed, "sed") => {
+            "Для чтения строк используйте `file_read` с `offset`/`limit`"
+        }
+        _ => "",
+    };
+    let pipe = denial.reason == PolicyDenialReason::CommandNotAllowed && command.contains('|');
+    match (hint.is_empty(), pipe) {
+        (true, false) => None,
+        (false, false) => Some(hint.to_string()),
+        (_, true) => {
+            let pipe = "Если `|` — часть текста аргумента, заключите весь аргумент в кавычки. Если это конвейер, проверьте разрешения каждой команды";
+            Some(if hint.is_empty() {
+                pipe.to_string()
+            } else {
+                format!("{hint}. {pipe}")
+            })
+        }
+    }
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -293,7 +353,12 @@ impl Tool for ShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::json(denial.to_json()),
-                    error: Some(denial.message),
+                    error: Some(
+                        match recovery_hint(command, &denial, self.runtime.shell_dialect()) {
+                            Some(hint) => format!("{}\nRecovery hint: {hint}", denial.message),
+                            None => denial.message,
+                        },
+                    ),
                 });
             }
         }
@@ -2357,5 +2422,173 @@ Path('end').touch()
         assert_eq!(data["policy_reason"], "path_not_allowed");
         assert_eq!(data["path"], "outside_workspace");
         assert!(data["blocked_command"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_recovery_hint_uses_typed_denial_and_preserves_policy_json() {
+        let policy =
+            test_security_with_allowed_commands(AutonomyLevel::Supervised, &["echo", "cat", "sed"]);
+        let tool = ShellTool::new(policy.clone(), test_runtime());
+        let pipe = "Если `|` — часть текста аргумента, заключите весь аргумент в кавычки. Если это конвейер, проверьте разрешения каждой команды";
+        let cd = "Передайте путь аргументом команды; для git используйте `git -C <path>`";
+        let read = "Для чтения строк используйте `file_read` с `offset`/`limit`";
+        for (command, reason, blocked, hint) in [
+            ("cd r", "command_not_allowed", "cd", cd.to_string()),
+            ("'cd' r", "command_not_allowed", "cd", cd.to_string()),
+            ("awk '1' x", "command_not_allowed", "awk", read.to_string()),
+            (
+                "sed -x 1p x",
+                "argument_not_allowed",
+                "sed",
+                read.to_string(),
+            ),
+            (
+                "blocked a|b",
+                "command_not_allowed",
+                "blocked",
+                pipe.to_string(),
+            ),
+            (
+                "blocked 'a|b'",
+                "command_not_allowed",
+                "blocked",
+                pipe.to_string(),
+            ),
+            (
+                r"blocked a\|b",
+                "command_not_allowed",
+                "blocked",
+                pipe.to_string(),
+            ),
+            (
+                "echo x | blocked",
+                "command_not_allowed",
+                "blocked",
+                pipe.to_string(),
+            ),
+            (
+                "echo x || blocked",
+                "command_not_allowed",
+                "blocked",
+                pipe.to_string(),
+            ),
+            (
+                "cd r | cat",
+                "command_not_allowed",
+                "cd",
+                format!("{cd}. {pipe}"),
+            ),
+            (
+                "cat x | awk '1'",
+                "command_not_allowed",
+                "awk",
+                format!("{read}. {pipe}"),
+            ),
+        ] {
+            let denial = policy
+                .validate_command_execution_for_shell_detailed(
+                    command,
+                    false,
+                    crate::platform::ShellDialect::Posix,
+                )
+                .unwrap_err();
+            assert_eq!(
+                denial.message,
+                format!("Command not allowed by security policy: {command}")
+            );
+            let result = tool.execute(json!({"command": command})).await.unwrap();
+            assert!(!result.success, "{command}");
+            assert_eq!(
+                result.output.data().unwrap(),
+                &json!({"status": "denied", "policy_reason": reason, "blocked_command": blocked}),
+                "{command}"
+            );
+            assert_eq!(
+                result.error.unwrap(),
+                format!("{}\nRecovery hint: {hint}", denial.message),
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_recovery_hint_does_not_advise_bypassing_write_or_path_denials() {
+        let policy =
+            test_security_with_allowed_commands(AutonomyLevel::Supervised, &["echo", "cat", "sed"]);
+        let tool = ShellTool::new(policy, test_runtime());
+        for command in [
+            "sed -i s/x/y/ x",
+            "sed -ni s/x/y/ x",
+            "sed --in-place s/x/y/ x",
+            "sed '1w x' x",
+            "sed 'w x' x",
+            "sed 'e' x",
+            "sed '1e' x",
+            "sed 's#x#y#e' x",
+            "sed 's/x/y/w x' x",
+            "sed -f x x",
+            "sed --file=x x",
+            "echo x | tee out",
+            "cat /etc/passwd",
+            "cd $HOME",
+            "blocked $(echo x)",
+            "echo cd",
+            "blocked x",
+        ] {
+            let result = tool.execute(json!({"command": command})).await.unwrap();
+            if command == "echo cd" {
+                assert!(result.success);
+            } else {
+                assert!(!result.success, "{command}");
+                assert!(
+                    !result.error.unwrap().contains("Recovery hint:"),
+                    "{command}"
+                );
+            }
+        }
+        let readonly = ShellTool::new(test_security(AutonomyLevel::ReadOnly), test_runtime());
+        let result = readonly
+            .execute(json!({"command": "cd r | cat"}))
+            .await
+            .unwrap();
+        assert_eq!(result.output.data().unwrap()["policy_reason"], "readonly");
+        assert!(!result.error.unwrap().contains("Recovery hint:"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_recovery_hint_keeps_readonly_sed_and_allowed_pipeline_executable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("x"), "first\nsecond\n").unwrap();
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            allowed_commands: vec!["echo".into(), "cat".into(), "sed".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(policy, test_runtime());
+        for command in ["sed -n 1p x", "cat x | sed -n 1p", "echo 'a|b'"] {
+            let result = tool.execute(json!({"command": command})).await.unwrap();
+            assert!(result.success, "{command}: {result:?}");
+            assert!(result.error.is_none(), "{command}");
+        }
+    }
+    #[test]
+    fn shell_recovery_hint_is_posix_only() {
+        use zeroclaw_config::policy::{CommandDenial, PolicyDenialReason};
+        let denial = CommandDenial {
+            reason: PolicyDenialReason::CommandNotAllowed,
+            blocked_command: Some("cd".to_string()),
+            message: "Command not allowed by security policy: cd r | cat".to_string(),
+        };
+        for dialect in [
+            crate::platform::ShellDialect::WindowsCmd,
+            crate::platform::ShellDialect::PowerShell,
+            crate::platform::ShellDialect::None,
+        ] {
+            assert!(recovery_hint("cd r | cat", &denial, dialect).is_none());
+        }
     }
 }
