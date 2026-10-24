@@ -9104,6 +9104,75 @@ path = "{trigger_path}"
         }
     }
 
+    #[derive(Default)]
+    struct DelegateRootProvider {
+        calls: AtomicUsize,
+        tool_result: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DelegateRootProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("PONG".into())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if !first {
+                *self.tool_result.lock().unwrap() = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role.as_str() == "tool")
+                    .map(|message| message.content.to_string());
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: (!first).then(|| "PONG".into()),
+                tool_calls: if first {
+                    vec![zeroclaw_providers::ToolCall {
+                        id: "delegate-call".into(),
+                        name: "delegate".into(),
+                        arguments: r#"{"agent":"worker","prompt":"reply as child"}"#.into(),
+                        extra_content: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DelegateRootProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "DelegateRootProvider"
+        }
+    }
+
     /// `Config::default()` plus the V3 single-agent bridge entries
     /// (`agents.default` + `risk_profiles.default`) that
     /// `run_gateway_webhook_agentic` resolves at turn time. Production
@@ -11915,6 +11984,236 @@ path = "{trigger_path}"
         );
         assert_eq!(migrated_final["attributes"]["text"], body["response"]);
         assert!(migrated_final["message"].is_null());
+    }
+
+    #[tokio::test]
+    async fn webhook_handler_nested_delegate_keeps_root_and_child_turns_distinct() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, CustomModelProviderConfig, LogPersistence, ModelProviderConfig,
+            ObservabilityConfig, RuntimeProfileConfig,
+        };
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_path = tmp.path().join("trace.jsonl");
+        let observability = ObservabilityConfig {
+            log_persistence: LogPersistence::Rolling,
+            log_persistence_path: trace_path.to_string_lossy().into_owned(),
+            log_persistence_max_entries: 1000,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(
+            &observability,
+            tmp.path(),
+        );
+
+        let child_calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&child_calls);
+        let app = Router::new().fallback(axum::routing::post(
+            move |Json(request): Json<serde_json::Value>| {
+                let calls = Arc::clone(&server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if request["stream"] == true {
+                        let chunk = serde_json::json!({
+                            "choices": [{"index": 0, "delta": {"content": "child reply"}, "finish_reason": "stop"}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "child reply"}}]
+                        }))
+                        .into_response()
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let child_uri = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let foreign_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let foreign_state = fresh_model_test_state(
+            foreign_provider,
+            Arc::new(MockMemory),
+            "foreign-provider",
+            "foreign-model",
+        );
+        let foreign = Box::pin(test_correlated_webhook(
+            foreign_state,
+            "tg_foreign_delegate_fixture",
+            "foreign",
+        ))
+        .await;
+        assert_eq!(foreign.status(), StatusCode::OK);
+
+        let root_provider = Arc::new(DelegateRootProvider::default());
+        let provider: Arc<dyn ModelProvider> = root_provider.clone();
+        let mut state =
+            fresh_model_test_state(provider, Arc::new(MockMemory), "mock", "root-model");
+        let mut config = test_config();
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config.observability = observability;
+        config.reliability.provider_retries = 0;
+        config
+            .risk_profiles
+            .get_mut("default")
+            .unwrap()
+            .delegation_policy = DelegationPolicy {
+            mode: DelegationMode::Allow,
+        };
+        config
+            .risk_profiles
+            .get_mut("default")
+            .unwrap()
+            .auto_approve
+            .push("delegate".into());
+        config.runtime_profiles.insert(
+            "child".into(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.providers.models.custom.insert(
+            "worker".into(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(child_uri),
+                    model: Some("child-model".into()),
+                    api_key: Some("fixture-key".into()),
+                    timeout_secs: Some(3),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.worker".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "child".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(
+            resolve_gateway_chat_agent_alias(&config, None).as_deref(),
+            Some("default")
+        );
+        state.config = Arc::new(RwLock::new(config));
+
+        let response = tokio::spawn(async move {
+            Box::pin(test_correlated_webhook(
+                state,
+                "tg_nested_delegate_fixture",
+                "delegate then answer",
+            ))
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["response"], "PONG");
+        assert_eq!(root_provider.calls.load(Ordering::SeqCst), 2);
+        let result = root_provider
+            .tool_result
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            result.contains("child reply"),
+            "delegate result did not include child output"
+        );
+
+        let native: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        zeroclaw_log::clear_broadcast_hook();
+        let legacy: Vec<serde_json::Value> = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let root_request = legacy
+            .iter()
+            .find(|row| {
+                row["event_type"] == "llm_request"
+                    && row["channel"] == "webhook"
+                    && row["provider"] == "mock"
+                    && row["model"] == "root-model"
+            })
+            .expect("root-owned legacy request");
+        let root_id = root_request["turn_id"].as_str().unwrap();
+        let root_shapes: Vec<serde_json::Value> = native
+            .iter()
+            .filter(|row| row["message"] == "llm_request")
+            .map(|row| {
+                serde_json::json!({
+                    "turn": row["trace_id"],
+                    "session": row["zeroclaw"]["session_key"],
+                    "alias": row["zeroclaw"]["agent_alias"],
+                    "model": row["attributes"]["model"],
+                })
+            })
+            .collect();
+        assert!(
+            native.iter().any(|row| {
+                row["message"] == "llm_request"
+                    && row["zeroclaw"]["session_key"] == "tg_foreign_delegate_fixture"
+            }),
+            "foreign webhook request missing among safe shapes: {root_shapes:?}"
+        );
+        let root_native = native
+            .iter()
+            .find(|row| {
+                row["message"] == "llm_request"
+                    && row["trace_id"] == root_id
+                    && row["zeroclaw"]["session_key"] == "tg_nested_delegate_fixture"
+                    && row["attributes"]["model"] == "root-model"
+            })
+            .unwrap_or_else(|| {
+                panic!("root native request missing among safe shapes: {root_shapes:?}")
+            });
+        assert_eq!(root_native["attributes"]["iteration"], 1);
+        let child = native
+            .iter()
+            .find(|row| {
+                row["message"] == "llm_request"
+                    && row["zeroclaw"]["session_key"] == "tg_nested_delegate_fixture"
+                    && row["zeroclaw"]["agent_alias"] == "worker"
+                    && row["attributes"]["model"] == "child-model"
+            })
+            .expect("real nested delegate request");
+        let child_id = child["trace_id"].as_str().unwrap();
+        assert_ne!(root_id, child_id);
+        assert!(uuid::Uuid::parse_str(root_id).is_ok());
+        assert!(uuid::Uuid::parse_str(child_id).is_ok());
+        assert!(legacy.iter().any(|row| {
+            row["event_type"] == "turn_final_response"
+                && row["turn_id"] == root_id
+                && row["payload"]["session_id"] == "tg_nested_delegate_fixture"
+                && row["payload"]["text"] == body["response"]
+        }));
+        assert!(!legacy.iter().any(|row| {
+            row["event_type"] == "turn_final_response" && row["turn_id"] == child_id
+        }));
+        server.abort();
     }
 
     async fn test_correlated_webhook(
