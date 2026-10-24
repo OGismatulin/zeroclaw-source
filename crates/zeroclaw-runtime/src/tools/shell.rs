@@ -739,6 +739,92 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    async fn wait_owned_shell_start(path: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path)
+                    && let Ok(pid) = pid.parse()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("owned shell child must start")
+    }
+
+    #[cfg(unix)]
+    async fn assert_owned_shell_stopped(pid: u32) {
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            while std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "owned shell child {pid} must stop after future drop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_kill_on_drop_without_process_group_guard() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut command = tokio::process::Command::new("python3");
+        command.current_dir(workspace.path()).args(["-c", "import os,time; from pathlib import Path; Path('started').write_text(str(os.getpid())); time.sleep(30); Path('end').touch()"]);
+        command.kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let pid = wait_owned_shell_start(&workspace.path().join("started")).await;
+        assert_eq!(child.id(), Some(pid));
+        drop(child);
+        assert_owned_shell_stopped(pid).await;
+        assert!(!workspace.path().join("end").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_future_drop_stops_owned_child_before_barrier_release() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("blocked.py"),
+            "import os,time
+from pathlib import Path
+Path('started').write_text(str(os.getpid()))
+while not Path('release').exists(): time.sleep(0.01)
+Path('end').touch()
+",
+        )
+        .unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["python3".into()],
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let mut future =
+            Box::pin(tool.execute(json!({"command":"python3 blocked.py", "timeout_secs":30})));
+        let started_path = workspace.path().join("started");
+        let pid = tokio::select! {
+            pid = wait_owned_shell_start(&started_path) => pid,
+            result = &mut future => panic!("shell completed before barrier: {result:?}"),
+        };
+        drop(future);
+        assert_owned_shell_stopped(pid).await;
+        assert!(!workspace.path().join("release").exists());
+        assert!(!workspace.path().join("end").exists());
+    }
+
     #[test]
     fn shell_tool_name() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
