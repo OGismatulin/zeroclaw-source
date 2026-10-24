@@ -953,23 +953,25 @@ class EpisodeTracker:
         row_session = legacy[0] if legacy is not None else zc.get("session_key")
         row_session = row_session if isinstance(row_session, str) and row_session else None
         key = (row_session, turn)
-        if row_session is None and key not in self._open:
-            matches = [candidate for candidate in self._open if candidate[1] == turn]
-            if len(matches) == 1:
-                key = matches[0]
         ep = self._open.get(key)
         if ep is None:
             ep = self._open[key] = {
-                "id": turn, "first": stamp, "last": stamp, "jira": False, "cron": None,
+                "id": f"{row_session}:{turn}" if row_session else turn,
+                "first": stamp, "last": stamp, "jira": False, "cron": None,
                 "session_key": row_session, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
                 "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
                 "failed_calls": [], "final": None, "legacy_final": None,
                 "legacy_final_chars": 0, "cancelled": False,
-                "error": False, "drift": False,
+                "error": False, "drift": False, "legacy_webhook_request": False,
             }
         ep["first"] = min(ep["first"], stamp)
         ep["last"] = max(ep["last"], stamp)
+        descriptor = row.get("event")
+        action = descriptor.get("action") if isinstance(descriptor, dict) else None
+        if (row_session is None and (row.get("event_type") or action) == "llm_request"
+                and (row.get("channel") or zc.get("channel")) == "webhook"):
+            ep["legacy_webhook_request"] = True
         if str(zc.get("runtime_profile") or "").startswith("jira_"):
             ep["jira"] = True
         if zc.get("cron_job_id"):
@@ -1065,15 +1067,47 @@ class EpisodeTracker:
             ep["error"] = True
 
     def closed(self, now: datetime, idle_secs: float = EPISODE_IDLE_SECS) -> list[dict]:
+        for (session, turn), pending in list(self._open.items()):
+            if session is not None:
+                continue
+            matches = [ep for (known, candidate), ep in self._open.items()
+                       if known is not None and candidate == turn]
+            if len(matches) != 1:
+                continue
+            target = matches[0]
+            target["first"] = min(target["first"], pending["first"])
+            target["last"] = max(target["last"], pending["last"])
+            target["jira"] |= pending["jira"]
+            target["cron"] = target["cron"] or pending["cron"]
+            target["aliases"].update(pending["aliases"])
+            target["llm_calls"] += pending["llm_calls"]
+            target["input_tokens"] += pending["input_tokens"]
+            target["output_tokens"] += pending["output_tokens"]
+            target["models"].update(pending["models"])
+            target["tools"].update(pending["tools"])
+            target["skills"].update(pending["skills"])
+            for command in pending["commands"]:
+                if command not in target["commands"] and len(target["commands"]) < EPISODE_MAX_COMMANDS:
+                    target["commands"].append(command)
+            target["adhoc_paths"].update(pending["adhoc_paths"])
+            target["adhoc_scripts"] += pending["adhoc_scripts"]
+            target["failures"].extend(pending["failures"][:EPISODE_MAX_FAILURES - len(target["failures"])])
+            target["failed_calls"].extend(pending["failed_calls"])
+            if pending["final"] is not None and (target["final"] is None or not target["final"]):
+                target["final"] = pending["final"]
+            target["legacy_final"] = target["legacy_final"] or pending["legacy_final"]
+            target["legacy_final_chars"] = max(target["legacy_final_chars"], pending["legacy_final_chars"])
+            target["cancelled"] |= pending["cancelled"]
+            target["error"] |= pending["error"]
+            target["drift"] |= pending["drift"]
+            del self._open[(None, turn)]
         records = []
         for ep in self._open.values():
             if (now - ep["last"]).total_seconds() < idle_secs:
                 continue
+            if ep["session_key"] is None and ep["legacy_webhook_request"] and ep["final"] is None:
+                continue
             records.append(self._record(ep))
-        id_counts = Counter(record["id"] for record in records)
-        for record in records:
-            if id_counts[record["id"]] > 1:
-                record["id"] = f"{record['session_key'] or 'unknown'}:{record['id']}"
         return records
 
     def _origin(self, ep: dict) -> tuple[str, str | None]:
@@ -1199,11 +1233,31 @@ def sweep(
             handle.write(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n")
 
     episode_known: dict[str, set[str]] = {}
+    episode_legacy_known: dict[str, set[tuple[str, str, str]]] = {}
     episodes_appended = 0
 
     def _episode_ids(day: str) -> set[str]:
         if day not in episode_known:
-            episode_known[day] = _known_ids(episodes_dir(data_root) / f"{day}.jsonl")
+            path = episodes_dir(data_root) / f"{day}.jsonl"
+            ids: set[str] = set()
+            legacy: set[tuple[str, str, str]] = set()
+            if path.is_file():
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(row, dict) or row.get("kind") == RECOVERY_KIND:
+                        continue
+                    ident = row.get("id")
+                    if ident:
+                        ids.add(str(ident))
+                    user, session = row.get("user"), row.get("session_key")
+                    if (row.get("kind") == "episode" and isinstance(ident, str)
+                            and isinstance(user, str) and isinstance(session, str) and session):
+                        legacy.add((user, session, ident))
+            episode_known[day] = ids
+            episode_legacy_known[day] = legacy
         return episode_known[day]
 
     def _sink_episode(record: dict) -> None:
@@ -1212,11 +1266,17 @@ def sweep(
         episode_day = stamp.astimezone(tz).date().isoformat()
         path = episodes_dir(data_root) / f"{episode_day}.jsonl"
         previous_day = (stamp.astimezone(tz).date() - timedelta(days=1)).isoformat()
-        if record["id"] in _episode_ids(previous_day):
+        prior = _episode_ids(previous_day)
+        current = _episode_ids(episode_day)
+        if record["id"] in prior or record["id"] in current:
             return
-        _episode_ids(episode_day)
-        if record["id"] in episode_known[episode_day]:
-            return
+        session = record.get("session_key")
+        if isinstance(session, str) and record["id"].startswith(f"{session}:"):
+            original = record["id"][len(session) + 1:]
+            legacy_key = (record["user"], session, original)
+            if (legacy_key in episode_legacy_known[previous_day]
+                    or legacy_key in episode_legacy_known[episode_day]):
+                return
         if apply:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
