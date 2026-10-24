@@ -50,6 +50,7 @@ skips=(
     # (`zeroclaw_log::__private_test_writer_lock` vs `TRACE_TEST_LOCK`), so the
     # row lands elsewhere and the count reads 0. Covered by the nextest `Test` job.
     tools::scoped::tests::assemble_emits_one_mcp_connect_failure_per_failed_boot_connect
+    cron::store::tests::remove_job_emits_structured_cron_delete_event
 )
 skip_args=()
 for skip in "${skips[@]}"; do
@@ -59,6 +60,10 @@ done
 for crate in "${crates[@]}"; do
     for ((run = 1; run <= runs; run++)); do
         echo "==> parallel runtime regression: $crate run $run/$runs ($threads threads)"
+        if [[ "$crate" == zeroclaw-runtime ]]; then
+            cargo test --locked --quiet -p "$crate" --lib \
+                cron::store::tests::remove_job_emits_structured_cron_delete_event -- --exact
+        fi
         cargo test --locked --quiet -p "$crate" --lib -- \
             --test-threads="$threads" "${skip_args[@]}"
     done
