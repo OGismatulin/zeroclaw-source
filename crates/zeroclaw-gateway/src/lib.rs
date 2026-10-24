@@ -12040,7 +12040,8 @@ path = "{trigger_path}"
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let child_uri = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
 
         let foreign_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let foreign_state = fresh_model_test_state(
@@ -12114,7 +12115,7 @@ path = "{trigger_path}"
         );
         state.config = Arc::new(RwLock::new(config));
 
-        let response = tokio::spawn(async move {
+        let response = zeroclaw_spawn::spawn!(async move {
             Box::pin(test_correlated_webhook(
                 state,
                 "tg_nested_delegate_fixture",
