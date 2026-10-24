@@ -339,16 +339,17 @@ pub fn record_mcp_connect_failure(
 /// pass 0. The fields are reserved in the trace payload for future plumbing.
 pub fn record_turn_cancelled(
     session_id: &str,
+    turn_id: &str,
     iterations_completed: u32,
     tool_calls_executed: u32,
     reason: &str,
 ) {
     record_event(
         "turn_cancelled",
+        Some("webhook"),
         None,
         None,
-        None,
-        None,
+        Some(turn_id),
         None,
         None,
         serde_json::json!({

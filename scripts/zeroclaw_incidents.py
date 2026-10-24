@@ -897,9 +897,8 @@ def _utc_iso(moment: datetime) -> str:
 
 
 def _legacy_final_parts(row: dict) -> tuple[str, str] | None:
-    if _turn_key(row):
-        return None
-    if row.get("event_type") == "turn_final_response":
+    kind = row.get("event_type")
+    if kind in ("turn_final_response", "turn_error", "turn_cancelled"):
         payload = row.get("payload")
         session_id = payload.get("session_id") if isinstance(payload, dict) else None
         flag = str(row.get("success")).lower()
@@ -908,20 +907,25 @@ def _legacy_final_parts(row: dict) -> tuple[str, str] | None:
         attrs = row.get("attributes")
         if row.get("message") is not None or not isinstance(event, dict):
             return None
-        if event.get("action") != "turn_final_response" or not isinstance(attrs, dict):
+        kind = event.get("action")
+        if kind not in ("turn_final_response", "turn_error", "turn_cancelled") or not isinstance(attrs, dict):
             return None
         session_id = attrs.get("session_id")
         flag = {"success": "true", "failure": "false"}.get(str(event.get("outcome")), "")
-    if not session_id or flag not in ("true", "false"):
+    if not isinstance(session_id, str) or not session_id:
         return None
-    return str(session_id), flag
+    if kind == "turn_cancelled":
+        return session_id, "cancelled"
+    if kind == "turn_error":
+        return session_id, "error"
+    return (session_id, flag) if flag in ("true", "false") else None
 
 
 class EpisodeTracker:
     def __init__(self, user: str, cron_names: Mapping[str, str]) -> None:
         self._user = user
         self._names = cron_names
-        self._open: dict[str, dict] = {}
+        self._open: dict[tuple[str | None, str], dict] = {}
         self._commands: dict[str, str] = {}
         self._twin_gates: set[str] = set()
         self._earliest: datetime | None = None
@@ -938,26 +942,34 @@ class EpisodeTracker:
         ):
             self._twin_gates.add(incident.tool_call_id)
         legacy = _legacy_final_parts(row)
-        if legacy is not None:
-            self._legacy_final(*legacy)
-            return
         turn = _turn_key(row)
+        if legacy is not None and not turn:
+            self._legacy_final(*legacy, row)
+            return
         if not turn or stamp is None:
             return
-        ep = self._open.get(turn)
+        zc = row.get("zeroclaw")
+        zc = zc if isinstance(zc, dict) else {}
+        row_session = legacy[0] if legacy is not None else zc.get("session_key")
+        row_session = row_session if isinstance(row_session, str) and row_session else None
+        key = (row_session, turn)
+        if row_session is None and key not in self._open:
+            matches = [candidate for candidate in self._open if candidate[1] == turn]
+            if len(matches) == 1:
+                key = matches[0]
+        ep = self._open.get(key)
         if ep is None:
-            ep = self._open[turn] = {
+            ep = self._open[key] = {
                 "id": turn, "first": stamp, "last": stamp, "jira": False, "cron": None,
-                "session_key": None, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
+                "session_key": row_session, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
                 "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
-                "failed_calls": [], "final": None, "legacy_final": None, "cancelled": False,
+                "failed_calls": [], "final": None, "legacy_final": None,
+                "legacy_final_chars": 0, "cancelled": False,
                 "error": False, "drift": False,
             }
         ep["first"] = min(ep["first"], stamp)
         ep["last"] = max(ep["last"], stamp)
-        zc = row.get("zeroclaw")
-        zc = zc if isinstance(zc, dict) else {}
         if str(zc.get("runtime_profile") or "").startswith("jira_"):
             ep["jira"] = True
         if zc.get("cron_job_id"):
@@ -980,20 +992,37 @@ class EpisodeTracker:
             self._tool_start(ep, attrs)
         elif message == "turn_final_response":
             ep["final"] = len(str(attrs.get("text") or "").strip())
+        if legacy is not None:
+            self._legacy_final(*legacy, row)
         if incident is not None and incident.turn_id == turn:
             self._incident(ep, incident)
         if drift is not None and drift.turn_id == turn:
             ep["drift"] = True
 
-    def _legacy_final(self, session_id: str, flag: str) -> None:
-        candidates = [
-            ep for ep in self._open.values()
-            if ep["session_key"] == session_id and ep["final"] is None
-            and ep["legacy_final"] is None
-        ]
-        if candidates:
+    def _legacy_final(self, session_id: str, flag: str, row: dict) -> None:
+        turn = _turn_key(row)
+        if turn:
+            target = self._open.get((session_id, turn))
+            if target is None:
+                return
+        else:
+            candidates = [
+                ep for ep in self._open.values()
+                if ep["session_key"] == session_id and ep["final"] is None
+                and ep["legacy_final"] is None
+            ]
+            if not candidates:
+                return
             target = max(candidates, key=lambda ep: (ep["last"], ep["first"]))
-            target["legacy_final"] = "answered" if flag == "true" else "error"
+        if flag == "cancelled":
+            target["cancelled"] = True
+        elif flag == "error" or flag == "false":
+            target["error"] = True
+        else:
+            attrs = row.get("payload") or row.get("attributes") or {}
+            text = attrs.get("text") if isinstance(attrs, dict) else None
+            target["legacy_final"] = "answered"
+            target["legacy_final_chars"] = len(text.strip()) if isinstance(text, str) else 0
 
     @staticmethod
     def _tool_start(ep: dict, attrs: dict) -> None:
@@ -1041,6 +1070,10 @@ class EpisodeTracker:
             if (now - ep["last"]).total_seconds() < idle_secs:
                 continue
             records.append(self._record(ep))
+        id_counts = Counter(record["id"] for record in records)
+        for record in records:
+            if id_counts[record["id"]] > 1:
+                record["id"] = f"{record['session_key'] or 'unknown'}:{record['id']}"
         return records
 
     def _origin(self, ep: dict) -> tuple[str, str | None]:
@@ -1059,10 +1092,12 @@ class EpisodeTracker:
         origin, ref = self._origin(ep)
         if ep["cancelled"]:
             outcome = "cancelled"
-        elif ep["final"] is not None:
-            outcome = "answered" if ep["final"] > 0 else "empty"
+        elif ep["final"]:
+            outcome = "answered"
         elif ep["legacy_final"]:
             outcome = ep["legacy_final"]
+        elif ep["final"] is not None:
+            outcome = "empty"
         elif ep["error"]:
             outcome = "error"
         else:
@@ -1094,7 +1129,7 @@ class EpisodeTracker:
             "commands": ep["commands"], "adhoc_scripts": ep["adhoc_scripts"],
             "failure_count": len(gated) - gate_count, "gate_count": gate_count,
             "failures": failures, "outcome": outcome,
-            "final_chars": ep["final"] or 0, "drift": ep["drift"],
+            "final_chars": ep["final"] or ep["legacy_final_chars"], "drift": ep["drift"],
             "start_maybe_evicted": evicted,
         }
 
