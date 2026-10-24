@@ -3310,6 +3310,7 @@ async fn run_gateway_webhook_agentic(
         None => ::zeroclaw_log::Span::none(),
     };
     let cancellation_token = cancel_handle.as_ref().map(|(_, t)| t.clone());
+    let turn_id = uuid::Uuid::new_v4().to_string();
     let (result, provider_fallback) =
         zeroclaw_providers::reliable::scope_provider_fallback(async {
             // fork(stabilization): wrap the whole agent_turn(...).await so the
@@ -3355,7 +3356,7 @@ async fn run_gateway_webhook_agentic(
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                     None,
                     Some(&agent_alias),
-                    None, // turn_id: self-minted
+                    Some(&turn_id),
                 )
                 .instrument(session_scope),
             )
@@ -3398,10 +3399,13 @@ async fn run_gateway_webhook_agentic(
                 Some("webhook"),
                 Some(provider_name),
                 Some(model_name),
-                None,
+                Some(&turn_id),
                 Some(true),
                 None,
-                serde_json::json!({ "session_id": session_id.unwrap_or_default() }),
+                serde_json::json!({
+                    "session_id": session_id.unwrap_or_default(),
+                    "text": zeroclaw_runtime::agent::loop_::scrub_credentials(&response),
+                }),
             );
             Ok(TurnOutcome::Ok(response))
         }
@@ -3410,6 +3414,7 @@ async fn run_gateway_webhook_agentic(
 
             zeroclaw_runtime::observability::runtime_trace::record_turn_cancelled(
                 session_id.unwrap_or_default(),
+                &turn_id,
                 0, // iterations_completed — best-effort; loop doesn't return counters today
                 0, // tool_calls_executed — same
                 "superseded",
@@ -3426,7 +3431,19 @@ async fn run_gateway_webhook_agentic(
 
             Ok(TurnOutcome::Cancelled)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            zeroclaw_runtime::observability::runtime_trace::record_event(
+                "turn_error",
+                Some("webhook"),
+                Some(provider_name),
+                Some(model_name),
+                Some(&turn_id),
+                Some(false),
+                None,
+                serde_json::json!({ "session_id": session_id.unwrap_or_default() }),
+            );
+            Err(err)
+        }
     };
 
     // Post-turn context compression: if the history grew past threshold for
@@ -8984,6 +9001,8 @@ path = "{trigger_path}"
         /// would race with `select!` and produce non-`ToolLoopCancelled` error
         /// paths, which the gateway's `is_tool_loop_cancelled` guard would reject.
         slow_ms: AtomicUsize,
+        response: std::sync::Mutex<Option<String>>,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -9000,7 +9019,15 @@ path = "{trigger_path}"
             if slow > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(slow as u64)).await;
             }
-            Ok("ok".into())
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("synthetic provider failure")
+            }
+            Ok(self
+                .response
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "ok".into()))
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
@@ -9013,6 +9040,67 @@ path = "{trigger_path}"
         }
         fn alias(&self) -> &str {
             "MockModelProvider"
+        }
+    }
+
+    struct ToolLoopModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for ToolLoopModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("summary".into())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let tool_calls = if request.tools.is_some() {
+                vec![zeroclaw_providers::ToolCall {
+                    id: "tool-1".into(),
+                    name: "nonexistent_tool".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: if tool_calls.is_empty() {
+                    Some("summary".into())
+                } else {
+                    None
+                },
+                tool_calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolLoopModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolLoopModelProvider"
         }
     }
 
@@ -11733,6 +11821,314 @@ path = "{trigger_path}"
         // Critical: MockModelProvider was actually invoked via state.model_provider,
         // proving no per-request provider was built for the default path.
         assert!(provider_impl.calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_handler_correlates_native_and_legacy_final_with_one_turn_id() {
+        use zeroclaw_config::schema::{LogPersistence, ObservabilityConfig};
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_path = tmp.path().join("trace.jsonl");
+        let config = ObservabilityConfig {
+            log_persistence: LogPersistence::Rolling,
+            log_persistence_path: trace_path.to_string_lossy().into_owned(),
+            log_persistence_max_entries: 1000,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&config, tmp.path());
+
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let state = fresh_model_test_state(provider, memory, "mock", "test-model");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            axum::http::HeaderValue::from_static("tg_user_correlation"),
+        );
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery { agent: None }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                model: None,
+                provider: None,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["response"], "ok");
+
+        let native: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        zeroclaw_log::clear_broadcast_hook();
+        let request = native
+            .iter()
+            .find(|row| {
+                row["message"] == "llm_request"
+                    && row["zeroclaw"]["session_key"] == "tg_user_correlation"
+            })
+            .expect("native webhook llm_request");
+        let turn_id = request["trace_id"].as_str().expect("engine trace ID");
+        let final_row = native
+            .iter()
+            .find(|row| row["message"] == "turn_final_response" && row["trace_id"] == turn_id)
+            .expect("native terminal with engine ID");
+        assert_eq!(final_row["zeroclaw"]["session_key"], "tg_user_correlation");
+
+        let trace = std::fs::read_to_string(&trace_path).unwrap();
+        let legacy = trace
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| {
+                row["event_type"] == "turn_final_response"
+                    && row["payload"]["session_id"] == "tg_user_correlation"
+            })
+            .expect("legacy webhook terminal");
+        assert_eq!(legacy["turn_id"], turn_id);
+        assert_eq!(legacy["payload"]["text"], body["response"]);
+        assert!(legacy["message"].is_null());
+
+        zeroclaw_log::migrate_legacy_jsonl_in_place(&trace_path).unwrap();
+        let migrated = std::fs::read_to_string(&trace_path).unwrap();
+        let migrated_final: serde_json::Value = migrated
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["event"]["action"] == "turn_final_response")
+            .unwrap();
+        assert_eq!(migrated_final["trace_id"], turn_id);
+        assert_eq!(
+            migrated_final["attributes"]["session_id"],
+            "tg_user_correlation"
+        );
+        assert_eq!(migrated_final["attributes"]["text"], body["response"]);
+        assert!(migrated_final["message"].is_null());
+    }
+
+    async fn test_correlated_webhook(
+        state: AppState,
+        session_id: &str,
+        message: &str,
+    ) -> axum::response::Response {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", session_id.parse().unwrap());
+        handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery { agent: None }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: message.into(),
+                model: None,
+                provider: None,
+            })),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn webhook_handler_correlates_empty_error_and_cancel_terminals() {
+        use zeroclaw_config::schema::{LogPersistence, ObservabilityConfig};
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_path = tmp.path().join("trace.jsonl");
+        let config = ObservabilityConfig {
+            log_persistence: LogPersistence::Rolling,
+            log_persistence_path: trace_path.to_string_lossy().into_owned(),
+            log_persistence_max_entries: 1000,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&config, tmp.path());
+
+        let empty_provider = Arc::new(MockModelProvider::default());
+        *empty_provider.response.lock().unwrap() = Some("<eom>".into());
+        let empty_state = fresh_model_test_state(
+            empty_provider.clone(),
+            Arc::new(MockMemory),
+            "mock",
+            "test-model",
+        );
+        let empty_response =
+            Box::pin(test_correlated_webhook(empty_state, "tg_empty", "empty")).await;
+        assert_eq!(empty_response.status(), StatusCode::OK);
+        let empty_body: serde_json::Value = serde_json::from_slice(
+            &empty_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert!(!empty_body["response"].as_str().unwrap().trim().is_empty());
+
+        let error_provider = Arc::new(MockModelProvider::default());
+        error_provider.fail.store(true, Ordering::SeqCst);
+        let error_state = fresh_model_test_state(
+            error_provider.clone(),
+            Arc::new(MockMemory),
+            "mock",
+            "test-model",
+        );
+        let error_response =
+            Box::pin(test_correlated_webhook(error_state, "tg_error", "error")).await;
+        assert_ne!(error_response.status(), StatusCode::OK);
+
+        let cancel_provider = Arc::new(MockModelProvider::default());
+        cancel_provider.slow_ms.store(2000, Ordering::SeqCst);
+        let cancel_state = fresh_model_test_state(
+            cancel_provider.clone(),
+            Arc::new(MockMemory),
+            "mock",
+            "test-model",
+        );
+        let first = Box::pin(test_correlated_webhook(
+            cancel_state.clone(),
+            "tg_cancel",
+            "first",
+        ));
+        let second = async {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            cancel_provider.slow_ms.store(0, Ordering::SeqCst);
+            Box::pin(test_correlated_webhook(cancel_state, "tg_cancel", "second")).await
+        };
+        let (cancel_response, next_response) = tokio::join!(first, second);
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+        assert_eq!(next_response.status(), StatusCode::OK);
+        let cancel_body: serde_json::Value = serde_json::from_slice(
+            &cancel_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cancel_body["status"], "cancelled");
+
+        let native: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        zeroclaw_log::clear_broadcast_hook();
+        let legacy: Vec<serde_json::Value> = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for (session_id, kind) in [
+            ("tg_empty", "turn_final_response"),
+            ("tg_error", "turn_error"),
+            ("tg_cancel", "turn_cancelled"),
+        ] {
+            let row = legacy
+                .iter()
+                .find(|row| row["event_type"] == kind && row["payload"]["session_id"] == session_id)
+                .unwrap();
+            let turn_id = row["turn_id"].as_str().expect("gateway turn ID");
+            assert!(native.iter().any(|entry| entry["message"] == "llm_request"
+                && entry["trace_id"] == turn_id
+                && entry["zeroclaw"]["session_key"] == session_id));
+            assert!(
+                !legacy
+                    .iter()
+                    .any(|entry| entry["event_type"] == "turn_final_response"
+                        && entry["turn_id"] == turn_id
+                        && kind != "turn_final_response")
+            );
+            if session_id == "tg_empty" {
+                assert_eq!(row["payload"]["text"], empty_body["response"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_handler_max_iterations_has_correlated_legacy_only_final() {
+        use zeroclaw_config::schema::{LogPersistence, ObservabilityConfig, RuntimeProfileConfig};
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let trace_path = tmp.path().join("trace.jsonl");
+        let config = ObservabilityConfig {
+            log_persistence: LogPersistence::Rolling,
+            log_persistence_path: trace_path.to_string_lossy().into_owned(),
+            log_persistence_max_entries: 1000,
+            ..ObservabilityConfig::default()
+        };
+        zeroclaw_runtime::observability::runtime_trace::init_from_config(&config, tmp.path());
+
+        let provider: Arc<dyn ModelProvider> = Arc::new(ToolLoopModelProvider);
+        let state = fresh_model_test_state(provider, Arc::new(MockMemory), "mock", "test-model");
+        {
+            let mut config = state.config.write();
+            config.agents.get_mut("default").unwrap().runtime_profile = "cap".into();
+            config.runtime_profiles.insert(
+                "cap".into(),
+                RuntimeProfileConfig {
+                    max_tool_iterations: 1,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        let response = Box::pin(test_correlated_webhook(state, "tg_max_iter", "exhaust")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(body["response"].as_str().unwrap().contains("summary"));
+
+        let native: Vec<serde_json::Value> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        zeroclaw_log::clear_broadcast_hook();
+        let legacy: Vec<serde_json::Value> = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let final_row = legacy
+            .iter()
+            .find(|row| {
+                row["event_type"] == "turn_final_response"
+                    && row["payload"]["session_id"] == "tg_max_iter"
+            })
+            .expect("legacy max-iteration final");
+        let turn_id = final_row["turn_id"].as_str().expect("gateway turn ID");
+        assert_eq!(final_row["payload"]["text"], body["response"]);
+        assert!(native.iter().any(|row| row["message"] == "llm_request"
+            && row["trace_id"] == turn_id
+            && row["zeroclaw"]["session_key"] == "tg_max_iter"));
+        assert!(
+            native
+                .iter()
+                .any(|row| row["message"] == "tool_loop_exhausted" && row["trace_id"] == turn_id)
+        );
+        assert!(
+            !native
+                .iter()
+                .any(|row| row["message"] == "turn_final_response" && row["trace_id"] == turn_id)
+        );
     }
 
     #[tokio::test]
