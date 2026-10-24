@@ -1443,6 +1443,7 @@ def sweep(
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _WS_PATH_RE = re.compile(r"/zeroclaw-data/workspaces/tg_\d+/")
 _NUM_RE = re.compile(r"\d+")
+_RECOVERY_HINT_RE = re.compile(r"\nRecovery hint: [^\n]*")
 MAX_SIGNATURE_CHARS = 120
 
 HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -1481,6 +1482,9 @@ def hint_for(error: str, error_kind: str | None) -> str | None:
 
 
 def _signature(error: str) -> str:
+    prefix, policy, refusal = error.partition("Command not allowed by security policy: ")
+    if policy:
+        error = prefix + policy + _RECOVERY_HINT_RE.sub("", refusal, count=1)
     text = _WS_PATH_RE.sub("<ws>/", error)
     text = _UUID_RE.sub("<uuid>", text)
     return _NUM_RE.sub("<n>", text)[:MAX_SIGNATURE_CHARS]
