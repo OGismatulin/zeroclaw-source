@@ -20,7 +20,6 @@ permissions:
 jobs:
   deploy:
     name: Deploy app
-    environment: fly-production
     runs-on: ubuntu-latest
     concurrency: zc-deploy-group
     if: >-
