@@ -221,6 +221,8 @@ COPY scripts/zeroclaw_incidents.py /usr/local/bin/zeroclaw_incidents.py
 
 # mcp pinned <2: 2.0.0 removed mcp.server.fastmcp (renamed to mcp.server.MCPServer),
 # which mcp_db_server.py imports — unpinned float broke lalafo-db MCP in prod 2026-08-03.
+COPY --from=node:22.23.4-trixie-slim@sha256:8eb619e402eaede1748a3c8173bffab391592812e85136452f781741c7242ddf /usr/local/bin/node /usr/local/bin/node
+
 RUN node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)'
 
 RUN pip install --no-cache-dir --break-system-packages "prometheus-client==0.26.0" "tzdata==2025.3" requests pandas croniter psycopg2-binary httpx "mcp[cli]<2" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn "yt-dlp[default]==2026.10.21"
