@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import select
 import unicodedata
 import secrets
 import signal
@@ -4107,6 +4108,7 @@ LALAFO_RELAY_TOKEN_ENV = "ZEROCLAW_RELAY_TOKEN"
 LALAFO_RELAY_MAX_BODY = 1024
 LALAFO_RELAY_MAX_RESPONSE = 64 * 1024
 LALAFO_RELAY_TIMEOUT_SECS = 12.0
+LALAFO_RELAY_IDLE_SECS = 30.0
 LALAFO_RELAY_PUSH_UP_KEYS = frozenset({"updated_time", "last_push_up"})
 
 
@@ -4141,6 +4143,7 @@ LALAFO_RELAY_ROUTES = (
 class LalafoRelay:
     token: str
     send: Callable[[str, str, str, bytes], tuple[int, str, bytes]]
+    close: Callable[[], None] | None = None
 
 
 def _lalafo_relay_route(
@@ -4170,34 +4173,93 @@ def _lalafo_relay_body_ok(route: LalafoRelayRoute, body: bytes | None) -> bool:
     )
 
 
-def _lalafo_relay_send(
-    method: str, host: str, path: str, body: bytes
-) -> tuple[int, str, bytes]:
-    headers = {"Accept": "*/*", "User-Agent": "zeroclaw-lalafo-relay"}
-    if body:
-        headers["Content-Type"] = "application/json"
-    connection = http.client.HTTPSConnection(
-        host, timeout=LALAFO_RELAY_TIMEOUT_SECS, context=ssl.create_default_context()
-    )
-    try:
-        connection.request(method, path, body=body, headers=headers)
-        response = connection.getresponse()
-        data = response.read(LALAFO_RELAY_MAX_RESPONSE + 1)
-        if len(data) > LALAFO_RELAY_MAX_RESPONSE:
-            raise http.client.HTTPException("upstream response exceeds the relay cap")
-        if response.length:
-            raise http.client.IncompleteRead(data, response.length)
-        content_type = response.getheader("Content-Type") or "application/octet-stream"
-        return response.status, content_type, data
-    finally:
+class LalafoRelayTransport:
+    def __init__(self) -> None:
+        self._context = ssl.create_default_context()
+        self._lock = threading.Lock()
+        self._idle: dict[str, list[tuple[http.client.HTTPSConnection, float]]] = {
+            route.host: [] for route in LALAFO_RELAY_ROUTES
+        }
+        self._closed = False
+
+    def _take(self, host: str) -> http.client.HTTPSConnection | None:
+        with self._lock:
+            if self._closed:
+                raise OSError("relay transport is closed")
+            idle = self._idle[host]
+            while idle:
+                connection, returned_at = idle.pop()
+                if (
+                    time.monotonic() - returned_at < LALAFO_RELAY_IDLE_SECS
+                    and connection.sock is not None
+                    and not select.select([connection.sock], [], [], 0)[0]
+                ):
+                    return connection
+                connection.close()
+        return None
+
+    def _give_back(self, host: str, connection: http.client.HTTPSConnection) -> None:
+        with self._lock:
+            if not self._closed:
+                self._idle[host].append((connection, time.monotonic()))
+                return
         connection.close()
+
+    def send(
+        self, method: str, host: str, path: str, body: bytes
+    ) -> tuple[int, str, bytes]:
+        connection = self._take(host)
+        reused = connection is not None
+        if connection is None:
+            connection = http.client.HTTPSConnection(
+                host, timeout=LALAFO_RELAY_TIMEOUT_SECS, context=self._context
+            )
+        headers = {"Accept": "*/*", "User-Agent": "zeroclaw-lalafo-relay"}
+        if body:
+            headers["Content-Type"] = "application/json"
+        try:
+            if connection.sock is None:
+                connection.connect()
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            data = response.read(LALAFO_RELAY_MAX_RESPONSE + 1)
+            if len(data) > LALAFO_RELAY_MAX_RESPONSE:
+                raise http.client.HTTPException(
+                    "upstream response exceeds the relay cap"
+                )
+            if response.length:
+                raise http.client.IncompleteRead(data, response.length)
+        except BaseException as exc:
+            connection.close()
+            if reused:
+                print(
+                    "[gateway-manager] lalafo-relay reuse_failed "
+                    f"host={host} error={type(exc).__name__}",
+                    flush=True,
+                )
+            raise
+        content_type = response.getheader("Content-Type") or "application/octet-stream"
+        self._give_back(host, connection)
+        return response.status, content_type, data
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            idle = [
+                connection for entries in self._idle.values() for connection, _ in entries
+            ]
+            for entries in self._idle.values():
+                entries.clear()
+        for connection in idle:
+            connection.close()
 
 
 def _lalafo_relay_from_env() -> LalafoRelay | None:
     token = os.environ.get(LALAFO_RELAY_TOKEN_ENV, "").strip()
     if not token:
         return None
-    return LalafoRelay(token=token, send=_lalafo_relay_send)
+    transport = LalafoRelayTransport()
+    return LalafoRelay(token=token, send=transport.send, close=transport.close)
 
 
 class VolumeJanitor:
@@ -4296,13 +4358,16 @@ class VolumeJanitor:
 
 
 def vpn_flap_message(count: int, window_secs: float) -> str:
-    minutes = max(int(window_secs) // 60, 1)
+    minutes = max(math.ceil(window_secs / 60), 1)
     return (
-        f"⚠ VPN-туннель прода флапает: {count} обрывов за {minutes} мин.\n\n"
-        "Частая причина — второй клиент того же `client.ovpn`, обычно поднятый"
-        " локальный docker-стек. Погаси его: `docker compose stop zeroclaw`\n\n"
-        "Пока туннель флапает, БД, Grafana и Graylog с прода недоступны."
-        " Последние обрывы: `grep SIGUSR1 /tmp/openvpn.log | tail -3`"
+        f"⚠ VPN-туннель ZeroClaw: не менее {count} обрывов за последние {minutes} мин.\n\n"
+        "Во время переподключений возможны перебои доступа к ресурсам через VPN, "
+        "включая relay подъёма объявлений. "
+        "Доступность БД, Grafana и Graylog отдельно не проверена.\n\n"
+        "Проверь последние обрывы: "
+        "`grep -F 'SIGUSR1[soft,connection-reset]' /tmp/openvpn.log | tail -3`\n\n"
+        "Одна из возможных причин — второй клиент того же VPN-сертификата. "
+        "Сначала подтверди конфликт по журналам клиентов и VPN-сервера."
     )
 
 
@@ -5219,6 +5284,9 @@ def main() -> int:
             stop_event = getattr(report_worker, "stop_event", None)
             if stop_event is not None:
                 stop_event.set()
+        relay = getattr(app, "lalafo_relay", None)
+        if relay is not None and relay.close is not None:
+            relay.close()
     return 0
 
 
