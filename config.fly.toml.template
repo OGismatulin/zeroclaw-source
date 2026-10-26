@@ -997,12 +997,8 @@ risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
 
-# jira_html_worker renders the HTML report (render_html, 2026-08-31). It shares
-# openai.codex_luna with analyst_luna (gpt-6-luna, max effort); the report is
-# user-facing. jira_worker stays on opencode.flash for translation and legacy
-# visual runs.
 [agents.jira_html_worker]
-model_provider = "openai.codex_luna"
+model_provider = "opencode.flash"
 risk_profile = "default"
 runtime_profile = "jira_analysis"
 mcp_bundles = ["all"]
