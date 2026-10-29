@@ -1,5 +1,5 @@
 {
-  "captured_at": "2026-10-08T15:58:48+00:00",
+  "captured_at": "2026-10-29T13:53:55+00:00",
   "source": "https://microsoft365.mcp.claude.com/mcp",
   "tools": [
     {
@@ -16,13 +16,13 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 100000,
-            "description": "For paginated file:/// (SharePoint/OneDrive) reads only: 1-based page number to start from. Applies to PDFs and Office formats that the connector reads via Graph's PDF conversion (e.g. docx, pptx), where a page is a document page, and to plain-text files (.txt, .csv, .tsv, .json, .md, .xml, .html, .htm, .log), where a page is as many whole lines as fit in one call and each call returns one page (for .csv/.tsv a line is a record — a line break inside a double-quoted field does not end it — and the header line is repeated on every page after the first). When more remains, the text ends with a footer like '[truncated: pages 1-14 of 16 — re-call with startPage=15]' or '[page 1 — lines 1–590 of a 6800000-byte file — more follows; re-call with startPage=2]'; follow that hint to read later pages. A plain-text file returned with no footer is complete; otherwise its final page ends in 'last page'. Each call can return up to ~200k characters of text, so many pages may fill the context window quickly. Ignored for every other URI scheme and for image and .xlsx workbook reads."
+            "description": "For paginated file:/// (SharePoint/OneDrive) reads only: 1-based page number to start from. Applies to PDFs and Office formats that the connector reads via Graph's PDF conversion (e.g. docx, pptx), where a page is a document page; to .xlsx workbooks, where a page is a worksheet, numbered as in the list at the top of the text (hidden sheets count; if the text instead begins by saying the workbook was read through its PDF conversion, a page is a PDF page); and to plain-text files (.txt, .csv, .tsv, .json, .md, .xml, .html, .htm, .log), where a page is as many whole lines as fit in one call and each call returns one page (for .csv/.tsv a line is a record — a line break inside a double-quoted field does not end it — and the header line is repeated on every page after the first). When more remains, the text ends with a footer like '[truncated: pages 1-14 of 16 — re-call with startPage=15]', '[Sheets 3–20 were not read; call again with startPage=3 to continue from sheet 3 (\"Budget\").]' or '[page 1 — lines 1–590 of a 6800000-byte file — more follows; re-call with startPage=2]'; follow that hint to read later pages. A plain-text file returned with no footer is complete; otherwise its final page ends in 'last page'. Applies also to a folder listing, where a page is 200 entries and each call returns one page; a final 'Note:' line says when to re-call with the next startPage. Each call can return up to ~200k characters of text, so many pages may fill the context window quickly. Ignored for every other URI scheme and for image reads."
           },
           "endPage": {
             "type": "integer",
             "minimum": 1,
             "maximum": 100000,
-            "description": "1-based last page to extract, inclusive. Must be >= startPage. Same applicability as startPage; plain-text reads return one page per call, so it has no effect on them."
+            "description": "1-based last page to extract, inclusive (for .xlsx workbooks, the last worksheet). Must be >= startPage. Same applicability as startPage; plain-text reads and folder listings return one page per call, so it has no effect on them."
           }
         },
         "required": [
@@ -478,38 +478,6 @@
       "inputSchema": {
         "type": "object",
         "properties": {},
-        "additionalProperties": false,
-        "$schema": "http://json-schema.org/draft-07/schema#"
-      },
-      "annotations": {
-        "readOnlyHint": true
-      },
-      "execution": {
-        "taskSupport": "forbidden"
-      }
-    },
-    {
-      "name": "search_people",
-      "description": "Search for people by name or email address. Results are drawn from and relevance-ranked by the signed-in user's own communication and collaboration history (mail, Teams, directory), so frequent contacts rank highest. Use this to resolve a name to an id or userPrincipalName before calling teams_create_chat (when that write-gated tool is available), or to find an email address before composing a message. Returns id, displayName, userPrincipalName, mail, jobTitle, relevanceScore, and personType (class/subclass, e.g. Person/OrganizationUser). Only Person/OrganizationUser entries (directory users with a non-null userPrincipalName) are valid teams_create_chat members when that tool is enabled; Person/PersonalContact entries are Outlook contacts reachable by mail instead.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "query": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Name, email address, or other identifying text to search for. Matches against names and email addresses of people relevant to the signed-in user."
-          },
-          "limit": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 25,
-            "default": 10,
-            "description": "Maximum number of results to return (default 10, max 25)."
-          }
-        },
-        "required": [
-          "query"
-        ],
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"
       },

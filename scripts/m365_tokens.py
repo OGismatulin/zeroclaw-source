@@ -34,7 +34,7 @@ READ_ALLOWLIST = (
     "read_resource", "sharepoint_search", "sharepoint_folder_search",
     "outlook_email_search", "outlook_calendar_search", "find_meeting_availability",
     "outlook_find_available_time", "chat_message_search", "teams_list_chats",
-    "get_me", "search_people", "teams_list_channels", "teams_list_channel_messages",
+    "get_me", "teams_list_channels", "teams_list_channel_messages",
     "get_granted_scopes",
 )
 
