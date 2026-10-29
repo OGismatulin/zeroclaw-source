@@ -504,6 +504,15 @@ command = "python3"
 args = ["/usr/local/bin/mcp_m365_stdio.py"]
 tool_timeout_secs = 120
 
+[[mcp.servers]]
+name = "datahub"
+transport = "http"
+url = "http://127.0.0.1:4002/mcp"
+tool_timeout_secs = 120
+
+[mcp.servers.headers]
+Authorization = "Bearer __DATAHUB_GMS_TOKEN__"
+
 # codemap-semantic: second remote MCP on the SAME box — natural-language semantic
 # search over the monorepa (claude-context + Zilliz), for "how does X work / where is
 # the logic for Y" where the symbol name is unknown. Its [mcp.servers.headers] MUST sit
@@ -555,6 +564,9 @@ Authorization = "Bearer __CODEMAP_API_KEY__"
 # `mcp_bundles = ["all"]` below restores that. Names match [[mcp.servers]].name.
 [mcp_bundles.all]
 servers = ["context7", "lalafo-db", "graylog", "codemap", "codemap-semantic", "codemap-fs", "m365"]
+
+[mcp_bundles.datahub]
+servers = ["datahub"]
 
 # ── Risk profile (default) ──────────────────────────────────────────────────
 [web_search]
@@ -1002,7 +1014,7 @@ protect_last_n = 10
 model_provider = "openai.codex"
 risk_profile = "default"
 runtime_profile = "default"
-mcp_bundles = ["all"]
+mcp_bundles = ["all", "datahub"]
 
 [agents.jira_coordinator]
 model_provider = "openai.codex_coordinator"
