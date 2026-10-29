@@ -39,6 +39,16 @@ pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Valu
 
 type SchedulerJobResult = (String, bool, String);
 
+enum CronAgentRunError {
+    TimedOut(Duration),
+    Failed(anyhow::Error),
+}
+
+enum CronAgentOutcome {
+    Completed { success: bool, output: String },
+    TimedOut { output: String },
+}
+
 /// Owns a successfully claimed cron lock for the lifetime of a spawned worker.
 ///
 /// The guard releases the lock after ordinary completion and also covers the
@@ -712,12 +722,12 @@ async fn await_cron_agent_run<F>(
     mut run: std::pin::Pin<&mut F>,
     cancellation: CancellationToken,
     timeout: Duration,
-) -> Result<String>
+) -> std::result::Result<String, CronAgentRunError>
 where
     F: std::future::Future<Output = Result<String>>,
 {
     match time::timeout(timeout, run.as_mut()).await {
-        Ok(result) => result,
+        Ok(result) => result.map_err(CronAgentRunError::Failed),
         Err(_) => {
             cancellation.cancel();
             // The agent loop receives this token through AgentRunOverrides and
@@ -728,10 +738,7 @@ where
                 run.as_mut(),
             )
             .await;
-            Err(anyhow::Error::msg(format!(
-                "{CRON_AGENT_TIMEOUT_PREFIX} {}s",
-                timeout.as_secs()
-            )))
+            Err(CronAgentRunError::TimedOut(timeout))
         }
     }
 }
@@ -769,7 +776,12 @@ async fn execute_job_with_retry(
                 };
                 run_job_command_with_runtime(config, runtime, security, job, approved).await
             }
-            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
+            JobType::Agent => {
+                match Box::pin(run_agent_job(config, security, agent_alias, job)).await {
+                    CronAgentOutcome::Completed { success, output } => (success, output),
+                    CronAgentOutcome::TimedOut { output } => return (false, output),
+                }
+            }
         };
         last_output = output;
 
@@ -779,13 +791,6 @@ async fn execute_job_with_retry(
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
-        }
-
-        if last_output.starts_with(CRON_AGENT_TIMEOUT_PREFIX) {
-            // The timeout is the job-level liveness boundary. Retrying it here
-            // would multiply that boundary by `scheduler_retries` and keep a
-            // global scheduler slot occupied long after its configured limit.
             return (false, last_output);
         }
 
@@ -954,26 +959,26 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
-) -> (bool, String) {
+) -> CronAgentOutcome {
     if !security.can_act() {
-        return (
-            false,
-            "blocked by security policy: autonomy is read-only".to_string(),
-        );
+        return CronAgentOutcome::Completed {
+            success: false,
+            output: "blocked by security policy: autonomy is read-only".to_string(),
+        };
     }
 
     if security.is_rate_limited() {
-        return (
-            false,
-            "blocked by security policy: rate limit exceeded".to_string(),
-        );
+        return CronAgentOutcome::Completed {
+            success: false,
+            output: "blocked by security policy: rate limit exceeded".to_string(),
+        };
     }
 
     if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".to_string(),
-        );
+        return CronAgentOutcome::Completed {
+            success: false,
+            output: "blocked by security policy: action budget exhausted".to_string(),
+        };
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -1056,15 +1061,15 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
+        Ok(response) => CronAgentOutcome::Completed {
+            success: true,
+            output: if response.trim().is_empty() {
                 "agent job executed".to_string()
             } else {
                 response
             },
-        ),
-        Err(e) => {
+        },
+        Err(error) => {
             if matches!(job.session_target, SessionTarget::Isolated) {
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
                     "cli:{}",
@@ -1082,7 +1087,18 @@ async fn run_agent_job(
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
-            (false, format!("agent job failed: {e}"))
+            match error {
+                CronAgentRunError::TimedOut(timeout) => CronAgentOutcome::TimedOut {
+                    output: format!(
+                        "agent job failed: {CRON_AGENT_TIMEOUT_PREFIX} {}s",
+                        timeout.as_secs()
+                    ),
+                },
+                CronAgentRunError::Failed(error) => CronAgentOutcome::Completed {
+                    success: false,
+                    output: format!("agent job failed: {error}"),
+                },
+            }
         }
     }
 }
@@ -1476,6 +1492,28 @@ mod tests {
     use zeroclaw_config::schema::{Config, RuntimeKind};
 
     const TEST_AGENT: &str = "test-agent";
+
+    struct TestServerGuard(Option<tokio::task::JoinHandle<()>>);
+
+    impl TestServerGuard {
+        fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+            Self(Some(handle))
+        }
+
+        async fn stop(mut self) {
+            let handle = self.0.take().expect("server handle must be present");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    impl Drop for TestServerGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = &self.0 {
+                handle.abort();
+            }
+        }
+    }
 
     fn build_configured_shell_command(
         config: &Config,
@@ -2396,10 +2434,383 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        match Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await {
+            CronAgentOutcome::Completed { success, output } => {
+                assert!(!success);
+                assert!(output.contains("agent job failed:"));
+            }
+            CronAgentOutcome::TimedOut { .. } => panic!("provider failure is not a timeout"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_agent_timeout_does_not_retry_after_side_effect() {
+        use axum::{Json, Router, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let tool_seen = Arc::new(AtomicBool::new(false));
+        let tool_succeeded = Arc::new(AtomicBool::new(false));
+        let attempts_handler = Arc::clone(&attempts);
+        let tool_seen_handler = Arc::clone(&tool_seen);
+        let tool_succeeded_handler = Arc::clone(&tool_succeeded);
+        let workspace = TempDir::new().unwrap();
+        let write_root = workspace.path().to_path_buf();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    })
+                });
+                async move {
+                    if has_tool_result {
+                        tool_seen_handler.store(true, Ordering::SeqCst);
+                        let wrote_file = std::fs::read_dir(&write_root)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .any(|entry| {
+                                entry.file_name().to_string_lossy().starts_with("effect-")
+                            });
+                        tool_succeeded_handler.store(wrote_file, Ordering::SeqCst);
+                        std::future::pending::<axum::response::Response>().await
+                    } else {
+                        let attempt = attempts_handler.fetch_add(1, Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": format!("call-write-{attempt}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "file_write",
+                                            "arguments": serde_json::json!({
+                                                "path": format!("effect-{attempt}.txt"),
+                                                "content": "owned QA"
+                                            }).to_string()
+                                    }
+                                    }]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServerGuard::new(zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.reliability.scheduler_retries = 1;
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-timeout-test-model".to_string()),
+                    timeout_secs: Some(60),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(2);
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+            crate::security::AutonomyLevel::Full;
+        let mut security = test_security(&config);
+        security.workspace_dir = workspace.path().to_path_buf();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Write the owned QA file, then wait".into());
+        job.allowed_tools = Some(vec!["file_write".into()]);
+        job.uses_memory = false;
+
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ))
+        .await;
+
+        let effect_paths: Vec<_> = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("effect-"))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert_eq!(output, "agent job failed: agent job timed out after 2s");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "attempt count and action files: attempts={}, effects={effect_paths:?}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert!(tool_seen.load(Ordering::SeqCst));
+        assert!(tool_succeeded.load(Ordering::SeqCst));
+        assert_eq!(effect_paths.len(), 1, "effects={effect_paths:?}");
+
+        server.stop().await;
+    }
+
+    async fn assert_cron_agent_failure_retries(error_body: &'static str) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_handler = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let attempt = attempts_handler.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        (StatusCode::INTERNAL_SERVER_ERROR, error_body).into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "recovered"}}]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServerGuard::new(zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.reliability.scheduler_retries = 1;
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-retry-test-model".to_string()),
+                    timeout_secs: Some(60),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+            crate::security::AutonomyLevel::Full;
+        let security = test_security(&config);
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Retry ordinary provider failure".into());
+        job.allowed_tools = Some(vec![]);
+        job.uses_memory = false;
+
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ))
+        .await;
+
+        assert!(
+            success,
+            "ordinary provider failure did not recover: {output}"
+        );
+        assert_eq!(output, "recovered");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cron_agent_non_timeout_failure_retries() {
+        assert_cron_agent_failure_retries("provider temporarily unavailable").await;
+    }
+
+    #[tokio::test]
+    async fn cron_timeout_terminal_result_is_persisted() {
+        use axum::{Json, Router, response::IntoResponse, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let tool_results = Arc::new(AtomicUsize::new(0));
+        let attempts_handler = Arc::clone(&attempts);
+        let tool_results_handler = Arc::clone(&tool_results);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    })
+                });
+                async move {
+                    if has_tool_result {
+                        tool_results_handler.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<axum::response::Response>().await
+                    } else {
+                        let attempt = attempts_handler.fetch_add(1, Ordering::SeqCst) + 1;
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": format!("call-persist-{attempt}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "file_write",
+                                            "arguments": serde_json::json!({
+                                                "path": format!("effect-{attempt}.txt"),
+                                                "content": "owned QA"
+                                            }).to_string()
+                                        }
+                                    }]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = TestServerGuard::new(zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+
+        async fn timeout_config(tmp: &TempDir, address: std::net::SocketAddr) -> Config {
+            let mut config = test_config(tmp).await;
+            config.memory.backend = "none".to_string();
+            config.reliability.scheduler_retries = 1;
+            config.reliability.provider_retries = 0;
+            config.reliability.provider_backoff_ms = 1;
+            config.providers.models.ollama.insert(
+                "default".to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("cron-timeout-persist-test-model".to_string()),
+                        timeout_secs: Some(60),
+                        uri: Some(format!("http://{address}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+            config
+                .runtime_profiles
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .agentic_timeout_secs = Some(1);
+            config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+                crate::security::AutonomyLevel::Full;
+            config
+        }
+
+        async fn timeout_job(config: &Config, name: &str) -> CronJob {
+            cron::add_agent_job(
+                config,
+                TEST_AGENT,
+                Some(name.to_string()),
+                Schedule::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                "Write the owned QA file, then wait",
+                SessionTarget::Isolated,
+                None,
+                None,
+                false,
+                Some(vec!["file_write".into()]),
+                false,
+            )
+            .unwrap()
+        }
+
+        let scheduled_tmp = TempDir::new().unwrap();
+        let scheduled_config = timeout_config(&scheduled_tmp, address).await;
+        let scheduled_job = timeout_job(&scheduled_config, "scheduled-timeout").await;
+        let scheduled_security = test_security(&scheduled_config);
+        let (scheduled_id, scheduled_success, scheduled_output) = execute_and_persist_job(
+            &scheduled_config,
+            &scheduled_security,
+            TEST_AGENT,
+            &scheduled_job,
+            "cron-timeout-persist-test",
+        )
+        .await;
+
+        let manual_tmp = TempDir::new().unwrap();
+        let manual_config = timeout_config(&manual_tmp, address).await;
+        let manual_job = timeout_job(&manual_config, "manual-timeout").await;
+        let manual_result = run_manual_job(
+            &manual_config,
+            &manual_job,
+            CronDeliveryContext::RpcManual,
+            &None,
+        )
+        .await;
+
+        for (config, job, job_id, success, status, output) in [
+            (
+                &scheduled_config,
+                &scheduled_job,
+                scheduled_id.as_str(),
+                scheduled_success,
+                "error",
+                scheduled_output.as_str(),
+            ),
+            (
+                &manual_config,
+                &manual_job,
+                manual_result.job_id.as_str(),
+                manual_result.success,
+                manual_result.status.as_str(),
+                manual_result.output.as_str(),
+            ),
+        ] {
+            assert_eq!(job_id, job.id);
+            assert!(!success);
+            assert_eq!(status, "error");
+            assert_eq!(output, "agent job failed: agent job timed out after 1s");
+            let runs = cron::list_runs(config, &job.id, 10).unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].job_id, job.id);
+            assert_eq!(runs[0].status, "error");
+            assert_eq!(runs[0].output.as_deref(), Some(output));
+            let workspace = config.agent_workspace_dir(TEST_AGENT);
+            let effect_count = std::fs::read_dir(workspace)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("effect-"))
+                .count();
+            assert_eq!(effect_count, 1);
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_results.load(Ordering::SeqCst), 2);
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -2517,9 +2928,11 @@ mod tests {
 
         let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
         assert!(
-            sequential.0,
-            "repeated cron agent run failed: {:?}",
-            sequential.1
+            matches!(
+                sequential,
+                CronAgentOutcome::Completed { success: true, .. }
+            ),
+            "repeated cron agent run failed"
         );
 
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
@@ -2528,7 +2941,10 @@ mod tests {
             run_agent_job(&config, &security, TEST_AGENT, &job),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
-            assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
+            assert!(
+                matches!(result, CronAgentOutcome::Completed { success: true, .. }),
+                "concurrent cron agent run failed"
+            );
         }
 
         let requests = requests.lock().unwrap();
@@ -2571,8 +2987,11 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let CronAgentOutcome::Completed { success, output } =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await
+        else {
+            panic!("policy rejection must be an ordinary failure");
+        };
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -2592,8 +3011,11 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let CronAgentOutcome::Completed { success, output } =
+            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await
+        else {
+            panic!("rate limit rejection must be an ordinary failure");
+        };
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -3545,8 +3967,11 @@ mod tests {
     async fn cron_agent_timeout_cancels_inflight_run_before_returning_failure() {
         let cancellation = CancellationToken::new();
         let observed = cancellation.clone();
+        let unwound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unwound_run = Arc::clone(&unwound);
         let mut run = Box::pin(async move {
             observed.cancelled().await;
+            unwound_run.store(true, std::sync::atomic::Ordering::SeqCst);
             anyhow::bail!("cancelled by scheduler")
         });
 
@@ -3556,7 +3981,28 @@ mod tests {
                 .expect_err("pending cron run must time out");
 
         assert!(cancellation.is_cancelled());
-        assert!(error.to_string().starts_with(CRON_AGENT_TIMEOUT_PREFIX));
+        assert!(unwound.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            CronAgentRunError::TimedOut(duration) if duration == Duration::from_millis(1)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cron_agent_timeout_drops_uncooperative_run_after_grace() {
+        let cancellation = CancellationToken::new();
+        let mut run = Box::pin(std::future::pending::<Result<String>>());
+        let error =
+            await_cron_agent_run(run.as_mut(), cancellation.clone(), Duration::from_millis(1))
+                .await
+                .expect_err("uncooperative cron run must time out");
+
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(
+            error,
+            CronAgentRunError::TimedOut(duration)
+                if duration == Duration::from_millis(1)
+        ));
     }
 
     #[tokio::test]

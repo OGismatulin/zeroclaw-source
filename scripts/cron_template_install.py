@@ -54,7 +54,6 @@ class CronTemplate:
     audience_all: bool = False
     exclude: frozenset[str] = field(default_factory=frozenset)
     tags: tuple[str, ...] = ()
-    slot_strategy: dict[str, Any] | None = None
     params_meta: dict[str, Any] = field(default_factory=dict)
     model_provider: str = ""
     model_name: str = ""
@@ -99,7 +98,6 @@ class CronTemplate:
             audience_all=audience_all,
             exclude=exclude,
             tags=tuple(data.get("tags", [])),
-            slot_strategy=data.get("slot_strategy"),
             params_meta=data.get("params", {}),
             model_provider=data.get("model", {}).get("provider", ""),
             model_name=data.get("model", {}).get("model", ""),
