@@ -627,15 +627,17 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_prefers_live_catalog_when_reachable() {
-        let live = match zeroclaw_providers::catalog::list_models_for_family("openai").await {
-            Ok(live) if !live.is_empty() => live,
-            _ => {
-                eprintln!("skipping: models.dev catalog unreachable (offline)");
-                return;
-            }
-        };
+        let live = vec!["openai-live-fixture-model".to_string()];
+        let live_for_resolver = live.clone();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_resolver = Arc::clone(&calls);
+        let tool = tool().with_catalog_resolver(move |family| {
+            calls_for_resolver.lock().unwrap().push(family);
+            let live = live_for_resolver.clone();
+            async move { Ok(live) }
+        });
 
-        let result = tool()
+        let result = tool
             .handle_list_models(&json!({ "model_provider": "openai.default" }))
             .await
             .expect("list_models should return a tool result");
@@ -649,17 +651,39 @@ mod tests {
             .map(|m| m.as_str().unwrap_or_default().to_string())
             .collect();
 
-        // The returned set must be the live catalog, not the stale hardcoded
-        // five-element list.
-        assert_eq!(
-            models, live,
-            "list_models should return the live catalog when reachable"
-        );
+        assert_eq!(output["model_provider"], "openai.default");
+        assert_eq!(models, live, "list_models should return the live catalog");
+        assert_eq!(*calls.lock().unwrap(), vec!["openai".to_string()]);
         assert_ne!(
             models,
             hardcoded_models_for("openai"),
             "live catalog should differ from the stale hardcoded fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_to_hardcoded_on_injected_catalog_err() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_resolver = Arc::clone(&calls);
+        let tool = tool().with_catalog_resolver(move |family| {
+            calls_for_resolver.lock().unwrap().push(family);
+            async { Err(anyhow::anyhow!("catalog unavailable")) }
+        });
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "openai.default" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let models: Vec<String> = out["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(out["model_provider"], "openai.default");
+        assert_eq!(models, hardcoded_models_for("openai"));
+        assert_eq!(*calls.lock().unwrap(), vec!["openai".to_string()]);
     }
 
     #[tokio::test]
