@@ -227,6 +227,8 @@ RUN node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(
 
 RUN pip install --no-cache-dir --break-system-packages "prometheus-client==0.26.0" "tzdata==2025.3" requests pandas croniter psycopg2-binary httpx "mcp[cli]<2" uvicorn starlette openpyxl gspread google-auth google-api-python-client pyarrow matplotlib seaborn "yt-dlp[default]==2026.10.21"
 
+RUN python3 -m venv /opt/datahub-mcp && /opt/datahub-mcp/bin/pip install --no-cache-dir "mcp-server-datahub==0.8.0" && /opt/datahub-mcp/bin/mcp-server-datahub --version
+
 RUN chmod 0755 /usr/local/bin/fly-entrypoint.sh /usr/local/bin/gateway_manager.py /usr/local/bin/code_repos_sync.py /usr/local/bin/bootstrap_nightly_retro_cron.py /usr/local/bin/fly_warmup.py /usr/local/bin/cron_template_install.py /usr/local/bin/bootstrap_default_cron_jobs.py /usr/local/bin/backfill_cron_agent_alias.py /usr/local/bin/volume_janitor.py /usr/local/bin/zeroclaw_metrics.py /usr/local/bin/zeroclaw_error_report.py /usr/local/bin/zeroclaw_incidents.py /usr/local/bin/m365_tokens.py /usr/local/bin/mcp_m365_stdio.py
 
 # agent-browser: native Rust browser-automation CLI (vercel-labs/agent-browser).

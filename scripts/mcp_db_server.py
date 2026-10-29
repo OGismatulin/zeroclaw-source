@@ -624,13 +624,19 @@ def _ch_timeout_message(timeout_secs: int) -> str:
     )
 
 
-def _ch_connection_params() -> dict[str, str]:
+CH_EVENTS_LIBRARY_RE = re.compile(r"\bevents_library\b", re.IGNORECASE)
+
+
+def _ch_connection_params(sql: str = "") -> dict[str, str]:
     user = os.environ.get("CH_USER", "").strip()
     password = os.environ.get("CH_PASSWORD", "")
     if not user or not password:
         raise ValueError(CH_NO_CREDENTIALS_MSG)
+    host = os.environ.get("CH_HOST", "ch-prod.yallasvc.net")
+    if CH_EVENTS_LIBRARY_RE.search(sql):
+        host = os.environ.get("CH_EVENTS_LIBRARY_HOST", "ch-prod-s1-r1.yallasvc.net")
     return {
-        "host": os.environ.get("CH_HOST", "ch-prod.yallasvc.net"),
+        "host": host,
         "port": os.environ.get("CH_PORT", "8123"),
         "user": user,
         "password": password,
@@ -708,7 +714,7 @@ def execute_ch_query(sql: str, db: str | None = None) -> str:
     if not CH_FORMAT_RE.search(stripped):
         stripped += "\nFORMAT TSVWithNames"
 
-    req = _ch_request(stripped, db, _ch_connection_params())
+    req = _ch_request(stripped, db, _ch_connection_params(stripped))
     try:
         return _ch_post_with_retry(req, timeout=CH_QUERY_TIMEOUT_SECS).decode("utf-8")
     except urllib.error.HTTPError as e:
@@ -1133,7 +1139,7 @@ def execute_ch_query_to_file(
         f"\nFORMAT {ch_format}"
     )
 
-    req = _ch_request(stripped, db, _ch_connection_params())
+    req = _ch_request(stripped, db, _ch_connection_params(stripped))
 
     start = _time.monotonic()
     tmp_path = abs_path if fmt != "xlsx" else abs_path + ".tmp.csv"

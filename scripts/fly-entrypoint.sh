@@ -211,6 +211,7 @@ sed -e "s|__ZEROCLAW_WEBHOOK_SECRET__|$ZEROCLAW_WEBHOOK_SECRET|g" \
     -e "s|__CODEMAP_API_KEY__|${CODEMAP_API_KEY:-}|g" \
     -e "s|__CODEMAP_SEMANTIC_API_KEY__|${CODEMAP_SEMANTIC_API_KEY:-}|g" \
     -e "s|__BRAVE_API_KEY__|${BRAVE_API_KEY:-}|g" \
+    -e "s|__DATAHUB_GMS_TOKEN__|${DATAHUB_GMS_TOKEN:-}|g" \
     "$template_file" > "$config_file"
 chmod 0600 "$config_file"
 
@@ -278,6 +279,23 @@ if [ "$MCP_GRAYLOG_READY" -eq 1 ]; then
     echo "[fly-entrypoint] MCP Graylog Server started (pid=$MCP_GRAYLOG_PID)"
 else
     echo "[fly-entrypoint] WARNING: MCP Graylog Server (pid=$MCP_GRAYLOG_PID) /health not yet OK — cookie may be expired/missing"
+fi
+
+echo "[fly-entrypoint] Starting DataHub MCP on 127.0.0.1:${DATAHUB_MCP_PORT:-4002}..."
+env -u DATAHUB_GMS_TOKEN DATAHUB_GMS_URL="${DATAHUB_GMS_URL:-https://datahub.yallasvc.net/api/gms}" DATAHUB_TELEMETRY_ENABLED=false FASTMCP_HOST=127.0.0.1 FASTMCP_PORT="${DATAHUB_MCP_PORT:-4002}" /opt/datahub-mcp/bin/mcp-server-datahub-http &
+DATAHUB_MCP_PID=$!
+DATAHUB_MCP_READY=0
+for i in $(seq 1 20); do
+    if curl -s "http://127.0.0.1:${DATAHUB_MCP_PORT:-4002}/health" > /dev/null 2>&1; then
+        DATAHUB_MCP_READY=1
+        break
+    fi
+    sleep 1
+done
+if [ "$DATAHUB_MCP_READY" -eq 1 ]; then
+    echo "[fly-entrypoint] DataHub MCP started (pid=$DATAHUB_MCP_PID)"
+else
+    echo "[fly-entrypoint] WARNING: DataHub MCP (pid=$DATAHUB_MCP_PID) /health not OK — datahub__* tools unavailable"
 fi
 
 # --- Lightpanda CDP sidecar (fast read-only parsing engine for agent-browser --cdp) ---
