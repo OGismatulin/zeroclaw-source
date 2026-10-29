@@ -667,7 +667,7 @@ mod tests {
         let calls_for_resolver = Arc::clone(&calls);
         let tool = tool().with_catalog_resolver(move |family| {
             calls_for_resolver.lock().unwrap().push(family);
-            async { Err(anyhow::anyhow!("catalog unavailable")) }
+            async { Err(anyhow::Error::msg("catalog unavailable")) }
         });
         let result = tool
             .handle_list_models(&json!({ "model_provider": "openai.default" }))
