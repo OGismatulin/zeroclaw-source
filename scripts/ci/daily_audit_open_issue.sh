@@ -31,14 +31,21 @@ try:
             if (
                 not isinstance(issue, dict)
                 or not isinstance(issue.get("title"), str)
-                or not isinstance(issue.get("user"), dict)
-                or not isinstance(issue["user"].get("login"), str)
+                or "user" not in issue
+                or (
+                    issue["user"] is not None
+                    and (
+                        not isinstance(issue["user"], dict)
+                        or not isinstance(issue["user"].get("login"), str)
+                    )
+                )
                 or not isinstance(issue.get("html_url"), str)
                 or not issue["html_url"]
             ):
                 raise ValueError("unexpected issue response shape")
             if (
                 "pull_request" not in issue
+                and issue["user"] is not None
                 and issue["user"]["login"] == "github-actions[bot]"
                 and issue["title"].startswith("ci: Advisory scan failed — ")
             ):

@@ -224,6 +224,42 @@ class DailyAuditIssueContractTest(unittest.TestCase):
                 self.assertEqual(state.get("created", []), [])
                 self.assert_calls(state, [(HAS_ARGS, 0), (LIST_ARGS, 0)])
 
+    def test_nullable_author_before_bot_issue_on_second_page_is_deduplicated(
+        self,
+    ) -> None:
+        result, state = self.run_script(
+            {"pages": [[issue(title="unrelated", user=None)], [issue()]]}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"issue_url={URL}\n")
+        self.assertEqual(state.get("created", []), [])
+        self.assert_calls(state, [(HAS_ARGS, 0), (LIST_ARGS, 0)])
+
+    def test_nullable_author_does_not_suppress_creation_or_repeat_deduplication(
+        self,
+    ) -> None:
+        result, state = self.run_script({"pages": [[issue(user=None)]]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"issue_url={URL}\n")
+        self.assertEqual(len(state["created"]), 1)
+        self.assert_calls(
+            state, [(HAS_ARGS, 0), (LIST_ARGS, 0), (self.create_args(), 0)]
+        )
+        result, repeated = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"issue_url={URL}\n")
+        self.assertEqual(len(repeated["created"]), 1)
+        self.assert_calls(
+            repeated,
+            [
+                (HAS_ARGS, 0),
+                (LIST_ARGS, 0),
+                (self.create_args(), 0),
+                (HAS_ARGS, 0),
+                (LIST_ARGS, 0),
+            ],
+        )
+
     def test_pr_similar_title_and_foreign_author_do_not_suppress_creation(self) -> None:
         cases = (
             issue(pull_request={"url": "https://example.invalid/pr/1"}),
@@ -292,6 +328,14 @@ class DailyAuditIssueContractTest(unittest.TestCase):
             "[[{}]]",
             '[[{"title":2,"user":{},"html_url":"x"}]]',
             json.dumps([[issue()], {"message": "bad second page"}]),
+            json.dumps([[issue(user="invalid")]]),
+            json.dumps([[issue(user=[])]]),
+            json.dumps([[issue(user={})]]),
+            json.dumps([[issue(user={"login": None})]]),
+            json.dumps([[issue(user={"login": 1})]]),
+            json.dumps(
+                [[{key: value for key, value in issue().items() if key != "user"}]]
+            ),
         ):
             with self.subTest(raw=raw):
                 result, state = self.run_script({"list_raw": raw})
