@@ -13,11 +13,27 @@ permissions:
   packages: write
 
 jobs:
+  classify-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      is_master: ${{ steps.ref.outputs.is_master }}
+    steps:
+      - id: ref
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == 'refs/heads/master' ]]; then
+            echo 'is_master=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'is_master=false' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build and push to GHCR
+    needs: classify-ref
+    if: ${{ needs.classify-ref.outputs.is_master == 'true' || needs.classify-ref.outputs.is_master == 'false' }}
     runs-on: ubuntu-latest
     concurrency:
-      group: zc-build-image
+      group: ${{ needs.classify-ref.outputs.is_master == 'true' && 'zc-build-image-master' || format('zc-build-image-other-{0}', github.ref) }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +57,7 @@ jobs:
         with:
           images: ghcr.io/ogismatulin/zeroclaw
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ needs.classify-ref.outputs.is_master == 'true' }}
             type=sha,prefix=sha-,format=short
 
       - uses: docker/build-push-action@v6

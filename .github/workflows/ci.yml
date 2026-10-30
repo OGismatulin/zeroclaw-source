@@ -160,6 +160,8 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy runner contract tests
         run: bash scripts/ci/run_clippy.test.sh
+      - name: ZC image workflow contract tests
+        run: python3 scripts/ci/zc_build_image_contract_test.py
       - name: Clippy
         shell: bash
         run: |
