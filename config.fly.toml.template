@@ -229,14 +229,6 @@ wire_api = "responses"
 provider_extra = { reasoning_effort = "high" }
 timeout_secs = 300
 
-[providers.models.opencode.luna_chat]
-model = "gpt-6-luna"
-uri = "https://opencode.ai/zen/go/v1"
-api_key = ""
-wire_api = "responses"
-provider_extra = { reasoning_effort = "high" }
-timeout_secs = 300
-
 [providers.models.opencode.argon]
 model = "gemini-4-argon"
 uri = "https://opencode.ai/inference/go/v1"
