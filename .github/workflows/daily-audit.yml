@@ -46,52 +46,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          issues_enabled=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')
-          if [[ "$issues_enabled" != "true" ]]; then
-            echo "issue_url=" >> "$GITHUB_OUTPUT"
-            echo "::notice::Repository issues are disabled; skipping advisory issue creation."
-            exit 0
-          fi
-
-          # Avoid opening a duplicate while an advisory issue is still open.
-          open_count=$(gh issue list \
-            --repo "$GITHUB_REPOSITORY" \
-            --label "security" \
-            --state open \
-            --search "Advisory scan failed in:title" \
-            --json number \
-            --jq 'length')
-
-          if [[ "$open_count" -gt 0 ]]; then
-            echo "An open advisory issue already exists — skipping duplicate."
-            exit 0
-          fi
-
-          advisory_output=$(cat /tmp/advisory-output.txt)
-
-          {
-            printf '## Advisory scan failed\n\n'
-            printf 'Workflow run: %s\n\n' "${RUN_URL}"
-            printf '```\n%s\n```\n\n' "${advisory_output}"
-            printf 'Review `deny.toml` for the current ignore list. If this advisory is a known\n'
-            printf 'acceptable risk, add an entry with a `reason` field. If it requires a\n'
-            printf 'dependency update, open a tracking issue and link it here.\n\n'
-            if [[ "$GITHUB_REPOSITORY" == "zeroclaw-labs/zeroclaw" ]]; then
-              printf 'cc @JordanTheJet @Audacity88\n'
-            fi
-          } > /tmp/issue-body.md
-
-          issue_url=$(gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "ci: Advisory scan failed — $(date -u +%Y-%m-%d)" \
-            --label "security" \
-            --label "risk:high" \
-            --body-file /tmp/issue-body.md)
-          echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
+        run: bash scripts/ci/daily_audit_open_issue.sh
 
       - name: Propagate scan failure
-        if: steps.scan.outcome == 'failure'
+        if: always() && steps.scan.outcome == 'failure'
         env:
           ISSUE_URL: ${{ steps.advisory_issue.outputs.issue_url }}
         run: |
