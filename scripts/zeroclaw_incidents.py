@@ -99,6 +99,7 @@ class Incident:
     parent_tool: str | None = None
     gate_reason: str | None = None
     skill: str | None = None
+    blocked_command: str | None = None
 
     def as_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -414,6 +415,7 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         location = f"{attrs['_file']}:{attrs.get('_line', '?')}"
     diagnostic = _diagnostic(attrs) if native else None
     policy_reason = _policy_reason(diagnostic)
+    blocked = diagnostic.get("blocked_command") if diagnostic else None
     task_ids = None
     if kind == "tool_failure":
         refined, task_ids = _await_outcome(diagnostic)
@@ -458,6 +460,7 @@ def normalize_trace_row(row: dict, user: str) -> Incident | None:
         task_ids=task_ids,
         policy_reason=policy_reason,
         input_path=input_path,
+        blocked_command=_clip(blocked, 64) if isinstance(blocked, str) and blocked else None,
         parent_tool=parent_tool,
     )
 
@@ -960,7 +963,7 @@ class EpisodeTracker:
                 "first": stamp, "last": stamp, "jira": False, "cron": None,
                 "session_key": row_session, "aliases": set(), "llm_calls": 0, "input_tokens": 0,
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
-                "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0, "failures": [],
+                "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0,
                 "failed_calls": [], "final": None, "legacy_final": None,
                 "legacy_final_chars": 0, "cancelled": False,
                 "error": False, "drift": False, "legacy_webhook_request": False,
@@ -1054,13 +1057,12 @@ class EpisodeTracker:
     @staticmethod
     def _incident(ep: dict, incident: Incident) -> None:
         if incident.kind == "tool_failure":
-            ep["failed_calls"].append((incident.tool_call_id, incident.gate))
-            if len(ep["failures"]) < EPISODE_MAX_FAILURES:
-                ep["failures"].append({
-                    "tool": incident.tool, "call_id": incident.tool_call_id,
-                    "error": incident.error, "gate": incident.gate,
-                    "near_skill": incident.skill, "incident_id": incident.id,
-                })
+            ep["failed_calls"].append({
+                "tool": incident.tool, "call_id": incident.tool_call_id,
+                "ts": _parse_ts(incident.ts), "error": incident.error, "gate": incident.gate,
+                "near_skill": incident.skill, "incident_id": incident.id,
+                "policy_reason": incident.policy_reason, "blocked_command": incident.blocked_command,
+            })
         elif incident.kind.startswith("provider") and incident.gate_reason == "cancelled":
             ep["cancelled"] = True
         elif incident.kind in ("provider_failure", "runtime_error") and not incident.gate:
@@ -1091,7 +1093,6 @@ class EpisodeTracker:
                     target["commands"].append(command)
             target["adhoc_paths"].update(pending["adhoc_paths"])
             target["adhoc_scripts"] += pending["adhoc_scripts"]
-            target["failures"].extend(pending["failures"][:EPISODE_MAX_FAILURES - len(target["failures"])])
             target["failed_calls"].extend(pending["failed_calls"])
             if pending["final"] is not None and (target["final"] is None or not target["final"]):
                 target["final"] = pending["final"]
@@ -1136,18 +1137,23 @@ class EpisodeTracker:
             outcome = "error"
         else:
             outcome = "no_final"
+        twins = _observer_twin_indexes(
+            [(call["tool"], call["call_id"], call["ts"]) for call in ep["failed_calls"]]
+        )
+        calls = [call for index, call in enumerate(ep["failed_calls"]) if index not in twins]
         gated = [
-            bool(gate or (call_id and call_id in self._twin_gates))
-            for call_id, gate in ep["failed_calls"]
+            bool(call["gate"] or (call["call_id"] and call["call_id"] in self._twin_gates))
+            for call in calls
         ]
         gate_count = sum(gated)
         failures = [
             {
-                **{key: value for key, value in item.items() if key not in ("call_id", "gate")},
-                "gate": bool(item["gate"] or (item.get("call_id") in self._twin_gates)),
-                "command": command_head(self._commands.get(item.get("call_id") or "")),
+                "tool": call["tool"], "error": call["error"], "near_skill": call["near_skill"],
+                "incident_id": call["incident_id"], "gate": gate,
+                "policy_reason": call["policy_reason"], "blocked_command": call["blocked_command"],
+                "command": command_head(self._commands.get(call["call_id"] or "")),
             }
-            for item in ep["failures"]
+            for call, gate in zip(calls[:EPISODE_MAX_FAILURES], gated)
         ]
         evicted = self._earliest is not None and (
             ep["first"] - self._earliest
@@ -1691,6 +1697,24 @@ _WAIT_KINDS = ("delegate_wait", "delegate_missing")
 
 TWIN_WINDOW_SECS = 2.0
 MCP_TWIN_WINDOW_SECS = 5.0
+
+
+def _observer_twin_indexes(
+    calls: list[tuple[str | None, str | None, datetime | None]],
+) -> set[int]:
+    twins: set[int] = set()
+    used: set[int] = set()
+    for index, (tool, call_id, stamp) in enumerate(calls):
+        if call_id or stamp is None:
+            continue
+        for base, (base_tool, base_call, base_stamp) in enumerate(calls):
+            if base in used or not base_call or base_tool != tool or base_stamp is None:
+                continue
+            if abs((base_stamp - stamp).total_seconds()) <= TWIN_WINDOW_SECS:
+                twins.add(index)
+                used.add(base)
+                break
+    return twins
 _MCP_CONNECT_RE = re.compile(r"Failed to connect to MCP server [`ʼ']?([\w.-]+)")
 
 
@@ -1766,6 +1790,23 @@ def _merge_same_call(
         index[key] = len(merged)
         merged.append((ts, dict(row)))
     return merged
+
+
+def _merge_observer_twins(
+    incidents: list[tuple[datetime, dict]],
+) -> list[tuple[datetime, dict]]:
+    groups: dict[tuple[object, object], list[int]] = {}
+    for index, (_ts, row) in enumerate(incidents):
+        if row.get("kind") == "tool_failure" and row.get("turn_id"):
+            groups.setdefault((row.get("user"), row["turn_id"]), []).append(index)
+    drop: set[int] = set()
+    for members in groups.values():
+        calls = [
+            (incidents[i][1].get("tool"), incidents[i][1].get("tool_call_id"), incidents[i][0])
+            for i in members
+        ]
+        drop.update(members[k] for k in _observer_twin_indexes(calls))
+    return [item for index, item in enumerate(incidents) if index not in drop]
 
 
 def _is_provider_row(row: dict) -> bool:
@@ -1988,6 +2029,7 @@ def build_digest(
     raw_gate = sum(1 for _, row in incidents if row.get("gate"))
     raw_non_gate = len(incidents) - raw_gate
     incidents = _merge_same_call(incidents)
+    incidents = _merge_observer_twins(incidents)
     incidents = _merge_runtime_twins(incidents)
     incidents, recovered_keys = _collapse_provider_episodes(incidents, recoveries)
 
