@@ -61,6 +61,7 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       - uses: docker/build-push-action@v6
+        id: image
         with:
           context: .
           file: ./Dockerfile.deploy
@@ -68,4 +69,49 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record immutable image digest
+        id: image-receipt
+        shell: python
+        env:
+          BUILD_HEAD_SHA: ${{ github.sha }}
+          BUILD_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+          BUILD_REF: ${{ github.ref }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          receipt = {
+              "head_sha": os.environ["BUILD_HEAD_SHA"],
+              "image_digest": os.environ["BUILD_IMAGE_DIGEST"],
+              "run_id": os.environ["BUILD_RUN_ID"],
+          }
+          for field, pattern in (
+              ("head_sha", r"[0-9a-f]{40}"),
+              ("image_digest", r"sha256:[0-9a-f]{64}"),
+              ("run_id", r"[1-9][0-9]*"),
+          ):
+              if re.fullmatch(pattern, receipt[field]) is None:
+                  raise SystemExit(f"Invalid image receipt {field}")
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if receipt["head_sha"] != head:
+              raise SystemExit("Image receipt SHA differs from checkout HEAD")
+          ref = os.environ["BUILD_REF"]
+          if not ref.startswith(("refs/heads/", "refs/tags/")):
+              raise SystemExit("Invalid image receipt ref")
+          subprocess.run(["git", "check-ref-format", ref], check=True)
+          with Path("image-digest.json").open("x", encoding="utf-8") as output:
+              json.dump(receipt, output, sort_keys=True)
+              output.write("\n")
+
+      - name: Upload immutable image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: zc-build-image-digest
+          path: image-digest.json
+          if-no-files-found: error
 # CI anchor 2026-04-22T07:55:19Z

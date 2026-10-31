@@ -1,21 +1,57 @@
 name: ZC Fly Deploy
 
-# Deploy a TESTED, SHA-pinned image to Fly. Gated on the Quality Gate (ci.yml)
-# passing for the commit — a red nextest now structurally blocks deploy.
 on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Explicit image tag to deploy (e.g. sha-abc1234 or latest). Manual escape hatch / rollback. Empty → current branch HEAD."
+        description: "Privileged emergency override: image tag; empty selects dispatch HEAD. Do not mix with digest inputs."
         required: false
+        type: string
+      image_digest:
+        description: "Immutable release image digest (sha256: plus 64 lowercase hex characters)."
+        required: false
+        type: string
+      expected_master_sha:
+        description: "Full master SHA for the digest release."
+        required: false
+        type: string
+      quality_run_id:
+        description: "Exact successful master Quality Gate run ID."
+        required: false
+        type: string
+      build_run_id:
+        description: "Exact successful master image build run ID."
+        required: false
+        type: string
+      skipped_deploy_run_id:
+        description: "Exact automatic deploy run skipped by the release marker."
+        required: false
+        type: string
+      release_cutoff:
+        description: "Release baseline UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)."
+        required: false
+        type: string
+      expected_machine_id:
+        description: "Baseline Fly machine ID."
+        required: false
+        type: string
+      expected_machine_version:
+        description: "Baseline Fly machine version."
+        required: false
+        type: string
+      expected_machine_digest:
+        description: "Baseline Fly machine image_ref.digest."
+        required: false
+        type: string
   workflow_run:
-    workflows: ["Quality Gate"]      # REPLACES the old build-image-success trigger (deploy now gates on tests)
+    workflows: ["Quality Gate"]
     types: [completed]
     branches: [master]
 
 permissions:
   contents: read
-  packages: read        # for docker login / manifest inspect against GHCR
+  packages: read
+  actions: read
 
 jobs:
   deploy:
@@ -24,67 +60,322 @@ jobs:
     concurrency: zc-deploy-group
     if: >-
       github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_commit.message &&
+      !contains(github.event.workflow_run.head_commit.message, '[manual-digest-deploy-20261031]'))
+    env:
+      INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+      MANUAL_DIGEST: ${{ inputs.image_digest }}
+      EXPECTED_MASTER_SHA: ${{ inputs.expected_master_sha }}
+      QUALITY_RUN_ID: ${{ inputs.quality_run_id }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      SKIPPED_DEPLOY_RUN_ID: ${{ inputs.skipped_deploy_run_id }}
+      RELEASE_CUTOFF: ${{ inputs.release_cutoff }}
+      EXPECTED_MACHINE_ID: ${{ inputs.expected_machine_id }}
+      EXPECTED_MACHINE_VERSION: ${{ inputs.expected_machine_version }}
+      EXPECTED_MACHINE_DIGEST: ${{ inputs.expected_machine_digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Resolve image tag
-        id: tag
+      - name: Select and validate deploy mode
+        id: mode
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ -n "${{ inputs.image_tag }}" ]; then
-              echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
-            else
-              # manual run w/o tag: use the SHA the dispatch ran on (workflow_run
-              # context is null here — using head_sha would yield an empty sha-)
-              echo "tag=sha-$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "tag=sha-$(echo '${{ github.event.workflow_run.head_sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY'
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-      # GHCR login: package is currently public (anon manifest inspect works),
-      # but authenticated requests dodge anonymous rate-limits (429) on the poll.
+          patterns = {
+              "MANUAL_DIGEST": r"sha256:[0-9a-f]{64}",
+              "EXPECTED_MASTER_SHA": r"[0-9a-f]{40}",
+              "QUALITY_RUN_ID": r"[1-9][0-9]*",
+              "BUILD_RUN_ID": r"[1-9][0-9]*",
+              "SKIPPED_DEPLOY_RUN_ID": r"[1-9][0-9]*",
+              "RELEASE_CUTOFF": r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+              "EXPECTED_MACHINE_ID": r"[0-9a-f]{14}",
+              "EXPECTED_MACHINE_VERSION": r"[0-7][0-9A-HJKMNP-TV-Z]{25}",
+              "EXPECTED_MACHINE_DIGEST": r"sha256:[0-9a-f]{64}",
+          }
+          mode = "digest" if any(os.environ.get(key, "") for key in patterns) else "legacy"
+          if mode == "digest":
+              if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or os.environ.get("INPUT_IMAGE_TAG"):
+                  raise SystemExit("Digest release requires workflow_dispatch without image_tag")
+              for key, pattern in patterns.items():
+                  if not re.fullmatch(pattern, os.environ.get(key, "")):
+                      raise SystemExit(f"Missing or invalid digest release input: {key}")
+              try:
+                  cutoff = datetime.strptime(os.environ["RELEASE_CUTOFF"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+              except ValueError:
+                  raise SystemExit("Invalid release cutoff")
+              if cutoff > datetime.now(timezone.utc):
+                  raise SystemExit("Release cutoff is in the future")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"mode={mode}\n")
+          PY
+
+      - name: Resolve legacy image tag
+        id: tag
+        if: steps.mode.outputs.mode == 'legacy'
+        env:
+          UPSTREAM_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              tag = os.environ.get("INPUT_IMAGE_TAG") or "sha-" + os.environ["GITHUB_SHA"][:7]
+          else:
+              tag = "sha-" + os.environ["UPSTREAM_HEAD_SHA"][:7]
+          if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+              raise SystemExit("Invalid legacy image tag")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"tag={tag}\n")
+          PY
+
+      - name: Verify private integration access
+        if: steps.mode.outputs.mode == 'digest'
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if not os.environ.get("GH_TOKEN"):
+              raise SystemExit("Private integration credential is unavailable")
+          def read(endpoint):
+              try:
+                  result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True, check=True)
+                  return json.loads(result.stdout)
+              except (subprocess.CalledProcessError, ValueError, OSError):
+                  raise SystemExit("Private integration access verification failed")
+          repo = read("repos/OGismatulin/zeroclaw")
+          commit = read("repos/OGismatulin/zeroclaw/commits/d8f7884f2c9401f68f745fcc1afdc6ac5951b062")
+          if not isinstance(repo, dict) or repo.get("private") is not True or repo.get("full_name", "").lower() != "ogismatulin/zeroclaw":
+              raise SystemExit("Unexpected private integration repository")
+          if not isinstance(commit, dict) or commit.get("sha") != "d8f7884f2c9401f68f745fcc1afdc6ac5951b062":
+              raise SystemExit("Unexpected private integration commit")
+          PY
+
+      - name: Checkout pinned integration preflight
+        if: steps.mode.outputs.mode == 'digest'
+        uses: actions/checkout@v4
+        with:
+          repository: OGismatulin/zeroclaw
+          ref: d8f7884f2c9401f68f745fcc1afdc6ac5951b062
+          token: ${{ secrets.GHCR_TOKEN }}
+          path: .manual-digest-integration
+          persist-credentials: false
+
+      - name: Verify pinned integration code
+        if: steps.mode.outputs.mode == 'digest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import subprocess
+          from pathlib import Path
+
+          root = Path(".manual-digest-integration")
+          head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+          if head != "d8f7884f2c9401f68f745fcc1afdc6ac5951b062":
+              raise SystemExit("Pinned integration HEAD mismatch")
+          hashes = {
+              "fly_preflight.py": "46367cf291636150e2f9eec6fe7017350a06f859f1a88e5e3395cef054df8a8b",
+              "common.py": "af3934c1b4cf1831cc0ece3f2998ef80c8ef404872c3adefdec7d618977ee812",
+          }
+          for name, expected in hashes.items():
+              path = root / ".claude/skills/fly-template-sync/scripts" / name
+              if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                  raise SystemExit("Pinned integration code hash mismatch")
+          PY
+
+      - name: Download exact build digest artifact
+        if: steps.mode.outputs.mode == 'digest'
+        uses: actions/download-artifact@v4
+        with:
+          name: zc-build-image-digest
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: manual-digest/producer
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Wait for image in GHCR (build runs in parallel)
-        if: steps.tag.outputs.tag != 'latest'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.mode.outputs.mode == 'digest'
+
+      - name: Inspect immutable registry image
+        id: registry
+        if: steps.mode.outputs.mode == 'digest'
+        shell: bash
         run: |
-          IMG="ghcr.io/ogismatulin/zeroclaw:${{ steps.tag.outputs.tag }}"
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          try:
+              result = subprocess.run(["docker", "buildx", "imagetools", "inspect", "ghcr.io/ogismatulin/zeroclaw@" + os.environ["MANUAL_DIGEST"], "--format", "{{json .Manifest}}"], capture_output=True, text=True, check=True)
+              registry = json.loads(result.stdout)
+          except (subprocess.CalledProcessError, OSError, ValueError):
+              raise SystemExit("Registry inspection failed")
+          if not isinstance(registry, dict) or registry.get("digest") != os.environ["MANUAL_DIGEST"] or registry.get("mediaType") not in ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"):
+              raise SystemExit("Registry index identity mismatch")
+          manifests = registry.get("manifests")
+          if not isinstance(manifests, list) or not all(isinstance(entry, dict) and isinstance(entry.get("platform"), dict) for entry in manifests):
+              raise SystemExit("Invalid registry platform manifests")
+          matches = [entry for entry in manifests if entry["platform"].get("os") == "linux" and entry["platform"].get("architecture") == "amd64"]
+          if len(matches) != 1:
+              raise SystemExit("Missing or ambiguous registry amd64 image")
+          if matches[0].get("mediaType") not in ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"):
+              raise SystemExit("Invalid registry amd64 media type")
+          runtime_digest = matches[0].get("digest")
+          if not isinstance(runtime_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_digest) or runtime_digest == os.environ["MANUAL_DIGEST"]:
+              raise SystemExit("Invalid registry amd64 digest")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write("runtime_image_digest=" + runtime_digest + "\n")
+          Path("manual-digest/registry.json").write_text(json.dumps({"digest": registry["digest"], "mediaType": registry["mediaType"], "manifests": [{"digest": runtime_digest, "mediaType": matches[0]["mediaType"], "platform": {"os": "linux", "architecture": "amd64"}}]}))
+          PY
+
+      - name: Wait for legacy image in GHCR
+        if: steps.mode.outputs.mode == 'legacy' && steps.tag.outputs.tag != 'latest'
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/ogismatulin/zeroclaw:$IMAGE_TAG"
           echo "Waiting for $IMG ..."
-          # Budget MUST exceed realistic Rust release-build duration (build is
-          # usually slower than tests). 40 × 30s = 20 min. Tune to build p95.
           for i in $(seq 1 40); do
             if docker manifest inspect "$IMG" >/dev/null 2>&1; then
-              echo "image present after $((i*30))s"; exit 0
+              echo "image present after $((i*30))s"
+              exit 0
             fi
             sleep 30
           done
-          echo "::error::image $IMG not found within budget — refusing to deploy untested/unbuilt commit"
+          echo "::error::image $IMG not found within budget"
           exit 1
 
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --image ghcr.io/ogismatulin/zeroclaw:${{ steps.tag.outputs.tag }}
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-      # Warm up per-user daemons so the cron catch-up (e.g. nightly retro)
-      # runs immediately after deploy instead of racing with the first user
-      # webhook. See docs/analysis/2026-05-21-deploy-cron-race-fix.md and
-      # docs/analysis/2026-05-29-warmup-vm-not-started-race.md.
-      #
-      # `flyctl deploy` returns as soon as the rolling restart is accepted
-      # by the Fly API, but the new VM still needs a few extra seconds to
-      # transition into `started` before `flyctl ssh console` can connect.
-      # In one observed deploy (run 26575928659, 2026-05-28T12:55Z) the
-      # warmup ran 2.3 s after `flyctl deploy` returned and got
-      # `Error: app ai-forge-zeroclaw has no started VMs`; the VM moved
-      # into `started` 6 s later. Sleep + retry tolerates that window.
+      - name: Prepare Fly CLI compatibility
+        if: steps.mode.outputs.mode == 'digest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          flyctl_path=$(command -v flyctl)
+          [[ "$flyctl_path" = /* && -x "$flyctl_path" ]]
+          mkdir "$RUNNER_TEMP/manual-digest-fly-bin"
+          ln -s "$flyctl_path" "$RUNNER_TEMP/manual-digest-fly-bin/fly"
+          "$RUNNER_TEMP/manual-digest-fly-bin/fly" version
+          printf '%s\n' "$RUNNER_TEMP/manual-digest-fly-bin" >> "$GITHUB_PATH"
+
+      - name: Verify fresh digest release state
+        id: release
+        if: steps.mode.outputs.mode == 'digest'
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          private_dir=$(mktemp -d "$RUNNER_TEMP/manual-digest-private.XXXXXX")
+          printf '%s\n' "$GITHUB_RUN_ID" > "$private_dir/.owner"
+          printf 'private_dir=%s\n' "$private_dir" >> "$GITHUB_OUTPUT"
+          if ! fly status --app ai-forge-zeroclaw --json > "$private_dir/fly-status.json" 2> "$private_dir/fly-status.stderr"; then
+            echo "::error::Fresh Fly status failed"
+            exit 1
+          fi
+          export RELEASE_PRIVATE_DIR="$private_dir"
+          actual_image=$(python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          status = json.loads((Path(os.environ["RELEASE_PRIVATE_DIR"]) / "fly-status.json").read_text())
+          if not isinstance(status, dict) or status.get("Name") != "ai-forge-zeroclaw" or not isinstance(status.get("Machines"), list):
+              raise SystemExit("Unexpected Fly status")
+          if not all(isinstance(machine, dict) and isinstance(machine.get("config"), dict) and isinstance(machine.get("image_ref"), dict) for machine in status["Machines"]):
+              raise SystemExit("Unexpected Fly machine data")
+          summary = {"Name": status["Name"], "Machines": [{"id": machine.get("id"), "version": machine.get("version"), "state": machine.get("state"), "image_ref": {"digest": machine["image_ref"].get("digest")}, "config": {"image": machine["config"].get("image")}} for machine in status["Machines"]]}
+          if not all(isinstance(value, str) for machine in summary["Machines"] for value in (machine["id"], machine["version"], machine["state"], machine["image_ref"]["digest"], machine["config"]["image"])):
+              raise SystemExit("Invalid Fly summary fields")
+          Path("manual-digest/fly-status.json").write_text(json.dumps(summary))
+          machines = [machine for machine in status["Machines"] if machine.get("id") == os.environ["EXPECTED_MACHINE_ID"]]
+          if len(machines) != 1:
+              raise SystemExit("Expected Fly machine is unavailable")
+          image = machines[0].get("config", {}).get("image")
+          if not isinstance(image, str) or not image or any(character.isspace() for character in image):
+              raise SystemExit("Invalid Fly baseline image")
+          print(image)
+          PY
+          )
+          if python3 .manual-digest-integration/.claude/skills/fly-template-sync/scripts/fly_preflight.py --quiescence --json --transport machines --machine "$EXPECTED_MACHINE_ID" --expected-image "$actual_image" > "$private_dir/preflight.json" 2> "$private_dir/preflight.stderr"; then
+            preflight_exit_code=0
+          else
+            preflight_exit_code=$?
+          fi
+          python3 - <<'PY' > "$private_dir/preflight-finished.txt"
+          from datetime import datetime, timezone
+
+          print(datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"))
+          PY
+          printf '%s\n' "$preflight_exit_code" > manual-digest/preflight.exit-code
+          PREFLIGHT_EXIT_CODE="$preflight_exit_code" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = json.loads((Path(os.environ["RELEASE_PRIVATE_DIR"]) / "preflight.json").read_text())
+          if not isinstance(report, dict):
+              raise SystemExit("Invalid preflight report")
+          summary = {"state": report.get("state") if report.get("state") in ("QUIET", "BUSY", "UNKNOWN") else "INVALID", "exec": "PASS" if report.get("exec") == "PASS" else "OTHER", "exit_code": int(os.environ["PREFLIGHT_EXIT_CODE"]), "busy_count": len(report["busy"]) if isinstance(report.get("busy"), list) else None, "unknown_count": len(report["unknown"]) if isinstance(report.get("unknown"), list) else None}
+          Path("manual-digest/preflight-summary.json").write_text(json.dumps(summary))
+          PY
+          PREFLIGHT_EXIT_CODE="$preflight_exit_code" python3 scripts/ci/verify_manual_digest_release.py --producer manual-digest/producer/image-digest.json --registry manual-digest/registry.json --preflight "$private_dir/preflight.json" --preflight-finished "$private_dir/preflight-finished.txt"
+
+      - name: Deploy validated immutable digest
+        if: steps.mode.outputs.mode == 'digest'
+        env:
+          VALIDATED_DIGEST: ${{ steps.release.outputs.image_digest }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          flyctl deploy --image "ghcr.io/ogismatulin/zeroclaw@$VALIDATED_DIGEST"
+
+      - name: Deploy legacy emergency image tag
+        if: steps.mode.outputs.mode == 'legacy'
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flyctl deploy --image "ghcr.io/ogismatulin/zeroclaw:$IMAGE_TAG"
+
       - name: Warm up per-user daemons
         run: |
           sleep 15
@@ -101,3 +392,102 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         continue-on-error: true
+
+      - name: Verify post-deploy digest and master
+        if: steps.mode.outputs.mode == 'digest'
+        env:
+          EXPECTED_RUNTIME_DIGEST: ${{ steps.registry.outputs.runtime_image_digest }}
+          RELEASE_PRIVATE_DIR: ${{ steps.release.outputs.private_dir }}
+          GH_TOKEN: ${{ github.token }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! fly status --app ai-forge-zeroclaw --json > "$RELEASE_PRIVATE_DIR/post-fly-status.json" 2> "$RELEASE_PRIVATE_DIR/post-fly-status.stderr"; then
+            echo "::error::Post-deploy Fly status failed; STOP"
+            exit 1
+          fi
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" > "$RELEASE_PRIVATE_DIR/post-master.json" 2> "$RELEASE_PRIVATE_DIR/post-master.stderr"; then
+            echo "::error::Post-deploy master check failed; STOP"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          def read(name):
+              return json.loads((Path(os.environ["RELEASE_PRIVATE_DIR"]) / name).read_text())
+          runtime_digest = os.environ["EXPECTED_RUNTIME_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_digest):
+              raise SystemExit("Missing validated registry runtime digest; STOP")
+          status = read("post-fly-status.json")
+          if status.get("Name") != "ai-forge-zeroclaw" or not isinstance(status.get("Machines"), list):
+              raise SystemExit("Post-deploy Fly app mismatch; STOP")
+          if len(status["Machines"]) != 1:
+              raise SystemExit("Post-deploy Fly machine roster drift; STOP")
+          if not all(isinstance(machine, dict) and isinstance(machine.get("config"), dict) and isinstance(machine.get("image_ref"), dict) for machine in status["Machines"]):
+              raise SystemExit("Unexpected post-deploy Fly machine data; STOP")
+          summary = {"Name": status["Name"], "Machines": [{"id": machine.get("id"), "version": machine.get("version"), "state": machine.get("state"), "image_ref": {"digest": machine["image_ref"].get("digest")}, "config": {"image": machine["config"].get("image")}} for machine in status["Machines"]]}
+          if not all(isinstance(value, str) for machine in summary["Machines"] for value in (machine["id"], machine["version"], machine["state"], machine["image_ref"]["digest"], machine["config"]["image"])):
+              raise SystemExit("Invalid post-deploy Fly summary fields; STOP")
+          Path("manual-digest/post-fly-status.json").write_text(json.dumps(summary))
+          machines = [machine for machine in status["Machines"] if machine.get("id") == os.environ["EXPECTED_MACHINE_ID"]]
+          if len(machines) != 1:
+              raise SystemExit("Post-deploy Fly machine mismatch; STOP")
+          machine = machines[0]
+          if machine.get("state") != "started" or not machine.get("version") or machine["version"] == os.environ["EXPECTED_MACHINE_VERSION"]:
+              raise SystemExit("Post-deploy Fly state/version mismatch; STOP")
+          if machine.get("image_ref", {}).get("digest") != runtime_digest:
+              raise SystemExit("Post-deploy Fly digest drift; STOP")
+          master = read("post-master.json")
+          if master.get("ref") != "refs/heads/master" or master.get("object", {}).get("type") != "commit" or master["object"].get("sha") != os.environ["EXPECTED_MASTER_SHA"]:
+              raise SystemExit("Post-deploy master drift; STOP")
+          Path("manual-digest/post-master.json").write_text(json.dumps({"ref": master["ref"], "object": {"type": master["object"]["type"], "sha": master["object"]["sha"]}}))
+          print("Post-deploy digest, machine version and master verified")
+          PY
+
+      - name: Preserve digest release evidence
+        if: always() && steps.mode.outputs.mode == 'digest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-digest-release-evidence
+          path: |
+            manual-digest/producer/image-digest.json
+            manual-digest/registry.json
+            manual-digest/fly-status.json
+            manual-digest/preflight-summary.json
+            manual-digest/preflight.exit-code
+            manual-digest/post-fly-status.json
+            manual-digest/post-master.json
+          if-no-files-found: warn
+
+      - name: Remove private release scratch
+        if: always() && steps.release.outputs.private_dir != ''
+        env:
+          RELEASE_PRIVATE_DIR: ${{ steps.release.outputs.private_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          scratch = Path(os.environ["RELEASE_PRIVATE_DIR"])
+          root = Path(os.environ["RUNNER_TEMP"]).resolve()
+          if scratch.is_symlink() or scratch.parent.resolve() != root or not re.fullmatch(r"manual-digest-private\.[A-Za-z0-9]{6}", scratch.name):
+              raise SystemExit("Private scratch ownership path mismatch")
+          allowed = {".owner", "fly-status.json", "fly-status.stderr", "preflight.json", "preflight.stderr", "preflight-finished.txt", "post-fly-status.json", "post-fly-status.stderr", "post-master.json", "post-master.stderr"}
+          files = list(scratch.iterdir())
+          if not all(path.name in allowed and path.is_file() and not path.is_symlink() for path in files):
+              raise SystemExit("Unexpected private scratch content")
+          owner = scratch / ".owner"
+          if not owner.is_file() or owner.read_text().strip() != os.environ["GITHUB_RUN_ID"]:
+              raise SystemExit("Private scratch owner mismatch")
+          for path in files:
+              path.unlink()
+          scratch.rmdir()
+          print("Private release scratch removed")
+          PY

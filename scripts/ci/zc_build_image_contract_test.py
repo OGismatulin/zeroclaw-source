@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -44,6 +46,25 @@ def ref_script(classify: str) -> str:
     return textwrap.dedent(match.group("script"))
 
 
+def receipt_step(build: str) -> str:
+    steps = re.findall(
+        r"^      - [^\n]+\n.*?(?=^      - |\Z)",
+        build,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    matches = [step for step in steps if "        id: image-receipt\n" in step]
+    if len(matches) != 1:
+        raise AssertionError("exactly one image receipt step required")
+    return matches[0]
+
+
+def receipt_script(step: str) -> str:
+    match = re.search(r"^        run: \|\n(.*)", step, flags=re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError("image receipt script not found")
+    return textwrap.dedent(match.group(1))
+
+
 class ZcBuildImageContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.build = job_block("build")
@@ -54,7 +75,7 @@ class ZcBuildImageContractTest(unittest.TestCase):
             classify, r"(?m)^      is_master: \$\{\{ steps.ref.outputs.is_master \}\}$"
         )
         script = ref_script(classify)
-        self.assertIn('if [[ "$GITHUB_REF" == \'refs/heads/master\' ]]; then', script)
+        self.assertIn("if [[ \"$GITHUB_REF\" == 'refs/heads/master' ]]; then", script)
         self.assertNotIn("${{", script)
         self.assertNotIn("github.ref ==", WORKFLOW)
 
@@ -131,6 +152,181 @@ class ZcBuildImageContractTest(unittest.TestCase):
         for output in ("", "unexpected", "0", "true false", "true\nfalse"):
             with self.subTest(output=output):
                 self.assertNotIn(output.casefold(), allowed)
+
+    def run_receipt(
+        self,
+        overrides: dict[str, str] | None = None,
+        workflow: str = WORKFLOW,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str] | None, bool]:
+        step = receipt_step(job_block("build", workflow))
+        bindings = dict(
+            re.findall(
+                r"^          (BUILD_[A-Z_]+): \$\{\{ ([^}]+) \}\}$", step, re.MULTILINE
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "user.name=CI Fixture",
+                    "-c",
+                    "user.email=ci@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "fixture",
+                ],
+                cwd=tmp,
+                check=True,
+                capture_output=True,
+            )
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=tmp, text=True
+            ).strip()
+            context = {
+                "github.sha": head,
+                "steps.image.outputs.digest": "sha256:" + "a" * 64,
+                "github.run_id": "12345",
+                "github.ref": "refs/heads/master",
+                **(overrides or {}),
+            }
+            env = {
+                **os.environ,
+                **{key: context.get(value, "") for key, value in bindings.items()},
+            }
+            script = directory / "receipt.py"
+            script.write_text(receipt_script(step), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=tmp,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            artifact = directory / "image-digest.json"
+            payload = json.loads(artifact.read_text()) if artifact.exists() else None
+            return result, payload, (directory / "injection-marker").exists()
+
+    def test_receipt_uses_successful_build_digest_and_exact_run_context(self) -> None:
+        self.assertRegex(
+            self.build,
+            r"(?m)^      - uses: docker/build-push-action@v6\n        id: image$",
+        )
+        step = receipt_step(self.build)
+        self.assertIn("        shell: python\n", step)
+        for key, expression in (
+            ("BUILD_HEAD_SHA", "github.sha"),
+            ("BUILD_IMAGE_DIGEST", "steps.image.outputs.digest"),
+            ("BUILD_RUN_ID", "github.run_id"),
+            ("BUILD_REF", "github.ref"),
+        ):
+            self.assertIn(f"          {key}: ${{{{ {expression} }}}}\n", step)
+        self.assertNotIn("${{", receipt_script(step))
+        self.assertNotRegex(step, r"(?m)^        (if|continue-on-error):")
+        self.assertLess(
+            self.build.index("id: image\n"), self.build.index("id: image-receipt\n")
+        )
+        result, payload, marker = self.run_receipt()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(payload), {"head_sha", "image_digest", "run_id"})
+        self.assertRegex(payload["head_sha"], r"^[0-9a-f]{40}$")
+        self.assertEqual(payload["image_digest"], "sha256:" + "a" * 64)
+        self.assertEqual(payload["run_id"], "12345")
+        self.assertFalse(marker)
+
+    def test_upload_requires_the_exact_receipt_file_after_production(self) -> None:
+        upload = self.build[
+            self.build.index("      - name: Upload immutable image digest\n") :
+        ]
+        self.assertIn("        uses: actions/upload-artifact@v4\n", upload)
+        self.assertIn("          name: zc-build-image-digest\n", upload)
+        self.assertIn("          path: image-digest.json\n", upload)
+        self.assertIn("          if-no-files-found: error\n", upload)
+        self.assertNotRegex(upload, r"(?m)^        (if|continue-on-error):")
+        self.assertLess(
+            self.build.index("id: image-receipt\n"), self.build.index(upload)
+        )
+
+    def test_missing_producer_output_mutation_cannot_write_receipt(self) -> None:
+        mutant = WORKFLOW.replace(
+            "BUILD_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}",
+            "BUILD_IMAGE_DIGEST: ${{ steps.image.outputs.missing }}",
+        )
+        self.assertNotEqual(mutant, WORKFLOW)
+        result, payload, marker = self.run_receipt(workflow=mutant)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid image receipt image_digest", result.stderr)
+        self.assertIsNone(payload)
+        self.assertFalse(marker)
+
+    def test_invalid_digest_mutations_cannot_write_receipt(self) -> None:
+        for digest in (
+            "",
+            "sha256:" + "a" * 63,
+            "sha256:" + "a" * 65,
+            "sha256:" + "A" * 64,
+            "sha512:" + "a" * 64,
+            "ghcr.io/ogismatulin/zeroclaw@sha256:" + "a" * 64,
+            "sha256:" + "a" * 64 + "\n",
+            "$(touch injection-marker)",
+        ):
+            with self.subTest(digest=digest):
+                result, payload, marker = self.run_receipt(
+                    {"steps.image.outputs.digest": digest}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(payload)
+                self.assertFalse(marker)
+
+    def test_wrong_sha_mutation_cannot_write_receipt(self) -> None:
+        for sha in (
+            "b" * 40,
+            "b" * 7,
+            "B" * 40,
+            "b" * 40 + "\n",
+            "$(touch injection-marker)",
+        ):
+            with self.subTest(sha=sha):
+                result, payload, marker = self.run_receipt({"github.sha": sha})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(payload)
+                self.assertFalse(marker)
+
+    def test_invalid_run_id_and_ref_do_not_write_receipt(self) -> None:
+        for key, value in (
+            ("github.run_id", "0"),
+            ("github.run_id", "-1"),
+            ("github.run_id", "1\n2"),
+            ("github.run_id", "$(touch injection-marker)"),
+            ("github.ref", "master"),
+            ("github.ref", "refs/heads/master\n"),
+            ("github.ref", "refs/heads/x..y"),
+        ):
+            with self.subTest(key=key, value=value):
+                result, payload, marker = self.run_receipt({key: value})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(payload)
+                self.assertFalse(marker)
+
+    def test_feature_tag_and_shell_like_valid_ref_are_passed_as_data(self) -> None:
+        for ref in (
+            "refs/heads/feature/x",
+            "refs/tags/v1",
+            "refs/heads/$(touch${IFS}injection-marker)",
+        ):
+            with self.subTest(ref=ref):
+                result, payload, marker = self.run_receipt({"github.ref": ref})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNotNone(payload)
+                self.assertFalse(marker)
 
     def test_contract_test_runs_in_required_lint_job(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
