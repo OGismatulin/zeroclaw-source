@@ -135,8 +135,7 @@ wire_api = "responses"
 requires_openai_auth = true
 
 # Codex judge slot: GPT-6 Sol on the OAuth runtime. Referenced by
-# [agents.analyst_sol]. (The GPT-5.6 Terra analyst slot codex_terra was retired
-# 2026-09-23 together with analyst_terra.)
+# [agents.analyst_sol].
 [providers.models.openai.codex_sol]
 model = "gpt-6.1-sol"
 api_key = ""
@@ -154,6 +153,13 @@ provider_extra = { reasoning_effort = "xhigh" }
 # #34 teaches the codex wire to read provider_extra.reasoning_effort per alias.
 # Live-probed 2026-08-19: luna/terra/sol all answer 200 to max|xhigh|medium and
 # echo back the requested effort. Referenced by [agents.analyst_luna].
+[providers.models.openai.codex_terra]
+model = "gpt-6.1-terra"
+api_key = ""
+wire_api = "responses"
+requires_openai_auth = true
+provider_extra = { reasoning_effort = "max" }
+
 [providers.models.openai.codex_luna]
 model = "gpt-6-luna"
 api_key = ""
@@ -196,31 +202,17 @@ provider_extra = { reasoning_effort = "high" }
 # costs the whole analyst. Stays inside [delegate].agentic_timeout_secs = 3600.
 timeout_secs = 300
 
-# Ensemble analyst alias on the Go router (2026-09-23): Muse Spark 1.3 Contributor
-# (Meta), replaced analyst_terra (gpt-5.6-terra). This model is served ONLY on the
-# Responses wire: opencode's models.json binds it to @ai-sdk/openai, and
-# /chat/completions answers 503 "Endpoint is unavailable" on both keys while
-# /responses answers 200 with a two-turn tool loop (probed 2026-09-23).
-# Supported efforts: minimal..xhigh (no max). NO fallback — analyst failure domain.
-[providers.models.opencode.muse]
-model = "muse-spark-1.3-contributor"
+[providers.models.opencode.deepseek]
+model = "deepseek-v4.1-flash"
 uri = "https://opencode.ai/zen/go/v1"
 api_key = ""
-wire_api = "responses"
-provider_extra = { reasoning_effort = "xhigh" }
-# 300s instead of the 120s default (entry.timeout_secs.unwrap_or(120)), same
-# reasoning as glm_flash: 2026-09-28 prod -- this analyst died with
-# "operation timed out" exactly 120s apart three times in a row (mimo_pro 0/4
-# in 7 days; muse likewise on DV-32751). Delegates retry same-provider x3 with
-# NO fallback (D2), so a per-request ceiling below the model's worst case
-# costs the whole analyst. Stays inside [delegate].agentic_timeout_secs = 3600.
+provider_extra = { reasoning_effort = "max" }
 timeout_secs = 300
 
 # /model button alias for Muse Spark 1.3 Contributor (2026-09-29). The bot sends
 # provider = "opencode.muse_chat": a bare "opencode-go" override would use the chat
-# wire and answer 503 (this model is Responses-only, see `muse` above). Separate
-# from `muse` so the analyst keeps its xhigh effort and own rollback point; chat
-# runs at high. NO fallback: the alias branch reads only a per-alias `fallback`.
+# wire and answer 503 (this model is Responses-only). NO fallback: the alias
+# branch reads only a per-alias `fallback`.
 [providers.models.opencode.muse_chat]
 model = "muse-spark-1.3-contributor"
 uri = "https://opencode.ai/zen/go/v1"
@@ -915,8 +907,6 @@ protect_last_n = 10
 # analyst_mimo_pro (2026-09-23): opencode models.json publishes 1_048_576; the
 # floor is written explicitly so the analyst never depends on the fallback.
 "mimo-v2.6-pro"           = 1_000_000
-# analyst_muse (2026-09-23): models.json publishes 1_048_576.
-"muse-spark-1.3-contributor" = 1_000_000
 # jira_worker / analyst_glm_flash (2026-09-23): were silently on the profile
 # fallback (max_context_tokens); models.json publishes 1_000_000 for both.
 "deepseek-v4.1-flash"     = 1_000_000
@@ -938,6 +928,7 @@ protect_last_n = 10
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
 "gpt-6.1-sol"             = 353_000
+"gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
 [runtime_profiles.jira_review]
@@ -958,7 +949,6 @@ protect_last_n = 10
 
 [runtime_profiles.jira_review.context_compression.model_windows]
 "mimo-v2.6-pro"           = 1_000_000
-"muse-spark-1.3-contributor" = 1_000_000
 "deepseek-v4.1-flash"     = 1_000_000
 "glm-5.3-flash"           = 1_000_000
 "deepseek-v4-pro"         = 800_000
@@ -971,6 +961,7 @@ protect_last_n = 10
 "hy3"                     = 256_000
 "gpt-5.5"                 = 256_000
 "gpt-6.1-sol"             = 353_000
+"gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
 [runtime_profiles.jira_research]
@@ -991,7 +982,6 @@ protect_last_n = 10
 
 [runtime_profiles.jira_research.context_compression.model_windows]
 "mimo-v2.6-pro"           = 1_000_000
-"muse-spark-1.3-contributor" = 1_000_000
 "deepseek-v4.1-flash"     = 1_000_000
 "glm-5.3-flash"           = 1_000_000
 "deepseek-v4-pro"         = 800_000
@@ -1004,6 +994,7 @@ protect_last_n = 10
 "hy3"                     = 256_000
 "gpt-5.5"                 = 256_000
 "gpt-6.1-sol"             = 353_000
+"gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
 # ── Agents ──────────────────────────────────────────────────────────────────
@@ -1067,10 +1058,7 @@ mcp_bundles = ["all"]
 # analyst_luna = GPT-6 Luna on the codex OAuth subscription (moved off the Go
 # router 2026-08-19; replaced mimo-v2.5-pro 2026-08-16). Renamed (was
 # analyst_mimo) for audit truth — pipeline diagnostics key on the agent name, so
-# a stale name would misattribute every ensemble output. NOTE: this puts three
-# roles (analyst_luna, judge analyst_sol) in the openai-codex failure domain
-# (analyst_terra was the third until 2026-09-23) — a codex outage takes out
-# the judge and 1 of 5 analysts.
+# a stale name would misattribute every ensemble output.
 [agents.analyst_luna]
 final_response_min_chars = 1000
 model_provider = "openai.codex_luna"
@@ -1126,15 +1114,22 @@ mcp_bundles = ["all"]
 [agents.analyst_sol.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-# analyst_muse = Muse Spark 1.3 Contributor on the Go router (2026-09-23),
-# replaced analyst_terra (gpt-5.6-terra) in the ensemble roster.
-[agents.analyst_muse]
+[agents.analyst_deepseek_flash]
 final_response_min_chars = 1000
-model_provider = "opencode.muse"
+model_provider = "opencode.deepseek"
 risk_profile = "default"
 runtime_profile = "jira_review"
 mcp_bundles = ["all"]
-[agents.analyst_muse.workspace]
+[agents.analyst_deepseek_flash.workspace]
+path = "/zeroclaw-data/template/workspace/personas/analyst"
+
+[agents.analyst_terra]
+final_response_min_chars = 1000
+model_provider = "openai.codex_terra"
+risk_profile = "default"
+runtime_profile = "jira_review"
+mcp_bundles = ["all"]
+[agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
 # Research specialists (design 2026-09-11-jira-research-specialists, owner
