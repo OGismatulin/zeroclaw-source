@@ -262,12 +262,12 @@ def run_window(run):
     )
     created = timestamp(run.get("created_at"))
     updated = timestamp(run.get("updated_at"))
-    require(created <= updated, "invalid workflow timestamps")
     return created, updated
 
 
 def run_identity(run):
-    run_window(run)
+    created, updated = run_window(run)
+    require(created <= updated, "invalid workflow timestamps")
     require(
         type(run.get("run_attempt")) is int and run["run_attempt"] > 0,
         "invalid workflow run attempt",

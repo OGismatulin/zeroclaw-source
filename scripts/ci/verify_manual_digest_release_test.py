@@ -814,6 +814,8 @@ class ManualDigestReleaseTest(unittest.TestCase):
                 }
                 self.runs[workflow].append(run)
                 self.verify()
+                run["created_at"] = "2026-10-30T00:02:00Z"
+                self.verify()
                 for field, value in (
                     ("id", 0),
                     ("created_at", "bad"),
@@ -826,6 +828,28 @@ class ManualDigestReleaseTest(unittest.TestCase):
                         self.verify()
                     run[field] = original
                 self.runs[workflow].pop()
+
+    def test_inverted_expected_run_timestamps_still_block(self):
+        for rows in self.runs.values():
+            run = rows[0]
+            original = run["updated_at"]
+            created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+            run["updated_at"] = (created - timedelta(seconds=1)).isoformat()
+            with self.assertRaisesRegex(VERIFIER.Failure, "invalid workflow timestamps"):
+                self.verify()
+            run["updated_at"] = original
+
+    def test_inverted_relevant_foreign_run_timestamps_still_block(self):
+        for workflow, rows in self.runs.items():
+            run = copy.deepcopy(rows[0])
+            run["id"] = 999
+            run["created_at"] = NOW.isoformat()
+            run["updated_at"] = (NOW - timedelta(seconds=1)).isoformat()
+            rows.append(run)
+            with self.subTest(workflow=workflow):
+                with self.assertRaisesRegex(VERIFIER.Failure, "invalid workflow timestamps"):
+                    self.verify()
+            rows.pop()
 
     def test_preflight_finished_timing_accepts_long_scan_and_bounds_all_gaps(self):
         self.preflight["observed_at"] = (NOW - timedelta(seconds=90)).isoformat()
