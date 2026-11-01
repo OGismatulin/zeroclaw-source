@@ -17,6 +17,7 @@ import datetime as dt
 from pathlib import Path
 import re
 import sys
+import tomllib
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -246,6 +247,29 @@ def check_child_secret_denylist() -> None:
         )
 
 
+def check_native_v3_gateway_config() -> None:
+    import gateway_manager as gm
+
+    source = (ROOT / "config.fly.toml.template").read_text(encoding="utf-8")
+    rendered = gm.WorkspaceBootstrapper._rewrite_gateway_config(
+        source, host="127.0.0.1", port=3011
+    )
+    for text in (source, rendered):
+        config = tomllib.loads(text)
+        check(config["schema_version"] == 3, "runtime template is not native V3")
+        check("channels_config" not in config, "native V3 contains legacy channels")
+        check(config.get("channels") == {"cli": True}, "native V3 channel defaults drifted")
+    check(tomllib.loads(rendered)["gateway"]["port"] == 3011, "gateway port was not rewritten")
+    legacy = gm.WorkspaceBootstrapper._rewrite_gateway_config(
+        "schema_version = 2\n[gateway]\nport = 3000\n",
+        host="127.0.0.1", port=3011,
+    )
+    check(
+        tomllib.loads(legacy)["channels_config"]["webhook"]["port"] == 3011,
+        "legacy webhook port compatibility drifted",
+    )
+
+
 def main() -> int:
     for probe in (
         check_error_catalog,
@@ -258,6 +282,7 @@ def main() -> int:
         check_completeness_rejects_absent_inputs,
         check_slot_identity_includes_instance,
         check_child_secret_denylist,
+        check_native_v3_gateway_config,
     ):
         try:
             probe()

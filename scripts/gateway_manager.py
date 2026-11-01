@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import traceback
 from typing import Any, Callable, TextIO, TypedDict
 from urllib import error, request
@@ -747,7 +748,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB — Telegram Bot API getFile limit
 # v3-69 = jira_analysis model_windows gain deepseek-v4.1-flash and glm-5.3-flash
 #         (jira_worker / analyst_glm_flash were on the silent 1M fallback).
 # v3-73 = GPT-6.1 Sol replaces GPT-6 Sol (codex_coder, codex_sol, fallbacks, windows).
-CURRENT_CONFIG_MARKER = "v3-93"
+CURRENT_CONFIG_MARKER = "v3-94"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -1457,7 +1458,10 @@ class WorkspaceBootstrapper:
                 ]
             )
 
-        if "[channels_config.webhook]" not in config_text:
+        if (
+            tomllib.loads(config_text).get("schema_version", 1) < 3
+            and "[channels_config.webhook]" not in config_text
+        ):
             if output and output[-1] != "":
                 output.append("")
             output.extend(
