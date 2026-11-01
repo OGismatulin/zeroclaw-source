@@ -392,18 +392,8 @@ long_running_request_timeout_secs = 600
 
 # Tunnel defaults to "none" in V3 (tunnel.tunnel_provider); no section needed.
 
-# Webhook section stays spelled [channels_config.webhook]: the V3 runtime treats
-# it as a legacy section and skips it (the embedded webhook channel is dead code
-# here — the live path is the gateway crate's handle_webhook bound to [gateway]
-# port), but gateway_manager._rewrite_gateway_config matches this literal block
-# to inject each daemon's per-user port. Keep the literal name (do NOT rename to
-# [channels.webhook.default] — that breaks the manager's port rewrite).
-[channels_config]
+[channels]
 cli = true
-
-[channels_config.webhook]
-port = 3000
-secret = "__ZEROCLAW_WEBHOOK_SECRET__"
 
 # ── Multimodal ──────────────────────────────────────────────────────────────
 [multimodal]
