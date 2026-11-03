@@ -5070,6 +5070,7 @@ class _RuntimeHTTPServer(ThreadingHTTPServer):
 
 class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     server: _RuntimeHTTPServer
+    timeout = 60.0
 
     def do_GET(self) -> None:
         try:
@@ -5178,7 +5179,21 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
             status_code = 413 if self.path == "/upload" else 400
             return self._reject_content_length(status_code=status_code)
 
-        body = self.rfile.read(content_length) if content_length else b""
+        try:
+            body = self.rfile.read(content_length) if content_length else b""
+        except OSError as exc:
+            reason = (
+                "body_read_timeout"
+                if isinstance(exc, TimeoutError)
+                else "body_read_error"
+            )
+            return self._reject_body(
+                reason, content_length, error_class=exc.__class__.__name__
+            )
+        if len(body) != content_length:
+            return self._reject_body(
+                "body_incomplete", content_length, received=len(body)
+            )
         headers = {key.lower(): value for key, value in self.headers.items()}
 
         if self.path == "/pair":
@@ -5212,6 +5227,20 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/upload":
             return self.server.app.handle_upload_rejection(status_code=status_code)
         return self.server.app.handle_request_rejection()
+
+    def _reject_body(
+        self, reason: str, expected: int, **fields: object
+    ) -> tuple[int, dict[str, object]]:
+        status_code, payload = self._reject_content_length(status_code=400)
+        extra = "".join(f" {key}={value}" for key, value in fields.items())
+        path = _safe_log_identity(self.path, limit=160) or "unknown"
+        print(
+            "[gateway-manager] request body rejected "
+            f"incident_id={payload.get('incident_id', '')} reason={reason} "
+            f"expected={expected}{extra} path={path}",
+            flush=True,
+        )
+        return status_code, payload
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
