@@ -4507,8 +4507,8 @@ def _go_key_http(
         return exc.code, exc.read(65536)
 
 
-_GO_KEY_TEMPLATES = {
-    "switched": (
+_GO_KEY_TEMPLATES = dict(
+    switched=(
         "🔁 **OpenCode Go: ключ переключён автоматически**\n\n"
         "- Было: слот {old_slot} (`{old_mask}`) — {old_reason}\n"
         "- Стало: слот {new_slot} (`{new_mask}`) — {new_windows}\n\n"
@@ -4516,77 +4516,77 @@ _GO_KEY_TEMPLATES = {
         "остаются на старом ключе. Резервных слотов, годных по окнам: {spare}.\n\n"
         "Выровнять `.env` и staged-секрет Fly: `make opencode-key-use SLOT={new_slot} CONFIRM=1`"
     ),
-    "would_switch": (
+    would_switch=(
         "🔁 **OpenCode Go: переключил бы ключ (режим alert)**\n\n"
         "- Активный: слот {old_slot} (`{old_mask}`) — {old_reason}\n"
         "- Кандидат: слот {new_slot} (`{new_mask}`) — {new_windows}\n\n"
         "Ключ не записан. Вручную: `make opencode-key-use SLOT={new_slot} CONFIRM=1`"
     ),
-    "no_reserve": (
+    no_reserve=(
         "⛔ **OpenCode Go: ключ на исходе, живого резерва нет**\n\n"
         "- Активный: слот {slot} (`{mask}`) — {reason}\n"
         "- Резервы: {reserves}\n\n"
         "Нужен человек: пополнить баланс в opencode.ai/auth или выпустить ключ, "
         "добавить его в `.env` и выполнить `make opencode-slots-push CONFIRM=1`."
     ),
-    "reserve_thin": (
+    reserve_thin=(
         "⚠️ **OpenCode Go: резерв на исходе**\n\n"
         "- Активный: слот {slot} (`{mask}`) — {reason}\n"
         "- Резервы: {reserves}\n\n"
         "Когда активный дойдёт до {switch_at}%, переключаться будет не на что. "
         "Пополнить баланс в opencode.ai/auth или выпустить ключ, затем `make opencode-slots-push CONFIRM=1`."
     ),
-    "reserve_unhealthy": (
+    reserve_unhealthy=(
         "⚠️ **OpenCode Go: резервный ключ неисправен**\n\n"
         "{lines}\n\n"
         "На них автопереключение не уйдёт. Заменить ключ в `.env` и выполнить "
         "`make opencode-slots-push CONFIRM=1`."
     ),
-    "probe_misconfigured": (
+    probe_misconfigured=(
         "⚠️ **OpenCode Go: проба ключа сломана**\n\n"
         "- Ответ: {reason}\n\n"
         "Модель пробы `{model}` недоступна на роутере: ключ не оценивается, автопереключение стоит. "
         "Поменять `ZEROCLAW_GO_KEY_PROBE_MODEL` в `fly.toml` на модель из каталога."
     ),
-    "unknown_streak": (
+    unknown_streak=(
         "⚠️ **OpenCode Go: ключ не проверить {count} раз подряд**\n\n"
         "- Слот {slot} (`{mask}`) — {reason}\n\n"
         "Сеть или роутер: ключ или резерв не удалось оценить, переключение не делается."
     ),
-    "active_outside_inventory": (
+    active_outside_inventory=(
         "⚠️ **OpenCode Go: активный ключ не из слотов**\n\n"
         "- Активный: `{mask}`; инвентарь: {inventory}\n\n"
         "Вернуться на него автопереключение не сможет. Выполнить `make opencode-slots-push CONFIRM=1`."
     ),
-    "no_active_key": (
+    no_active_key=(
         "⛔ **OpenCode Go: активного ключа нет**\n\n"
         "- Файл `{path}` пуст или отсутствует, `OPENCODE_GO_API_KEY` в окружении тоже пуст\n\n"
         "Go-каналы рантайма без ключа. Записать живой слот: `make opencode-key-use SLOT=<N> CONFIRM=1`."
     ),
-    "lock_stuck": (
+    lock_stuck=(
         "⚠️ **OpenCode Go: замок ротации висит дольше 15 минут**\n\n"
         "- `{path}`\n\n"
         "Автопереключение стоит. Сначала убедиться, что ручная ротация (`make opencode-key-use`) не идёт; "
         "если не идёт — удалить каталог замка."
     ),
-    "write_unconfirmed": (
+    write_unconfirmed=(
         "⛔ **OpenCode Go: запись ключа не подтвердилась**\n\n"
         "- `{path}`\n\n"
         "Ключ мог не смениться. Проверить: "
         "`fly ssh console -a ai-forge-zeroclaw --command \"sha256sum {path}\"`"
     ),
-    "switch_storm": (
+    switch_storm=(
         "⛔ **OpenCode Go: автопереключение остановлено**\n\n"
         "- За последний час уже {count} переключения\n\n"
         "Похоже на дребезг ответов роутера: запись стоит до выхода из часового окна. "
         "Разобраться: `fly logs -a ai-forge-zeroclaw --no-tail | grep go-key`"
     ),
-    "watch_failed": (
+    watch_failed=(
         "⚠️ **OpenCode Go: проверка ключа падает {count} раз подряд**\n\n"
         "- {reason}\n\n"
         "Автопереключение не работает. Логи: `fly logs -a ai-forge-zeroclaw --no-tail | grep go-key`"
     ),
-}
+)
 
 
 def go_key_message(kind: str, **fields: str) -> str:
