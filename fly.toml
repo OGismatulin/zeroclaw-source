@@ -31,6 +31,7 @@ swap_size_mb = 512
   # Path is duplicated as DEFAULT_KEY_FILE in workspace/scripts/opencode_usage.py
   # (gated by tests/test_configuration.py).
   OPENCODE_GO_API_KEY_FILE = '/zeroclaw-data/opencode/go_api_key'
+  ZEROCLAW_GO_KEY_WATCH_MODE = 'switch'
   ZEROCLAW_MANAGER_HOST = '0.0.0.0'
   ZEROCLAW_MANAGER_PORT = '3000'
   ZEROCLAW_MANAGER_BASE_PORT = '3001'

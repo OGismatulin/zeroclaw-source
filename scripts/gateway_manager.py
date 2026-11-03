@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import Counter, deque
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import email.parser
 import email.policy
 import functools
+import hashlib
 import html
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -4375,6 +4377,701 @@ def vpn_flap_message(count: int, window_secs: float) -> str:
     )
 
 
+GO_KEY_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+GO_KEY_CHAT_URL = "https://opencode.ai/zen/go/v1/chat/completions"
+GO_KEY_WINDOWS = ("rolling", "weekly", "monthly")
+GO_KEY_USER_AGENT = "zeroclaw/0.8.5"
+GO_KEY_MARKERS = (
+    "Insufficient account funds",
+    "Insufficient balance",
+    "api_key_expired",
+    "CreditsError",
+    "GoUsageLimitError",
+)
+GO_KEY_MODES = ("off", "alert", "switch")
+GO_KEY_TRANSPORT_ERRORS = (OSError, ValueError, http.client.HTTPException)
+GO_KEY_LOCK_STUCK_SECS = 900.0
+GO_KEY_DISARM_MARGIN = 15.0
+GO_KEY_MAX_SWITCHES_PER_HOUR = 3
+GoKeyHttp = Callable[[str, str, dict[str, str], bytes | None, float], tuple[int, bytes]]
+
+
+def go_key_mask(key: str) -> str:
+    return f"***{key[-4:]}" if len(key) > 8 else "***"
+
+
+def go_key_form_ok(key: str) -> bool:
+    return 16 <= len(key) <= 512 and all(33 <= ord(char) <= 126 for char in key)
+
+
+def parse_go_usage(body: bytes) -> dict[str, dict[str, Any]] | None:
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    windows: dict[str, dict[str, Any]] = {}
+    for name in GO_KEY_WINDOWS:
+        raw = usage.get(name)
+        if not isinstance(raw, dict) or raw.get("status") not in ("ok", "rate-limited"):
+            return None
+        try:
+            percent = float(raw.get("percent"))
+        except (TypeError, ValueError):
+            return None
+        resets_at = raw.get("resetsAt")
+        if not 0.0 <= percent <= 100.0 or not isinstance(resets_at, str):
+            return None
+        try:
+            datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        windows[name] = {"status": raw["status"], "percent": percent, "resets_at": resets_at}
+    return windows
+
+
+def classify_go_usage(
+    status: int, body: bytes, switch_at: float
+) -> tuple[str, dict[str, dict[str, Any]] | None, str]:
+    if status == 403 and b"error code: 1010" in body:
+        return "unknown", None, "usage 403 blocked_ua"
+    if status in (401, 403):
+        return "dead", None, f"usage {status}"
+    if status != 200:
+        return "unknown", None, f"usage {status}"
+    windows = parse_go_usage(body)
+    if windows is None:
+        return "unknown", None, "usage payload unreadable"
+    detail = ", ".join(f"{name} {windows[name]['percent']:g}%" for name in GO_KEY_WINDOWS)
+    pressured = any(
+        window["status"] == "rate-limited" or window["percent"] >= switch_at
+        for window in windows.values()
+    )
+    return ("pressured" if pressured else "alive"), windows, detail
+
+
+def classify_go_probe(status: int, body: bytes) -> tuple[str, str]:
+    text = body[:2000].decode("utf-8", "replace")
+    if status == 200:
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if isinstance(choices, list) and choices:
+            return "alive", ""
+        return "unknown", "200 without choices"
+    if "not supported" in text or "Model is unavailable" in text:
+        return "probe_misconfigured", f"{status} model unavailable"
+    if status == 403 and "error code: 1010" in text:
+        return "unknown", "403 blocked_ua"
+    marker = next((marker for marker in GO_KEY_MARKERS if marker in text), "")
+    label = f"{status} {marker}".strip()
+    if status in (401, 402, 403) or (status == 429 and marker == "GoUsageLimitError"):
+        return "dead", label
+    return "unknown", label
+
+
+def combine_go_key_state(usage_state: str, probe_state: str) -> str:
+    if "dead" in (usage_state, probe_state):
+        return "dead"
+    if probe_state == "probe_misconfigured":
+        return "probe_misconfigured"
+    if usage_state == "pressured":
+        return "pressured"
+    if "unknown" in (usage_state, probe_state):
+        return "unknown"
+    return "alive"
+
+
+class _GoKeyNoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(
+        self, req: request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
+_GO_KEY_OPENER = request.build_opener(_GoKeyNoRedirect)
+
+
+def _go_key_http(
+    method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: float
+) -> tuple[int, bytes]:
+    req = request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with _GO_KEY_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read(65536)
+    except error.HTTPError as exc:
+        return exc.code, exc.read(65536)
+
+
+_GO_KEY_TEMPLATES = {
+    "switched": (
+        "🔁 **OpenCode Go: ключ переключён автоматически**\n\n"
+        "- Было: слот {old_slot} (`{old_mask}`) — {old_reason}\n"
+        "- Стало: слот {new_slot} (`{new_mask}`) — {new_windows}\n\n"
+        "Ходы, которые уже идут, и запасной кандидат чата по умолчанию (до респавна демона) "
+        "остаются на старом ключе. Резервных слотов, годных по окнам: {spare}.\n\n"
+        "Выровнять `.env` и staged-секрет Fly: `make opencode-key-use SLOT={new_slot} CONFIRM=1`"
+    ),
+    "would_switch": (
+        "🔁 **OpenCode Go: переключил бы ключ (режим alert)**\n\n"
+        "- Активный: слот {old_slot} (`{old_mask}`) — {old_reason}\n"
+        "- Кандидат: слот {new_slot} (`{new_mask}`) — {new_windows}\n\n"
+        "Ключ не записан. Вручную: `make opencode-key-use SLOT={new_slot} CONFIRM=1`"
+    ),
+    "no_reserve": (
+        "⛔ **OpenCode Go: ключ на исходе, живого резерва нет**\n\n"
+        "- Активный: слот {slot} (`{mask}`) — {reason}\n"
+        "- Резервы: {reserves}\n\n"
+        "Нужен человек: пополнить баланс в opencode.ai/auth или выпустить ключ, "
+        "добавить его в `.env` и выполнить `make opencode-slots-push CONFIRM=1`."
+    ),
+    "reserve_thin": (
+        "⚠️ **OpenCode Go: резерв на исходе**\n\n"
+        "- Активный: слот {slot} (`{mask}`) — {reason}\n"
+        "- Резервы: {reserves}\n\n"
+        "Когда активный дойдёт до {switch_at}%, переключаться будет не на что. "
+        "Пополнить баланс в opencode.ai/auth или выпустить ключ, затем `make opencode-slots-push CONFIRM=1`."
+    ),
+    "reserve_unhealthy": (
+        "⚠️ **OpenCode Go: резервный ключ неисправен**\n\n"
+        "{lines}\n\n"
+        "На них автопереключение не уйдёт. Заменить ключ в `.env` и выполнить "
+        "`make opencode-slots-push CONFIRM=1`."
+    ),
+    "probe_misconfigured": (
+        "⚠️ **OpenCode Go: проба ключа сломана**\n\n"
+        "- Ответ: {reason}\n\n"
+        "Модель пробы `{model}` недоступна на роутере: ключ не оценивается, автопереключение стоит. "
+        "Поменять `ZEROCLAW_GO_KEY_PROBE_MODEL` в `fly.toml` на модель из каталога."
+    ),
+    "unknown_streak": (
+        "⚠️ **OpenCode Go: ключ не проверить {count} раз подряд**\n\n"
+        "- Слот {slot} (`{mask}`) — {reason}\n\n"
+        "Сеть или роутер: ключ или резерв не удалось оценить, переключение не делается."
+    ),
+    "active_outside_inventory": (
+        "⚠️ **OpenCode Go: активный ключ не из слотов**\n\n"
+        "- Активный: `{mask}`; инвентарь: {inventory}\n\n"
+        "Вернуться на него автопереключение не сможет. Выполнить `make opencode-slots-push CONFIRM=1`."
+    ),
+    "no_active_key": (
+        "⛔ **OpenCode Go: активного ключа нет**\n\n"
+        "- Файл `{path}` пуст или отсутствует, `OPENCODE_GO_API_KEY` в окружении тоже пуст\n\n"
+        "Go-каналы рантайма без ключа. Записать живой слот: `make opencode-key-use SLOT=<N> CONFIRM=1`."
+    ),
+    "lock_stuck": (
+        "⚠️ **OpenCode Go: замок ротации висит дольше 15 минут**\n\n"
+        "- `{path}`\n\n"
+        "Автопереключение стоит. Сначала убедиться, что ручная ротация (`make opencode-key-use`) не идёт; "
+        "если не идёт — удалить каталог замка."
+    ),
+    "write_unconfirmed": (
+        "⛔ **OpenCode Go: запись ключа не подтвердилась**\n\n"
+        "- `{path}`\n\n"
+        "Ключ мог не смениться. Проверить: "
+        "`fly ssh console -a ai-forge-zeroclaw --command \"sha256sum {path}\"`"
+    ),
+    "switch_storm": (
+        "⛔ **OpenCode Go: автопереключение остановлено**\n\n"
+        "- За последний час уже {count} переключения\n\n"
+        "Похоже на дребезг ответов роутера: запись стоит до выхода из часового окна. "
+        "Разобраться: `fly logs -a ai-forge-zeroclaw --no-tail | grep go-key`"
+    ),
+    "watch_failed": (
+        "⚠️ **OpenCode Go: проверка ключа падает {count} раз подряд**\n\n"
+        "- {reason}\n\n"
+        "Автопереключение не работает. Логи: `fly logs -a ai-forge-zeroclaw --no-tail | grep go-key`"
+    ),
+}
+
+
+def go_key_message(kind: str, **fields: str) -> str:
+    return _GO_KEY_TEMPLATES[kind].format(**fields)
+
+
+class GoKeyWatcher:
+    def __init__(
+        self,
+        *,
+        key_file: Path,
+        state_path: Path,
+        mode: str,
+        interval_secs: float,
+        switch_at: float,
+        candidate_max: float,
+        cooldown_secs: float,
+        unknown_alert_after: int,
+        probe_model: str,
+        alert: Callable[[str, str], bool],
+        fallback_key: str = "",
+        http: GoKeyHttp = _go_key_http,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._key_file = key_file
+        self._slots_file = key_file.parent / "slots.json"
+        self._lock_dir = key_file.parent / ".rotate.lock"
+        self._state_path = state_path
+        self._mode_file = state_path.with_name("go_key_watch.mode")
+        self._mode = mode
+        self._interval = max(interval_secs, 60.0)
+        self._switch_at = switch_at
+        self._candidate_max = candidate_max
+        self._cooldown = cooldown_secs
+        self._unknown_after = max(unknown_alert_after, 1)
+        self._probe_model = probe_model
+        self._alert = alert
+        self._fallback_key = fallback_key.strip()
+        self._http = http
+        self._clock = clock
+        self._secrets: set[str] = set()
+        self._state = self._load_state()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="go-key-watcher", daemon=True)
+        self._thread.start()
+        print(
+            f"[gateway-manager] go-key: thread started (slots={len(self._read_slots()[0])},"
+            f" mode={self._effective_mode()}, every {int(self._interval)}s)",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while True:
+            started = time.monotonic()
+            try:
+                self.run_once()
+            except Exception as exc:
+                print(f"[gateway-manager] go-key: loop error: {type(exc).__name__}", flush=True)
+            if self._stop.wait(max(self._interval - (time.monotonic() - started), 1.0)):
+                return
+
+    def run_once(self) -> str:
+        try:
+            outcome = self._tick()
+            self._state["error_streak"] = 0
+            self._close("watch_failed")
+        except Exception as exc:
+            streak = int(self._state.get("error_streak", 0)) + 1
+            self._state["error_streak"] = streak
+            outcome = "error"
+            print(
+                f"[gateway-manager] go-key: check failed: {type(exc).__name__}: {self._redact(str(exc))[:300]}",
+                flush=True,
+            )
+            if streak >= 3:
+                self._episode(
+                    "watch_failed",
+                    go_key_message("watch_failed", count=str(streak), reason=type(exc).__name__),
+                )
+        self._state["last_outcome"] = outcome
+        peak = self._state.get("last_peak")
+        peak_text = f"{peak:g}%" if isinstance(peak, (int, float)) else "?"
+        print(
+            f"[gateway-manager] go-key: check outcome={outcome}"
+            f" slot={self._state.get('last_slot', '?')} peak={peak_text}",
+            flush=True,
+        )
+        self._save_state()
+        return outcome
+
+    def _tick(self) -> str:
+        self._state["last_slot"] = "?"
+        self._state["last_peak"] = None
+        mode = self._effective_mode()
+        if mode == "off":
+            return "off"
+        active = self._active_key()
+        if not active:
+            self._episode("no_active_key", go_key_message("no_active_key", path=str(self._key_file)))
+            return "no_active_key"
+        self._close("no_active_key")
+        slots, inventory = self._read_slots()
+        self._secrets = {active, *slots.values()}
+        active_slot = next((n for n, key in sorted(slots.items()) if key == active), None)
+        if active_slot is None:
+            self._episode(
+                "active_outside_inventory",
+                go_key_message("active_outside_inventory", mask=go_key_mask(active), inventory=inventory),
+            )
+        else:
+            self._close("active_outside_inventory")
+        usage_state, windows, usage_detail = self._usage(active)
+        probe_state, probe_detail = self._probe(active)
+        state = combine_go_key_state(usage_state, probe_state)
+        if probe_state in ("dead", "probe_misconfigured"):
+            detail = probe_detail
+        elif usage_state == "dead" or state == "pressured" or probe_state == "alive":
+            detail = usage_detail
+        else:
+            detail = probe_detail
+        peak = max(window["percent"] for window in windows.values()) if windows else None
+        self._state["last_slot"] = str(active_slot) if active_slot is not None else "?"
+        self._state["last_peak"] = peak
+        self._state["last_check_at"] = self._clock()
+        reserves = {n: self._reserve(key) for n, key in sorted(slots.items()) if key != active}
+        if state == "pressured" and probe_state == "alive" and self._state["episodes"].get("no_reserve") == "dead":
+            self._state["episodes"]["no_reserve"] = "pressured"
+        try:
+            outcome = self._decide(mode, slots, reserves, active, active_slot, state, f"{state}: {detail}", peak)
+        finally:
+            self._report_reserves(slots, reserves)
+        if outcome != "unknown":
+            self._state["unknown_streak"] = 0
+            self._close("unknown_streak")
+        return outcome
+
+    def _decide(
+        self,
+        mode: str,
+        slots: dict[int, str],
+        reserves: dict[int, dict[str, Any]],
+        active: str,
+        active_slot: int | None,
+        state: str,
+        reason: str,
+        peak: float | None,
+    ) -> str:
+        label = str(active_slot) if active_slot is not None else "?"
+        mask = go_key_mask(active)
+        if state == "unknown":
+            return self._unknown(label, mask, reason)
+        if state == "probe_misconfigured":
+            self._episode(
+                "probe_misconfigured",
+                go_key_message("probe_misconfigured", reason=reason, model=self._probe_model),
+            )
+            return state
+        self._close("probe_misconfigured")
+        roomy = self._eligible(reserves, self._candidate_max)
+        if roomy or (peak is not None and peak < self._candidate_max - GO_KEY_DISARM_MARGIN):
+            self._close("reserve_thin")
+        elif (
+            state == "alive"
+            and peak is not None
+            and peak >= self._candidate_max
+            and "no_reserve" not in self._state["episodes"]
+        ):
+            self._episode(
+                "reserve_thin",
+                go_key_message(
+                    "reserve_thin",
+                    slot=label,
+                    mask=mask,
+                    reason=reason,
+                    reserves=self._reserves_text(slots, reserves),
+                    switch_at=f"{self._switch_at:g}",
+                ),
+            )
+        if state == "alive":
+            if peak is not None and peak < self._switch_at - GO_KEY_DISARM_MARGIN:
+                self._close("no_reserve", "would_switch")
+            return state
+        eligible = roomy if state == "pressured" else self._eligible(reserves, self._switch_at)
+        if not eligible:
+            self._no_reserve(slots, reserves, label, mask, reason, state)
+            return "no_reserve"
+        if state == "pressured" and self._in_cooldown():
+            return "cooldown"
+        if len(self._recent_switches()) >= GO_KEY_MAX_SWITCHES_PER_HOUR:
+            self._episode(
+                "switch_storm",
+                go_key_message("switch_storm", count=str(GO_KEY_MAX_SWITCHES_PER_HOUR)),
+            )
+            return "switch_storm"
+        self._close("switch_storm")
+        new_slot = self._pick(slots, reserves, eligible)
+        if new_slot is None:
+            if any(reserves[n]["state"] != "dead" for _peak, n in eligible):
+                return self._unknown(label, mask, f"{state}: резерв не проверен")
+            self._no_reserve(slots, reserves, label, mask, reason, state)
+            return "no_reserve"
+        fields = {
+            "old_slot": label,
+            "old_mask": mask,
+            "old_reason": reason,
+            "new_slot": str(new_slot),
+            "new_mask": go_key_mask(slots[new_slot]),
+            "new_windows": reserves[new_slot]["detail"],
+        }
+        if mode != "switch":
+            self._episode("would_switch", go_key_message("would_switch", **fields))
+            return f"would_switch:{new_slot}"
+        written = self._write_key(slots[new_slot], active, new_slot)
+        if written != "ok":
+            return written
+        now = self._clock()
+        self._state["last_switch_at"] = now
+        self._state["switches"] = [
+            *self._state["switches"],
+            {"at": now, "from": label, "to": new_slot, "reason": reason},
+        ][-10:]
+        if state == "dead" and active_slot is not None:
+            self._state["slots"][str(active_slot)] = "dead"
+        self._close("no_reserve", "would_switch", "write_unconfirmed", "reserve_thin")
+        spare = sum(1 for _peak, n in self._eligible(reserves, self._candidate_max) if n != new_slot)
+        self._send("switched", go_key_message("switched", spare=str(spare), **fields))
+        return f"switched:{new_slot}"
+
+    def _no_reserve(
+        self,
+        slots: dict[int, str],
+        reserves: dict[int, dict[str, Any]],
+        label: str,
+        mask: str,
+        reason: str,
+        state: str,
+    ) -> None:
+        self._episode(
+            "no_reserve",
+            go_key_message(
+                "no_reserve", slot=label, mask=mask, reason=reason, reserves=self._reserves_text(slots, reserves)
+            ),
+            level=state,
+        )
+
+    def _unknown(self, label: str, mask: str, reason: str) -> str:
+        streak = int(self._state.get("unknown_streak", 0)) + 1
+        self._state["unknown_streak"] = streak
+        if streak >= self._unknown_after:
+            self._episode(
+                "unknown_streak",
+                go_key_message("unknown_streak", count=str(streak), slot=label, mask=mask, reason=reason),
+            )
+        return "unknown"
+
+    def _in_cooldown(self) -> bool:
+        last = self._state.get("last_switch_at")
+        return isinstance(last, (int, float)) and self._clock() - last < self._cooldown
+
+    def _recent_switches(self) -> list[dict[str, Any]]:
+        now = self._clock()
+        return [
+            row
+            for row in self._state["switches"]
+            if isinstance(row, dict) and isinstance(row.get("at"), (int, float)) and now - row["at"] < 3600
+        ]
+
+    @staticmethod
+    def _eligible(reserves: dict[int, dict[str, Any]], limit: float) -> list[tuple[float, int]]:
+        ranked: list[tuple[float, int]] = []
+        for n, row in reserves.items():
+            if row["state"] != "alive" or row["windows"] is None:
+                continue
+            peak = max(window["percent"] for window in row["windows"].values())
+            if peak < limit:
+                ranked.append((peak, n))
+        return sorted(ranked)
+
+    def _pick(
+        self, slots: dict[int, str], reserves: dict[int, dict[str, Any]], eligible: list[tuple[float, int]]
+    ) -> int | None:
+        for _peak, n in eligible:
+            probe_state, probe_detail = self._probe(slots[n])
+            if probe_state == "alive":
+                return n
+            reserves[n] = {**reserves[n], "state": probe_state, "detail": probe_detail}
+            print(
+                f"[gateway-manager] go-key: candidate slot={n} rejected ({probe_state} {probe_detail})",
+                flush=True,
+            )
+        return None
+
+    def _reserve(self, key: str) -> dict[str, Any]:
+        state, windows, detail = self._usage(key)
+        return {"state": state, "windows": windows, "detail": detail}
+
+    def _report_reserves(self, slots: dict[int, str], reserves: dict[int, dict[str, Any]]) -> None:
+        known = self._state["slots"]
+        fresh = [n for n, row in reserves.items() if row["state"] == "dead" and known.get(str(n)) != "dead"]
+        delivered = bool(fresh) and self._send(
+            "reserve_unhealthy",
+            go_key_message(
+                "reserve_unhealthy",
+                lines="\n".join(
+                    f"- Слот {n} (`{go_key_mask(slots[n])}`) — {reserves[n]['detail']}" for n in fresh
+                ),
+            ),
+        )
+        for n, row in reserves.items():
+            if row["state"] in ("unknown", "probe_misconfigured") or (n in fresh and not delivered):
+                continue
+            known[str(n)] = "dead" if row["state"] == "dead" else "alive"
+
+    @staticmethod
+    def _reserves_text(slots: dict[int, str], reserves: dict[int, dict[str, Any]]) -> str:
+        parts = [
+            f"слот {n} (`{go_key_mask(slots[n])}`) — {row['state']}: {row['detail']}"
+            for n, row in sorted(reserves.items())
+        ]
+        return "; ".join(parts) if parts else "нет"
+
+    def _write_key(self, key: str, expected: str, slot: int) -> str:
+        self._key_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._lock_dir.mkdir()
+        except FileExistsError:
+            try:
+                age = self._clock() - self._lock_dir.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age > GO_KEY_LOCK_STUCK_SECS:
+                self._episode("lock_stuck", go_key_message("lock_stuck", path=str(self._lock_dir)))
+            return "lock_busy"
+        self._close("lock_stuck")
+        tmp = self._key_file.with_name(f"{self._key_file.name}.{os.getpid()}.new")
+        try:
+            if self._active_key() != expected or self._read_slots()[0].get(slot) != key:
+                return "stale"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._key_file)
+            try:
+                landed = self._key_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                landed = ""
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                self._lock_dir.rmdir()
+        if hashlib.sha256(landed.encode()).hexdigest() != hashlib.sha256(key.encode()).hexdigest():
+            self._episode("write_unconfirmed", go_key_message("write_unconfirmed", path=str(self._key_file)))
+            return "write_unconfirmed"
+        return "ok"
+
+    def _headers(self, key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": GO_KEY_USER_AGENT,
+            "x-opencode-session": secrets.token_hex(16),
+        }
+
+    def _usage(self, key: str) -> tuple[str, dict[str, dict[str, Any]] | None, str]:
+        try:
+            status, body = self._http("GET", GO_KEY_USAGE_URL, self._headers(key), None, 20.0)
+        except GO_KEY_TRANSPORT_ERRORS as exc:
+            return "unknown", None, f"usage {type(exc).__name__}"
+        return classify_go_usage(status, body, self._switch_at)
+
+    def _probe(self, key: str) -> tuple[str, str]:
+        body = json.dumps(
+            {
+                "model": self._probe_model,
+                "messages": [{"role": "user", "content": "Reply: ok"}],
+                "max_tokens": 16,
+            }
+        ).encode()
+        try:
+            status, raw = self._http("POST", GO_KEY_CHAT_URL, self._headers(key), body, 60.0)
+        except GO_KEY_TRANSPORT_ERRORS as exc:
+            return "unknown", f"probe {type(exc).__name__}"
+        if status != 200:
+            print(
+                f"[gateway-manager] go-key: probe {go_key_mask(key)} status={status}"
+                f" body={self._redact(raw.decode('utf-8', 'replace'))[:300]}",
+                flush=True,
+            )
+        return classify_go_probe(status, raw)
+
+    def _redact(self, text: str) -> str:
+        for secret in self._secrets:
+            text = text.replace(secret, go_key_mask(secret))
+        return text
+
+    def _active_key(self) -> str:
+        try:
+            value = self._key_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        return value or self._fallback_key
+
+    def _effective_mode(self) -> str:
+        try:
+            value = self._mode_file.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            return self._mode
+        return value if value in GO_KEY_MODES else self._mode
+
+    def _read_slots(self) -> tuple[dict[int, str], str]:
+        try:
+            raw = json.loads(self._slots_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, "slots.json нет"
+        except (OSError, ValueError):
+            return {}, "slots.json не читается"
+        if not isinstance(raw, dict):
+            return {}, "slots.json не читается"
+        slots: dict[int, str] = {}
+        for name, value in sorted(raw.items(), key=lambda item: str(item[0])):
+            if not (str(name).isdigit() and 1 <= int(name) <= 9 and isinstance(value, str)):
+                continue
+            key = value.strip()
+            if go_key_form_ok(key) and key not in slots.values():
+                slots[int(name)] = key
+        return slots, ("slots.json ok" if slots else "slots.json пуст")
+
+    def _send(self, kind: str, message: str) -> bool:
+        try:
+            sent = bool(self._alert(kind, message))
+        except Exception as exc:
+            print(f"[gateway-manager] go-key: alert kind={kind} error={type(exc).__name__}", flush=True)
+            sent = False
+        print(f"[gateway-manager] go-key: alert kind={kind} sent={str(sent).lower()}", flush=True)
+        return sent
+
+    def _episode(self, kind: str, message: str, level: str = "open") -> None:
+        episodes = self._state["episodes"]
+        stored = episodes.get(kind)
+        if stored is not None and not (stored == "pressured" and level == "dead"):
+            return
+        if self._send(kind, message):
+            episodes[kind] = level
+
+    def _close(self, *kinds: str) -> None:
+        for kind in kinds:
+            self._state["episodes"].pop(kind, None)
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for name, kind in (("episodes", dict), ("slots", dict), ("switches", list)):
+            if not isinstance(data.get(name), kind):
+                data[name] = kind()
+        for name in ("unknown_streak", "error_streak"):
+            if not isinstance(data.get(name), int):
+                data[name] = 0
+        return data
+
+    def _save_state(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+            tmp.write_text(json.dumps(self._state, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            print(f"[gateway-manager] go-key: state write failed: {type(exc).__name__}", flush=True)
+
+
 class VpnFlapWatcher:
     def __init__(
         self,
@@ -4893,6 +5590,45 @@ def build_default_server(settings: ManagerSettings) -> GatewayManagerServer:
         vpn_flap_watcher.start()
     else:
         print("[gateway-manager] vpn-flap: disabled by env", flush=True)
+
+    def _go_key_alert(kind: str, message: str) -> bool:
+        if not notify_url or not operator_user_id.strip().isdigit():
+            return False
+        return _post_operator_telegram(
+            notify_url=notify_url,
+            notify_secret=notify_secret,
+            user_id=int(operator_user_id.strip()),
+            message=message,
+        )
+
+    def _go_key_env(name: str, default: float) -> float:
+        value = _env_float(name, default)
+        return value if math.isfinite(value) else default
+
+    go_key_file = os.environ.get("OPENCODE_GO_API_KEY_FILE", "").strip()
+    go_key_mode = os.environ.get("ZEROCLAW_GO_KEY_WATCH_MODE", "off").strip().lower()
+    if go_key_mode not in {"switch", "alert"}:
+        print("[gateway-manager] go-key: disabled by env", flush=True)
+    elif not go_key_file:
+        print("[gateway-manager] go-key: OPENCODE_GO_API_KEY_FILE unset, watcher off", flush=True)
+    else:
+        try:
+            GoKeyWatcher(
+                key_file=Path(go_key_file),
+                state_path=settings.data_root / "state" / "manager" / "go_key_watch.json",
+                mode=go_key_mode,
+                interval_secs=_go_key_env("ZEROCLAW_GO_KEY_WATCH_INTERVAL_SECS", 300.0),
+                switch_at=_go_key_env("ZEROCLAW_GO_KEY_SWITCH_AT", 95.0),
+                candidate_max=_go_key_env("ZEROCLAW_GO_KEY_CANDIDATE_MAX", 80.0),
+                cooldown_secs=_go_key_env("ZEROCLAW_GO_KEY_SWITCH_COOLDOWN_SECS", 1800.0),
+                unknown_alert_after=int(_go_key_env("ZEROCLAW_GO_KEY_UNKNOWN_ALERT_AFTER", 3.0)),
+                probe_model=os.environ.get("ZEROCLAW_GO_KEY_PROBE_MODEL", "").strip()
+                or "deepseek-v4.1-flash",
+                alert=_go_key_alert,
+                fallback_key=os.environ.get("OPENCODE_GO_API_KEY", ""),
+            ).start()
+        except Exception as exc:
+            print(f"[gateway-manager] go-key: start failed: {type(exc).__name__}", flush=True)
 
     def _m365_alert(code: str, error: str, hint: str, user_key: str | None) -> bool:
         # user_id only labels the card ("User:"); the recipient is always the operator.
