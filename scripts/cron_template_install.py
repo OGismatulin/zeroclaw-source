@@ -302,6 +302,7 @@ def install_template(
     next_run = compute_next_run(schedule, now=now)
     params = resolve_params(template, user_id, cli_params)
     rendered_prompt = template.render_prompt(params)
+    shell = template.job_type == "shell"
     job_id = str(uuid.uuid4())
     model = ""
     if template.model_provider and template.model_name:
@@ -334,11 +335,12 @@ def install_template(
                 session_target, model, enabled, delivery, delete_after_run,
                 created_at, next_run, last_run, last_status, last_output,
                 agent_alias
-            ) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, 1, NULL, ?,
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 1, NULL, ?,
                       ?, ?, NULL, NULL, NULL, ?)
             """,
             (
-                job_id, schedule, template.job_type, rendered_prompt,
+                job_id, schedule, rendered_prompt if shell else "",
+                template.job_type, None if shell else rendered_prompt,
                 template.name, template.session_target,
                 model if model else None,
                 1 if template.delete_after_run else 0,
