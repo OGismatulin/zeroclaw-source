@@ -4387,6 +4387,8 @@ GO_KEY_MARKERS = (
     "api_key_expired",
     "CreditsError",
     "GoUsageLimitError",
+    "overloaded",
+    "Endpoint is unavailable",
 )
 GO_KEY_MODES = ("off", "alert", "switch")
 GO_KEY_TRANSPORT_ERRORS = (OSError, ValueError, http.client.HTTPException)
@@ -4549,9 +4551,10 @@ _GO_KEY_TEMPLATES = dict(
         "Поменять `ZEROCLAW_GO_KEY_PROBE_MODEL` в `fly.toml` на модель из каталога."
     ),
     unknown_streak=(
-        "⚠️ **OpenCode Go: ключ не проверить {count} раз подряд**\n\n"
-        "- Слот {slot} (`{mask}`) — {reason}\n\n"
-        "Сеть или роутер: ключ или резерв не удалось оценить, переключение не делается."
+        "⚠️ **OpenCode Go: {title}**\n\n"
+        "- Слот {slot} (`{mask}`) — {reason}\n"
+        "- Неудачных проверок подряд: {count}\n\n"
+        "{hint}"
     ),
     active_outside_inventory=(
         "⚠️ **OpenCode Go: активный ключ не из слотов**\n\n"
@@ -4587,6 +4590,40 @@ _GO_KEY_TEMPLATES = dict(
         "Автопереключение не работает. Логи: `fly logs -a ai-forge-zeroclaw --no-tail | grep go-key`"
     ),
 )
+
+
+_GO_KEY_UNKNOWN_CAUSES = dict(
+    provider=(
+        "сбой у провайдера, ключ не проверить",
+        "Роутер OpenCode Go отвечает ошибкой: перегрузка или сбой модели. "
+        "Ключ ни при чём, смена ключа не поможет — переключение не делается. Обычно проходит само.",
+    ),
+    network=(
+        "нет связи с провайдером, ключ не проверить",
+        "Запрос не дошёл до роутера OpenCode Go: таймаут или обрыв сети. Переключение не делается.",
+    ),
+    blocked_ua=(
+        "Cloudflare не пускает проверку ключа",
+        "Cloudflare отверг User-Agent проверки (403 1010): проблема на нашей стороне, не в ключе. "
+        "Переключение не делается.",
+    ),
+    reserve=(
+        "резерв не проверить, переключение отложено",
+        "Активному ключу нужна замена, но резервный ключ не удалось оценить: сеть или провайдер. "
+        "Переключение не делается.",
+    ),
+)
+
+
+def go_key_unknown_cause(reason: str) -> str:
+    if "резерв не проверен" in reason:
+        return "reserve"
+    if "blocked_ua" in reason:
+        return "blocked_ua"
+    # An HTTP status in the reason means the router answered; otherwise only the exception name.
+    if re.search(r"\b\d{3}\b", reason) or "unreadable" in reason:
+        return "provider"
+    return "network"
 
 
 def go_key_message(kind: str, **fields: str) -> str:
@@ -4844,9 +4881,12 @@ class GoKeyWatcher:
         streak = int(self._state.get("unknown_streak", 0)) + 1
         self._state["unknown_streak"] = streak
         if streak >= self._unknown_after:
+            title, hint = _GO_KEY_UNKNOWN_CAUSES[go_key_unknown_cause(reason)]
             self._episode(
                 "unknown_streak",
-                go_key_message("unknown_streak", count=str(streak), slot=label, mask=mask, reason=reason),
+                go_key_message(
+                    "unknown_streak", count=str(streak), slot=label, mask=mask, reason=reason, title=title, hint=hint
+                ),
             )
         return "unknown"
 
