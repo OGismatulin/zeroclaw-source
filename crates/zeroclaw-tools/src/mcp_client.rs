@@ -590,7 +590,7 @@ impl McpServer {
     /// This reads transport-owned atomic connection state and does not acquire
     /// the async server metadata lock.
     pub fn health_check(&self) -> bool {
-        self.transport.health_check()
+        !self.recovery.is_poisoned() && self.transport.health_check()
     }
 
     /// Identity comparison on the underlying transport handle. Two
@@ -2152,6 +2152,26 @@ mod tests {
         let detail = format!("{error:#}");
         assert!(detail.contains("reset/reap failed"), "got: {detail}");
         assert!(detail.contains("cleanup failed"), "got: {detail}");
+    }
+
+    #[tokio::test]
+    async fn poisoned_server_is_dead_in_registry() {
+        let server = server_with_transport("poisoned", Arc::new(FailedResetTransport), 5);
+        let healthy = server_with_transport("healthy", Arc::new(FailedResetTransport), 5);
+        let registry = McpRegistry::from_servers(vec![server.clone(), healthy.clone()]).await;
+
+        assert!(registry.health_check_all().is_empty());
+        server.recovery.arm(0);
+        assert!(server.health_check());
+        assert!(server.reestablish(0).await.is_err());
+        assert_eq!(registry.health_check_all(), vec!["poisoned".to_owned()]);
+        assert!(healthy.health_check());
+        let error = server.call_tool("probe", json!({})).await.unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("not writing on an unrecovered session"),
+            "{detail}"
+        );
     }
 
     struct TimeoutThenRecoverTransport {
