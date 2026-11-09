@@ -12,6 +12,9 @@ ignore = [
     "RUSTSEC-2026-0292",  # imbl-sized-chunks double free; matrix-sdk 0.18 pins imbl 6.1 and vulnerable 0.1.x; Matrix unused on Telegram path; tracking #8519
     "RUSTSEC-2026-0318",  # matrix-sdk-crypto to-device send panic; fix needs breaking matrix-sdk 0.19; Matrix unused on Telegram path; tracking #8519
     "RUSTSEC-2026-0319",  # anymap2 unmaintained, no safe upgrade; transitive via matrix-sdk 0.18; tracking #8519
+    "RUSTSEC-2026-0451",  # vodozemac 0.10 keys not zeroized; fix needs breaking matrix-sdk 0.19; Matrix E2EE unused on Telegram path; tracking #8519
+    "RUSTSEC-2026-0441",  # pin-utils unmaintained, no safe upgrade; via async-imap 0.11; same waiver upstream (#12252)
+    "RUSTSEC-2026-0459",  # libsqlite3-sys 0.35 bundled SQLite (CVE-2026-119375, local); fix needs rusqlite 0.41; same waiver upstream (#12320)
     "RUSTSEC-2026-0097",  # rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected
     "RUSTSEC-2024-0429",  # glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; in cargo-deny's resolved graph via matrix-sdk dev-deps; tracking #8519

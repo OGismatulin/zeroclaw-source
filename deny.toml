@@ -41,6 +41,11 @@ ignore = [
     { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks panic-drop double free; matrix-sdk 0.18 pins imbl 6.1 and 0.1.x; Matrix unused on Telegram path; awaiting matrix-sdk/imbl upgrade; tracking #8519" },
     { id = "RUSTSEC-2026-0318", reason = "matrix-sdk-crypto custom to-device send panic; fixed only in 0.19, a breaking matrix-sdk 0.18 -> 0.19 bump; Matrix channel unconfigured on the Telegram path; tracking #8519" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained (no CVE, no safe upgrade); transitive via matrix-sdk 0.18; Matrix unused on Telegram path; tracking #8519" },
+    # Published 2026-11-08; all three are fixed or waived the same way upstream
+    # (master on matrix-sdk 0.19.1 / vodozemac 0.11.2; 0441 and 0459 waived there).
+    { id = "RUSTSEC-2026-0451", reason = "vodozemac Olm ratchet keys not zeroized; matrix-sdk-crypto 0.18 pins vodozemac 0.10, fix 0.11.2 needs the breaking matrix-sdk 0.19 bump; Matrix E2EE unused on Telegram path; tracking #8519" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained (no CVE, no safe upgrade); async-imap 0.11.x still depends on it; same waiver upstream (#12252)" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.35 bundles SQLite < 3.54 (CVE-2026-119375, local, needs an attacker-written db plus -wal pair); fix 0.39 needs rusqlite 0.41, breaking from 0.37 and blocked by matrix-sdk-sqlite on a links crate; same waiver upstream (#12320)" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
