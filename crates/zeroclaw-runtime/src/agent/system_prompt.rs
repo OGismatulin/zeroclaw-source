@@ -137,6 +137,7 @@ pub fn build_system_prompt_with_mode(
 const SHELL_POLICY_GUIDANCE: &str = "\
 - The shell working directory is already your workspace. Do not use `cd`; it is not allowed. To work in another repository use `git -C <repo> ...`.
 - Every pipeline segment is checked against the allowlist, and argument, path and syntax guards still apply; a listed command can still be refused.
+- Do not create files with shell redirection, heredocs, or shell loops. If a file-write tool is available, use it; otherwise use an existing allowed script. Never call an MCP tool name as a shell command.
 - Read a file at a git ref with line numbers: `git -C <repo> show <ref>:<path> | grep -n '' | head -N | tail -n +M`. Search a ref: `git -C <repo> grep -n <pattern> <ref> -- <path>`. For the working tree use `file_read` with offset and limit.
 - `git_operations` works only inside the workspace.
 - Use workspace-relative paths (`skills/`, `scripts/`, `state/`, `uploads/`). For external code use the declared MCP tools or the lalafo-code skill, not absolute paths.

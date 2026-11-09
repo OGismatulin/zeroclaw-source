@@ -9994,6 +9994,10 @@ mod tests {
             .unwrap();
         assert!(with_policy.contains("`only-this-command`"));
         assert!(with_policy.contains("Do not use `cd`"));
+        assert!(
+            with_policy
+                .contains("Do not create files with shell redirection, heredocs, or shell loops.")
+        );
         assert!(!with_policy.contains("trash"));
 
         let non_agentic = tool
