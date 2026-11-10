@@ -66,6 +66,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 # The optional WASM plugin host generates bindings from the repository-owned
 # WIT contract during compilation. Keep it in this persistent builder before
 # both the dependency prefetch and the real source build.

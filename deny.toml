@@ -31,21 +31,8 @@ ignore = [
     # LruCache in this tree is keyed by String/integer ids, whose Drop cannot panic.
     # Removing it for real means bumping nostr-sdk; tracked separately.
     { id = "RUSTSEC-2026-0253", reason = "lru LruCache::pop() panic-safety unsoundness; affected 0.16.4 copy is transitive via nostr-database 0.44 which excludes the patched 0.18.2; unreachable without catch_unwind plus a panicking key Drop, and all keys here are String/integer" },
-    # bitmaps -- unmaintained advisory (no CVE). Transitive only, via
-    # imbl/imbl-sized-chunks; 3.2.1 is the latest published version, so there is
-    # nothing to bump to. Removing it means dropping imbl, which is not ours to
-    # drop. Published 2026-09-04, after the v0.8.4 tag.
-    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained (no CVE); transitive via imbl/imbl-sized-chunks with no patched release; awaiting an upstream imbl migration" },
-    # Matrix SDK 0.18 pins imbl 6.1, which requires imbl-sized-chunks 0.1.x;
-    # the 0.2.0 fix is incompatible. Matrix is not configured for Telegram.
-    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks panic-drop double free; matrix-sdk 0.18 pins imbl 6.1 and 0.1.x; Matrix unused on Telegram path; awaiting matrix-sdk/imbl upgrade; tracking #8519" },
-    { id = "RUSTSEC-2026-0318", reason = "matrix-sdk-crypto custom to-device send panic; fixed only in 0.19, a breaking matrix-sdk 0.18 -> 0.19 bump; Matrix channel unconfigured on the Telegram path; tracking #8519" },
-    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained (no CVE, no safe upgrade); transitive via matrix-sdk 0.18; Matrix unused on Telegram path; tracking #8519" },
-    # Published 2026-11-08; all three are fixed or waived the same way upstream
-    # (master on matrix-sdk 0.19.1 / vodozemac 0.11.2; 0441 and 0459 waived there).
-    { id = "RUSTSEC-2026-0451", reason = "vodozemac Olm ratchet keys not zeroized; matrix-sdk-crypto 0.18 pins vodozemac 0.10, fix 0.11.2 needs the breaking matrix-sdk 0.19 bump; Matrix E2EE unused on Telegram path; tracking #8519" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained; still required by matrix-sdk 0.19.1 testing feature; remove when Matrix replaces its test map; tracking #8519" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained (no CVE, no safe upgrade); async-imap 0.11.x still depends on it; same waiver upstream (#12252)" },
-    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.35 bundles SQLite < 3.54 (CVE-2026-119375, local, needs an attacker-written db plus -wal pair); fix 0.39 needs rusqlite 0.41, breaking from 0.37 and blocked by matrix-sdk-sqlite on a links crate; same waiver upstream (#12320)" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
@@ -86,10 +73,6 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained; tracking #8519" },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained; tracking #8519" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained; tracking #8519" },
-    # macro/font helpers unmaintained (transitive); tracking #8519.
-    # RUSTSEC-2024-0370 (proc-macro-error) was dropped when zeroclaw-desktop
-    # (Tauri) was removed in PR #8544.
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper; tracking #8519" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive derive helper; tracking #8519" },
 ]
 
@@ -358,6 +341,41 @@ version = "=0.60.2"
 [[bans.skip]]
 name = "windows_i686_gnullvm"
 version = "=0.52.6"
+
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.10.4"
+reason = "Matrix vodozemac uses RustCrypto 0.12; local encryption still uses 0.10"
+
+[[bans.skip]]
+name = "cipher"
+version = "=0.4.4"
+reason = "Matrix vodozemac uses cipher 0.5; local encryption still uses 0.4"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "=0.1.7"
+reason = "Matrix vodozemac uses crypto-common 0.2; local encryption still uses 0.1"
+
+[[bans.skip]]
+name = "inout"
+version = "=0.1.4"
+reason = "Matrix vodozemac uses inout 0.2; local encryption still uses 0.1"
+
+[[bans.skip]]
+name = "windows-core"
+version = "=0.61.2"
+reason = "process-wrap 9 uses windows 0.61; Matrix reqwest uses windows 0.62"
+
+[[bans.skip]]
+name = "windows-result"
+version = "=0.3.4"
+reason = "windows-core 0.61 compatibility; remove with process-wrap windows upgrade"
+
+[[bans.skip]]
+name = "windows-strings"
+version = "=0.4.2"
+reason = "windows-core 0.61 compatibility; remove with process-wrap windows upgrade"
 
 [sources]
 unknown-registry = "deny"

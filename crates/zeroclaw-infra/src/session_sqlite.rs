@@ -1428,6 +1428,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn linked_sqlite_meets_wal_security_floor() {
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "linked SQLite {} is affected by RUSTSEC-2026-0459",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
     fn round_trip_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
