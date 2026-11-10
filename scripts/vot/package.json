@@ -1,0 +1,10 @@
+{
+  "name": "zeroclaw-vot",
+  "private": true,
+  "description": "Yandex video translation client for the replicate skill dub command",
+  "dependencies": {
+    "@vot.js/core": "3.2.2",
+    "@vot.js/node": "3.2.2",
+    "@vot.js/shared": "3.2.2"
+  }
+}

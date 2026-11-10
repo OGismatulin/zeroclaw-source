@@ -85,6 +85,8 @@ apps/*
 # Новый scripts/X.py БЕЗ строки !scripts/X.py => файла нет в контексте => COPY роняет сборку.
 scripts/
 !scripts/gateway_manager.py
+!scripts/vot/package.json
+!scripts/vot/package-lock.json
 !scripts/bootstrap_nightly_retro_cron.py
 !scripts/fly-entrypoint.sh
 !scripts/mcp_db_server.py
