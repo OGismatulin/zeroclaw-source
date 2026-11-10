@@ -2602,6 +2602,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_allowed_tools_round_trip_and_unrelated_update() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "default",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec![]),
+            false,
+        )
+        .unwrap();
+        let conn = Connection::open(cron_db_path(&config)).unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT allowed_tools FROM cron_jobs WHERE id = ?1",
+                [&job.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some("[]"));
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec![])
+        );
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec![])
+        );
+    }
+
+    #[test]
     fn update_job_persists_allowed_tools_patch() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);

@@ -7428,6 +7428,98 @@ path = "{trigger_path}"
         headers
     }
 
+    #[tokio::test]
+    async fn cron_post_empty_allowlist_runs_without_tools() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+        type Seen = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            seen.lock().unwrap().push(body);
+            axum::Json(serde_json::json!({"choices": [{"message": {"content": "done"}}]}))
+        }
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(Arc::clone(&seen));
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        {
+            let mut config = state.config.write();
+            config.memory.backend = "none".into();
+            config.providers.models.ollama.insert(
+                "fixture".into(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("test".into()),
+                        timeout_secs: Some(5),
+                        uri: Some(format!("http://{addr}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".into(),
+                AliasedAgentConfig {
+                    model_provider: "ollama.fixture".into(),
+                    risk_profile: "default".into(),
+                    ..Default::default()
+                },
+            );
+            config
+                .risk_profiles
+                .insert("default".into(), RiskProfileConfig::default());
+            let skill_dir = config
+                .agent_workspace_dir("test-agent")
+                .join("skills/sentinel");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: sentinel\ndescription: GATEWAY_SKILL_SENTINEL\nalways: true\n---\n\nGATEWAY_SKILL_SENTINEL\n").unwrap();
+        }
+        let router = Router::new()
+            .route("/api/cron", post(api::handle_api_cron_add))
+            .with_state(state.clone());
+        let request = Request::builder().method("POST").uri("/api/cron").header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"agent": "test-agent", "schedule": "*/5 * * * *", "job_type": "agent", "prompt": "hello", "allowed_tools": [], "uses_memory": false}).to_string())).unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].allowed_tools, Some(vec![]));
+        let result = zeroclaw_runtime::agent::run(
+            config,
+            "test-agent",
+            Some("hello".into()),
+            None,
+            None,
+            None,
+            vec![],
+            false,
+            None,
+            jobs[0].allowed_tools.clone(),
+            zeroclaw_api::ingress::TurnOrigin::Cron,
+            zeroclaw_runtime::agent::loop_::AgentRunOverrides {
+                memory_free: !jobs[0].uses_memory,
+                ..Default::default()
+            },
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap(), "done");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].get("tools").is_none());
+        assert!(!bodies[0].to_string().contains("GATEWAY_SKILL_SENTINEL"));
+    }
+
     fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
         let dist_dir = tmp.path().join("web").join("dist");
         std::fs::create_dir_all(&dist_dir).unwrap();

@@ -583,3 +583,113 @@ fn cron_delivery_accepts_negative_telegram_chat_id() {
         "the message must not advertise an escape hatch that does not work:\n{equals_stderr}"
     );
 }
+
+#[test]
+fn no_tools_stores_empty_allowed_tools() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_TOML).expect("write config");
+    let add = run(
+        dir.path(),
+        &[
+            "cron",
+            "add-every",
+            "60000",
+            "--agent",
+            "default",
+            "--prompt",
+            "--no-tools",
+            "--uses-memory",
+            "false",
+            "translate",
+        ],
+    );
+    assert_ok(&add, "cron add-every with no tools");
+    let job = stored_job(dir.path(), &job_id_from(&add));
+    assert_eq!(job.allowed_tools, Some(Vec::new()));
+    assert!(!job.uses_memory);
+}
+
+#[test]
+fn no_tools_requires_prompt() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_TOML).expect("write config");
+    let out = run(
+        dir.path(),
+        &[
+            "cron",
+            "add-every",
+            "60000",
+            "--agent",
+            "default",
+            "--no-tools",
+            "echo",
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--prompt") && stderr.contains("required") && stderr.contains("Usage:"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument '--no-tools'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn no_tools_conflicts_allowed_tool() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_TOML).expect("write config");
+    let out = run(
+        dir.path(),
+        &[
+            "cron",
+            "add-every",
+            "60000",
+            "--agent",
+            "default",
+            "--prompt",
+            "--no-tools",
+            "--allowed-tool",
+            "shell",
+            "echo",
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("--allowed-tool")
+            && stderr.contains("--no-tools")
+            && stderr.contains("cannot be used with")
+            && stderr.contains("Usage:"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument '--no-tools'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn no_flag_legacy_empty_vec_stays_none() {
+    let dir = tempfile::tempdir().expect("temp config dir");
+    std::fs::write(dir.path().join("config.toml"), CONFIG_TOML).expect("write config");
+    let out = run(
+        dir.path(),
+        &[
+            "cron",
+            "add-every",
+            "60000",
+            "--agent",
+            "default",
+            "--prompt",
+            "echo",
+        ],
+    );
+    assert_ok(&out, "legacy cron add-every");
+    assert_eq!(
+        stored_job(dir.path(), &job_id_from(&out)).allowed_tools,
+        None
+    );
+}

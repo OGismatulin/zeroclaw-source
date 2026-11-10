@@ -227,6 +227,22 @@ impl ScopedToolRegistry {
                 delegate_tool: _,
         } = built;
 
+        if caller_allowed.is_some_and(<[String]>::is_empty) {
+            return ScopedAssembled {
+                registry: ScopedToolRegistry(Vec::new()),
+                delegate_handle,
+                ask_user_handle,
+                reaction_handle,
+                poll_handle,
+                escalate_handle,
+                channel_room_handle,
+                deferred_section: String::new(),
+                pinned_section: String::new(),
+                activated_handle: None,
+                mcp_tool_names: HashSet::new(),
+            };
+        }
+
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
         //    real devices), so this is gated: execution surfaces pass
         //    `connect_peripherals: true`; listing-only surfaces pass `false` and
@@ -1959,5 +1975,123 @@ mod tests {
                 "the allowed tool must be activated after a select, not just schema-rendered"
             );
         }
+    }
+    #[tokio::test]
+    async fn scoped_empty_skips_skills_and_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _trace_guard = crate::observability::runtime_trace::TRACE_TEST_LOCK
+            .lock()
+            .await;
+        init_trace_to(tmp.path());
+        let server = mock_mcp_http_server_rejecting().await;
+        let config = config_with_bundled_mcp(server.uri(), server.uri());
+        let security = Arc::new(SecurityPolicy::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let skill = Skill {
+            name: "ops".into(),
+            description: "test skill".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+            tools: vec![SkillTool {
+                name: "call".into(),
+                description: "test call".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some("shell".into()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+        };
+        let empty: Vec<String> = vec![];
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "scoped",
+            security: &security,
+            built: built_with_counting_tools(Arc::clone(&calls), &["shell"]),
+            skills: std::slice::from_ref(&skill),
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: Some(&empty),
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        assert!(assembled.registry.is_empty());
+        assert!(assembled.activated_handle.is_none());
+        assert!(assembled.deferred_section().is_empty());
+        assert!(assembled.pinned_section().is_empty());
+        assert!(assembled.mcp_tool_names.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(mcp_connect_failure_events(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn scoped_empty_never_constructs_peripherals() {
+        const CHILD: &str = "ZEROCLAW_TEST_NO_TOOLS_PERIPHERAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::scoped::tests::scoped_empty_never_constructs_peripherals",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        assert!(
+            crate::agent::loop_::PERIPHERAL_TOOLS_FN
+                .set(Box::new(|_| {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(Vec::new()) })
+                }))
+                .is_ok()
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let config = Config::default();
+            let security = Arc::new(SecurityPolicy::default());
+            let empty = Vec::<String>::new();
+            for allowed in [Some(empty.as_slice()), None] {
+                let _ = ScopedToolRegistry::assemble(ScopedAssembly {
+                    config: &config,
+                    agent_alias: "default",
+                    security: &security,
+                    built: built_with(Vec::new()),
+                    skills: &[],
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: allowed,
+                    connect_mcp: false,
+                    connect_peripherals: true,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: None,
+                })
+                .await;
+                assert_eq!(CALLS.load(Ordering::SeqCst), usize::from(allowed.is_none()));
+            }
+        });
     }
 }

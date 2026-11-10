@@ -1556,6 +1556,9 @@ pub async fn run(
             None,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        let no_tools = allowed_tools.as_deref().is_some_and(<[String]>::is_empty);
+        let prompt_skills = if no_tools { &[][..] } else { &skills };
+        let prompt_inject_memory = !(no_tools && memory_free);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
@@ -1886,7 +1889,7 @@ pub async fn run(
             &model_name,
             &tool_descs,
             &deferred_section,
-            &skills,
+            prompt_skills,
             Some(&agent.identity),
             bootstrap_max_chars,
             &risk_profile,
@@ -1898,7 +1901,7 @@ pub async fn run(
             eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
-            true,
+            prompt_inject_memory,
             config.channels.show_tool_calls,
             None,
             runtime.shell_profile().as_ref(),
@@ -1982,7 +1985,7 @@ pub async fn run(
                 &model_name,
                 &tool_descs,
                 &deferred_section,
-                &skills,
+                prompt_skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
                 &risk_profile,
@@ -1994,7 +1997,7 @@ pub async fn run(
                 eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
-                true,
+                prompt_inject_memory,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
                 runtime.shell_profile().as_ref(),
@@ -2103,7 +2106,7 @@ pub async fn run(
                         &model_name,
                         &tool_descs,
                         &deferred_section,
-                        &skills,
+                        prompt_skills,
                         Some(&agent.identity),
                         bootstrap_max_chars,
                         &risk_profile,
@@ -2115,7 +2118,7 @@ pub async fn run(
                         eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
-                        true,
+                        prompt_inject_memory,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                         runtime.shell_profile().as_ref(),
@@ -2663,7 +2666,7 @@ pub async fn run(
                             &model_name,
                             &tool_descs,
                             &deferred_section,
-                            &skills,
+                            prompt_skills,
                             Some(&agent.identity),
                             bootstrap_max_chars,
                             &risk_profile,
@@ -2675,7 +2678,7 @@ pub async fn run(
                             eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
-                            true,
+                            prompt_inject_memory,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                             runtime.shell_profile().as_ref(),
@@ -5903,6 +5906,192 @@ mod tests {
             sop_reassembly: None,
         })
         .await
+    }
+
+    struct CapturingToolProvider {
+        inner: ScriptedModelProvider,
+        tools_present: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CapturingToolProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected chat_with_system")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.tools_present
+                .lock()
+                .unwrap()
+                .push(request.tools.is_some());
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CapturingToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "capturing-tool-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_blocks_forced_skill_dispatch() {
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let skill = crate::skills::Skill {
+            name: "ops".into(),
+            description: "test".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: vec![],
+            prompts: vec![],
+            slash_options: vec![],
+            always: false,
+            location: None,
+            tools: vec![crate::skills::SkillTool {
+                name: "call".into(),
+                description: "test".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some("shell".into()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+        };
+        for allowed in [Some(vec![]), None] {
+            let inner: Arc<dyn Tool> =
+                Arc::new(CountingTool::new("shell", Arc::clone(&invocations)));
+            let built = crate::tools::AllToolsResult {
+                tools: vec![Box::new(crate::tools::ArcToolRef(Arc::clone(&inner)))],
+                unfiltered_tool_arcs: vec![inner],
+                delegate_handle: None,
+                ask_user_handle: None,
+                reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                poll_handle: None,
+                escalate_handle: None,
+                channel_room_handle: None,
+                delegate_tool: None,
+            };
+            let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+                crate::tools::scoped::ScopedAssembly {
+                    config: &config,
+                    agent_alias: "test",
+                    security: &security,
+                    built,
+                    skills: std::slice::from_ref(&skill),
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: allowed.as_deref(),
+                    connect_mcp: false,
+                    connect_peripherals: false,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: None,
+                },
+            )
+            .await;
+            let tools_present = Arc::new(Mutex::new(Vec::new()));
+            let provider = CapturingToolProvider {
+                inner: ScriptedModelProvider::from_native_tool_calls(
+                    vec![("call-1", "ops__call", "{}")],
+                    "done",
+                ),
+                tools_present: Arc::clone(&tools_present),
+            };
+            let mut history = vec![ChatMessage::system("test"), ChatMessage::user("start")];
+            let observer = NoopObserver;
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let result = run_tool_call_loop(ToolLoop {
+                final_response_min_chars: None,
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "test",
+                        model: "test",
+                        temperature: Some(0.0),
+                    },
+                    ResolvedIo {
+                        tools_registry: &assembled.registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &multimodal,
+                        config: None,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: 4,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing: &pacing,
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        knobs: &knobs,
+                    },
+                ),
+                history: &mut history,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: &turn_id,
+                sop_reassembly: None,
+            })
+            .await;
+            let seen = tools_present.lock().unwrap();
+            if allowed.is_some() {
+                assert_eq!(invocations.load(Ordering::SeqCst), 0);
+                assert!(!seen.is_empty() && seen.iter().all(|present| !present));
+                assert!(seen.len() <= 1 + MAX_MALFORMED_TOOL_PROTOCOL_RETRIES);
+            } else {
+                assert_eq!(result.unwrap(), "done");
+                assert_eq!(invocations.load(Ordering::SeqCst), 1);
+                assert!(seen[0]);
+            }
+        }
     }
 
     fn trimmable_context_history() -> Vec<ChatMessage> {
@@ -18977,6 +19166,100 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn run_empty_allowlist_prompt_omits_skill_and_memory_sentinels() {
+        use axum::{Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        type Seen = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            seen.lock().unwrap().push(body);
+            axum::Json(serde_json::json!({"choices": [{"message": {"content": "done"}}]}))
+        }
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(Arc::clone(&seen));
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.memory.backend = "none".into();
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test".into()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "prompt-agent".into(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        let workspace = config.agent_workspace_dir("prompt-agent");
+        let skill_dir = workspace.join("skills/sentinel");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: sentinel\ndescription: SKILL_SENTINEL\nalways: true\n---\n\nSKILL_SENTINEL_BODY\n").unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "MEMORY_SENTINEL").unwrap();
+        for (allowed, memory_free) in [
+            (None, true),
+            (Some(vec!["shell".into()]), true),
+            (Some(vec![]), true),
+            (Some(vec![]), false),
+        ] {
+            let result = super::run(
+                config.clone(),
+                "prompt-agent",
+                Some("hello".into()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                false,
+                None,
+                allowed,
+                TurnOrigin::SubTurn,
+                super::AgentRunOverrides {
+                    memory_free,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap(), "done");
+        }
+        server.abort();
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        for index in [0, 1] {
+            let body = bodies[index].to_string();
+            assert!(body.contains("SKILL_SENTINEL"), "{body}");
+            assert!(body.contains("MEMORY_SENTINEL"), "{body}");
+        }
+        assert!(!bodies[2].to_string().contains("SKILL_SENTINEL"));
+        assert!(!bodies[2].to_string().contains("MEMORY_SENTINEL"));
+        assert!(!bodies[3].to_string().contains("SKILL_SENTINEL"));
+        assert!(bodies[3].to_string().contains("MEMORY_SENTINEL"));
     }
 
     #[tokio::test]

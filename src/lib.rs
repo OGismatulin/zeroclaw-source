@@ -803,6 +803,10 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Run the agent without tools.
+        #[arg(long, requires = "prompt", conflicts_with = "allowed_tools")]
+        #[serde(default)]
+        no_tools: bool,
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,

@@ -1233,3 +1233,4 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+cli-cron-no-tools-requires-isolation = --no-tools requires --prompt and --uses-memory false, and cannot be combined with --allowed-tool.

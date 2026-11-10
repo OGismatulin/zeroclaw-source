@@ -1894,6 +1894,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cron_empty_allowlist_reaches_agent_assembly() {
+        use axum::{Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+        type Seen = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(seen): State<Seen>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            seen.lock().unwrap().push(body);
+            axum::Json(serde_json::json!({"choices": [{"message": {"content": "done"}}]}))
+        }
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(Arc::clone(&seen));
+        let server =
+            zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".into();
+        config.providers.models.ollama.insert(
+            "fixture".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test".into()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.fixture".into();
+        let workspace = config.agent_workspace_dir(TEST_AGENT);
+        let skill_dir = workspace.join("skills/sentinel");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: sentinel\ndescription: SCHEDULER_SKILL_SENTINEL\nalways: true\n---\n\nSCHEDULER_SKILL_SENTINEL\n").unwrap();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("hello".into());
+        job.allowed_tools = Some(vec![]);
+        job.uses_memory = false;
+        let outcome = run_agent_job(&config, &test_security(&config), TEST_AGENT, &job).await;
+        server.abort();
+        assert!(matches!(
+            outcome,
+            CronAgentOutcome::Completed { success: true, .. }
+        ));
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].to_string().contains("SCHEDULER_SKILL_SENTINEL"));
+        assert!(bodies[0].get("tools").is_none());
+    }
+
     #[test]
     fn cron_caller_allowed_star_sentinel_means_no_narrowing() {
         let mut job = test_job("");
@@ -1909,6 +1966,8 @@ mod tests {
 
         job.allowed_tools = None;
         assert_eq!(cron_caller_allowed(&job), None);
+        job.allowed_tools = Some(vec![]);
+        assert_eq!(cron_caller_allowed(&job), Some(vec![]));
 
         job.allowed_tools = Some(vec!["*".into(), "shell".into()]);
         assert_eq!(

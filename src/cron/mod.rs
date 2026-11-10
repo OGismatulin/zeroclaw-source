@@ -365,10 +365,17 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             agent_alias,
             prompt,
             allowed_tools,
+            no_tools,
             uses_memory,
             delivery,
             command,
         } => {
+            if no_tools && (!prompt || !allowed_tools.is_empty() || uses_memory != Some(false)) {
+                bail!(
+                    "{}",
+                    get_required_cli_string("cli-cron-no-tools-requires-isolation")
+                );
+            }
             require_configured_agent(config, &agent_alias)?;
             let schedule = Schedule::Every { every_ms };
             let delivery = build_delivery(&delivery);
@@ -383,7 +390,9 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     None,
                     delivery,
                     false,
-                    if allowed_tools.is_empty() {
+                    if no_tools {
+                        Some(Vec::new())
+                    } else if allowed_tools.is_empty() {
                         None
                     } else {
                         Some(allowed_tools)
@@ -721,6 +730,54 @@ mod tests {
             },
         );
         config
+    }
+
+    fn no_tools_command(
+        prompt: bool,
+        allowed_tools: Vec<&str>,
+        uses_memory: Option<bool>,
+    ) -> crate::CronCommands {
+        serde_json::from_value(serde_json::json!({"AddEvery": {
+            "every_ms": 60000, "agent_alias": "test-agent", "prompt": prompt,
+            "no_tools": true, "allowed_tools": allowed_tools, "uses_memory": uses_memory,
+            "command": "hello"
+        }}))
+        .unwrap()
+    }
+
+    #[test]
+    fn no_tools_direct_guard_rejects_without_prompt_or_with_allowed_tool() {
+        for (prompt, tools) in [(false, vec![]), (true, vec!["shell"])] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let error =
+                handle_command(no_tools_command(prompt, tools, Some(false)), &config).unwrap_err();
+            assert!(error.to_string().contains("--no-tools"), "{error}");
+            assert!(list_jobs(&config).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn no_tools_direct_guard_requires_uses_memory_false() {
+        for uses_memory in [None, Some(true)] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let error =
+                handle_command(no_tools_command(true, vec![], uses_memory), &config).unwrap_err();
+            assert!(error.to_string().contains("--no-tools"), "{error}");
+            assert!(list_jobs(&config).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn no_tools_serde_old_payload_defaults_false() {
+        let old = serde_json::json!({"AddEvery": {
+            "every_ms": 60000, "agent_alias": "test-agent", "prompt": true,
+            "allowed_tools": [], "uses_memory": false, "command": "hello"
+        }});
+        let parsed: crate::CronCommands = serde_json::from_value(old).unwrap();
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert_eq!(serialized["AddEvery"]["no_tools"], false);
     }
 
     #[test]
