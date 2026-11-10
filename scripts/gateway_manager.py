@@ -25,6 +25,7 @@ import unicodedata
 import secrets
 import signal
 import shutil
+import stat
 import ssl
 import subprocess
 import sys
@@ -2383,6 +2384,30 @@ class GatewayManagerServer:
             manager_classified=True,
         )
 
+    def open_media_share(
+        self, path: str, *, now: float | None = None
+    ) -> tuple[int, int] | None:
+        """Open a file the dub worker shared for Yandex; None means 404."""
+        match = MEDIA_SHARE_PATH.fullmatch(path)
+        if match is None:
+            return None
+        moment = time.time() if now is None else now
+        if not moment <= int(match.group(2)) <= moment + MEDIA_SHARE_MAX_TTL_SECS:
+            return None
+        root = self.settings.data_root / "media-share"
+        folder = root / match.group(1)
+        try:
+            if not all(stat.S_ISDIR(os.lstat(p).st_mode) for p in (root, folder)):
+                return None
+            fd = os.open(folder / match.group(3), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            return None
+        return fd, info.st_size
+
     def handle_lalafo_relay(
         self,
         *,
@@ -4110,6 +4135,10 @@ def _voice_transcriber_from_env() -> Callable[[bytes, str], str] | None:
 
 
 LALAFO_RELAY_PREFIX = "/lalafo-relay/"
+MEDIA_SHARE_PREFIX = "/media-share/"
+MEDIA_SHARE_PATH = re.compile(r"/media-share/(e([0-9]{10})-[0-9a-f]{32})/([a-z0-9-]{1,32}\.mp4)")
+MEDIA_SHARE_MAX_TTL_SECS = 3600
+MEDIA_SHARE_CHUNK = 1024 * 1024
 LALAFO_RELAY_TOKEN_ENV = "ZEROCLAW_RELAY_TOKEN"
 LALAFO_RELAY_MAX_BODY = 1024
 LALAFO_RELAY_MAX_RESPONSE = 64 * 1024
@@ -5900,6 +5929,9 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
     timeout = 60.0
 
     def do_GET(self) -> None:
+        if self.path.startswith(MEDIA_SHARE_PREFIX):
+            self._serve_media_share(head=False)
+            return
         try:
             status_code, payload = self._dispatch_get()
         except Exception as exc:
@@ -5920,6 +5952,65 @@ class _RuntimeRequestHandler(BaseHTTPRequestHandler):
                 hint="Check the request path",
             )
         return self.server.app.handle_health()
+
+    def do_HEAD(self) -> None:
+        if self.path.startswith(MEDIA_SHARE_PREFIX):
+            self._serve_media_share(head=True)
+            return
+        self.send_error(501, f"Unsupported method ('{self.command}')")
+
+    def _serve_media_share(self, *, head: bool) -> None:
+        opened = self.server.app.open_media_share(self.path)
+        if opened is None:
+            status_code, payload = self.server.app._manager_error(
+                status_code=404,
+                code="invalid_request",
+                component="request",
+                retryable=False,
+                error_message="Route not found",
+                hint="Check the request path",
+            )
+            self._record_outcome(status_code, payload)
+            sent = self._media_share_send(lambda: self._write_json(status_code, payload))
+            self._log_media_share(head, status_code if sent else "aborted", 0)
+            return
+        fd, size = opened
+        written = 0
+
+        def stream() -> None:
+            nonlocal written
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if head:
+                return
+            with os.fdopen(fd, "rb", closefd=False) as source:
+                while chunk := source.read(MEDIA_SHARE_CHUNK):
+                    self.wfile.write(chunk)
+                    written += len(chunk)
+
+        try:
+            sent = self._media_share_send(stream)
+        finally:
+            os.close(fd)
+        self._record_outcome(200, {})
+        self._log_media_share(head, 200 if sent else "aborted", written)
+
+    def _media_share_send(self, write: Callable[[], None]) -> bool:
+        try:
+            write()
+        except OSError:
+            return False
+        return True
+
+    def _log_media_share(self, head: bool, status: int | str, written: int) -> None:
+        agent = _safe_log_identity(self.headers.get("User-Agent"), limit=80) or "-"
+        print(
+            f"[gateway-manager] media-share method={'HEAD' if head else 'GET'} "
+            f"status={status} bytes={written} ua={agent}",
+            flush=True,
+        )
 
     def do_PUT(self) -> None:
         self._serve_lalafo_relay("PUT")
