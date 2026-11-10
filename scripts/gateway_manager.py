@@ -4402,6 +4402,10 @@ def go_key_mask(key: str) -> str:
     return f"***{key[-4:]}" if len(key) > 8 else "***"
 
 
+def go_key_fingerprint(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def go_key_form_ok(key: str) -> bool:
     return 16 <= len(key) <= 512 and all(33 <= ord(char) <= 126 for char in key)
 
@@ -4434,11 +4438,22 @@ def parse_go_usage(body: bytes) -> dict[str, dict[str, Any]] | None:
     return windows
 
 
+def go_key_403_reason(status: int, body: bytes) -> str:
+    if status != 403:
+        return ""
+    if b"error code: 1010" in body.lower():
+        return "blocked_ua"
+    prefix = body[:2000].removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    if re.match(rb"(?:<!doctype\s+html\b|<html\b)", prefix):
+        return "html_response"
+    return ""
+
+
 def classify_go_usage(
     status: int, body: bytes, switch_at: float
 ) -> tuple[str, dict[str, dict[str, Any]] | None, str]:
-    if status == 403 and b"error code: 1010" in body:
-        return "unknown", None, "usage 403 blocked_ua"
+    if blocked := go_key_403_reason(status, body):
+        return "unknown", None, f"usage 403 {blocked}"
     if status in (401, 403):
         return "dead", None, f"usage {status}"
     if status != 200:
@@ -4455,6 +4470,8 @@ def classify_go_usage(
 
 
 def classify_go_probe(status: int, body: bytes) -> tuple[str, str]:
+    if blocked := go_key_403_reason(status, body):
+        return "unknown", f"403 {blocked}"
     text = body[:2000].decode("utf-8", "replace")
     if status == 200:
         try:
@@ -4467,8 +4484,6 @@ def classify_go_probe(status: int, body: bytes) -> tuple[str, str]:
         return "unknown", "200 without choices"
     if "not supported" in text or "Model is unavailable" in text:
         return "probe_misconfigured", f"{status} model unavailable"
-    if status == 403 and "error code: 1010" in text:
-        return "unknown", "403 blocked_ua"
     marker = next((marker for marker in GO_KEY_MARKERS if marker in text), "")
     label = f"{status} {marker}".strip()
     if status in (401, 402, 403) or (status == 429 and marker == "GoUsageLimitError"):
@@ -4607,6 +4622,11 @@ _GO_KEY_UNKNOWN_CAUSES = dict(
         "Cloudflare отверг User-Agent проверки (403 1010): проблема на нашей стороне, не в ключе. "
         "Переключение не делается.",
     ),
+    http_html=(
+        "проверка получила HTML 403, ключ не проверить",
+        "Роутер вернул HTML-страницу вместо ответа API (403). "
+        "Причина ограничения доступа не установлена. Переключение не делается.",
+    ),
     reserve=(
         "резерв не проверить, переключение отложено",
         "Активному ключу нужна замена, но резервный ключ не удалось оценить: сеть или провайдер. "
@@ -4620,6 +4640,8 @@ def go_key_unknown_cause(reason: str) -> str:
         return "reserve"
     if "blocked_ua" in reason:
         return "blocked_ua"
+    if "html_response" in reason:
+        return "http_html"
     # An HTTP status in the reason means the router answered; otherwise only the exception name.
     if re.search(r"\b\d{3}\b", reason) or "unreadable" in reason:
         return "provider"
@@ -4628,6 +4650,22 @@ def go_key_unknown_cause(reason: str) -> str:
 
 def go_key_message(kind: str, **fields: str) -> str:
     return _GO_KEY_TEMPLATES[kind].format(**fields)
+
+
+def read_go_key_json(path: Path) -> Any:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    pending = [(data, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > 16:
+            raise ValueError("JSON nesting exceeds 16")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite JSON number")
+        if isinstance(value, dict):
+            pending.extend((item, depth + 1) for item in value.values())
+        elif isinstance(value, list):
+            pending.extend((item, depth + 1) for item in value)
+    return data
 
 
 class GoKeyWatcher:
@@ -4654,7 +4692,8 @@ class GoKeyWatcher:
         self._state_path = state_path
         self._mode_file = state_path.with_name("go_key_watch.mode")
         self._mode = mode
-        self._interval = max(interval_secs, 60.0)
+        interval = interval_secs if math.isfinite(interval_secs) else 300.0
+        self._interval = min(max(interval, 60.0), 86400.0)
         self._switch_at = switch_at
         self._candidate_max = candidate_max
         self._cooldown = cooldown_secs
@@ -4816,6 +4855,8 @@ class GoKeyWatcher:
             return state
         eligible = roomy if state == "pressured" else self._eligible(reserves, self._switch_at)
         if not eligible:
+            if any(row["state"] in ("unknown", "probe_misconfigured") for row in reserves.values()):
+                return self._unknown(label, mask, f"{state}: резерв не проверен")
             self._no_reserve(slots, reserves, label, mask, reason, state)
             return "no_reserve"
         if state == "pressured" and self._in_cooldown():
@@ -4829,7 +4870,7 @@ class GoKeyWatcher:
         self._close("switch_storm")
         new_slot = self._pick(slots, reserves, eligible)
         if new_slot is None:
-            if any(reserves[n]["state"] != "dead" for _peak, n in eligible):
+            if any(row["state"] in ("unknown", "probe_misconfigured") for row in reserves.values()):
                 return self._unknown(label, mask, f"{state}: резерв не проверен")
             self._no_reserve(slots, reserves, label, mask, reason, state)
             return "no_reserve"
@@ -4854,7 +4895,9 @@ class GoKeyWatcher:
             {"at": now, "from": label, "to": new_slot, "reason": reason},
         ][-10:]
         if state == "dead" and active_slot is not None:
-            self._state["slots"][str(active_slot)] = "dead"
+            self._state["slots"][str(active_slot)] = {
+                "fingerprint": go_key_fingerprint(active), "state": "dead",
+            }
         self._close("no_reserve", "would_switch", "write_unconfirmed", "reserve_thin")
         spare = sum(1 for _peak, n in self._eligible(reserves, self._candidate_max) if n != new_slot)
         self._send("switched", go_key_message("switched", spare=str(spare), **fields))
@@ -4933,7 +4976,12 @@ class GoKeyWatcher:
 
     def _report_reserves(self, slots: dict[int, str], reserves: dict[int, dict[str, Any]]) -> None:
         known = self._state["slots"]
-        fresh = [n for n, row in reserves.items() if row["state"] == "dead" and known.get(str(n)) != "dead"]
+        fresh = [
+            n for n, row in reserves.items()
+            if row["state"] == "dead" and known.get(str(n)) != {
+                "fingerprint": go_key_fingerprint(slots[n]), "state": "dead",
+            }
+        ]
         delivered = bool(fresh) and self._send(
             "reserve_unhealthy",
             go_key_message(
@@ -4946,7 +4994,10 @@ class GoKeyWatcher:
         for n, row in reserves.items():
             if row["state"] in ("unknown", "probe_misconfigured") or (n in fresh and not delivered):
                 continue
-            known[str(n)] = "dead" if row["state"] == "dead" else "alive"
+            known[str(n)] = {
+                "fingerprint": go_key_fingerprint(slots[n]),
+                "state": "dead" if row["state"] == "dead" else "alive",
+            }
 
     @staticmethod
     def _reserves_text(slots: dict[int, str], reserves: dict[int, dict[str, Any]]) -> str:
@@ -5050,16 +5101,16 @@ class GoKeyWatcher:
 
     def _read_slots(self) -> tuple[dict[int, str], str]:
         try:
-            raw = json.loads(self._slots_file.read_text(encoding="utf-8"))
+            raw = read_go_key_json(self._slots_file)
         except FileNotFoundError:
             return {}, "slots.json нет"
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return {}, "slots.json не читается"
         if not isinstance(raw, dict):
             return {}, "slots.json не читается"
         slots: dict[int, str] = {}
         for name, value in sorted(raw.items(), key=lambda item: str(item[0])):
-            if not (str(name).isdigit() and 1 <= int(name) <= 9 and isinstance(value, str)):
+            if not (re.fullmatch(r"[1-9]", name) and isinstance(value, str)):
                 continue
             key = value.strip()
             if go_key_form_ok(key) and key not in slots.values():
@@ -5089,8 +5140,8 @@ class GoKeyWatcher:
 
     def _load_state(self) -> dict[str, Any]:
         try:
-            data = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            data = read_go_key_json(self._state_path)
+        except (OSError, ValueError, RecursionError):
             data = {}
         if not isinstance(data, dict):
             data = {}
