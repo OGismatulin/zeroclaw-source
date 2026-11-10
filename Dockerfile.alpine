@@ -43,6 +43,7 @@ RUN apk add --no-cache build-base perl pkgconfig zig \
     && cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
 
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 # The optional WASM plugin host generates bindings from the repository-owned
 # WIT contract during compilation. Keep it in this persistent builder before
 # both the dependency prefetch and the real source build.

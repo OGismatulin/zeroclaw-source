@@ -2348,6 +2348,7 @@ store_timeout_ms = 40000
 
     #[test]
     fn resolve_embedding_settings_exposes_resolved_values_for_runtime_refresh() {
+        clear_embedding_env();
         // The public runtime entry pointmust surface the same resolved
         // literal provider/model/dims/key the constructor would use.
         let cfg = MemoryConfig {
