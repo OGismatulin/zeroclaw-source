@@ -4849,6 +4849,141 @@ mod tests {
         // clearing the global hook for the next test.
     }
 
+    #[tokio::test]
+    async fn retry_heartbeat_replaces_poisoned_http_session_without_replay() {
+        use serde_json::json;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpTransport};
+
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
+        let endpoint = MockServer::start().await;
+        let initializes = Arc::new(AtomicUsize::new(0));
+        let initialize_count = initializes.clone();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(move |request: &wiremock::Request| {
+                if initialize_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return ResponseTemplate::new(500);
+                }
+                let body: serde_json::Value = request.body_json().unwrap();
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "qa-session")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": body["id"], "result": {}}))
+            })
+            .expect(3)
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 2, "result": {"tools": [
+                    {"name": "side_effect", "inputSchema": {"type": "object"}},
+                    {"name": "probe", "inputSchema": {"type": "object"}}
+                ]}
+            })))
+            .expect(2)
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "tools/call", "params": {"name": "side_effect"}}),
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&endpoint)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "tools/call", "params": {"name": "probe"}}),
+            ))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"jsonrpc": "2.0", "id": body["id"], "result": {"ok": true}}),
+                )
+            })
+            .expect(1)
+            .mount(&endpoint)
+            .await;
+
+        let mut remote_config = test_server_config("remote");
+        remote_config.transport = McpTransport::Http;
+        remote_config.url = Some(endpoint.uri());
+        let initial = crate::tools::McpRegistry::connect_all(&[remote_config.clone()])
+            .await
+            .unwrap();
+        let old = initial.server_handles().pop().unwrap().1;
+        let peer = make_test_server_handle("peer");
+        let held = Arc::new(
+            crate::tools::McpRegistry::from_servers(vec![old.clone(), peer.clone()]).await,
+        );
+        let mut shared = Some(held.clone());
+        let error = held
+            .call_tool("remote__side_effect", json!({}))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not replayed"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while old.health_check() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed re-handshake must poison the live handle");
+        assert_eq!(initializes.load(Ordering::SeqCst), 2);
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![remote_config, test_server_config("peer")];
+        config.mcp_bundles.insert(
+            "qa".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into(), "peer".into()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "ops".into(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["qa".into()],
+                ..Default::default()
+            },
+        );
+        retry_heartbeat_mcp_registry(&mut shared, &config, "ops")
+            .await
+            .unwrap();
+        let recovered = shared.unwrap();
+        let handles = recovered.server_handles();
+        assert!(peer.ptr_eq(&handles.iter().find(|(name, _)| name == "peer").unwrap().1));
+        assert!(!old.ptr_eq(&handles.iter().find(|(name, _)| name == "remote").unwrap().1));
+        assert_eq!(
+            recovered
+                .call_tool("remote__probe", json!({}))
+                .await
+                .unwrap(),
+            json!({"ok": true})
+        );
+        let error = old.call_tool("probe", json!({})).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not writing on an unrecovered session"));
+        assert_eq!(initializes.load(Ordering::SeqCst), 3);
+        endpoint.verify().await;
+    }
+
     /// When every granted server already has a healthy current handle,
     /// nothing is missing -- `connect_heartbeat_mcp_registry` must return
     /// `Ok(None)` rather than issuing a no-op `connect_all([])`, and must
