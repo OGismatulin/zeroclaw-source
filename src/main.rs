@@ -4027,7 +4027,11 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
-    async_main(command)
+    let result = async_main(command);
+    if zeroclaw_log::flush().is_err() {
+        eprintln!("warning: unable to flush runtime log");
+    }
+    result
 }
 
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
