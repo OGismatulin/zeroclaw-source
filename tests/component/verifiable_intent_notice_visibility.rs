@@ -272,7 +272,7 @@ fn log_flush_failure_preserves_successful_config_patch() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(
         dir.path().join("config.toml"),
-        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n[verifiable_intent]\nenabled = false\n",
+        "schema_version = 3\nlocale = \"en\"\n\n[observability]\nlog_persistence = \"rolling\"\n\n[verifiable_intent]\nenabled = false\n",
     ).unwrap();
     let patch = dir.path().join("patch.json");
     std::fs::write(
@@ -283,7 +283,6 @@ fn log_flush_failure_preserves_successful_config_patch() {
     std::fs::create_dir_all(trace_path(dir.path())).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
         .env("ZEROCLAW_CONFIG_DIR", dir.path())
-        .env("LANG", "en_US.UTF-8")
         .args(["config", "patch"])
         .arg(&patch)
         .output()
