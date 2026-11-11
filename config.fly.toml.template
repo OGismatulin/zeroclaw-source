@@ -1122,13 +1122,8 @@ mcp_bundles = ["all"]
 [agents.analyst_terra.workspace]
 path = "/zeroclaw-data/template/workspace/personas/analyst"
 
-# Research specialists (design 2026-09-11-jira-research-specialists, owner
-# decisions D1/D3): the map, the cross-service contracts and the acceptance
-# study, plus the single gap pass of the B contract. All four sit on the
-# existing openai.codex_luna alias (gpt-6-luna at reasoning_effort = max) and
-# on the jira_research runtime profile with a 4800-second agentic timeout.
-# They are aux workers, NOT
-# members of ANALYST_ROSTER, and deliberately absent from FAILURE_DOMAINS.
+# Research specialists use jira_research (4800-second timeout).
+# Supplemental aux workers, excluded from ANALYST_ROSTER and FAILURE_DOMAINS.
 [agents.jira_topology_researcher]
 model_provider = "openai.codex_luna"
 risk_profile = "default"
