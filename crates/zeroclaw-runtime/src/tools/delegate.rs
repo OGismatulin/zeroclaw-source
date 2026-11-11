@@ -187,6 +187,33 @@ pub struct DelegateTool {
     caller_alias: String,
 }
 
+enum BackgroundFailure {
+    Cancelled,
+    Failed(String),
+}
+
+struct BackgroundTaskOwner {
+    token: Option<CancellationToken>,
+    settlement: tokio::sync::Mutex<()>,
+}
+
+struct BackgroundTaskLease {
+    task_id: String,
+    owner: Arc<BackgroundTaskOwner>,
+}
+
+impl Drop for BackgroundTaskLease {
+    fn drop(&mut self) {
+        let mut owners = DelegateTool::background_task_cancels().lock();
+        if owners
+            .get(&self.task_id)
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner) && Arc::strong_count(owner) == 2)
+        {
+            owners.remove(&self.task_id);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelegateAdmission {
     /// This call entered through the user-visible `delegate` tool and must run
@@ -1095,6 +1122,47 @@ impl DelegateTool {
         Ok(())
     }
 
+    async fn settle_background_result(
+        result_path: &Path,
+        mut result: BackgroundDelegateResult,
+        owner: &BackgroundTaskOwner,
+    ) -> anyhow::Result<bool> {
+        let _guard = owner.settlement.lock().await;
+        let current: BackgroundDelegateResult =
+            serde_json::from_slice(&tokio::fs::read(result_path).await?)?;
+        if current.status != BackgroundTaskStatus::Running {
+            return Ok(false);
+        }
+        if owner
+            .token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            result.status = BackgroundTaskStatus::Cancelled;
+            result.output = None;
+            result.error = Some("Cancelled by parent session".into());
+        }
+        Self::write_result_atomic(result_path, &result).await?;
+        if let Some(cp) = crate::control_plane::control_plane() {
+            let cp_status = match result.status {
+                BackgroundTaskStatus::Completed => crate::control_plane::TaskStatus::Completed,
+                BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
+                BackgroundTaskStatus::Cancelled => crate::control_plane::TaskStatus::Cancelled,
+                BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
+            };
+            let _ = cp
+                .store
+                .update_status(
+                    &result.task_id,
+                    cp_status,
+                    result.output.clone(),
+                    result.error.clone(),
+                )
+                .await;
+        }
+        Ok(true)
+    }
+
     /// Validate that a user-provided task_id is a valid UUID to prevent
     /// path traversal attacks (e.g. `../../etc/passwd`).
     fn validate_task_id(task_id: &str) -> Result<(), String> {
@@ -1636,7 +1704,11 @@ impl DelegateTool {
         // Runaway backstop: refuse a new background delegation once too many are already in
         // flight (each is a full agent loop). The in-flight set is the live cancel-token map.
         if Self::at_background_capacity(
-            Self::background_task_cancels().lock().len(),
+            Self::background_task_cancels()
+                .lock()
+                .values()
+                .filter(|owner| owner.token.is_some())
+                .count(),
             Self::MAX_CONCURRENT_BACKGROUND_DELEGATIONS,
         ) {
             return Ok(ToolResult {
@@ -1682,6 +1754,9 @@ impl DelegateTool {
             updated_at: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
+        let child_token = self.cancellation_token.child_token();
+        let owner = Self::register_background_task_owner(&task_id, child_token.clone())?;
+        let initial_guard = owner.owner.settlement.lock().await;
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
@@ -1710,6 +1785,8 @@ impl DelegateTool {
                 .await;
         }
 
+        drop(initial_guard);
+
         let agents = Arc::clone(&self.agents);
         let security = target_policy;
         let global_credential = self.global_credential.clone();
@@ -1724,12 +1801,6 @@ impl DelegateTool {
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
         let workspace_dir = self.workspace_dir.clone();
-        let child_token = self.cancellation_token.child_token();
-        // Register the live token so `cancel_task` can actually abort THIS task (removed
-        // when it settles, in the spawned closure below).
-        Self::background_task_cancels()
-            .lock()
-            .insert(task_id.clone(), child_token.clone());
         let task_id_clone = task_id.clone();
         let providers_models = Arc::clone(&self.providers_models);
         let risk_profiles = Arc::clone(&self.risk_profiles);
@@ -1812,7 +1883,7 @@ impl DelegateTool {
                 // Race the delegation against cancellation
                 let outcome = tokio::select! {
                     () = child_token.cancelled() => {
-                        Err("Cancelled by parent session".to_string())
+                        Err(BackgroundFailure::Cancelled)
                     }
                     result = Box::pin(inner.execute_sync_with_admission(
                         &agent_name_owned,
@@ -1825,10 +1896,11 @@ impl DelegateTool {
                                 if tool_result.success {
                                     Ok(tool_result.output.into_string())
                                 } else {
-                                    Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
+                                    Err(BackgroundFailure::Failed(tool_result.error.unwrap_or_else(|| "Unknown error".into())))
                                 }
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) if crate::agent::turn::is_tool_loop_cancelled(&e) => Err(BackgroundFailure::Cancelled),
+                            Err(e) => Err(BackgroundFailure::Failed(e.to_string())),
                         }
                     }
                 };
@@ -1853,11 +1925,10 @@ impl DelegateTool {
                         finished_at: Some(finished_at),
                         updated_at: None,
                     },
-                    Err(err) => {
-                        let status = if err.contains("Cancelled") {
-                            BackgroundTaskStatus::Cancelled
-                        } else {
-                            BackgroundTaskStatus::Failed
+                    Err(failure) => {
+                        let (status, err) = match failure {
+                            BackgroundFailure::Cancelled => (BackgroundTaskStatus::Cancelled, "Cancelled by parent session".to_string()),
+                            BackgroundFailure::Failed(err) => (BackgroundTaskStatus::Failed, err),
                         };
                         BackgroundDelegateResult {
                             task_id: task_id_clone.clone(),
@@ -1874,34 +1945,12 @@ impl DelegateTool {
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
-
-                if let Some(cp) = crate::control_plane::control_plane() {
-                    let cp_status = match final_result.status {
-                        BackgroundTaskStatus::Completed => {
-                            crate::control_plane::TaskStatus::Completed
-                        }
-                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
-                        BackgroundTaskStatus::Cancelled => {
-                            crate::control_plane::TaskStatus::Cancelled
-                        }
-                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
-                    };
-                    let _ = cp
-                        .store
-                        .update_status(
-                            &task_id_clone,
-                            cp_status,
-                            final_result.output.clone(),
-                            final_result.error.clone(),
-                        )
-                        .await;
+                if DelegateTool::settle_background_result(&result_path, final_result, &owner.owner).await.is_err() {
+                    ::zeroclaw_log::record!(ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "delegate terminal result settlement failed");
                 }
-
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -2532,11 +2581,48 @@ impl DelegateTool {
         })
     }
 
-    fn background_task_cancels() -> &'static parking_lot::Mutex<HashMap<String, CancellationToken>>
-    {
-        static M: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, CancellationToken>>> =
-            std::sync::OnceLock::new();
+    fn background_task_cancels()
+    -> &'static parking_lot::Mutex<HashMap<String, Arc<BackgroundTaskOwner>>> {
+        static M: std::sync::OnceLock<
+            parking_lot::Mutex<HashMap<String, Arc<BackgroundTaskOwner>>>,
+        > = std::sync::OnceLock::new();
         M.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+    }
+
+    fn register_background_task_owner(
+        task_id: &str,
+        token: CancellationToken,
+    ) -> anyhow::Result<BackgroundTaskLease> {
+        let mut owners = Self::background_task_cancels().lock();
+        if owners.contains_key(task_id) {
+            return Err(anyhow::Error::msg("background task owner already exists"));
+        }
+        let owner = Arc::new(BackgroundTaskOwner {
+            token: Some(token),
+            settlement: tokio::sync::Mutex::new(()),
+        });
+        owners.insert(task_id.to_string(), Arc::clone(&owner));
+        Ok(BackgroundTaskLease {
+            task_id: task_id.to_string(),
+            owner,
+        })
+    }
+
+    fn background_task_owner(task_id: &str) -> BackgroundTaskLease {
+        let mut owners = Self::background_task_cancels().lock();
+        let owner = owners
+            .entry(task_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(BackgroundTaskOwner {
+                    token: None,
+                    settlement: tokio::sync::Mutex::new(()),
+                })
+            })
+            .clone();
+        BackgroundTaskLease {
+            task_id: task_id.to_string(),
+            owner,
+        }
     }
 
     /// Runaway backstop: the maximum number of background delegations allowed in flight at
@@ -2576,6 +2662,8 @@ impl DelegateTool {
             });
         }
 
+        let owner = Self::background_task_owner(task_id);
+        let _guard = owner.owner.settlement.lock().await;
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         if !result_path.exists() {
             return Ok(ToolResult {
@@ -2607,14 +2695,19 @@ impl DelegateTool {
         // registry, the global map can cancel a task spawned by an earlier turn
         // / before a daemon respawn. Falls back to file-marking when the task
         // already settled (token absent).
-        let aborted = Self::background_task_cancels()
-            .lock()
-            .remove(task_id)
-            .inspect(CancellationToken::cancel)
+        let aborted = owner
+            .owner
+            .token
+            .as_ref()
+            .inspect(|token| token.cancel())
             .is_some();
 
         result.status = BackgroundTaskStatus::Cancelled;
-        result.error = Some("Cancelled by user request (marked; process not reachable)".into());
+        result.error = Some(if aborted {
+            "Cancelled by user request".into()
+        } else {
+            "Cancelled by user request (marked; process not reachable)".into()
+        });
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
 
@@ -3184,6 +3277,12 @@ impl DelegateTool {
         };
 
         match result {
+            Ok(Err(e))
+                if admission == DelegateAdmission::Prevalidated
+                    && crate::agent::turn::is_tool_loop_cancelled(&e) =>
+            {
+                Err(e)
+            }
             Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -3400,33 +3499,21 @@ mod tests {
     async fn background_cancel_token_aborts_and_clears() {
         let token = CancellationToken::new();
         let key = "test-cancel-unique-1";
-        DelegateTool::background_task_cancels()
-            .lock()
-            .insert(key.into(), token.clone());
-        // cancel_task-style lookup: remove + signal the live token
-        let aborted = DelegateTool::background_task_cancels()
-            .lock()
-            .remove(key)
-            .inspect(CancellationToken::cancel)
-            .is_some();
-        assert!(aborted, "a registered task token is found and aborted");
-        assert!(
-            token.is_cancelled(),
-            "the running task's token is signalled"
-        );
+        let owner = DelegateTool::register_background_task_owner(key, token.clone()).unwrap();
+        let waiter = DelegateTool::background_task_owner(key);
+        waiter.owner.token.as_ref().unwrap().cancel();
+        assert!(token.is_cancelled());
+        drop(owner);
         assert!(
             DelegateTool::background_task_cancels()
                 .lock()
-                .remove(key)
-                .is_none(),
-            "the token is gone after cancellation"
+                .contains_key(key)
         );
-        // An unknown id is a no-op (cancel_task falls back to file-marking).
+        drop(waiter);
         assert!(
-            DelegateTool::background_task_cancels()
+            !DelegateTool::background_task_cancels()
                 .lock()
-                .remove("test-cancel-missing")
-                .is_none()
+                .contains_key(key)
         );
     }
 
@@ -5275,12 +5362,106 @@ mod tests {
         let token = DelegateTool::background_task_cancels()
             .lock()
             .get(task_id)
-            .cloned()
+            .and_then(|owner| owner.token.clone())
             .expect("background cancellation token");
         token.cancel();
         let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
         assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
         assert_eq!(terminal.prompt_sha256, running.prompt_sha256);
+    }
+
+    #[tokio::test]
+    async fn accepted_background_cancel_survives_worker_settlement() {
+        let (server, requests) = start_slow_chat_server(Duration::from_secs(5)).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let started = fixture
+            .tool
+            .execute(json!({"agent":"target","prompt":"cancel me","background":true}))
+            .await
+            .unwrap();
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .unwrap()
+            .to_string();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real agentic provider call must begin");
+        let path = fixture
+            .workspace_dir
+            .join("delegate_results")
+            .join(format!("{task_id}.json"));
+        let running: BackgroundDelegateResult =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let result = fixture
+            .tool
+            .handle_cancel_task(&json!({"task_id":task_id}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(&task_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker owner must be removed after settlement");
+        let terminal: BackgroundDelegateResult =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
+        assert_eq!(terminal.prompt_sha256, running.prompt_sha256);
+        assert!(
+            !fixture
+                .workspace_dir
+                .join("delegate_results")
+                .join(format!("{task_id}.progress.json"))
+                .exists()
+        );
+        server._task.abort();
+        let _ = server._task.await;
+    }
+
+    #[tokio::test]
+    async fn background_agentic_timeout_remains_failed() {
+        let (server, requests) = start_slow_chat_server(Duration::from_secs(5)).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let mut config = (**fixture.tool.root_config.as_ref().unwrap()).clone();
+        config
+            .runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+        let tool = fixture
+            .tool
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_root_config(Arc::new(config));
+        let started = tool
+            .execute(json!({"agent":"target","prompt":"wait","background":true}))
+            .await
+            .unwrap();
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .unwrap();
+        let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(terminal.status, BackgroundTaskStatus::Failed);
+        assert!(terminal.error.as_deref().unwrap().contains("timed out"));
+        assert_eq!(
+            terminal.prompt_sha256.as_deref(),
+            Some(format!("{:x}", Sha256::digest(b"wait")).as_str())
+        );
+        server._task.abort();
+        let _ = server._task.await;
     }
 
     #[tokio::test]
@@ -6111,6 +6292,50 @@ mod tests {
                 "cancelled delegate must not invoke its next provider step"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn background_agentic_preserves_typed_tool_loop_cancellation() {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let token = CancellationToken::new();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".into()]))
+            .with_cancellation_token(token.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                BlockingCancellationTool {
+                    started: started.clone(),
+                    dropped: dropped.clone(),
+                },
+            )])));
+        let provider = EchoToolResultThenFinalModelProvider::new();
+        let config = agentic_agent_config();
+        let mut future = Box::pin(tool.execute_agentic_with_admission(
+            "agentic",
+            &config,
+            "test-provider",
+            "test-model",
+            &provider,
+            "run",
+            None,
+            DelegateAdmission::Prevalidated,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                permit = started.acquire() => permit.unwrap().forget(),
+                result = &mut future => panic!("delegate completed before nested barrier: {result:?}"),
+            }
+        }).await.expect("nested tool must start");
+        token.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut future)
+            .await
+            .expect("cancellation must settle");
+        assert!(
+            matches!(&result, Err(e) if crate::agent::turn::is_tool_loop_cancelled(e)),
+            "background agentic cancellation must retain typed cause: {result:?}"
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -8707,6 +8932,277 @@ mod tests {
             "must exit early on terminal, not wait out the full window (elapsed {elapsed:?})"
         );
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    async fn assert_polled_pending<F: std::future::Future + ?Sized>(
+        mut future: std::pin::Pin<&mut F>,
+    ) {
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn settlement_lock_orders_cancel_and_completion() {
+        for cancel_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let results = dir.path().join("delegate_results");
+            let mut running = running_result(&task_id);
+            running.prompt_sha256 = Some("a".repeat(64));
+            write_bg_result(&results, &running);
+            let path = results.join(format!("{task_id}.json"));
+            let token = CancellationToken::new();
+            let owner =
+                DelegateTool::register_background_task_owner(&task_id, token.clone()).unwrap();
+            let guard = owner.owner.settlement.lock().await;
+            let tool = DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(dir.path().to_path_buf());
+            let args = json!({"task_id":task_id});
+            let mut done = completed_result(&task_id, "done");
+            done.prompt_sha256 = running.prompt_sha256.clone();
+            let mut cancel = Box::pin(tool.handle_cancel_task(&args));
+            let mut complete = Box::pin(DelegateTool::settle_background_result(
+                &path,
+                done,
+                &owner.owner,
+            ));
+            if cancel_first {
+                assert_polled_pending(cancel.as_mut()).await;
+                assert_polled_pending(complete.as_mut()).await;
+            } else {
+                assert_polled_pending(complete.as_mut()).await;
+                assert_polled_pending(cancel.as_mut()).await;
+            }
+            drop(guard);
+            let (cancel_result, complete_result) = tokio::join!(cancel, complete);
+            assert_eq!(cancel_result.unwrap().success, cancel_first);
+            assert_eq!(complete_result.unwrap(), !cancel_first);
+            let final_result: BackgroundDelegateResult =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                final_result.status,
+                if cancel_first {
+                    BackgroundTaskStatus::Cancelled
+                } else {
+                    BackgroundTaskStatus::Completed
+                }
+            );
+            assert_eq!(final_result.prompt_sha256, running.prompt_sha256);
+            assert_eq!(token.is_cancelled(), cancel_first);
+            drop(owner);
+            assert!(
+                !DelegateTool::background_task_cancels()
+                    .lock()
+                    .contains_key(&task_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_owner_blocks_cancel_until_running_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let token = CancellationToken::new();
+        let owner = DelegateTool::register_background_task_owner(&task_id, token.clone()).unwrap();
+        let guard = owner.owner.settlement.lock().await;
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(dir.path().to_path_buf());
+        let args = json!({"task_id":task_id});
+        let mut cancel = Box::pin(tool.handle_cancel_task(&args));
+        assert_polled_pending(cancel.as_mut()).await;
+        write_bg_result(
+            &dir.path().join("delegate_results"),
+            &running_result(&task_id),
+        );
+        assert!(!token.is_cancelled());
+        drop(guard);
+        assert!(cancel.await.unwrap().success);
+        assert!(token.is_cancelled());
+        drop(owner);
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(&task_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_legacy_cancels_share_one_owner_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_bg_result(
+            &dir.path().join("delegate_results"),
+            &running_result(&task_id),
+        );
+        let owner = DelegateTool::background_task_owner(&task_id);
+        let guard = owner.owner.settlement.lock().await;
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(dir.path().to_path_buf());
+        let args = json!({"task_id":task_id});
+        let mut first = Box::pin(tool.handle_cancel_task(&args));
+        let mut second = Box::pin(tool.handle_cancel_task(&args));
+        assert_polled_pending(first.as_mut()).await;
+        assert_polled_pending(second.as_mut()).await;
+        drop(guard);
+        let (first_result, second_result) = tokio::join!(first, second);
+        assert!(first_result.unwrap().success);
+        assert!(!second_result.unwrap().success);
+        drop(owner);
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(&task_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_failures_do_not_become_cancelled_from_error_text() {
+        for message in [
+            "Cancelled is part of an ordinary failure",
+            "agent timed out",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let results = dir.path().join("delegate_results");
+            let mut running = running_result(&task_id);
+            running.prompt_sha256 = Some("b".repeat(64));
+            write_bg_result(&results, &running);
+            let path = results.join(format!("{task_id}.json"));
+            let owner =
+                DelegateTool::register_background_task_owner(&task_id, CancellationToken::new())
+                    .unwrap();
+            let mut failed = running.clone();
+            failed.status = BackgroundTaskStatus::Failed;
+            failed.error = Some(message.into());
+            assert!(
+                DelegateTool::settle_background_result(&path, failed, &owner.owner)
+                    .await
+                    .unwrap()
+            );
+            let actual: BackgroundDelegateResult =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(actual.status, BackgroundTaskStatus::Failed);
+            assert_eq!(actual.error.as_deref(), Some(message));
+            assert_eq!(actual.prompt_sha256, running.prompt_sha256);
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_keeps_control_plane_and_flat_status_in_sync() {
+        const CHILD: &str = "ZC_TEST_DELEGATE_CP_PARITY_CHILD";
+        const NAME: &str =
+            "tools::delegate::tests::settlement_keeps_control_plane_and_flat_status_in_sync";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated CP test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use crate::control_plane::{ControlPlaneHandle, TaskRecord, TaskStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let cp = ControlPlaneHandle::start(dir.path()).await.unwrap();
+        let store = Arc::clone(&cp.store);
+        assert!(crate::control_plane::init_control_plane(cp));
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(dir.path().to_path_buf());
+        for cancel_first in [true, false] {
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let rec: TaskRecord = serde_json::from_value(json!({"id":task_id,"kind":"delegate","agent":"researcher","status":"running","started_at":"2026-06-20T00:00:00Z"})).unwrap();
+            store.create(rec).await.unwrap();
+            let results = dir.path().join("delegate_results");
+            write_bg_result(&results, &running_result(&task_id));
+            let path = results.join(format!("{task_id}.json"));
+            let owner =
+                DelegateTool::register_background_task_owner(&task_id, CancellationToken::new())
+                    .unwrap();
+            let args = json!({"task_id":task_id});
+            if cancel_first {
+                assert!(tool.handle_cancel_task(&args).await.unwrap().success);
+                assert!(
+                    !DelegateTool::settle_background_result(
+                        &path,
+                        completed_result(&task_id, "done"),
+                        &owner.owner
+                    )
+                    .await
+                    .unwrap()
+                );
+            } else {
+                assert!(
+                    DelegateTool::settle_background_result(
+                        &path,
+                        completed_result(&task_id, "done"),
+                        &owner.owner
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert!(!tool.handle_cancel_task(&args).await.unwrap().success);
+            }
+            let flat: BackgroundDelegateResult =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let stored = store.get(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                flat.status,
+                if cancel_first {
+                    BackgroundTaskStatus::Cancelled
+                } else {
+                    BackgroundTaskStatus::Completed
+                }
+            );
+            assert_eq!(
+                stored.status,
+                if cancel_first {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Completed
+                }
+            );
+            drop(owner);
+            assert!(
+                !DelegateTool::background_task_cancels()
+                    .lock()
+                    .contains_key(&task_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_publication_drops_only_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("not-a-directory");
+        std::fs::write(&parent, b"file").unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let owner =
+            DelegateTool::register_background_task_owner(&task_id, CancellationToken::new())
+                .unwrap();
+        let guard = owner.owner.settlement.lock().await;
+        assert!(
+            DelegateTool::write_result_atomic(
+                &parent.join("result.json"),
+                &running_result(&task_id)
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        drop(owner);
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(&task_id)
+        );
     }
 
     #[tokio::test]
