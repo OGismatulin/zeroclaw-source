@@ -3638,6 +3638,100 @@ done
     }
 
     #[tokio::test]
+    async fn boot_hung_peer_does_not_close_healthy_peer() {
+        use wiremock::matchers::{body_partial_json, header, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let bad = wiremock::MockServer::start().await;
+        let good = wiremock::MockServer::start().await;
+        for (server, session) in [(&bad, "bad-session"), (&good, "good-session")] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"initialize"})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Mcp-Session-Id", session)
+                        .set_body_json(
+                            json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}),
+                        ),
+                )
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(22)))
+            .mount(&bad)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(header("Mcp-Session-Id", "bad-session"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bad)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&good)
+            .await;
+        Mock::given(method("POST")).and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            }))).mount(&good).await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"healthy"}]}
+            })))
+            .mount(&good)
+            .await;
+        let mut bad_config = http_server_config(bad.uri());
+        bad_config.name = "bad".into();
+        let mut good_config = http_server_config(good.uri());
+        good_config.name = "good".into();
+        let (registry, failures) = timeout(
+            Duration::from_secs(25),
+            McpRegistry::connect_all_with_failures(&[bad_config, good_config]),
+        )
+        .await
+        .expect("whole registry must finish")
+        .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].server, "bad");
+        assert_eq!(failures[0].stage.as_str(), "boot_connect_timeout");
+        assert_eq!(failures[0].timeout_secs, 20);
+        let result = registry.call_tool("good__ping", json!({})).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "healthy");
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if bad
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "DELETE")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("known bad session must be deleted");
+        assert!(
+            !good
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "DELETE")
+        );
+    }
+
+    #[tokio::test]
     async fn boot_registry_keeps_config_order_and_duplicate_last_wins() {
         use wiremock::matchers::{body_partial_json, method};
         use wiremock::{Mock, ResponseTemplate};
