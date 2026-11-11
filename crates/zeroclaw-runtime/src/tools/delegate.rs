@@ -239,11 +239,11 @@ impl Drop for BackgroundTaskLease {
 }
 
 #[cfg(test)]
-fn background_lease_drop_hook()
--> &'static parking_lot::Mutex<Option<(String, Arc<std::sync::Barrier>)>> {
-    static HOOK: std::sync::OnceLock<
-        parking_lot::Mutex<Option<(String, Arc<std::sync::Barrier>)>>,
-    > = std::sync::OnceLock::new();
+type BackgroundLeaseDropHook = parking_lot::Mutex<Option<(String, Arc<std::sync::Barrier>)>>;
+
+#[cfg(test)]
+fn background_lease_drop_hook() -> &'static BackgroundLeaseDropHook {
+    static HOOK: std::sync::OnceLock<BackgroundLeaseDropHook> = std::sync::OnceLock::new();
     HOOK.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
