@@ -11,6 +11,7 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +66,8 @@ where
 pub struct BackgroundDelegateResult {
     pub task_id: String,
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_sha256: Option<String>,
     pub status: BackgroundTaskStatus,
     pub output: Option<String>,
     pub error: Option<String>,
@@ -1662,6 +1665,7 @@ impl DelegateTool {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
+        let prompt_sha256 = format!("{:x}", Sha256::digest(full_prompt.as_bytes()));
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
 
@@ -1669,6 +1673,7 @@ impl DelegateTool {
         let initial_result = BackgroundDelegateResult {
             task_id: task_id.clone(),
             agent: agent_name_owned.clone(),
+            prompt_sha256: Some(prompt_sha256.clone()),
             status: BackgroundTaskStatus::Running,
             output: None,
             error: None,
@@ -1840,6 +1845,7 @@ impl DelegateTool {
                     Ok(output) => BackgroundDelegateResult {
                         task_id: task_id_clone.clone(),
                         agent: agent_name_owned,
+                        prompt_sha256: Some(prompt_sha256.clone()),
                         status: BackgroundTaskStatus::Completed,
                         output: Some(output),
                         error: None,
@@ -1856,6 +1862,7 @@ impl DelegateTool {
                         BackgroundDelegateResult {
                             task_id: task_id_clone.clone(),
                             agent: agent_name_owned,
+                            prompt_sha256: Some(prompt_sha256.clone()),
                             status,
                             output: None,
                             error: Some(err),
@@ -3544,6 +3551,7 @@ mod tests {
         BackgroundDelegateResult {
             task_id: task_id.to_string(),
             agent: "researcher".to_string(),
+            prompt_sha256: None,
             status,
             output: output.map(str::to_string),
             error: error.map(str::to_string),
@@ -5228,6 +5236,52 @@ mod tests {
         assert_stored_for_target_only(&fixture, "sync-key").await;
     }
 
+    #[test]
+    fn delegate_fingerprint_legacy_json_is_compatible() {
+        let legacy = serde_json::to_value(running_result("legacy")).unwrap();
+        let decoded: BackgroundDelegateResult = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.prompt_sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn delegate_fingerprint_tracks_context_and_survives_cancellation() {
+        let (server, _) = start_slow_chat_server(Duration::from_secs(5)).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let started = fixture
+            .tool
+            .execute(json!({
+                "agent": "target", "prompt": "task", "context": "context", "background": true
+            }))
+            .await
+            .unwrap();
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .unwrap();
+        let path = fixture
+            .workspace_dir
+            .join("delegate_results")
+            .join(format!("{task_id}.json"));
+        let running: BackgroundDelegateResult =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(b"[Context]\ncontext\n\n[Task]\ntask")
+        );
+        assert_eq!(running.status, BackgroundTaskStatus::Running);
+        assert_eq!(running.prompt_sha256.as_deref(), Some(expected.as_str()));
+        assert_ne!(expected, format!("{:x}", Sha256::digest(b"task")));
+        fixture
+            .tool
+            .execute(json!({"action": "cancel_task", "task_id": task_id}))
+            .await
+            .unwrap();
+        let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
+        assert_eq!(terminal.prompt_sha256, running.prompt_sha256);
+    }
+
     #[tokio::test]
     async fn background_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Same memory-scope invariant as the sync path, but through the detached
@@ -5256,6 +5310,8 @@ mod tests {
             .trim();
         let bg_result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
         assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
+        let expected = format!("{:x}", Sha256::digest(b"store and recall target memory"));
+        assert_eq!(bg_result.prompt_sha256.as_deref(), Some(expected.as_str()));
         assert!(
             bg_result
                 .output
@@ -5302,6 +5358,8 @@ mod tests {
             BackgroundTaskStatus::Failed,
             "{background:?}"
         );
+        let expected = format!("{:x}", Sha256::digest(b"return a final answer"));
+        assert_eq!(background.prompt_sha256.as_deref(), Some(expected.as_str()));
         assert!(background.output.is_none(), "{background:?}");
         assert_eq!(
             background.error.as_deref(),
@@ -8453,6 +8511,7 @@ mod tests {
         BackgroundDelegateResult {
             task_id: task_id.to_string(),
             agent: "researcher".into(),
+            prompt_sha256: None,
             status: BackgroundTaskStatus::Running,
             output: None,
             error: None,
@@ -8524,6 +8583,7 @@ mod tests {
         BackgroundDelegateResult {
             task_id: task_id.to_string(),
             agent: "researcher".into(),
+            prompt_sha256: None,
             status: BackgroundTaskStatus::Completed,
             output: Some(output.to_string()),
             error: None,
