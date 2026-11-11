@@ -75,6 +75,7 @@ swap_size_mb = 512
 
   # ── Incident sweeper ────────────────────────────────────────────────────
   # Ships inert. Turning it on is a separate, later step, after its own gates.
+  ZEROCLAW_RETRO_QA_USERS = 'tg_99999,tg_83292437'
   ZEROCLAW_INCIDENTS_ENABLED = '1'
   ZEROCLAW_INCIDENTS_SWEEP_SECS = '1800'
 
