@@ -199,19 +199,52 @@ struct BackgroundTaskOwner {
 
 struct BackgroundTaskLease {
     task_id: String,
-    owner: Arc<BackgroundTaskOwner>,
+    owner: Option<Arc<BackgroundTaskOwner>>,
+}
+
+impl BackgroundTaskLease {
+    fn owner(&self) -> &BackgroundTaskOwner {
+        self.owner.as_deref().expect("lease owner remains present")
+    }
 }
 
 impl Drop for BackgroundTaskLease {
     fn drop(&mut self) {
         let mut owners = DelegateTool::background_task_cancels().lock();
-        if owners
+        let lease_owner = self.owner.take().expect("lease owner remains present");
+        let same_owner = owners
             .get(&self.task_id)
-            .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner) && Arc::strong_count(owner) == 2)
+            .is_some_and(|owner| Arc::ptr_eq(owner, &lease_owner));
+        drop(lease_owner);
+        if same_owner
+            && owners
+                .get(&self.task_id)
+                .is_some_and(|owner| Arc::strong_count(owner) == 1)
         {
             owners.remove(&self.task_id);
         }
+        drop(owners);
+        #[cfg(test)]
+        {
+            let barrier = background_lease_drop_hook()
+                .lock()
+                .as_ref()
+                .filter(|(task_id, _)| task_id == &self.task_id)
+                .map(|(_, barrier)| Arc::clone(barrier));
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
     }
+}
+
+#[cfg(test)]
+fn background_lease_drop_hook()
+-> &'static parking_lot::Mutex<Option<(String, Arc<std::sync::Barrier>)>> {
+    static HOOK: std::sync::OnceLock<
+        parking_lot::Mutex<Option<(String, Arc<std::sync::Barrier>)>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1756,7 +1789,7 @@ impl DelegateTool {
         let result_path = results_dir.join(format!("{task_id}.json"));
         let child_token = self.cancellation_token.child_token();
         let owner = Self::register_background_task_owner(&task_id, child_token.clone())?;
-        let initial_guard = owner.owner.settlement.lock().await;
+        let initial_guard = owner.owner().settlement.lock().await;
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
         // EPIC-A supervision: register the task in the durable control-plane BEFORE the
@@ -1945,7 +1978,7 @@ impl DelegateTool {
                 };
 
                 let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                if DelegateTool::settle_background_result(&result_path, final_result, &owner.owner).await.is_err() {
+                if DelegateTool::settle_background_result(&result_path, final_result, owner.owner()).await.is_err() {
                     ::zeroclaw_log::record!(ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
@@ -2604,7 +2637,7 @@ impl DelegateTool {
         owners.insert(task_id.to_string(), Arc::clone(&owner));
         Ok(BackgroundTaskLease {
             task_id: task_id.to_string(),
-            owner,
+            owner: Some(owner),
         })
     }
 
@@ -2621,7 +2654,7 @@ impl DelegateTool {
             .clone();
         BackgroundTaskLease {
             task_id: task_id.to_string(),
-            owner,
+            owner: Some(owner),
         }
     }
 
@@ -2663,7 +2696,7 @@ impl DelegateTool {
         }
 
         let owner = Self::background_task_owner(task_id);
-        let _guard = owner.owner.settlement.lock().await;
+        let _guard = owner.owner().settlement.lock().await;
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         if !result_path.exists() {
             return Ok(ToolResult {
@@ -2696,7 +2729,7 @@ impl DelegateTool {
         // / before a daemon respawn. Falls back to file-marking when the task
         // already settled (token absent).
         let aborted = owner
-            .owner
+            .owner()
             .token
             .as_ref()
             .inspect(|token| token.cancel())
@@ -3501,7 +3534,7 @@ mod tests {
         let key = "test-cancel-unique-1";
         let owner = DelegateTool::register_background_task_owner(key, token.clone()).unwrap();
         let waiter = DelegateTool::background_task_owner(key);
-        waiter.owner.token.as_ref().unwrap().cancel();
+        waiter.owner().token.as_ref().unwrap().cancel();
         assert!(token.is_cancelled());
         drop(owner);
         assert!(
@@ -8957,7 +8990,7 @@ mod tests {
             let token = CancellationToken::new();
             let owner =
                 DelegateTool::register_background_task_owner(&task_id, token.clone()).unwrap();
-            let guard = owner.owner.settlement.lock().await;
+            let guard = owner.owner().settlement.lock().await;
             let tool = DelegateTool::new(sample_agents(), None, test_security())
                 .with_workspace_dir(dir.path().to_path_buf());
             let args = json!({"task_id":task_id});
@@ -8967,7 +9000,7 @@ mod tests {
             let mut complete = Box::pin(DelegateTool::settle_background_result(
                 &path,
                 done,
-                &owner.owner,
+                owner.owner(),
             ));
             if cancel_first {
                 assert_polled_pending(cancel.as_mut()).await;
@@ -9007,7 +9040,7 @@ mod tests {
         let task_id = uuid::Uuid::new_v4().to_string();
         let token = CancellationToken::new();
         let owner = DelegateTool::register_background_task_owner(&task_id, token.clone()).unwrap();
-        let guard = owner.owner.settlement.lock().await;
+        let guard = owner.owner().settlement.lock().await;
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_workspace_dir(dir.path().to_path_buf());
         let args = json!({"task_id":task_id});
@@ -9038,7 +9071,7 @@ mod tests {
             &running_result(&task_id),
         );
         let owner = DelegateTool::background_task_owner(&task_id);
-        let guard = owner.owner.settlement.lock().await;
+        let guard = owner.owner().settlement.lock().await;
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_workspace_dir(dir.path().to_path_buf());
         let args = json!({"task_id":task_id});
@@ -9051,6 +9084,27 @@ mod tests {
         assert!(first_result.unwrap().success);
         assert!(!second_result.unwrap().success);
         drop(owner);
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(&task_id)
+        );
+    }
+
+    #[test]
+    fn simultaneous_last_leases_remove_registry_owner() {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let first =
+            DelegateTool::register_background_task_owner(&task_id, CancellationToken::new())
+                .unwrap();
+        let second = DelegateTool::background_task_owner(&task_id);
+        *background_lease_drop_hook().lock() =
+            Some((task_id.clone(), Arc::new(std::sync::Barrier::new(2))));
+        let first_thread = std::thread::spawn(move || drop(first));
+        let second_thread = std::thread::spawn(move || drop(second));
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+        *background_lease_drop_hook().lock() = None;
         assert!(
             !DelegateTool::background_task_cancels()
                 .lock()
@@ -9078,7 +9132,7 @@ mod tests {
             failed.status = BackgroundTaskStatus::Failed;
             failed.error = Some(message.into());
             assert!(
-                DelegateTool::settle_background_result(&path, failed, &owner.owner)
+                DelegateTool::settle_background_result(&path, failed, owner.owner())
                     .await
                     .unwrap()
             );
@@ -9133,7 +9187,7 @@ mod tests {
                     !DelegateTool::settle_background_result(
                         &path,
                         completed_result(&task_id, "done"),
-                        &owner.owner
+                        owner.owner()
                     )
                     .await
                     .unwrap()
@@ -9143,7 +9197,7 @@ mod tests {
                     DelegateTool::settle_background_result(
                         &path,
                         completed_result(&task_id, "done"),
-                        &owner.owner
+                        owner.owner()
                     )
                     .await
                     .unwrap()
@@ -9187,7 +9241,7 @@ mod tests {
         let owner =
             DelegateTool::register_background_task_owner(&task_id, CancellationToken::new())
                 .unwrap();
-        let guard = owner.owner.settlement.lock().await;
+        let guard = owner.owner().settlement.lock().await;
         assert!(
             DelegateTool::write_result_atomic(
                 &parent.join("result.json"),
