@@ -1077,3 +1077,5 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+
+cli-runtime-log-flush-failed = 警告: 実行ログをフラッシュできませんでした。

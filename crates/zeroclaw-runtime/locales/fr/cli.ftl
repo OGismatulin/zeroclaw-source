@@ -1082,3 +1082,5 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+
+cli-runtime-log-flush-failed = Avertissement : impossible de vider le journal d’exécution.

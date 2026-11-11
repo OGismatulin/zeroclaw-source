@@ -1078,3 +1078,5 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+
+cli-runtime-log-flush-failed = 警告：无法刷新运行日志。

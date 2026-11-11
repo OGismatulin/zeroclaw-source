@@ -267,6 +267,35 @@ fn the_withheld_notice_is_recorded_once_per_config_application() {
     );
 }
 
+#[test]
+fn log_flush_failure_preserves_successful_config_patch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n[verifiable_intent]\nenabled = false\n",
+    ).unwrap();
+    let patch = dir.path().join("patch.json");
+    std::fs::write(
+        &patch,
+        r#"[{"op":"replace","path":"/verifiable_intent/enabled","value":true}]"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(trace_path(dir.path())).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .env("LANG", "en_US.UTF-8")
+        .args(["config", "patch"])
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "config patch must retain success");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unable to flush runtime log"),
+        "missing flush warning: {stderr}"
+    );
+}
+
 /// Enabling the section through `config patch` records the notice.
 ///
 /// The runtime writes this notice after the initial config load and after a

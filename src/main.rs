@@ -4029,7 +4029,13 @@ fn main() -> Result<()> {
 
     let result = async_main(command);
     if zeroclaw_log::flush().is_err() {
-        eprintln!("warning: unable to flush runtime log");
+        eprintln!(
+            "{}",
+            t(
+                "cli-runtime-log-flush-failed",
+                "warning: unable to flush runtime log"
+            )
+        );
     }
     result
 }
