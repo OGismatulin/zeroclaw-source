@@ -5401,6 +5401,18 @@ class M365Refresher:
                 return
 
 
+
+def question_users_from_env() -> frozenset[str]:
+    raw = os.environ.get("ZEROCLAW_RETRO_QA_USERS", "").strip()
+    if not raw:
+        return frozenset()
+    parts = [part.strip() for part in raw.split(",")]
+    if any(re.fullmatch(r"tg_[0-9]+", part) is None for part in parts):
+        print("[gateway-manager] qa: invalid_users", flush=True)
+        return frozenset()
+    return frozenset(parts)
+
+
 class IncidentSweeper:
     """Periodic incident-digest sweep. Never raises into the manager.
 
@@ -5435,6 +5447,7 @@ class IncidentSweeper:
         self._sweeper = sweeper if sweeper is not None else functools.partial(
             zeroclaw_incidents.sweep,
             lifecycle_evidence=zeroclaw_incidents.delegate_never_created,
+            question_users=question_users_from_env(),
         )
         self._alert = alert
         self._fail_streak = 0

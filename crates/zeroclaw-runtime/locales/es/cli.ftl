@@ -1079,3 +1079,5 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+
+cli-runtime-log-flush-failed = Advertencia: no se pudo vaciar el registro de ejecución.

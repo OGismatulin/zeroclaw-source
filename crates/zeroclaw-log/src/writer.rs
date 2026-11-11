@@ -449,7 +449,7 @@ pub fn active_log_path() -> Option<PathBuf> {
         .map(|s| s.policy.path.clone())
 }
 
-pub fn flush_for_test() -> Result<()> {
+pub fn flush() -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
     };
@@ -467,6 +467,10 @@ pub fn flush_for_test() -> Result<()> {
     ack_rx
         .recv()
         .context("log writer worker disconnected before reporting flush result")?
+}
+
+pub fn flush_for_test() -> Result<()> {
+    flush()
 }
 
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
@@ -990,6 +994,58 @@ mod tests {
             ..LogConfig::default()
         };
         init_from_config(&cfg, dir);
+    }
+
+    #[test]
+    fn accepted_event_survives_normal_process_return() {
+        const CHILD: &str = "ZC_TEST_LOG_EXIT_FIXTURE";
+        const NAME: &str = "writer::tests::accepted_event_survives_normal_process_return";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let _guard = WRITER_TEST_LOCK.lock();
+            install_writer(Path::new(&dir), 10);
+            let state = current_state().unwrap();
+            let (entered_tx, entered_rx) = sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            state
+                .tx
+                .send(WriterJob::Pause {
+                    entered: entered_tx,
+                    release: release_rx,
+                })
+                .unwrap();
+            entered_rx.recv().unwrap();
+            let mut event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            event.message = Some("accepted-before-normal-exit".into());
+            state
+                .tx
+                .send(WriterJob::Write(serde_json::to_value(event).unwrap()))
+                .unwrap();
+            let (started_tx, started_rx) = sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let flush_thread = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(flush()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.try_recv().is_err());
+            release_tx.send(()).unwrap();
+            done_rx.recv().unwrap().unwrap();
+            flush_thread.join().unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME])
+            .env(CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let trace = std::fs::read_to_string(dir.path().join("state/runtime-trace.jsonl"))
+            .unwrap_or_default();
+        assert!(
+            trace.contains("accepted-before-normal-exit"),
+            "accepted event missing at normal process return: {trace}"
+        );
     }
 
     fn detached_enabled_policy(dir: &Path) -> ResolvedPolicy {

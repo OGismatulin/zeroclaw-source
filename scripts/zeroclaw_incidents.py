@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 import argparse
+import hashlib
+import fcntl
+import time
+import unicodedata
 import json
 import os
 import re
@@ -65,6 +69,28 @@ def _scrub(text: object) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         value = pattern.sub(replacement, value)
     return value
+
+
+_QUESTION_SUBSTITUTIONS = (
+    (re.compile(r"https?://\S+", re.I), " tokenurl "),
+    (re.compile(r"[\w.+-]+@[\w.-]+\.[a-z]{2,}", re.I), " tokenemail "),
+    (re.compile(r"(?<!\w)@[\w_]+"), " tokenhandle "),
+    (re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.I), " tokenuuid "),
+    (re.compile(r"\b\d{1,4}[./-]\d{1,2}[./-]\d{1,4}\b"), " tokendate "),
+    (re.compile(r"(?<!\w)\+?\d[\d ()-]{7,}\d(?!\w)"), " tokenphone "),
+    (re.compile(r"(?<!\w)\d+(?:[.,]\d+)?(?!\w)"), " tokennumber "),
+)
+
+
+def question_hash(text: str) -> str | None:
+    value = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
+    value = _scrub(value)
+    for pattern, replacement in _QUESTION_SUBSTITUTIONS:
+        value = pattern.sub(replacement, value)
+    value = " ".join(re.sub(r"[^\w\s]", " ", value).split())
+    if not value:
+        return None
+    return "sha256:" + hashlib.sha256(("v1\0" + value).encode()).hexdigest()
 
 
 def _safe_clip(text: object, limit: int) -> str:
@@ -965,7 +991,7 @@ class EpisodeTracker:
                 "output_tokens": 0, "models": set(), "tools": Counter(), "skills": set(),
                 "commands": [], "adhoc_paths": set(), "adhoc_scripts": 0,
                 "failed_calls": [], "final": None, "legacy_final": None,
-                "legacy_final_chars": 0, "cancelled": False,
+                "legacy_final_chars": 0, "qa_answer": None, "qa_conflict": False, "cancelled": False,
                 "error": False, "drift": False, "legacy_webhook_request": False,
             }
         ep["first"] = min(ep["first"], stamp)
@@ -997,6 +1023,7 @@ class EpisodeTracker:
             self._tool_start(ep, attrs)
         elif message == "turn_final_response":
             ep["final"] = len(str(attrs.get("text") or "").strip())
+            self._answer(ep, attrs.get("text"))
         if legacy is not None:
             self._legacy_final(*legacy, row)
         if incident is not None and incident.turn_id == turn:
@@ -1006,6 +1033,7 @@ class EpisodeTracker:
 
     def _legacy_final(self, session_id: str, flag: str, row: dict) -> None:
         turn = _turn_key(row)
+        qa_unambiguous = True
         if turn:
             target = self._open.get((session_id, turn))
             if target is None:
@@ -1019,6 +1047,7 @@ class EpisodeTracker:
             if not candidates:
                 return
             target = max(candidates, key=lambda ep: (ep["last"], ep["first"]))
+            qa_unambiguous = len(candidates) == 1
         if flag == "cancelled":
             target["cancelled"] = True
         elif flag == "error" or flag == "false":
@@ -1028,6 +1057,28 @@ class EpisodeTracker:
             text = attrs.get("text") if isinstance(attrs, dict) else None
             target["legacy_final"] = "answered"
             target["legacy_final_chars"] = len(text.strip()) if isinstance(text, str) else 0
+            if qa_unambiguous:
+                self._answer(target, text)
+
+    @staticmethod
+    def _answer(ep: dict, text: object) -> None:
+        if not isinstance(text, str) or ep["qa_conflict"]:
+            return
+        answer = {
+            "available": True, "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "chars": len(text), "shape": {
+                "table": any(line.lstrip().startswith("|") for line in text.splitlines()),
+                "code_block": "```" in text,
+                "user_response_block": "USER_RESPONSE_BEGIN" in text,
+                "sections": sum(bool(re.match(r"^\s*#{1,6}\s", line)) for line in text.splitlines()),
+                "ends_with_question": text.rstrip().endswith("?"),
+            },
+        }
+        if ep["qa_answer"] is not None and ep["qa_answer"] != answer:
+            ep["qa_answer"] = None
+            ep["qa_conflict"] = True
+        else:
+            ep["qa_answer"] = answer
 
     @staticmethod
     def _tool_start(ep: dict, attrs: dict) -> None:
@@ -1098,6 +1149,11 @@ class EpisodeTracker:
                 target["final"] = pending["final"]
             target["legacy_final"] = target["legacy_final"] or pending["legacy_final"]
             target["legacy_final_chars"] = max(target["legacy_final_chars"], pending["legacy_final_chars"])
+            if pending["qa_conflict"] or (pending["qa_answer"] and target["qa_answer"]
+                    and pending["qa_answer"] != target["qa_answer"]):
+                target["qa_answer"], target["qa_conflict"] = None, True
+            elif not target["qa_conflict"] and pending["qa_answer"]:
+                target["qa_answer"] = pending["qa_answer"]
             target["cancelled"] |= pending["cancelled"]
             target["error"] |= pending["error"]
             target["drift"] |= pending["drift"]
@@ -1174,6 +1230,186 @@ class EpisodeTracker:
         }
 
 
+QUESTION_LIMIT = 10000
+QUESTION_READ_SECS = 2.0
+
+
+def _aware_ts(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+
+
+def _question_rows(db: Path, starts: list[datetime]) -> list[tuple]:
+    if not starts:
+        return []
+    deadline = time.monotonic() + QUESTION_READ_SECS
+    for attempt in range(2):
+        try:
+            with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.1) as conn:
+                conn.execute("PRAGMA query_only=ON")
+                conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                rows = conn.execute(
+                    "SELECT key, content, session_id, created_at FROM memories "
+                    "WHERE category = ? AND substr(key, 1, 12) = ? "
+                    "AND julianday(created_at) BETWEEN julianday(?) AND julianday(?) LIMIT ?",
+                    ("conversation", "webhook_msg_", _utc_iso(min(starts) - timedelta(seconds=60)),
+                     _utc_iso(max(starts) + timedelta(seconds=60)), QUESTION_LIMIT + 1),
+                ).fetchall()
+                if len(rows) > QUESTION_LIMIT or time.monotonic() >= deadline:
+                    raise TimeoutError("question_read_limit")
+                return rows
+        except sqlite3.OperationalError as exc:
+            if attempt or not any(word in str(exc).lower() for word in ("busy", "locked")):
+                raise
+            if time.monotonic() + 0.1 >= deadline:
+                raise TimeoutError("question_read_timeout") from exc
+            time.sleep(0.1)
+    raise TimeoutError("question_read_timeout")
+
+
+def _json_lines(path: Path, *, strict: bool = False) -> list[dict]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+            if isinstance(value, dict):
+                if strict and (value.get("kind") != "qa" or value.get("schema_version") != 1):
+                    raise ValueError("invalid_question_record")
+                rows.append(value)
+            elif strict:
+                raise ValueError("invalid_question_record")
+        except ValueError:
+            if strict:
+                raise ValueError("invalid_question_record") from None
+    return rows
+
+
+def _atomic_json(path: Path, value: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(value, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _collect_questions(data_root: Path, now: datetime, timezone_name: str,
+                       question_users: frozenset[str], observed: dict[str, dict]) -> dict[str, int]:
+    tz = ZoneInfo(timezone_name)
+    today = now.astimezone(tz).date()
+    days = [(today - timedelta(days=back)).isoformat() for back in (1, 0)]
+    out = data_root / "observability" / "questions"
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        malformed_by_user: Counter[str] = Counter()
+        by_day = {day: _json_lines(out / f"{day}.jsonl", strict=True) for day in days}
+        previous = {}
+        for path in out.glob("????-??-??.jsonl"):
+            for row in _json_lines(path, strict=True):
+                if row.get("user") and row.get("episode_id"):
+                    previous[(row["user"], row["episode_id"])] = row
+        episode_rows = [row for day in days for row in _json_lines(episodes_dir(data_root) / f"{day}.jsonl")]
+        for user in sorted(question_users):
+            context = observed.get(user, {})
+            records = {(row["user"], row["id"]): row for row in episode_rows
+                       if row.get("kind") == "episode" and row.get("user") == user
+                       and row.get("origin") == "chat" and row.get("id")}
+            # Current tracker records include still-open turns as join competitors.
+            candidates = dict(records)
+            for row in context.get("open", []):
+                if row.get("origin") == "chat":
+                    candidates[(user, row["id"])] = row
+            starts = [_aware_ts(ep.get("start")) for ep in candidates.values()]
+            starts = [stamp for stamp in starts if stamp is not None]
+            try:
+                rows = _question_rows(context["workspace"] / "memory" / "brain.db", starts)
+                unavailable = False
+                malformed_by_user[user] += sum(_aware_ts(row[3]) is None for row in rows)
+            except (KeyError, OSError, sqlite3.Error, TimeoutError):
+                rows, unavailable = [], True
+            graph: dict[tuple[str, str], list[tuple]] = {}
+            reverse: dict[str, set[tuple[str, str]]] = {}
+            for key, ep in candidates.items():
+                start, session = _aware_ts(ep.get("start")), ep.get("session_key")
+                if start is None or not session:
+                    continue
+                matches = []
+                for ref, text, row_session, created in rows:
+                    stamp = _aware_ts(created)
+                    if row_session == session and stamp and abs((stamp - start).total_seconds()) <= 60:
+                        matches.append((ref, text, stamp))
+                        reverse.setdefault(str(ref), set()).add(key)
+                graph[key] = matches
+            for key, old in previous.items():
+                question = old.get("question") or {}
+                if key[0] == user and question.get("join") == "nearest" and question.get("ref"):
+                    reverse.setdefault(str(question["ref"]), set()).add(key)
+            for key, ep in records.items():
+                start = _aware_ts(ep.get("start"))
+                if not start:
+                    continue
+                day = start.astimezone(tz).date().isoformat()
+                if day not in by_day:
+                    continue
+                old = previous.get(key, {})
+                session = ep.get("session_key")
+                join = ("no_session" if not session else "evicted" if ep.get("start_maybe_evicted")
+                        else "unavailable" if unavailable else "missing")
+                question = {"join": join, "ref": None, "normalizer": "v1", "hash": None,
+                            "chars": None, "delta_s": None}
+                matches = graph.get(key, [])
+                eligible = bool(session) and not ep.get("start_maybe_evicted")
+                if eligible and not unavailable and len(matches) == 1 and len(reverse[str(matches[0][0])]) == 1:
+                    ref, text, stamp = matches[0]
+                    if isinstance(text, str) and isinstance(ref, str):
+                        question = {"join": "nearest", "ref": ref, "normalizer": "v1",
+                                    "hash": question_hash(text), "chars": len(text),
+                                    "delta_s": round((stamp - start).total_seconds(), 3)}
+                elif eligible and matches:
+                    question["join"] = "ambiguous"
+                old_question = old.get("question") or {}
+                if old_question.get("join") == "nearest":
+                    old_ref = str(old_question.get("ref") or "")
+                    disproved = (not unavailable and
+                                 (len(matches) > 1 or len(reverse.get(old_ref, set())) > 1))
+                    if disproved:
+                        question = {"join": "ambiguous", "ref": None, "normalizer": "v1",
+                                    "hash": None, "chars": None, "delta_s": None}
+                    else:
+                        question = old_question
+                answer = context.get("answers", {}).get(ep["id"])
+                old_answer = old.get("answer") or {}
+                if (ep["id"] in context.get("answer_conflicts", set()) or old_answer.get("conflict")
+                        or (old_answer.get("available") and answer and answer.get("available")
+                            and old_answer.get("sha256") != answer.get("sha256"))):
+                    answer = {"available": False, "sha256": None, "chars": None,
+                              "shape": None, "conflict": True}
+                elif old_answer.get("available"):
+                    answer = old_answer
+                if answer is None:
+                    answer = {"available": False, "sha256": None, "chars": None, "shape": None}
+                row = {"kind": "qa", "schema_version": 1, "id": f"{user}:{ep['id']}",
+                       "episode_id": ep["id"], "user": user, "day": day, "session_key": session,
+                       "origin": "chat", "start": ep["start"], "end": ep["end"],
+                       "question": question, "answer": answer}
+                by_day[day] = [item for item in by_day[day]
+                               if (item.get("user"), item.get("episode_id")) != key]
+                by_day[day].append(row)
+        for day, rows in by_day.items():
+            _atomic_json(out / f"{day}.jsonl", "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows))
+        cutoff = (today - timedelta(days=EPISODE_RETENTION_DAYS)).isoformat()
+        for path in out.iterdir():
+            match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:\.jsonl|\.coverage\.json)", path.name)
+            if match and match.group(1) < cutoff:
+                path.unlink()
+    return dict(malformed_by_user)
+
+
 def sweep(
     data_root: Path,
     now: datetime,
@@ -1183,6 +1419,7 @@ def sweep(
     retention_days: int = 14,
     max_per_day: int = 20000,
     lifecycle_evidence: Callable[[Path, str], bool] | None = None,
+    question_users: frozenset[str] = frozenset(),
 ) -> dict:
     """Capture new failures into the durable daily snapshot. Never raises.
 
@@ -1238,14 +1475,14 @@ def sweep(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n")
 
-    episode_known: dict[str, set[str]] = {}
+    episode_known: dict[str, set[tuple[str, str]]] = {}
     episode_legacy_known: dict[str, set[tuple[str, str, str]]] = {}
     episodes_appended = 0
 
-    def _episode_ids(day: str) -> set[str]:
+    def _episode_ids(day: str) -> set[tuple[str, str]]:
         if day not in episode_known:
             path = episodes_dir(data_root) / f"{day}.jsonl"
-            ids: set[str] = set()
+            ids: set[tuple[str, str]] = set()
             legacy: set[tuple[str, str, str]] = set()
             if path.is_file():
                 for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1257,7 +1494,8 @@ def sweep(
                         continue
                     ident = row.get("id")
                     if ident:
-                        ids.add(str(ident))
+                        user = row.get("user")
+                        ids.add((user if isinstance(user, str) else "", str(ident)))
                     user, session = row.get("user"), row.get("session_key")
                     if (row.get("kind") == "episode" and isinstance(ident, str)
                             and isinstance(user, str) and isinstance(session, str) and session):
@@ -1274,7 +1512,9 @@ def sweep(
         previous_day = (stamp.astimezone(tz).date() - timedelta(days=1)).isoformat()
         prior = _episode_ids(previous_day)
         current = _episode_ids(episode_day)
-        if record["id"] in prior or record["id"] in current:
+        episode_key = (record["user"], record["id"])
+        if (episode_key in prior or episode_key in current
+                or ("", record["id"]) in prior or ("", record["id"]) in current):
             return
         session = record.get("session_key")
         if isinstance(session, str) and record["id"].startswith(f"{session}:"):
@@ -1287,7 +1527,7 @@ def sweep(
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-        episode_known[episode_day].add(record["id"])
+        episode_known[episode_day].add(episode_key)
         episodes_appended += 1
 
     try:
@@ -1296,12 +1536,16 @@ def sweep(
         errors.append(f"workspace_dirs: {type(exc).__name__}")
         workspaces = []
     previous_seen = _previous_sources_seen(out_dir)
+    question_observed: dict[str, dict] = {}
     for workspace in workspaces:
         user = workspace.parent.name
+        if user in question_users:
+            question_observed[user] = {"workspace": workspace}
         state: dict = {
             "trace": False, "cron": False, "delegate": False,
             "earliest_trace_ts": None, "trace_malformed_lines": 0,
             "source_status": {}, "sources_seen": sorted(previous_seen.get(user, set())),
+            "episode_ok": True,
         }
         try:
             seen_now = set(previous_seen.get(user, set()))
@@ -1321,6 +1565,7 @@ def sweep(
                         episodes.observe(row, incident, drift)
                     except Exception as exc:
                         errors.append(f"{user} episodes: {type(exc).__name__}")
+                        state["episode_ok"] = False
                         episodes = None
 
                 with trace.open("r", encoding="utf-8", errors="replace") as handle:
@@ -1376,7 +1621,17 @@ def sweep(
                     try:
                         for record in episodes.closed(now):
                             _sink_episode(record)
+                        if user in question_users:
+                            question_observed[user] = {
+                                "workspace": workspace, "malformed": malformed,
+                                "open": [episodes._record(ep) for ep in episodes._open.values()],
+                                "answers": {episodes._record(ep)["id"]: ep["qa_answer"]
+                                            for ep in episodes._open.values()},
+                                "answer_conflicts": {episodes._record(ep)["id"]
+                                                     for ep in episodes._open.values() if ep["qa_conflict"]},
+                            }
                     except Exception as exc:
+                        state["episode_ok"] = False
                         errors.append(f"{user} episodes: {type(exc).__name__}")
                 # Set only once the file has been read to the end: a source
                 # that threw halfway must never advertise itself as healthy.
@@ -1410,6 +1665,15 @@ def sweep(
     }
     if apply:
         try:
+            qa_ok = True
+            qa_malformed: dict[str, int] = {}
+            if question_users:
+                try:
+                    qa_malformed = _collect_questions(data_root, now, timezone_name, question_users, question_observed)
+                except Exception as exc:
+                    qa_ok = False
+                    errors.append(f"questions: {type(exc).__name__}")
+            receipt["qa"] = {"users": sorted(question_users), "ok": qa_ok, "malformed": qa_malformed}
             out_dir.mkdir(parents=True, exist_ok=True)
             day = now.astimezone(tz).date().isoformat()
             try:
@@ -1437,6 +1701,9 @@ def sweep(
             for day in (today - timedelta(days=1), today):
                 try:
                     write_episode_coverage(data_root, day, now, timezone_name=timezone_name)
+                    if question_users:
+                        write_question_coverage(data_root, day, now, question_users,
+                                                timezone_name=timezone_name)
                 except Exception as exc:
                     errors.append(f"coverage {day.isoformat()}: {type(exc).__name__}")
         except OSError as exc:  # e.g. out_dir exists as a non-directory
@@ -2097,6 +2364,73 @@ def write_episode_coverage(
     tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     os.replace(tmp, target)
     return payload
+
+
+def write_question_coverage(data_root: Path, day, now: datetime, users: frozenset[str],
+                            *, timezone_name: str = DEFAULT_TIMEZONE) -> dict:
+    tz = ZoneInfo(timezone_name)
+    start = datetime(day.year, day.month, day.day, tzinfo=tz).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    receipt_rows = _json_lines(snapshot_dir(data_root) / f"{day.isoformat()}.jsonl")
+    receipts = []
+    malformed_by_user: Counter[str] = Counter()
+    for row in receipt_rows:
+        stamp = _aware_ts(row.get("ts"))
+        qa = row.get("qa") or {}
+        if (row.get("kind") != "sweep" or not stamp or not start <= stamp <= end
+                or not set(users).issubset(set(qa.get("users") or []))):
+            continue
+        sources = row.get("sources") or {}
+        projected = {}
+        for user in users:
+            info = sources.get(user) or {}
+            projected[user] = {"trace": bool(info.get("trace") and info.get("episode_ok")),
+                               "cron": True, "delegate": True,
+                               "earliest_trace_ts": info.get("earliest_trace_ts"),
+                               "trace_malformed_lines": info.get("trace_malformed_lines", 0)}
+            malformed_by_user[user] = max(malformed_by_user[user],
+                int((qa.get("malformed") or {}).get(user, 0)),
+                int(info.get("trace_malformed_lines") or 0))
+        receipts.append((stamp, {"scanned": len(projected), "sources": projected,
+                                  "errors": [] if qa.get("ok") else ["qa_collection_failed"]}))
+    state, reasons = _completeness(receipts, start, end, DEFAULT_SWEEP_INTERVAL_SECS, tz)
+    out = data_root / "observability" / "questions"
+    with (out / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows = _json_lines(out / f"{day.isoformat()}.jsonl", strict=True)
+        qa_rows = {(row.get("user"), row.get("episode_id")): row for row in rows}
+        episodes = _json_lines(episodes_dir(data_root) / f"{day.isoformat()}.jsonl")
+        names = ("eligible", "joined", "ambiguous", "missing", "unavailable", "no_session", "evicted", "answer_available", "malformed")
+        by_user = {user: dict.fromkeys(names, 0) for user in sorted(users)}
+        for ep in episodes:
+            user = ep.get("user")
+            if user not in users or ep.get("kind") != "episode" or ep.get("origin") != "chat":
+                continue
+            counts = by_user[user]
+            counts["eligible"] += 1
+            qa = qa_rows.get((user, ep.get("id"))) or {}
+            status = (qa.get("question") or {}).get("join", "unavailable")
+            if status == "nearest":
+                counts["joined"] += 1
+            elif status in counts:
+                counts[status] += 1
+            else:
+                counts["unavailable"] += 1
+            if (qa.get("answer") or {}).get("available"):
+                counts["answer_available"] += 1
+        for user, counts in by_user.items():
+            counts["malformed"] = malformed_by_user[user]
+        totals = {name: sum(counts[name] for counts in by_user.values()) for name in names}
+        if totals["joined"] != totals["eligible"] or totals["malformed"]:
+            if state == "полное":
+                state = "частичное"
+            reasons.append("question_coverage_incomplete")
+        coverage = {"schema_version": 1, "day": day.isoformat(), "enabled": True,
+                    "state": state, "reasons": reasons, "computed_at": _utc_iso(now),
+                    "enabled_users": sorted(users), "by_user": by_user, "totals": totals,
+                    "join_rate": totals["joined"] / totals["eligible"] if totals["eligible"] else None}
+        _atomic_json(out / f"{day.isoformat()}.coverage.json", json.dumps(coverage, ensure_ascii=False, sort_keys=True))
+    return coverage
 
 
 # --- Rendering: channel sections within an explicit character budget ---
