@@ -5272,11 +5272,12 @@ mod tests {
         assert_eq!(running.status, BackgroundTaskStatus::Running);
         assert_eq!(running.prompt_sha256.as_deref(), Some(expected.as_str()));
         assert_ne!(expected, format!("{:x}", Sha256::digest(b"task")));
-        fixture
-            .tool
-            .execute(json!({"action": "cancel_task", "task_id": task_id}))
-            .await
-            .unwrap();
+        let token = DelegateTool::background_task_cancels()
+            .lock()
+            .get(task_id)
+            .cloned()
+            .expect("background cancellation token");
+        token.cancel();
         let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
         assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
         assert_eq!(terminal.prompt_sha256, running.prompt_sha256);
