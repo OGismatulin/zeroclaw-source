@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
@@ -27,21 +28,11 @@ use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 /// Prevents a hung server from blocking the daemon indefinitely.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
-// fork: Bounded handshake timeout for the *initial* connect (daemon boot),
-// distinct from the 30s reconnect/tool-call budget. Boot connects every
-// configured MCP server sequentially and non-fatally; three of ours (codemap,
-// codemap-semantic, codemap-fs) share one remote box, so a saturated/slow box
-// could burn 3×30s = 90s and push daemon boot past the gateway manager's 90s
-// health window → spawn fails → respawn storm → outage. A short connect budget
-// makes an unreachable/slow server fail fast so the daemon still becomes healthy
-// with the servers that DO answer (connect_all is non-fatal per server). Healthy
-// connects observed at ~1.5s, so 10s is generous headroom. See
-// .superpowers/sdd/task-hotfix-mcp-report.md.
+// fork: keep per-step boot connects below the reconnect budget.
+// Whole-server deadline and ordered bounded concurrency protect daemon startup.
 const MCP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-// fork: compile-time guard — the initial-connect budget must stay strictly
-// under the reconnect/tool budget, so three slow servers sharing one box cannot
-// burn 3×30s and blow the gateway manager's 90s daemon-health window.
+// fork: initial per-step budget remains below the reconnect budget.
 const _: () = assert!(MCP_CONNECT_TIMEOUT_SECS < RECV_TIMEOUT_SECS);
 
 /// Default timeout for tool calls (seconds) when not configured per-server.
@@ -454,6 +445,30 @@ impl McpServer {
     /// fork: initial connect uses the short boot budget so a slow/saturated
     /// server fails fast and does not blow the daemon's 90s health window.
     async fn connect_classified(
+        config: McpServerConfig,
+        connect_timeout_secs: u64,
+    ) -> std::result::Result<Self, McpConnectFailure> {
+        let name = config.name.clone();
+        let whole_budget = connect_timeout_secs.saturating_mul(2);
+        match timeout(
+            Duration::from_secs(whole_budget),
+            Self::connect_classified_inner(config, connect_timeout_secs),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(McpConnectFailure {
+                server: name.clone(),
+                stage: McpConnectStage::Timeout,
+                timeout_secs: whole_budget,
+                error: format!(
+                    "MCP server `{name}` exceeded the {whole_budget}s boot connect deadline"
+                ),
+            }),
+        }
+    }
+
+    async fn connect_classified_inner(
         config: McpServerConfig,
         connect_timeout_secs: u64,
     ) -> std::result::Result<Self, McpConnectFailure> {
@@ -1081,16 +1096,24 @@ impl McpRegistry {
         let mut server_index = HashMap::new();
         let mut failures = Vec::new();
 
-        for config in configs {
-            match McpServer::connect_classified(config.clone(), MCP_CONNECT_TIMEOUT_SECS).await {
+        let pending = futures_util::stream::iter(configs.iter().cloned())
+            .map(|config| async move {
+                let name = config.name.clone();
+                let result = McpServer::connect_classified(config, MCP_CONNECT_TIMEOUT_SECS).await;
+                (name, result)
+            })
+            .buffered(4);
+        futures_util::pin_mut!(pending);
+        while let Some((name, result)) = pending.next().await {
+            match result {
                 Ok(server) => {
                     let server_idx = servers.len();
-                    server_index.insert(config.name.clone(), server_idx);
+                    server_index.insert(name.clone(), server_idx);
                     // Collect tools while holding the lock once, then release
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed = format!("{}__{}", name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -3574,6 +3597,224 @@ done
             failures.is_empty(),
             "a successful connect emits no failure, got: {failures:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_boot_reaps_owned_stdio_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let config = McpServerConfig {
+            name: "child".into(),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; exec sleep 60", pidfile.display()),
+            ],
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        };
+        let failure = McpServer::connect_classified(config, 1)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.stage.as_str(), "boot_connect_timeout");
+        let pid = std::fs::read_to_string(pidfile).unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let alive = std::process::Command::new("/bin/kill")
+                    .args(["-0", pid.trim()])
+                    .status()
+                    .unwrap()
+                    .success();
+                if !alive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned MCP child must exit");
+    }
+
+    #[tokio::test]
+    async fn boot_registry_keeps_config_order_and_duplicate_last_wins() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        let first = wiremock::MockServer::start().await;
+        let second = wiremock::MockServer::start().await;
+        for (server, delay, value) in [(&first, 250, "first"), (&second, 0, "second")] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method":"initialize"})))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(delay))
+                        .set_body_json(
+                            json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}),
+                        ),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(
+                    json!({"method":"notifications/initialized"}),
+                ))
+                .respond_with(ResponseTemplate::new(202))
+                .mount(server)
+                .await;
+            Mock::given(method("POST")).and(body_partial_json(json!({"method":"tools/list"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"which","inputSchema":{"type":"object"}}]}})))
+                .mount(server).await;
+            Mock::given(method("POST")).and(body_partial_json(json!({"method":"tools/call"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":value}]}})))
+                .mount(server).await;
+        }
+        let mut a = http_server_config(first.uri());
+        a.name = "dup".into();
+        let mut b = http_server_config(second.uri());
+        b.name = "dup".into();
+        let bad = |name: &str| McpServerConfig {
+            name: name.into(),
+            command: "/usr/bin/does_not_exist_zc_test".into(),
+            transport: McpTransport::Stdio,
+            ..Default::default()
+        };
+        let (registry, failures) =
+            McpRegistry::connect_all_with_failures(&[a, bad("bad-a"), b, bad("bad-b")])
+                .await
+                .unwrap();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|f| f.server.as_str())
+                .collect::<Vec<_>>(),
+            ["bad-a", "bad-b"]
+        );
+        assert_eq!(registry.server_count(), 2);
+        let result = registry.call_tool("dup__which", json!({})).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "second");
+        let (empty, failures) = McpRegistry::connect_all_with_failures(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        assert!(failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn boot_connects_are_bounded_and_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, Request, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let p = peak.clone();
+        let n = started.clone();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"initialize"})))
+            .respond_with(move |_: &Request| {
+                n.fetch_add(1, Ordering::SeqCst);
+                let current = a.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(current, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let a = active.clone();
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(move |_: &Request| {
+                a.fetch_sub(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}}))
+            })
+            .mount(&server)
+            .await;
+        let configs: Vec<_> = (0..8)
+            .map(|i| {
+                let mut c = http_server_config(server.uri());
+                c.name = format!("server-{i}");
+                c
+            })
+            .collect();
+        let (registry, failures) = McpRegistry::connect_all_with_failures(&configs)
+            .await
+            .unwrap();
+        assert!(failures.is_empty());
+        assert_eq!(registry.server_count(), 8);
+        assert_eq!(started.load(Ordering::SeqCst), 8);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            4,
+            "connects must overlap with cap four"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_deadline_covers_stalled_initialized_notification() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "boot-deadline-test")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202).set_delay(Duration::from_secs(4)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = timeout(
+            Duration::from_secs(3),
+            McpServer::connect_classified(http_server_config(server.uri()), 1),
+        )
+        .await;
+        let failure = match result {
+            Ok(Err(failure)) => failure,
+            _ => panic!("boot connect must finish with its own classified deadline"),
+        };
+        assert_eq!(failure.stage.as_str(), "boot_connect_timeout");
+        assert_eq!(failure.timeout_secs, 2);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "DELETE")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("known HTTP session must be deleted");
     }
 
     #[tokio::test]
