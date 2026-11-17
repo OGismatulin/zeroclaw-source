@@ -1013,34 +1013,38 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // The context-compression config is not reachable in the turn
                 // module, so build the retrim params from serde defaults
                 // (retrim_chars=2000, protect_first_n=3, emergency_protect_last_n=2).
-                let cc = delegate_control.as_ref().map_or_else(
-                    zeroclaw_config::scattered_types::ContextCompressionConfig::default,
-                    |control| control.compression.clone(),
-                );
-                let protect_first_n = if delegate_control.is_some() {
-                    cc.protect_first_n
-                        .max(crate::agent::context_compressor::delegate_head_floor(
-                            turn_state.history,
-                        ))
-                } else {
-                    cc.protect_first_n
-                };
-                let tool_retrim = crate::agent::turn::context_recovery::ToolRetrimParams {
-                    retrim_chars: cc.tool_result_retrim_chars,
-                    protect_first_n,
-                    emergency_protect_last_n: cc.emergency_protect_last_n,
-                    exempt: cc.tool_result_trim_exempt.clone(),
-                };
-                let recovered = try_recover_context_overflow(
-                    turn_state.history,
-                    &e,
-                    iteration,
-                    event_tx.as_ref(),
-                    on_delta.as_ref(),
-                    observer,
-                    context_token_budget,
-                    &tool_retrim,
-                )
+                let recovered = Box::pin(async {
+                    let cc = delegate_control.as_ref().map_or_else(
+                        zeroclaw_config::scattered_types::ContextCompressionConfig::default,
+                        |control| (*control.compression).clone(),
+                    );
+                    let protect_first_n = if delegate_control.is_some() {
+                        cc.protect_first_n.max(
+                            crate::agent::context_compressor::delegate_head_floor(
+                                turn_state.history,
+                            ),
+                        )
+                    } else {
+                        cc.protect_first_n
+                    };
+                    let tool_retrim = crate::agent::turn::context_recovery::ToolRetrimParams {
+                        retrim_chars: cc.tool_result_retrim_chars,
+                        protect_first_n,
+                        emergency_protect_last_n: cc.emergency_protect_last_n,
+                        exempt: cc.tool_result_trim_exempt,
+                    };
+                    try_recover_context_overflow(
+                        turn_state.history,
+                        &e,
+                        iteration,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        observer,
+                        context_token_budget,
+                        &tool_retrim,
+                    )
+                    .await
+                })
                 .await;
                 if recovered {
                     zeroclaw_providers::reliable::record_provider_context_truncation();

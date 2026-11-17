@@ -1072,7 +1072,7 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias.map(str::to_string),
         Some(turn_id.clone()),
     );
-    let result = run_tool_call_loop(ToolLoop {
+    let result = Box::pin(run_tool_call_loop(ToolLoop {
         final_response_min_chars: None,
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
@@ -1131,7 +1131,7 @@ async fn agent_turn_with_sop_reassembly(
         parent_agent_alias: None,
         turn_id: &turn_id,
         delegate_control: None,
-    })
+    }))
     .await;
     // Snapshot token usage from the task-local cost context when the caller
     // scoped one around this call (the gateway scopes both

@@ -9,6 +9,7 @@ use crate::agent::context_compressor::{
 };
 use crate::tools::ToolSpec;
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::observability_traits::ObserverEvent;
@@ -20,7 +21,7 @@ pub struct DelegateRunControl {
     pub started_at: tokio::time::Instant,
     pub hard_deadline: tokio::time::Instant,
     pub work_deadline: tokio::time::Instant,
-    pub compression: ContextCompressionConfig,
+    pub compression: Arc<ContextCompressionConfig>,
     pub fallback_context_window: usize,
     pub history_pruning_max_tokens: Option<usize>,
 }
@@ -41,7 +42,7 @@ impl DelegateRunControl {
             started_at,
             hard_deadline,
             work_deadline,
-            compression,
+            compression: Arc::new(compression),
             fallback_context_window,
             history_pruning_max_tokens,
         }
@@ -228,7 +229,7 @@ pub(crate) async fn maintain_context_after_round(
 
     let started = tokio::time::Instant::now();
     let mut candidate = history.clone();
-    let compressor = ContextCompressor::new(control.compression.clone(), context_window);
+    let compressor = ContextCompressor::new((*control.compression).clone(), context_window);
     let outcome = compressor
         .compress_for_delegate(
             &mut candidate,
