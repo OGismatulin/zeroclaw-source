@@ -6396,6 +6396,7 @@ mod tests {
             parent_agent_alias: None,
             turn_id: "stream-test",
             sop_reassembly: None,
+            delegate_control: None,
         })
         .await
         .unwrap_err();
@@ -6477,7 +6478,7 @@ mod tests {
                     ResolvedIo { tools_registry: &tools, observer: &observer, silent: true, approval: None, multimodal_config: &multimodal, config: None, hooks: None, activated_tools: None, model_switch_callback: None, receipt_generator: None },
                     ResolvedRuntimeKnobs { max_tool_iterations: 1, excluded_tools: &[], dedup_exempt_tools: &[], pacing: &pacing, strict_tool_parsing: false, parallel_tools: false, max_tool_result_chars: 0, context_token_budget: 0, knobs: &knobs },
                 ),
-                final_response_min_chars: None, history: &mut history, channel_name: "test", channel_reply_target: None, cancellation_token: None, on_delta: None, shared_budget: None, channel: None, collected_receipts: None, event_tx: Some(events), steering: None, new_messages_out: None, image_cache: None, ingress: zeroclaw_api::ingress::IngressContext::sub_turn(), memory: None, agent_alias: None, parent_agent_alias: None, turn_id: "stream-test", sop_reassembly: None,
+                final_response_min_chars: None, history: &mut history, channel_name: "test", channel_reply_target: None, cancellation_token: None, on_delta: None, shared_budget: None, channel: None, collected_receipts: None, event_tx: Some(events), steering: None, new_messages_out: None, image_cache: None, ingress: zeroclaw_api::ingress::IngressContext::sub_turn(), memory: None, agent_alias: None, parent_agent_alias: None, turn_id: "stream-test", sop_reassembly: None, delegate_control: None,
             }).await.unwrap_err();
             let response = build_structured_runtime_error(&error);
             let envelope = serde_json::to_value(response.envelope).unwrap();

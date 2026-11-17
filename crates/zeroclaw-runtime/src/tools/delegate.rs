@@ -1088,6 +1088,8 @@ impl DelegateTool {
                 resolved.max_tool_result_chars = max_tool_result_chars;
             }
             resolved.strict_tool_parsing = profile.strict_tool_parsing;
+            resolved.context_compression = profile.context_compression.clone();
+            resolved.history_pruning = profile.history_pruning.clone();
         }
 
         resolved
@@ -3226,80 +3228,109 @@ impl DelegateTool {
         });
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
-        let execution = tokio::time::timeout(
-            Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(ToolLoop {
-                final_response_min_chars: loop_runtime.final_response_min_chars,
-                sop_reassembly: None,
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider,
-                        provider_name: provider_type,
-                        model,
-                        temperature: effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: &sub_tools,
-                        observer: &noop_observer,
-                        silent: true,
-                        approval: approval_manager.as_ref(),
-                        multimodal_config: &self.multimodal_config,
-                        // Full config so the delegated sub-agent's vision route
-                        // resolves the configured `vision_model_provider`'s alias
-                        // options (the `vision` override, endpoint URI, credentials),
-                        // exactly as the parent turn does. `None` only on the
-                        // configless test builder (`root_config` unset).
-                        config: self.root_config.as_deref(),
-                        hooks: None,
-                        // Thread the target's deferred-MCP activated set so `tool_search`
-                        // can activate the target's deferred tools mid-turn (Some only for
-                        // an independent target with granted deferred-MCP bundles).
-                        activated_tools: sub_activated.as_ref(),
-                        model_switch_callback: None,
-                        receipt_generator,
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: loop_runtime.max_tool_iterations,
-                        excluded_tools: &[],
-                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &pacing,
-                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                        parallel_tools: loop_runtime.parallel_tools,
-                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        // Model-aware: analysts on deepseek-v4-flash (800K window) get their
-                        // real window instead of the profile's max_context_tokens fallback.
-                        context_token_budget: loop_runtime
-                            .effective_context_budget_for_model(model),
-                        knobs: &loop_knobs,
-                    },
-                ),
-                history: &mut history,
-                channel_name: "delegate",
-                channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
-                on_delta: stream_sink,
-                shared_budget: None,
-                // TODO thread from parent in future
-                channel: None,
-                collected_receipts,
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Per-transport
-                // stamping lands in a later phase.
-                memory: None,
-                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
-                agent_alias: Some(agent_name),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-            })
-            .instrument(::zeroclaw_log::attribution_span!(
-                &crate::agent::AgentAttribution(agent_name)
-            )),
+        let total_timeout = Duration::from_secs(agentic_timeout_secs);
+        let started_at = tokio::time::Instant::now();
+        let hard_deadline = started_at + total_timeout;
+        let history_pruning_max_tokens = (loop_runtime.history_pruning.enabled
+            && loop_runtime.history_pruning.max_tokens > 0)
+            .then_some(loop_runtime.history_pruning.max_tokens);
+        // fork(#79): invocation-local context compaction + pre-timeout work deadline.
+        let delegate_control = crate::agent::turn::DelegateRunControl::new(
+            total_timeout,
+            started_at,
+            loop_runtime.context_compression.clone(),
+            loop_runtime.max_context_tokens,
+            history_pruning_max_tokens,
         );
+        let loop_future = Box::pin(run_tool_call_loop(ToolLoop {
+            final_response_min_chars: loop_runtime.final_response_min_chars,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider,
+                    provider_name: provider_type,
+                    model,
+                    temperature: effective_temperature,
+                },
+                ResolvedIo {
+                    tools_registry: &sub_tools,
+                    observer: &noop_observer,
+                    silent: true,
+                    approval: approval_manager.as_ref(),
+                    multimodal_config: &self.multimodal_config,
+                    // Full config so the delegated sub-agent's vision route
+                    // resolves the configured `vision_model_provider`'s alias
+                    // options (the `vision` override, endpoint URI, credentials),
+                    // exactly as the parent turn does. `None` only on the
+                    // configless test builder (`root_config` unset).
+                    config: self.root_config.as_deref(),
+                    hooks: None,
+                    // Thread the target's deferred-MCP activated set so `tool_search`
+                    // can activate the target's deferred tools mid-turn (Some only for
+                    // an independent target with granted deferred-MCP bundles).
+                    activated_tools: sub_activated.as_ref(),
+                    model_switch_callback: None,
+                    receipt_generator,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: loop_runtime.max_tool_iterations,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                    pacing: &pacing,
+                    strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                    parallel_tools: loop_runtime.parallel_tools,
+                    max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                    // Keep delegate subagent context pruning aligned with top-level
+                    // agents instead of preserving the old disabled-by-zero path.
+                    // Model-aware: analysts on deepseek-v4-flash (800K window) get their
+                    // real window instead of the profile's max_context_tokens fallback.
+                    context_token_budget: loop_runtime.effective_context_budget_for_model(model),
+                    knobs: &loop_knobs,
+                },
+            ),
+            history: &mut history,
+            channel_name: "delegate",
+            channel_reply_target: None,
+            cancellation_token: Some(self.cancellation_token.child_token()),
+            on_delta: stream_sink,
+            shared_budget: None,
+            // TODO thread from parent in future
+            channel: None,
+            collected_receipts,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Per-transport
+            // stamping lands in a later phase.
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+            agent_alias: Some(agent_name),
+            parent_agent_alias: None,
+            turn_id: &turn_id,
+            delegate_control: Some(delegate_control),
+        }));
+        let delegate_attr_span =
+            ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(agent_name));
+        let delegate_scope_span = {
+            let _attr_guard = delegate_attr_span.enter();
+            ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                risk_profile = %agent_config.risk_profile,
+                runtime_profile = %agent_config.runtime_profile,
+            )
+        };
+        let loop_future = loop_future
+            .instrument(delegate_scope_span)
+            .instrument(delegate_attr_span);
+        let execution = async {
+            if agentic_timeout_secs == 0 {
+                tokio::time::timeout(Duration::ZERO, loop_future).await
+            } else {
+                tokio::time::timeout_at(hard_deadline, loop_future).await
+            }
+        };
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -12524,6 +12555,7 @@ command = "rm independent-delegate-marker"
         );
     }
     include!("delegate_reasoning_tests.rs");
+    include!("delegate_compaction_tests.rs");
 }
 
 #[cfg(test)]

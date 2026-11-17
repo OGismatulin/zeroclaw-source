@@ -13,6 +13,30 @@ use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizationReason {
+    IterationLimit(usize),
+    WorkDeadline {
+        elapsed_secs: u64,
+        reserve_secs: u64,
+    },
+    ContextPressure {
+        tokens: usize,
+        threshold: usize,
+    },
+}
+
+impl FinalizationReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::IterationLimit(_) => "iteration_limit",
+            Self::WorkDeadline { .. } => "work_deadline",
+            Self::ContextPressure { .. } => "context_pressure",
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     model_provider: &dyn ModelProvider,
@@ -23,40 +47,115 @@ pub(crate) async fn finish_after_max_iterations(
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     max_iterations: usize,
+    accumulated_display_text: String,
+    turn_id: &str,
+    knobs: &LoopKnobs,
+    event_tx: Option<&Sender<TurnEvent>>,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
+) -> Result<String> {
+    finish_with_finalization_reason(
+        model_provider,
+        history,
+        provider_name,
+        model,
+        temperature,
+        pacing,
+        cancellation_token,
+        FinalizationReason::IterationLimit(max_iterations),
+        accumulated_display_text,
+        turn_id,
+        knobs,
+        event_tx,
+        new_messages_out,
+    )
+    .await
+}
+
+// fork(#79): structured tools-free finalization on work deadline or context pressure.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn finish_with_finalization_reason(
+    model_provider: &dyn ModelProvider,
+    history: &mut Vec<ChatMessage>,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    pacing: &PacingConfig,
+    cancellation_token: Option<&CancellationToken>,
+    reason: FinalizationReason,
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "model": model,
-                "max_iterations": max_iterations,
-                "trace_id": turn_id,
-            })),
-        "tool_loop_exhausted"
-    );
+    match reason {
+        FinalizationReason::IterationLimit(max_iterations) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "max_iterations": max_iterations,
+                        "reason": reason.as_str(),
+                        "trace_id": turn_id,
+                    })),
+                "tool_loop_exhausted"
+            );
 
-    // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
-    // control signal: bail instead of spending another LLM call on a summary.
-    if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
+            // control signal: bail instead of spending another LLM call on a summary.
+            if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
+                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            }
+
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
+                "Max iterations reached, requesting final summary"
+            );
+        }
+        FinalizationReason::WorkDeadline {
+            elapsed_secs,
+            reserve_secs,
+        } => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "reason": reason.as_str(),
+                        "elapsed_secs": elapsed_secs,
+                        "reserve_secs": reserve_secs,
+                        "trace_id": turn_id,
+                    })),
+                "tool_loop_finalizing"
+            );
+        }
+        FinalizationReason::ContextPressure { tokens, threshold } => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "reason": reason.as_str(),
+                        "tokens": tokens,
+                        "threshold": threshold,
+                        "trace_id": turn_id,
+                    })),
+                "tool_loop_finalizing"
+            );
+        }
     }
 
-    // Graceful shutdown: ask the LLM for a final summary without tools
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
-        "Max iterations reached, requesting final summary"
-    );
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
     let tool_messages_removed =
@@ -74,12 +173,31 @@ pub(crate) async fn finish_after_max_iterations(
         );
     }
 
-    let summary_prompt = ChatMessage::user(
-        "You have reached the maximum number of tool iterations. \
-         Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
-            .to_string(),
-    );
+    let summary_prompt_text = match reason {
+        FinalizationReason::IterationLimit(_) => {
+            "You have reached the maximum number of tool iterations. \
+             Please provide your best answer based on the work completed so far. \
+             Summarize what you accomplished and what remains to be done."
+        }
+        FinalizationReason::WorkDeadline { .. } => {
+            "The research time budget has reached its finalization reserve before the hard deadline, \
+             and no further tools can be called. Based ONLY on the verified work already completed \
+             in this conversation, provide your final response now in the exact output format and \
+             contract requested by the original task. Clearly separate confirmed findings from \
+             unverified or incomplete items, and record unresolved gaps in open_questions (or the \
+             equivalent section of the requested output contract). Do not emit tool calls."
+        }
+        FinalizationReason::ContextPressure { .. } => {
+            "The conversation context has reached its safe token budget and cannot be compacted \
+             further without losing required context, so no further tools can be called. Based ONLY \
+             on the verified work already completed in this conversation, provide your final response \
+             now in the exact output format and contract requested by the original task. Clearly \
+             separate confirmed findings from unverified or incomplete items, and record unresolved \
+             gaps in open_questions (or the equivalent section of the requested output contract). \
+             Do not emit tool calls."
+        }
+    };
+    let summary_prompt = ChatMessage::user(summary_prompt_text.to_string());
     let summary_prompt_mirror = summary_prompt.clone();
     history.push(summary_prompt);
 
@@ -140,6 +258,18 @@ pub(crate) async fn finish_after_max_iterations(
         }
     };
 
+    let bail_for_empty = || -> anyhow::Error {
+        match reason {
+            FinalizationReason::IterationLimit(max_iterations) => anyhow::Error::msg(format!(
+                "Agent exceeded maximum tool iterations ({max_iterations})"
+            )),
+            FinalizationReason::WorkDeadline { .. }
+            | FinalizationReason::ContextPressure { .. } => {
+                anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+            }
+        }
+    };
+
     let resp = match summary_call {
         SummaryCall::Cancelled => {
             history.pop();
@@ -150,24 +280,69 @@ pub(crate) async fn finish_after_max_iterations(
             anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
         SummaryCall::Done(Err(e)) => {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "provider": provider_name,
-                        "max_iterations": max_iterations,
-                        "trace_id": turn_id,
-                        "error": format!("{e}"),
-                    })),
-                "final summary LLM call failed after iteration exhaustion; bailing"
-            );
-            history.pop();
-            return Err(e).context(format!(
-                "Agent exceeded maximum tool iterations ({max_iterations})"
-            ));
+            let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            let error_kind = zeroclaw_providers::terminal_provider_failure(&e)
+                .map_or("provider_error", |failure| failure.diagnostic().kind());
+            match reason {
+                FinalizationReason::IterationLimit(max_iterations) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "provider": provider_name,
+                                "max_iterations": max_iterations,
+                                "trace_id": turn_id,
+                                "error": safe_error,
+                                "error_kind": error_kind,
+                            })),
+                        "final summary LLM call failed after iteration exhaustion; bailing"
+                    );
+                    history.pop();
+                    return Err(e).context(format!(
+                        "Agent exceeded maximum tool iterations ({max_iterations})"
+                    ));
+                }
+                FinalizationReason::WorkDeadline { .. } => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "reason": reason.as_str(),
+                                "trace_id": turn_id,
+                                "error_kind": error_kind,
+                            })),
+                        "final summary LLM call failed at work deadline; bailing"
+                    );
+                    history.pop();
+                    return Err(e)
+                        .context("Agent reached work deadline before producing a final response");
+                }
+                FinalizationReason::ContextPressure { .. } => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model": model,
+                                "reason": reason.as_str(),
+                                "trace_id": turn_id,
+                                "error_kind": error_kind,
+                            })),
+                        "final summary LLM call failed under context pressure; bailing"
+                    );
+                    history.pop();
+                    return Err(e).context(
+                        "Agent reached context pressure limit before producing a final response",
+                    );
+                }
+            }
         }
         SummaryCall::Done(Ok(resp)) => resp,
     };
@@ -175,7 +350,7 @@ pub(crate) async fn finish_after_max_iterations(
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        return Err(bail_for_empty());
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -196,9 +371,9 @@ pub(crate) async fn finish_after_max_iterations(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model": model,
-                    "max_iterations": max_iterations,
+                    "reason": reason.as_str(),
                     "trace_id": turn_id,
-                    "error": "malformed internal tool protocol omitted from max-iteration summary",
+                    "error": "malformed internal tool protocol omitted from final summary",
                 })),
             "max_iteration_summary_protocol_suppressed"
         );
@@ -210,7 +385,7 @@ pub(crate) async fn finish_after_max_iterations(
     };
     if display_text.trim().is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        return Err(bail_for_empty());
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -220,14 +395,21 @@ pub(crate) async fn finish_after_max_iterations(
         out.push(summary_msg.clone());
     }
     history.push(summary_msg);
-    // Graceful shutdown with a visible reason so the user knows why the
-    // agent stopped making progress.
-    let stop_reason = crate::i18n::get_required_cli_string_with_args(
-        "turn-max-iterations-reached",
-        &[("max_iterations", &max_iterations.to_string())],
-    );
-    let segment = format!("{display_text}\n\n{stop_reason}");
-    // This summary is the turn's only visible output on the max-iteration
+    let segment = match reason {
+        FinalizationReason::IterationLimit(max_iterations) => {
+            // Graceful shutdown with a visible reason so the user knows why the
+            // agent stopped making progress.
+            let stop_reason = crate::i18n::get_required_cli_string_with_args(
+                "turn-max-iterations-reached",
+                &[("max_iterations", &max_iterations.to_string())],
+            );
+            format!("{display_text}\n\n{stop_reason}")
+        }
+        FinalizationReason::WorkDeadline { .. } | FinalizationReason::ContextPressure { .. } => {
+            display_text
+        }
+    };
+    // This summary is the turn's only visible output on the finalization
     // exit path, and it comes from a fresh non-streaming call — there is no
     // live delta a client could have already received, so unlike the normal
     // final-response path this emit needs no live-vs-post-hoc guard. Only the

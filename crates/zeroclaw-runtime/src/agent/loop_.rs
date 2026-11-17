@@ -1072,7 +1072,7 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias.map(str::to_string),
         Some(turn_id.clone()),
     );
-    let result = run_tool_call_loop(ToolLoop {
+    let result = Box::pin(run_tool_call_loop(ToolLoop {
         final_response_min_chars: None,
         sop_reassembly,
         exec: ResolvedAgentExecution::resolve(
@@ -1130,7 +1130,8 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias,
         parent_agent_alias: None,
         turn_id: &turn_id,
-    })
+        delegate_control: None,
+    }))
     .await;
     // Snapshot token usage from the task-local cost context when the caller
     // scoped one around this call (the gateway scopes both
@@ -1170,11 +1171,11 @@ pub(crate) use super::turn::{
     maybe_inject_channel_delivery_defaults, resolve_display_text,
 };
 pub use super::turn::{
-    DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
-    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
-    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
-    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
+    DRAFT_PLACEHOLDER, DelegateRunControl, DraftEvent, LoopKnobs, MaxIterationBehavior,
+    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
+    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop,
+    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
     is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
     thinking_status_round, thinking_status_text,
 };
@@ -2194,6 +2195,7 @@ pub async fn run(
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
+                                delegate_control: None,
                             }),
                         ),
                     )
@@ -2758,6 +2760,7 @@ pub async fn run(
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
+                                    delegate_control: None,
                                 }),
                             ),
                         )
@@ -5481,6 +5484,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await;
 
@@ -5901,6 +5905,7 @@ mod tests {
             parent_agent_alias: None,
             turn_id: &turn_id,
             sop_reassembly: None,
+            delegate_control: None,
         })
         .await
     }
@@ -6261,6 +6266,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("user image on a non-vision provider should error");
@@ -6343,6 +6349,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("oversized payload should be skipped and continue as text-only");
@@ -6429,6 +6436,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("a carried-over image must not fail a plain-text turn");
@@ -6520,6 +6528,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("valid multimodal payload should pass");
@@ -6596,6 +6605,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("text-only fallback should succeed, not abort the turn");
@@ -6675,6 +6685,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("should fail when vision model_provider cannot be created");
@@ -6746,6 +6757,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: Some("analyst_test"),
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("scripted final-response turn succeeds");
@@ -6867,6 +6879,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("text-only messages should succeed with default model_provider");
@@ -6932,6 +6945,7 @@ mod tests {
                 ingress: ctx,
                 agent_alias: None,
                 turn_id: &turn_id,
+                delegate_control: None,
             })
             .await
             .expect("default-Loop ingress must run the turn exactly as today")
@@ -7126,6 +7140,7 @@ mod tests {
                 ingress: IngressContext::from_origin(origin),
                 agent_alias: None,
                 turn_id: &turn_id,
+                delegate_control: None,
             })
             .await
             .expect("turn should complete");
@@ -7249,6 +7264,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
@@ -7329,6 +7345,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -7407,6 +7424,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
@@ -7569,6 +7587,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("parallel execution should complete");
@@ -7710,6 +7729,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("live SOP execution should complete");
@@ -7872,6 +7892,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("scoped SOP execution should complete");
@@ -7993,6 +8014,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("native parallel execution should complete");
@@ -8203,6 +8225,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id,
+            delegate_control: None,
         })
         .await;
 
@@ -8347,6 +8370,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await;
 
@@ -8489,6 +8513,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -8583,6 +8608,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("explicit delivery mode should be preserved");
@@ -8669,6 +8695,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("lark cron_add delivery defaults should be injected");
@@ -8763,6 +8790,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("feishu cron_add delivery defaults should be injected");
@@ -8860,6 +8888,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -8963,6 +8992,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -9056,6 +9086,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await;
 
@@ -9177,6 +9208,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("identical prompt-required shell call should abort before another prompt");
@@ -9276,6 +9308,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("same-round prompt-required duplicate should use duplicate result path");
@@ -9380,6 +9413,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("dedup-exempt prompt-required repeats should still abort before reprompting");
@@ -9476,6 +9510,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -9574,6 +9609,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("loop should finish running both identical subagent calls");
@@ -9674,6 +9710,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("loop should complete");
@@ -9760,6 +9797,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("native fallback id flow should complete");
@@ -9850,6 +9888,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -9935,6 +9974,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("business JSON should be returned as normal text");
@@ -10018,6 +10058,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("unknown business JSON should be returned as normal text");
@@ -10104,6 +10145,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("malformed tool protocol should return a safe fallback");
@@ -10188,6 +10230,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -10275,6 +10318,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect_err("visible stream failure must remain an interruption error");
@@ -10369,6 +10413,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -10444,6 +10489,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("schema JSON should remain visible without tools");
@@ -10520,6 +10566,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("audit JSON should remain visible without tools");
@@ -10596,6 +10643,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("reference JSON should remain visible without tools");
@@ -10674,6 +10722,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool_call tag examples should remain visible without tools");
@@ -10756,6 +10805,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("registered tool_call fenced examples should remain visible");
@@ -10850,6 +10900,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("registered tool_call tag examples should remain visible");
@@ -10928,6 +10979,7 @@ Done."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
@@ -11009,6 +11061,7 @@ Done."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("embedded fenced tool protocol should retry and recover");
@@ -11088,6 +11141,7 @@ Done."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
@@ -11168,6 +11222,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool_call fenced examples should remain visible without tools");
@@ -11305,6 +11360,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
@@ -11393,6 +11449,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
@@ -11484,6 +11541,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("streamed fenced tool call should execute and continue");
@@ -11598,6 +11656,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool loop should complete");
@@ -11744,6 +11803,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("streaming model_provider should complete");
@@ -11839,6 +11899,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -11943,6 +12004,7 @@ This is an example, not an invocation."#;
             ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("should complete");
@@ -12840,6 +12902,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -12946,6 +13009,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("narration-then-tool streaming should preserve tool loop semantics");
@@ -13051,6 +13115,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool-then-narration streaming should preserve tool loop semantics");
@@ -13156,6 +13221,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("guard-withheld narration tail should not break the tool loop");
@@ -13320,6 +13386,7 @@ This is an example, not an invocation."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("routed streaming model_provider should complete");
@@ -16136,6 +16203,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool loop should complete");
@@ -16384,6 +16452,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool loop should complete");
@@ -16569,6 +16638,7 @@ Let me check the result."#;
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: &turn_id,
+                    delegate_control: None,
                 }),
             )
             .await
@@ -16686,6 +16756,7 @@ Let me check the result."#;
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: "recovered-usage-test",
+                    delegate_control: None,
                 }),
             )
             .await
@@ -16807,6 +16878,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool loop should complete");
@@ -16928,6 +17000,7 @@ Let me check the result."#;
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: &turn_id,
+                    delegate_control: None,
                 }),
             )
             .await
@@ -17023,6 +17096,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("should succeed without cost scope");
@@ -17113,6 +17187,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: "test-turn-id",
+            delegate_control: None,
         })
         .instrument(zeroclaw_log::attribution_span!(
             &crate::agent::AgentAttribution("trimtest")
@@ -18594,6 +18669,7 @@ Let me check the result."#;
             ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
+            delegate_control: None,
         })
         .await
         .expect("tool loop should succeed");

@@ -513,6 +513,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         ingress: IngressContext::sub_turn(),
         agent_alias: None,
         turn_id: &turn_id,
+        delegate_control: None,
     })
     .await
     .expect("loop should succeed");
@@ -911,6 +912,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 ingress: IngressContext::sub_turn(),
                 agent_alias: None,
                 turn_id: &turn_id,
+                delegate_control: None,
             })
             .await
         }),

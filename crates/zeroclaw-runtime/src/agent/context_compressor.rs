@@ -22,6 +22,53 @@ pub struct CompressionResult {
     pub passes_used: u32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DelegateCompressionCalibration {
+    pub scale: f64,
+    pub tools_tokens: usize,
+    pub media_overhead_tokens: usize,
+}
+
+impl Default for DelegateCompressionCalibration {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            tools_tokens: 0,
+            media_overhead_tokens: 0,
+        }
+    }
+}
+
+impl DelegateCompressionCalibration {
+    pub(crate) fn estimate(&self, history: &[ChatMessage]) -> usize {
+        let media = if multimodal::count_image_markers(history) > 0 {
+            self.media_overhead_tokens
+        } else {
+            0
+        };
+        let raw = estimate_tokens(history)
+            .saturating_add(self.tools_tokens)
+            .saturating_add(media);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            ((raw as f64) * self.scale).ceil().max(0.0) as usize
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DelegateCompressionOutcome {
+    pub made_progress: bool,
+    pub fits_threshold: bool,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    pub passes_used: u32,
+    pub fast_trimmed_chars: usize,
+    pub emergency_trimmed_chars: usize,
+    pub used_fallback_excerpt: bool,
+    pub fallback_reason: Option<&'static str>,
+}
+
 // ---------------------------------------------------------------------------
 // Probe tiers for unknown model context windows
 // ---------------------------------------------------------------------------
@@ -477,6 +524,357 @@ impl ContextCompressor {
 
         Ok(true)
     }
+
+    // fork(#79): calibrated single-turn delegate compaction (no memory writes, cancel-aware).
+    pub(crate) async fn compress_for_delegate(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        threshold: usize,
+        model_access: &crate::agent::turn::ResolvedModelAccess<'_>,
+        calibration: &DelegateCompressionCalibration,
+        max_budget: Duration,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<DelegateCompressionOutcome> {
+        let tokens_before = calibration.estimate(history);
+        if tokens_before <= threshold {
+            return Ok(DelegateCompressionOutcome {
+                made_progress: false,
+                fits_threshold: true,
+                tokens_before,
+                tokens_after: tokens_before,
+                passes_used: 0,
+                fast_trimmed_chars: 0,
+                emergency_trimmed_chars: 0,
+                used_fallback_excerpt: false,
+                fallback_reason: None,
+            });
+        }
+
+        if !self.config.enabled {
+            return Ok(DelegateCompressionOutcome {
+                made_progress: false,
+                fits_threshold: false,
+                tokens_before,
+                tokens_after: tokens_before,
+                passes_used: 0,
+                fast_trimmed_chars: 0,
+                emergency_trimmed_chars: 0,
+                used_fallback_excerpt: false,
+                fallback_reason: None,
+            });
+        }
+
+        let head_floor = delegate_head_floor(history);
+        let protect_first = self.config.protect_first_n.max(head_floor);
+
+        let fast_trimmed_chars =
+            self.trim_tool_results_in_range(history, protect_first, self.config.protect_last_n);
+        if fast_trimmed_chars > 0 {
+            let recheck = calibration.estimate(history);
+            if recheck <= threshold {
+                return Ok(DelegateCompressionOutcome {
+                    made_progress: recheck < tokens_before,
+                    fits_threshold: true,
+                    tokens_before,
+                    tokens_after: recheck,
+                    passes_used: 0,
+                    fast_trimmed_chars,
+                    emergency_trimmed_chars: 0,
+                    used_fallback_excerpt: false,
+                    fallback_reason: None,
+                });
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + max_budget;
+        let mut passes_used = 0u32;
+        let mut used_fallback_excerpt = false;
+        let mut fallback_reason: Option<&'static str> = None;
+
+        for _ in 0..self.config.max_passes {
+            if cancellation_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(crate::agent::turn::ToolLoopCancelled.into());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let prev_tokens = calibration.estimate(history);
+            let pass_outcome = self
+                .compress_once_delegate(
+                    history,
+                    protect_first,
+                    model_access,
+                    remaining,
+                    cancellation_token,
+                )
+                .await?;
+            if pass_outcome.fallback_used {
+                used_fallback_excerpt = true;
+                fallback_reason = pass_outcome.fallback_reason;
+            }
+            if !pass_outcome.applied {
+                break;
+            }
+            passes_used += 1;
+            let now_tokens = calibration.estimate(history);
+            if now_tokens <= threshold || now_tokens >= prev_tokens {
+                break;
+            }
+        }
+
+        if cancellation_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(crate::agent::turn::ToolLoopCancelled.into());
+        }
+
+        let mut tokens_after = calibration.estimate(history);
+        let mut emergency_trimmed_chars = 0usize;
+        if tokens_after > threshold {
+            let mut protect = self.config.emergency_protect_last_n.min(history.len());
+            loop {
+                emergency_trimmed_chars +=
+                    self.trim_tool_results_in_range(history, protect_first, protect);
+                tokens_after = calibration.estimate(history);
+                if tokens_after <= threshold || protect == 0 {
+                    break;
+                }
+                protect -= 1;
+            }
+        }
+
+        let made_progress = tokens_after < tokens_before;
+        Ok(DelegateCompressionOutcome {
+            made_progress,
+            fits_threshold: tokens_after <= threshold,
+            tokens_before,
+            tokens_after,
+            passes_used,
+            fast_trimmed_chars,
+            emergency_trimmed_chars,
+            used_fallback_excerpt,
+            fallback_reason,
+        })
+    }
+
+    async fn compress_once_delegate(
+        &self,
+        history: &mut Vec<ChatMessage>,
+        protect_first: usize,
+        model_access: &crate::agent::turn::ResolvedModelAccess<'_>,
+        remaining_budget: Duration,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<DelegatePassOutcome> {
+        let n = history.len();
+        let protected_total = protect_first.saturating_add(self.config.protect_last_n);
+        if n <= protected_total {
+            return Ok(DelegatePassOutcome::noop());
+        }
+
+        let raw_start = protect_first.min(n);
+        let raw_end = n.saturating_sub(self.config.protect_last_n);
+        let (start, end) = align_delegate_boundaries(history, raw_start, raw_end);
+        if start >= end {
+            return Ok(DelegatePassOutcome::noop());
+        }
+
+        let summary_model = self
+            .config
+            .summary_model
+            .as_deref()
+            .unwrap_or(model_access.model);
+        let preserve_media_markers = self.config.summary_model.is_none()
+            && model_access
+                .model_provider
+                .capabilities_for_model(summary_model)
+                .vision;
+
+        let middle = &history[start..end];
+        let transcript = build_summarizer_transcript(
+            middle,
+            self.config.source_max_chars,
+            preserve_media_markers,
+        );
+        if transcript.is_empty() {
+            return Ok(DelegatePassOutcome::noop());
+        }
+
+        let message_count = end - start;
+        let identifier_note = if self.config.identifier_policy == "strict" {
+            "\nIMPORTANT: Preserve all identifiers exactly as they appear."
+        } else {
+            ""
+        };
+        let user_prompt = format!(
+            "Summarize the following conversation history ({message_count} messages) for context preservation. \
+             Keep it concise (max 20 bullet points).{identifier_note}\n\n{transcript}"
+        );
+
+        let call_timeout = Duration::from_secs(self.config.timeout_secs).min(remaining_budget);
+        let summary_messages = [
+            ChatMessage::system(SUMMARIZER_SYSTEM),
+            ChatMessage::user(user_prompt),
+        ];
+        let summary_request = zeroclaw_api::model_provider::ChatRequest {
+            messages: &summary_messages,
+            tools: None,
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        };
+        let summary_access = crate::agent::turn::ResolvedModelAccess {
+            model_provider: model_access.model_provider,
+            provider_name: model_access.provider_name,
+            model: summary_model,
+            temperature: model_access.temperature,
+        };
+
+        let call_fut = summary_access.run_model_query(summary_request);
+        let call_result = if let Some(token) = cancellation_token {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return Err(crate::agent::turn::ToolLoopCancelled.into()),
+                timed = tokio::time::timeout(call_timeout, call_fut) => timed,
+            }
+        } else {
+            tokio::time::timeout(call_timeout, call_fut).await
+        };
+
+        let mut fallback_used = false;
+        let mut fallback_reason: Option<&'static str> = None;
+        let summary_raw = match call_result {
+            Ok(Ok(resp)) => {
+                let text = zeroclaw_tool_call_parser::strip_think_tags(resp.text_or_empty());
+                if text.trim().is_empty() {
+                    fallback_used = true;
+                    fallback_reason = Some("empty_summary");
+                    truncate_chars(&transcript, self.config.summary_max_chars)
+                } else {
+                    text
+                }
+            }
+            Ok(Err(err)) => {
+                if crate::agent::turn::is_tool_loop_cancelled(&err) {
+                    return Err(err);
+                }
+                fallback_used = true;
+                fallback_reason = Some(classify_summary_error_kind(
+                    &err,
+                    model_access.provider_name,
+                    summary_model,
+                ));
+                truncate_chars(&transcript, self.config.summary_max_chars)
+            }
+            Err(_) => {
+                fallback_used = true;
+                fallback_reason = Some("timeout");
+                truncate_chars(&transcript, self.config.summary_max_chars)
+            }
+        };
+
+        let summary = truncate_chars(&summary_raw, self.config.summary_max_chars);
+        let summary_msg = build_delegate_summary_message(
+            &history[start..end],
+            &summary,
+            message_count,
+            fallback_reason,
+        );
+        history.splice(start..end, std::iter::once(summary_msg));
+        repair_tool_pairs(history);
+
+        Ok(DelegatePassOutcome {
+            applied: true,
+            fallback_used,
+            fallback_reason,
+        })
+    }
+}
+
+struct DelegatePassOutcome {
+    applied: bool,
+    fallback_used: bool,
+    fallback_reason: Option<&'static str>,
+}
+
+impl DelegatePassOutcome {
+    fn noop() -> Self {
+        Self {
+            applied: false,
+            fallback_used: false,
+            fallback_reason: None,
+        }
+    }
+}
+
+fn classify_summary_error_kind(
+    err: &anyhow::Error,
+    provider_name: &str,
+    model: &str,
+) -> &'static str {
+    if matches!(
+        crate::agent::cost::check_tool_loop_budget(),
+        Some(crate::cost::types::BudgetCheck::Exceeded { .. })
+    ) {
+        return "cost_budget_exceeded";
+    }
+    if err
+        .chain()
+        .any(|source| source.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>())
+    {
+        return "empty_summary";
+    }
+    if let Some(failure) = zeroclaw_providers::terminal_provider_failure(err) {
+        return failure.diagnostic().kind();
+    }
+    let wrapped = zeroclaw_providers::ensure_terminal_provider_failure(
+        anyhow::Error::msg(zeroclaw_providers::sanitize_api_error(&err.to_string())),
+        provider_name,
+        model,
+        zeroclaw_providers::ProviderRoute::Main,
+    );
+    zeroclaw_providers::terminal_provider_failure(&wrapped)
+        .map_or("provider_error", |failure| failure.diagnostic().kind())
+}
+
+fn is_text_tool_results_message(msg: &ChatMessage) -> bool {
+    msg.role == "user" && msg.content.trim_start().starts_with("[Tool results]")
+}
+
+pub(crate) fn delegate_head_floor(messages: &[ChatMessage]) -> usize {
+    let system_count = messages.iter().take_while(|m| m.role == "system").count();
+    let first_task_end = messages[system_count..]
+        .iter()
+        .position(|m| m.role == "user" && !is_text_tool_results_message(m))
+        .map_or(system_count, |rel| system_count + rel + 1);
+    first_task_end.max(system_count)
+}
+
+fn align_delegate_boundaries(
+    messages: &[ChatMessage],
+    min_start: usize,
+    max_end: usize,
+) -> (usize, usize) {
+    let mut start = min_start.min(messages.len());
+    while start < messages.len()
+        && (messages[start].role == "tool" || is_text_tool_results_message(&messages[start]))
+    {
+        start += 1;
+    }
+
+    let mut end = max_end.min(messages.len());
+    while end > start && end < messages.len() {
+        if messages[end].role == "tool" || is_text_tool_results_message(&messages[end]) {
+            end -= 1;
+            continue;
+        }
+        if messages[end].role == "assistant" && messages[end - 1].role == "assistant" {
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+
+    (start, end)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +953,9 @@ fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) -> usize {
     // [CONTEXT SUMMARY] message (it's orphaned by definition).
     let mut i = 0;
     while i < messages.len() {
-        if messages[i].content.contains("[CONTEXT SUMMARY") {
+        if messages[i].content.contains("[CONTEXT SUMMARY")
+            || messages[i].content.contains("[CONTEXT EXCERPT")
+        {
             // Remove any immediately following orphaned tool results
             while i + 1 < messages.len() && messages[i + 1].role == "tool" {
                 messages.remove(i + 1);
@@ -649,7 +1049,27 @@ fn build_summary_message(
     let summary_text = format!(
         "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
     );
+    wrap_summary_with_reasoning(compressed, summary_text)
+}
 
+fn build_delegate_summary_message(
+    compressed: &[ChatMessage],
+    summary: &str,
+    message_count: usize,
+    fallback_reason: Option<&'static str>,
+) -> ChatMessage {
+    let summary_text = match fallback_reason {
+        Some(reason) => format!(
+            "[CONTEXT EXCERPT (unconfirmed fallback: {reason}) \u{2014} {message_count} earlier messages truncated]\n\n{summary}"
+        ),
+        None => format!(
+            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
+        ),
+    };
+    wrap_summary_with_reasoning(compressed, summary_text)
+}
+
+fn wrap_summary_with_reasoning(compressed: &[ChatMessage], summary_text: String) -> ChatMessage {
     let last_reasoning = compressed
         .iter()
         .rev()

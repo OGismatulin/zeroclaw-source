@@ -255,7 +255,9 @@ pub(crate) fn trim_oversized_tool_results_in_range(
         return 0;
     }
     for msg in &mut history[protect_start..protect_end] {
-        if msg.role != "tool" {
+        let is_text_tool_carrier =
+            msg.role == "user" && msg.content.trim_start().starts_with(TOOL_RESULTS_PREFIX);
+        if msg.role != "tool" && !is_text_tool_carrier {
             continue;
         }
         if msg.content.len() <= max_chars {
@@ -268,7 +270,20 @@ pub(crate) fn trim_oversized_tool_results_in_range(
             continue;
         }
         let original_len = msg.content.len();
-        msg.content = crate::agent::history::truncate_tool_message(&msg.content, max_chars);
+        if is_text_tool_carrier {
+            let trimmed_start = msg.content.trim_start();
+            let after_prefix = trimmed_start
+                .strip_prefix(TOOL_RESULTS_PREFIX)
+                .unwrap_or(trimmed_start);
+            let body = after_prefix.strip_prefix('\n').unwrap_or(after_prefix);
+            let truncated_body = crate::agent::history::truncate_tool_message(body, max_chars);
+            let candidate = format!("{TOOL_RESULTS_PREFIX}\n{truncated_body}");
+            if candidate.len() < original_len {
+                msg.content = candidate;
+            }
+        } else {
+            msg.content = crate::agent::history::truncate_tool_message(&msg.content, max_chars);
+        }
         saved += original_len - msg.content.len();
     }
     saved
