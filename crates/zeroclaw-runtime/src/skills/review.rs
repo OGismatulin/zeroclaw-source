@@ -177,6 +177,7 @@ pub async fn maybe_run_skill_review(
                 agent_alias,
                 parent_agent_alias: None,
                 turn_id: &turn_id,
+                delegate_control: None,
             })
             .await
         })

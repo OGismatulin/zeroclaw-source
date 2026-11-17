@@ -2634,6 +2634,7 @@ impl Agent {
                         .as_ref()
                         .and_then(|c| c.config.as_deref())
                         .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    delegate_control: None,
                 }),
             ),
         );
@@ -3078,6 +3079,7 @@ impl Agent {
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
                             .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        delegate_control: None,
                     }),
                 ),
             );

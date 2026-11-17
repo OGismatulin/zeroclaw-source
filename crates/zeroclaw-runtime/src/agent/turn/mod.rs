@@ -4,6 +4,7 @@ pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
+pub(crate) mod delegate_control;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod execution;
@@ -31,6 +32,7 @@ pub(crate) use context_recovery::{
     record_llm_failure, try_recover_context_overflow, try_recover_empty_completion,
     try_recover_reasoning_roundtrip,
 };
+pub use delegate_control::DelegateRunControl;
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -43,7 +45,7 @@ pub use execution::{
 };
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
-pub(crate) use max_iter::finish_after_max_iterations;
+pub(crate) use max_iter::{FinalizationReason, finish_with_finalization_reason};
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
@@ -238,6 +240,7 @@ pub struct ToolLoop<'a> {
     /// FAILS CLOSED (the step errors rather than running with the parent
     /// agent's broader context).
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
+    pub delegate_control: Option<DelegateRunControl>,
 }
 
 async fn enforce_reported_budget(
@@ -410,6 +413,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         parent_agent_alias,
         turn_id,
         sop_reassembly,
+        delegate_control,
     } = p;
     let ResolvedAgentExecution {
         model_access:
@@ -441,6 +445,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     } = exec;
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
+
+    if delegate_control.is_some() && turn_state.canonical.is_some() {
+        anyhow::bail!(
+            "delegate_control is incompatible with canonical new_messages_out history mirror"
+        );
+    }
 
     turn_state.sync_pending();
 
@@ -577,8 +587,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // steps drain across several iterations.
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
+    let mut last_request_snapshot: Option<delegate_control::RequestPopulationSnapshot> = None;
+    let mut finalization_reason: Option<FinalizationReason> = None;
 
     for iteration in 0..max_iterations {
+        if let Some(ref control) = delegate_control
+            && control.is_work_deadline_reached()
+        {
+            finalization_reason = Some(control.work_deadline_reason());
+            break;
+        }
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
@@ -895,6 +913,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             );
         }
 
+        if let Some(ref control) = delegate_control
+            && control.is_work_deadline_reached()
+        {
+            finalization_reason = Some(control.work_deadline_reason());
+            break;
+        }
+        if delegate_control.is_some() {
+            last_request_snapshot = Some(
+                delegate_control::RequestPopulationSnapshot::snapshot_request(
+                    turn_state.history,
+                    &provider_request_messages,
+                    request_tools,
+                ),
+            );
+        }
+
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -979,10 +1013,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // The context-compression config is not reachable in the turn
                 // module, so build the retrim params from serde defaults
                 // (retrim_chars=2000, protect_first_n=3, emergency_protect_last_n=2).
-                let cc = zeroclaw_config::scattered_types::ContextCompressionConfig::default();
+                let cc = delegate_control.as_ref().map_or_else(
+                    zeroclaw_config::scattered_types::ContextCompressionConfig::default,
+                    |control| control.compression.clone(),
+                );
+                let protect_first_n = if delegate_control.is_some() {
+                    cc.protect_first_n
+                        .max(crate::agent::context_compressor::delegate_head_floor(
+                            turn_state.history,
+                        ))
+                } else {
+                    cc.protect_first_n
+                };
                 let tool_retrim = crate::agent::turn::context_recovery::ToolRetrimParams {
                     retrim_chars: cc.tool_result_retrim_chars,
-                    protect_first_n: cc.protect_first_n,
+                    protect_first_n,
                     emergency_protect_last_n: cc.emergency_protect_last_n,
                     exempt: cc.tool_result_trim_exempt.clone(),
                 };
@@ -1151,6 +1196,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // A provider transport success is only a candidate. Commit (or clear)
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
+        let effective_delegate_model = if vision_model_provider_box.is_some() {
+            model.to_string()
+        } else {
+            served_model.to_string()
+        };
         zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -1233,6 +1283,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 .await;
             }
             return Ok(accumulated_display_text);
+        }
+
+        if let Some(ref control) = delegate_control
+            && control.is_work_deadline_reached()
+        {
+            finalization_reason = Some(control.work_deadline_reason());
+            break;
         }
 
         // Relay only the portion of narration the live stream did not already
@@ -1504,7 +1561,35 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.mark_all_synced();
         }
 
-        if let Some(reported) = reported_input_tokens {
+        if let Some(ref control) = delegate_control {
+            let delegate_access = ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model: effective_delegate_model.as_str(),
+                temperature,
+            };
+            // fork(#79): single-turn delegate compaction and post-round deadline gate.
+            // Box this future so compress_for_delegate stack state does not bloat every
+            // run_tool_call_loop frame (needed for nested delegate tests on 2MB debug stacks).
+            match Box::pin(delegate_control::maintain_context_after_round(
+                turn_state.history,
+                control,
+                &delegate_access,
+                last_request_snapshot.as_ref(),
+                reported_input_tokens,
+                cancellation_token.as_ref(),
+                &ctx,
+                iteration,
+            ))
+            .await?
+            {
+                delegate_control::PostRoundAction::Continue => {}
+                delegate_control::PostRoundAction::Finalize(reason) => {
+                    finalization_reason = Some(reason);
+                    break;
+                }
+            }
+        } else if let Some(reported) = reported_input_tokens {
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
@@ -1516,7 +1601,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
-    finish_after_max_iterations(
+    Box::pin(finish_with_finalization_reason(
         model_provider,
         turn_state.history,
         provider_name,
@@ -1524,13 +1609,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         temperature,
         pacing,
         cancellation_token.as_ref(),
-        max_iterations,
+        finalization_reason.unwrap_or(FinalizationReason::IterationLimit(max_iterations)),
         accumulated_display_text,
         turn_id,
         knobs,
         event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
-    )
+    ))
     .await
 }
 
@@ -2312,6 +2397,7 @@ async fn drive_live_sop_actions(
                                     },
                                     turn_id: &nested_turn_id,
                                     sop_reassembly,
+                                    delegate_control: None,
                                 })),
                             )
                             .await;

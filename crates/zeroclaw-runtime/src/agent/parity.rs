@@ -197,6 +197,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
         memory: None,
         agent_alias: None,
         turn_id: &turn_id,
+        delegate_control: None,
     })
     .await;
     assert_eq!(
