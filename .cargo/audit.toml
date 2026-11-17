@@ -10,6 +10,8 @@ ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
     "RUSTSEC-2026-0319",  # anymap2 unmaintained; still required by matrix-sdk 0.19.1 testing; tracking #8519
     "RUSTSEC-2026-0441",  # pin-utils unmaintained, no safe upgrade; via async-imap 0.11; same waiver upstream (#12252)
+    "RUSTSEC-2026-0543",  # chrono unmaintained (no CVE); already on 0.4.44 across workspace
+    "RUSTSEC-2026-0555",  # chrono-tz unmaintained (no CVE, no safe upgrade)
     "RUSTSEC-2026-0097",  # rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected
     "RUSTSEC-2024-0429",  # glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series
 
