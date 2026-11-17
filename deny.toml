@@ -33,6 +33,9 @@ ignore = [
     { id = "RUSTSEC-2026-0253", reason = "lru LruCache::pop() panic-safety unsoundness; affected 0.16.4 copy is transitive via nostr-database 0.44 which excludes the patched 0.18.2; unreachable without catch_unwind plus a panicking key Drop, and all keys here are String/integer" },
     { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained; still required by matrix-sdk 0.19.1 testing feature; remove when Matrix replaces its test map; tracking #8519" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained (no CVE, no safe upgrade); async-imap 0.11.x still depends on it; same waiver upstream (#12252)" },
+    # chrono / chrono-tz marked unmaintained (RUSTSEC-2026-0543 / -0555, no CVE, no safe upgrade in chrono 0.4.x).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (no CVE); already on 0.4.44 and used across workspace; migrating to jiff is separate work" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained (no CVE, no safe upgrade); paired with chrono in runtime" },
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
