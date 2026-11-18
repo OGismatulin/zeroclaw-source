@@ -36,7 +36,10 @@ impl DelegateRunControl {
         history_pruning_max_tokens: Option<usize>,
     ) -> Self {
         let hard_deadline = started_at + total_timeout;
-        let reserve = Duration::from_secs(300).min(total_timeout / 4);
+        // Reserve up to 15m (capped at 25% for short timeouts) so an in-flight
+        // `effort="max"` step overshoot plus tools-free finalization still
+        // completes before `hard_deadline`.
+        let reserve = Duration::from_secs(900).min(total_timeout / 4);
         let work_deadline = hard_deadline.checked_sub(reserve).unwrap_or(started_at);
         Self {
             started_at,
@@ -313,4 +316,37 @@ pub(crate) async fn maintain_context_after_round(
     }
 
     Ok(PostRoundAction::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control_for(timeout_secs: u64) -> DelegateRunControl {
+        DelegateRunControl::new(
+            Duration::from_secs(timeout_secs),
+            tokio::time::Instant::now(),
+            ContextCompressionConfig::default(),
+            128_000,
+            None,
+        )
+    }
+
+    #[test]
+    fn work_deadline_reserve_scales_and_caps_at_900s() {
+        for (timeout_secs, expected_reserve) in
+            [(5400, 900), (4800, 900), (3600, 900), (1200, 300), (8, 2)]
+        {
+            let control = control_for(timeout_secs);
+            let FinalizationReason::WorkDeadline { reserve_secs, .. } =
+                control.work_deadline_reason()
+            else {
+                panic!("expected WorkDeadline reason");
+            };
+            assert_eq!(
+                reserve_secs, expected_reserve,
+                "unexpected reserve for total_timeout={timeout_secs}s"
+            );
+        }
+    }
 }
