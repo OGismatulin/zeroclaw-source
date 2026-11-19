@@ -180,6 +180,13 @@ fn hash_value_into<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
     }
 }
 
+fn is_no_progress_exempt_tool(name: &str) -> bool {
+    // Read-only count probes legitimately return `total_results: 0` across
+    // many distinct queries (e.g. searching for new feature log lines). Exact
+    // repeats with identical arguments are still caught by detect_exact_repeat.
+    name == "graylog__count"
+}
+
 fn hash_str(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
@@ -407,6 +414,9 @@ impl LoopDetector {
             .iter()
             .rev()
             .find(|r| r.kind == RecordKind::Call)?;
+        if is_no_progress_exempt_tool(&last.name) {
+            return None;
+        }
         // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
@@ -1157,6 +1167,73 @@ mod tests {
                 !matches!(r, LoopDetectionResult::Break(_)),
                 "ping-pong disabled must never Break"
             );
+        }
+    }
+
+    #[test]
+    fn no_progress_exempts_graylog_count_zero_series() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            window_size: 20,
+            no_progress_min_calls: 15,
+            ..default_config()
+        });
+        let zero = r#"{"total_results": 0, "time_range": null}"#;
+        for idx in 0..20 {
+            let args =
+                json!({"query": format!("facility:prod-payment* AND sig_{idx}"), "range": "7d"});
+            let res = detector.record("graylog__count", &args, zero);
+            assert_eq!(
+                res,
+                LoopDetectionResult::Ok,
+                "unexpected loop detection at call {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_repeat_still_breaks_identical_graylog_count() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            max_repeats: 3,
+            no_progress_min_calls: 15,
+            ..default_config()
+        });
+        let args = json!({"query": "facility:prod-payment*", "range": "7d"});
+        let zero = r#"{"total_results": 0, "time_range": null}"#;
+        assert_eq!(
+            detector.record("graylog__count", &args, zero),
+            LoopDetectionResult::Ok
+        );
+        assert_eq!(
+            detector.record("graylog__count", &args, zero),
+            LoopDetectionResult::Ok
+        );
+        assert!(matches!(
+            detector.record("graylog__count", &args, zero),
+            LoopDetectionResult::Warning(_)
+        ));
+        assert!(matches!(
+            detector.record("graylog__count", &args, zero),
+            LoopDetectionResult::Block(_)
+        ));
+        assert!(matches!(
+            detector.record("graylog__count", &args, zero),
+            LoopDetectionResult::Break(_)
+        ));
+    }
+
+    #[test]
+    fn no_progress_still_breaks_other_tools_with_varying_args() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            window_size: 20,
+            no_progress_min_calls: 15,
+            ..default_config()
+        });
+        for idx in 0..17 {
+            let args = json!({"path": format!("file_{idx}.rs")});
+            let res = detector.record("file_read", &args, "same");
+            if idx == 16 {
+                assert!(matches!(res, LoopDetectionResult::Break(_)));
+            }
         }
     }
 }

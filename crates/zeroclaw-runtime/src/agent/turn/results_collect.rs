@@ -650,6 +650,117 @@ mod tests {
         assert!(err.contains("loop detector"), "got: {err}");
     }
 
+    #[test]
+    fn graylog_count_zero_batches_do_not_trip_no_progress_circuit_breaker() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            window_size: 20,
+            no_progress_min_calls: 15,
+            ping_pong_min_cycles: 20,
+            ..LoopDetectorConfig::default()
+        });
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let zero = r#"{"content":[{"text":"{\"total_results\": 0, \"time_range\": null}","type":"text"}]}"#;
+        for (iteration, batch_size) in [(0usize, 12usize), (1usize, 6usize)] {
+            let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+            let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
+                Vec::new();
+            for i in 0..batch_size {
+                tool_calls.push(ParsedToolCall {
+                    name: "graylog__count".to_string(),
+                    arguments: serde_json::json!({
+                        "query": format!("facility:prod-payment* AND q_{iteration}_{i}"),
+                        "range": "90d"
+                    }),
+                    tool_call_id: None,
+                });
+                ordered.push(Some((
+                    "graylog__count".to_string(),
+                    None,
+                    outcome(zero, true),
+                )));
+            }
+            let collected = collect_tool_results(
+                ordered,
+                &tool_calls,
+                &mut history,
+                &mut detector,
+                &ignore,
+                10_000,
+                None,
+                "gpt-6-luna",
+                iteration,
+                "turn-dv35397",
+            )
+            .expect("collect_tool_results should succeed");
+            assert!(
+                collected.loop_error.is_none(),
+                "iteration {iteration} unexpectedly tripped circuit breaker"
+            );
+            assert!(
+                history
+                    .iter()
+                    .all(|m| !m.content.contains("[Loop Detection")),
+                "iteration {iteration} unexpectedly injected loop-detector warning/block"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_graylog_count_calls_still_trip_exact_repeat_in_results_collect() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            window_size: 20,
+            max_repeats: 3,
+            no_progress_min_calls: 15,
+            ping_pong_min_cycles: 20,
+            ..LoopDetectorConfig::default()
+        });
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let zero = r#"{"content":[{"text":"{\"total_results\": 0, \"time_range\": null}","type":"text"}]}"#;
+        let mut tripped = false;
+        for iteration in 0..5 {
+            let tool_calls = vec![ParsedToolCall {
+                name: "graylog__count".to_string(),
+                arguments: serde_json::json!({
+                    "query": "facility:prod-payment* AND same_query",
+                    "range": "7d"
+                }),
+                tool_call_id: None,
+            }];
+            let ordered = vec![Some((
+                "graylog__count".to_string(),
+                None,
+                outcome(zero, true),
+            ))];
+            let collected = collect_tool_results(
+                ordered,
+                &tool_calls,
+                &mut history,
+                &mut detector,
+                &ignore,
+                10_000,
+                None,
+                "gpt-6-luna",
+                iteration,
+                "turn-dv35397-exact",
+            )
+            .expect("collect_tool_results should succeed");
+            if let Some(err) = collected.loop_error {
+                assert!(
+                    err.to_string().contains("identical arguments"),
+                    "unexpected error: {err}"
+                );
+                tripped = true;
+                break;
+            }
+        }
+        assert!(
+            tripped,
+            "identical graylog__count repeats must still trip exact_repeat breaker"
+        );
+    }
+
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
         // `Some(0)` => loop detection active immediately (`elapsed() >= 0s`).
         let pacing = PacingConfig {
