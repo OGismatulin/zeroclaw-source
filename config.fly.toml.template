@@ -77,7 +77,7 @@ provider_extra = { reasoning_effort = "max" }
 
 # Codex subagents fold under the `openai` family with the codex OAuth runtime
 # (wire_api = "responses" + requires_openai_auth = true — what the V1→V3
-# migration applies to "openai-codex"). worker = gpt-6-luna, coder = gpt-6.1-sol.
+# migration applies to "openai-codex"). worker = gpt-6-luna, coder = gpt-6.2-sol.
 # The codex_cli_rs identity patch #22 remains required for recent models.
 # CHAT BOOT SLOT. ZEROCLAW_PROVIDER=openai-codex resolves here
 # (normalize_provider_type("openai-codex", ..) -> family "openai", alias "codex",
@@ -129,7 +129,7 @@ wire_api = "responses"
 requires_openai_auth = true
 
 [providers.models.openai.codex_coder]
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -137,7 +137,7 @@ requires_openai_auth = true
 # Codex judge slot: GPT-6 Sol on the OAuth runtime. Referenced by
 # [agents.analyst_sol].
 [providers.models.openai.codex_sol]
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 api_key = ""
 wire_api = "responses"
 requires_openai_auth = true
@@ -296,7 +296,8 @@ fallback_providers = ["opencode-go"]
 # glm-5.3-flash + longcat-2.0 added (single + multi-turn tool loop PASS, 2 probes
 # each). deepseek-v4.1-flash is the fallback target, so it is never a key.
 # Codex family
-"gpt-6.1-sol"        = ["deepseek-v4.1-flash"]
+"gpt-6.2-sol"        = ["deepseek-v4.1-flash"]
+"gpt-6.2-astra"      = ["deepseek-v4.1-flash"]
 "gpt-6-luna"       = ["deepseek-v4.1-flash"]
 "gpt-6.1-terra"      = ["deepseek-v4.1-flash"]
 # Go-plan native opencode-go
@@ -735,7 +736,8 @@ protect_last_n = 10
 "gpt-5.5"                 = 256_000
 # GPT-6 publishes 1.05M, but 353K remains the conservative effective
 # window until this Codex OAuth path is measured with long prompts.
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
+"gpt-6.2-astra"           = 353_000
 "gpt-6-luna"            = 353_000
 # Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
 # (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
@@ -791,7 +793,8 @@ protect_last_n = 10
 "qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
 "gpt-5.5"                 = 256_000
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
+"gpt-6.2-astra"           = 353_000
 "gpt-6-luna"            = 353_000
 "glm-5.3-flash"           = 200_000
 "longcat-2.0"             = 128_000
@@ -844,7 +847,8 @@ protect_last_n = 10
 # 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
+"gpt-6.2-astra"           = 353_000
 "gpt-6-luna"            = 353_000
 # Catalog refresh 2026-08-27: ox-alpha-free / muse-spark-1.2-contributor dropped
 # (router answers 401 "Model is not supported" resp. 500 on every call, 3 probes
@@ -917,7 +921,7 @@ protect_last_n = 10
 # 2026-07-11). Values below = codex effective caps; 0.70 now trims safely under them.
 # gpt-5.5 stays after leaving the chat catalog — it is still the image_gen codex model.
 "gpt-5.5"                 = 256_000
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
 "gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
@@ -950,7 +954,7 @@ protect_last_n = 10
 "qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
 "gpt-5.5"                 = 256_000
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
 "gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
@@ -983,7 +987,7 @@ protect_last_n = 10
 "qwen3.8-max"             = 256_000
 "hy3"                     = 256_000
 "gpt-5.5"                 = 256_000
-"gpt-6.1-sol"             = 353_000
+"gpt-6.2-sol"             = 353_000
 "gpt-6.1-terra"           = 353_000
 "gpt-6-luna"            = 353_000
 
