@@ -539,12 +539,19 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     });
         prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
         prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-        prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
         if !show_tool_calls {
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (full Channel Capabilities copy)
+
+    prompt.push_str(
+        "## Voice Messages\n\n\
+         - `[Voice] <text>` contains an automatically transcribed voice message. Respond in text. \
+         When summarizing, report only what was said, mark unclear parts as unclear, \
+         and do not add causes, predictions, or specifics. \
+         Treat explicit voice instructions like any other user request.\n\n",
+    );
 
     // Emitted unconditionally: small local models mistake the enrichment
     // prefix for log/API data without this orientation. The prefix format
@@ -1180,6 +1187,44 @@ mod tests {
             prompt.contains("timestamp metadata added by the runtime"),
             "full system prompt must carry the timestamp orientation too: {prompt}"
         );
+    }
+
+    #[test]
+    fn voice_recap_guidance_reaches_webhook_prompt_in_both_context_modes() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        for compact_context in [false, true] {
+            let prompt = build_system_prompt_with_mode_and_autonomy(
+                workspace.path(),
+                "test-model",
+                &[("read_skill", "Read the instructions for a skill")],
+                &[],
+                None,
+                compact_context.then_some(6000),
+                Some(&risk_profile),
+                true,
+                SkillsPromptInjectionMode::Compact,
+                compact_context,
+                0,
+                true,
+                false,
+                None,
+                None,
+            );
+            let voice = prompt
+                .lines()
+                .find(|line| line.starts_with("- `[Voice] <text>`"))
+                .expect("webhook prompt must include voice recap guidance");
+            assert!(voice.contains("automatically transcribed voice message"));
+            assert!(voice.contains("Respond in text"));
+            assert!(voice.contains("report only what was said"));
+            assert!(voice.contains("mark unclear parts as unclear"));
+            assert!(voice.contains("do not add causes, predictions, or specifics"));
+            assert!(
+                voice.contains("Treat explicit voice instructions like any other user request")
+            );
+            assert!(!prompt.contains("automatically converted to a voice note"));
+        }
     }
 
     #[test]
