@@ -210,6 +210,11 @@ impl AwsCredentials {
 
     /// Fetch credentials from EC2 IMDSv2 instance metadata service.
     async fn from_imds() -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !env_optional("AWS_EC2_METADATA_DISABLED")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            "EC2 metadata credentials disabled by AWS_EC2_METADATA_DISABLED"
+        );
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()?;
@@ -1914,6 +1919,7 @@ mod tests {
         let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
         let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
         let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        let _imds = EnvGuard::set("AWS_EC2_METADATA_DISABLED", Some("true"));
         let model_provider = BedrockModelProvider {
             alias: "test".to_string(),
             auth: None,
@@ -1923,14 +1929,9 @@ mod tests {
         let result = model_provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
             .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("credentials not set")
-                || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("builder error"),
-            "Expected missing-credentials style error, got: {err}"
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "EC2 metadata credentials disabled by AWS_EC2_METADATA_DISABLED"
         );
     }
 

@@ -82,7 +82,7 @@ _QUESTION_SUBSTITUTIONS = (
 )
 
 
-def question_hash(text: str) -> str | None:
+def _question_hash(text: str, version: str) -> str | None:
     value = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
     value = _scrub(value)
     for pattern, replacement in _QUESTION_SUBSTITUTIONS:
@@ -90,7 +90,44 @@ def question_hash(text: str) -> str | None:
     value = " ".join(re.sub(r"[^\w\s]", " ", value).split())
     if not value:
         return None
-    return "sha256:" + hashlib.sha256(("v1\0" + value).encode()).hexdigest()
+    return "sha256:" + hashlib.sha256((version + "\0" + value).encode()).hexdigest()
+
+
+def question_hash(text: str) -> str | None:
+    return _question_hash(text, "v1")
+
+
+_TELEGRAM_QUESTION_HEADER = "Current Telegram context (request-scoped):"
+_TELEGRAM_QUESTION_FIELDS = ("user_id", "username", "chat_id", "chat_type", "chat_title")
+_TELEGRAM_QUESTION_SUFFIX = [
+    "", "Rules:",
+    "- Use this context only when relevant to the current request.",
+    "- If the user asks about their Telegram identity or current chat, answer from this context.",
+    "- Do not infer the current Telegram user from USER.md or global owner context.",
+    "- Do not mention these identifiers unless the user asked or the task requires it.",
+    "", "Current user message:",
+]
+_QUESTION_ENVELOPE_MARKERS = (
+    _TELEGRAM_QUESTION_HEADER, "Current user message:", "Conversation history:",
+    "File attached by user:", "Files attached by user:", "[IMAGE:", "[Voice",
+)
+
+
+def question_body_hash_v2(text: str) -> str | None:
+    if text.startswith(_TELEGRAM_QUESTION_HEADER + "\n"):
+        parts = text.split("\n", 14)
+        if len(parts) != 15 or parts[6:14] != _TELEGRAM_QUESTION_SUFFIX:
+            return None
+        for line, field in zip(parts[1:6], _TELEGRAM_QUESTION_FIELDS, strict=True):
+            prefix = f"- {field}: "
+            if not line.startswith(prefix) or not line[len(prefix):].strip() or "\r" in line:
+                return None
+        text = parts[14]
+    elif any(marker in text for marker in _QUESTION_ENVELOPE_MARKERS):
+        return None
+    if text.startswith("[в ответ на сообщение ") or "[Voice" in text or "[IMAGE:" in text:
+        return None
+    return _question_hash(text, "v2")
 
 
 def _safe_clip(text: object, limit: int) -> str:
@@ -1369,6 +1406,7 @@ def _collect_questions(data_root: Path, now: datetime, timezone_name: str,
                     if isinstance(text, str) and isinstance(ref, str):
                         question = {"join": "nearest", "ref": ref, "normalizer": "v1",
                                     "hash": question_hash(text), "chars": len(text),
+                                    "body_hash_v2": question_body_hash_v2(text),
                                     "delta_s": round((stamp - start).total_seconds(), 3)}
                 elif eligible and matches:
                     question["join"] = "ambiguous"
