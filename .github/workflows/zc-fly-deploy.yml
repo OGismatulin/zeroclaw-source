@@ -142,7 +142,6 @@ jobs:
           PY
 
       - name: Verify private integration access
-        if: steps.mode.outputs.mode == 'digest'
         env:
           GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
         shell: bash
@@ -162,25 +161,23 @@ jobs:
               except (subprocess.CalledProcessError, ValueError, OSError):
                   raise SystemExit("Private integration access verification failed")
           repo = read("repos/OGismatulin/zeroclaw")
-          commit = read("repos/OGismatulin/zeroclaw/commits/d8f7884f2c9401f68f745fcc1afdc6ac5951b062")
+          commit = read("repos/OGismatulin/zeroclaw/commits/f5728205bad6a4b19f1057e278b676b8a9ccd87b")
           if not isinstance(repo, dict) or repo.get("private") is not True or repo.get("full_name", "").lower() != "ogismatulin/zeroclaw":
               raise SystemExit("Unexpected private integration repository")
-          if not isinstance(commit, dict) or commit.get("sha") != "d8f7884f2c9401f68f745fcc1afdc6ac5951b062":
+          if not isinstance(commit, dict) or commit.get("sha") != "f5728205bad6a4b19f1057e278b676b8a9ccd87b":
               raise SystemExit("Unexpected private integration commit")
           PY
 
       - name: Checkout pinned integration preflight
-        if: steps.mode.outputs.mode == 'digest'
         uses: actions/checkout@v4
         with:
           repository: OGismatulin/zeroclaw
-          ref: d8f7884f2c9401f68f745fcc1afdc6ac5951b062
+          ref: f5728205bad6a4b19f1057e278b676b8a9ccd87b
           token: ${{ secrets.GHCR_TOKEN }}
           path: .manual-digest-integration
           persist-credentials: false
 
       - name: Verify pinned integration code
-        if: steps.mode.outputs.mode == 'digest'
         shell: bash
         run: |
           set -euo pipefail
@@ -191,11 +188,11 @@ jobs:
 
           root = Path(".manual-digest-integration")
           head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-          if head != "d8f7884f2c9401f68f745fcc1afdc6ac5951b062":
+          if head != "f5728205bad6a4b19f1057e278b676b8a9ccd87b":
               raise SystemExit("Pinned integration HEAD mismatch")
           hashes = {
-              "fly_preflight.py": "46367cf291636150e2f9eec6fe7017350a06f859f1a88e5e3395cef054df8a8b",
-              "common.py": "af3934c1b4cf1831cc0ece3f2998ef80c8ef404872c3adefdec7d618977ee812",
+              "fly_preflight.py": "802bd1ae071544e57760e640dd4ec22d5dfc231c26cd7c022e5c0e66ccf1e1f5",
+              "common.py": "d468d29221dcf01333e67a5b2e47e6460669dd6a311244e923c3a14959d5c88e",
           }
           for name, expected in hashes.items():
               path = root / ".claude/skills/fly-template-sync/scripts" / name
@@ -219,7 +216,6 @@ jobs:
           password: ${{ github.token }}
 
       - uses: docker/setup-buildx-action@v3
-        if: steps.mode.outputs.mode == 'digest'
 
       - name: Inspect immutable registry image
         id: registry
@@ -279,7 +275,6 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Prepare Fly CLI compatibility
-        if: steps.mode.outputs.mode == 'digest'
         shell: bash
         run: |
           set -euo pipefail
@@ -370,11 +365,16 @@ jobs:
         if: steps.mode.outputs.mode == 'legacy'
         env:
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          UPSTREAM_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          flyctl deploy --image "ghcr.io/ogismatulin/zeroclaw:$IMAGE_TAG"
+          python3 scripts/ci/verify_legacy_deploy_quiescence.py \
+            --preflight .manual-digest-integration/.claude/skills/fly-template-sync/scripts/fly_preflight.py \
+            --image-tag "$IMAGE_TAG" --upstream-sha "${UPSTREAM_HEAD_SHA:-}" \
+            --receipt fly-preflight-evidence/result.json --mode deploy
 
       - name: Warm up per-user daemons
         run: |
@@ -447,6 +447,14 @@ jobs:
           Path("manual-digest/post-master.json").write_text(json.dumps({"ref": master["ref"], "object": {"type": master["object"]["type"], "sha": master["object"]["sha"]}}))
           print("Post-deploy digest, machine version and master verified")
           PY
+
+      - name: Preserve legacy preflight receipt
+        if: always() && steps.mode.outputs.mode == 'legacy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-preflight-evidence-${{ github.run_attempt }}
+          path: fly-preflight-evidence/result.json
+          if-no-files-found: warn
 
       - name: Preserve digest release evidence
         if: always() && steps.mode.outputs.mode == 'digest'

@@ -1,0 +1,115 @@
+name: ZC Fly Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  actions: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    concurrency: zc-preflight-probe
+    timeout-minutes: 5
+    steps:
+      - name: Verify observation request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/master ]]
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify private integration access
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          if not os.environ.get("GH_TOKEN"):
+              raise SystemExit("Private integration credential is unavailable")
+          def read(endpoint):
+              try:
+                  result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True, check=True)
+                  return json.loads(result.stdout)
+              except (subprocess.CalledProcessError, ValueError, OSError):
+                  raise SystemExit("Private integration access verification failed")
+          repo = read("repos/OGismatulin/zeroclaw")
+          commit = read("repos/OGismatulin/zeroclaw/commits/f5728205bad6a4b19f1057e278b676b8a9ccd87b")
+          if not isinstance(repo, dict) or repo.get("private") is not True or repo.get("full_name", "").lower() != "ogismatulin/zeroclaw":
+              raise SystemExit("Unexpected private integration repository")
+          if not isinstance(commit, dict) or commit.get("sha") != "f5728205bad6a4b19f1057e278b676b8a9ccd87b":
+              raise SystemExit("Unexpected private integration commit")
+          PY
+
+      - name: Checkout pinned integration preflight
+        uses: actions/checkout@v4
+        with:
+          repository: OGismatulin/zeroclaw
+          ref: f5728205bad6a4b19f1057e278b676b8a9ccd87b
+          token: ${{ secrets.GHCR_TOKEN }}
+          path: .manual-digest-integration
+          persist-credentials: false
+
+      - name: Verify pinned integration code
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import subprocess
+          from pathlib import Path
+
+          root = Path(".manual-digest-integration")
+          head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+          if head != "f5728205bad6a4b19f1057e278b676b8a9ccd87b":
+              raise SystemExit("Pinned integration HEAD mismatch")
+          hashes = {
+              "fly_preflight.py": "802bd1ae071544e57760e640dd4ec22d5dfc231c26cd7c022e5c0e66ccf1e1f5",
+              "common.py": "d468d29221dcf01333e67a5b2e47e6460669dd6a311244e923c3a14959d5c88e",
+          }
+          for name, expected in hashes.items():
+              path = root / ".claude/skills/fly-template-sync/scripts" / name
+              if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                  raise SystemExit("Pinned integration code hash mismatch")
+          PY
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Prepare Fly CLI compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          flyctl_path=$(command -v flyctl)
+          [[ "$flyctl_path" = /* && -x "$flyctl_path" ]]
+          mkdir "$RUNNER_TEMP/manual-digest-fly-bin"
+          ln -s "$flyctl_path" "$RUNNER_TEMP/manual-digest-fly-bin/fly"
+          "$RUNNER_TEMP/manual-digest-fly-bin/fly" version
+          printf '%s\n' "$RUNNER_TEMP/manual-digest-fly-bin" >> "$GITHUB_PATH"
+
+      - name: Observe Fly quiescence
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_legacy_deploy_quiescence.py \
+            --preflight .manual-digest-integration/.claude/skills/fly-template-sync/scripts/fly_preflight.py \
+            --upstream-sha '' --receipt fly-preflight-evidence/result.json --mode observe
+
+      - name: Preserve observation receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fly-preflight-observation-${{ github.run_attempt }}
+          path: fly-preflight-evidence/result.json
+          if-no-files-found: warn

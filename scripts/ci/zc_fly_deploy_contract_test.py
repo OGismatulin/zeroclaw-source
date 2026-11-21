@@ -13,8 +13,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / ".github/workflows/zc-fly-deploy.yml").read_text()
+OBSERVATION = (ROOT / ".github/workflows/zc-fly-preflight.yml").read_text()
+SHARED_PREPARATION = (
+    "Verify private integration access",
+    "Checkout pinned integration preflight",
+    "Verify pinned integration code",
+    "Prepare Fly CLI compatibility",
+)
 MARKER = "[manual-digest-deploy-20261031]"
-PIN = "d8f7884f2c9401f68f745fcc1afdc6ac5951b062"
+PIN = "f5728205bad6a4b19f1057e278b676b8a9ccd87b"
 DIGEST = "sha256:" + "a" * 64
 CHILD = "sha256:" + "b" * 64
 SHA = "c" * 40
@@ -144,12 +151,8 @@ def require_contract(workflow):
                 "digest failure ignored",
             )
     digest_steps = (
-        "Verify private integration access",
-        "Checkout pinned integration preflight",
-        "Verify pinned integration code",
         "Download exact build digest artifact",
         "Inspect immutable registry image",
-        "Prepare Fly CLI compatibility",
         "Verify fresh digest release state",
         "Deploy validated immutable digest",
         "Verify post-deploy digest and master",
@@ -159,11 +162,25 @@ def require_contract(workflow):
             "        if: steps.mode.outputs.mode == 'digest'\n" in step(name, workflow),
             "digest step can fall back",
         )
+    for name in SHARED_PREPARATION:
+        require("        if:" not in step(name, workflow), "legacy lost pinned scanner preparation")
     for name in ("Resolve legacy image tag", "Deploy legacy emergency image tag"):
         require(
             "        if: steps.mode.outputs.mode == 'legacy'\n" in step(name, workflow),
             "legacy fallback is not isolated",
         )
+    legacy = script("Deploy legacy emergency image tag", workflow)
+    require("set -euo pipefail" in legacy and "--mode deploy" in legacy
+            and "verify_legacy_deploy_quiescence.py" in legacy and "flyctl deploy" not in legacy,
+            "legacy deploy bypasses the guard")
+    require("        if:" not in step("Warm up per-user daemons", workflow),
+            "warmup can run after guarded deploy holds")
+    legacy_receipt = step("Preserve legacy preflight receipt", workflow)
+    require("if: always() && steps.mode.outputs.mode == 'legacy'" in legacy_receipt
+            and "          path: fly-preflight-evidence/result.json\n" in legacy_receipt,
+            "legacy receipt is missing after HOLD or includes private data")
+    require("      - uses: docker/setup-buildx-action@v3\n\n" in workflow,
+            "legacy registry inspection has no Buildx setup")
     checkout = step("Checkout pinned integration preflight", workflow)
     require(
         f"          ref: {PIN}\n" in checkout
@@ -179,8 +196,8 @@ def require_contract(workflow):
     pin = script("Verify pinned integration code", workflow)
     require(
         PIN in pin
-        and "46367cf291636150e2f9eec6fe7017350a06f859f1a88e5e3395cef054df8a8b" in pin
-        and "af3934c1b4cf1831cc0ece3f2998ef80c8ef404872c3adefdec7d618977ee812" in pin,
+        and "802bd1ae071544e57760e640dd4ec22d5dfc231c26cd7c022e5c0e66ccf1e1f5" in pin
+        and "d468d29221dcf01333e67a5b2e47e6460669dd6a311244e923c3a14959d5c88e" in pin,
         "preflight integrity checks changed",
     )
     artifact = step("Download exact build digest artifact", workflow)
@@ -327,6 +344,26 @@ def require_contract(workflow):
     )
 
 
+def require_observation_contract(workflow):
+    if "on:\n  workflow_dispatch:\n\n" not in workflow or "workflow_run:" in workflow:
+        raise AssertionError("read-only probe must have exactly one manual trigger")
+    if "    concurrency: zc-preflight-probe\n" not in workflow or "zc-deploy-group" in workflow:
+        raise AssertionError("probe is sharing deploy queue")
+    if any(word in workflow for word in ("flyctl deploy", "fly_warmup.py", "docker manifest", "--image-tag")):
+        raise AssertionError("probe waits for an image or can mutate Fly")
+    for name in SHARED_PREPARATION:
+        if step(name, workflow).strip() != step(name).strip():
+            raise AssertionError("probe and deploy trust different scanner preparation")
+    observe = script("Observe Fly quiescence", workflow)
+    if "--mode observe" not in observe or "verify_legacy_deploy_quiescence.py" not in observe:
+        raise AssertionError("probe is not reaching the observation controller")
+    if workflow.index("      - name: Verify observation request") > workflow.index("      - uses: actions/checkout"):
+        raise AssertionError("probe trusts a ref before checking it")
+    upload = step("Preserve observation receipt", workflow)
+    if "if: always()" not in upload or "          path: fly-preflight-evidence/result.json\n" not in upload:
+        raise AssertionError("probe receipt is missing after failure or includes private data")
+
+
 class ZcFlyDeployContractTest(unittest.TestCase):
     def run_script(self, name, env=None, workflow=WORKFLOW, cwd=None):
         if cwd is None:
@@ -357,6 +394,93 @@ class ZcFlyDeployContractTest(unittest.TestCase):
 
     def test_actual_workflow_contract(self):
         require_contract(WORKFLOW)
+
+    def test_actual_observation_workflow_accepts_only_master_dispatch(self):
+        require_observation_contract(OBSERVATION)
+        for event, ref, allowed in (
+            ('workflow_dispatch', 'refs/heads/master', True),
+            ('workflow_dispatch', 'refs/heads/MASTER', False),
+            ('workflow_dispatch', 'refs/tags/master', False),
+            ('workflow_run', 'refs/heads/master', False),
+        ):
+            with self.subTest(event=event, ref=ref):
+                result, _ = self.run_script('Verify observation request', {
+                    'GITHUB_EVENT_NAME': event, 'GITHUB_REF': ref,
+                }, workflow=OBSERVATION)
+                self.assertEqual(result.returncode == 0, allowed)
+
+        unguarded = OBSERVATION.replace('          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/master ]]', '          :')
+        self.assertNotEqual(unguarded, OBSERVATION)
+        result, _ = self.run_script('Verify observation request', {'GITHUB_REF': 'refs/heads/MASTER'}, workflow=unguarded)
+        self.assertEqual(result.returncode, 0)
+
+    def test_actual_observation_arguments_produce_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts/ci"
+            scripts.mkdir(parents=True)
+            for name in ("verify_legacy_deploy_quiescence.py", "verify_manual_digest_release.py"):
+                (scripts / name).write_bytes((ROOT / "scripts/ci" / name).read_bytes())
+            result, _ = self.run_script(
+                "Observe Fly quiescence",
+                {"GITHUB_REF": "refs/heads/master"},
+                workflow=OBSERVATION,
+                cwd=root,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads((root / "fly-preflight-evidence/result.json").read_text())
+            self.assertEqual(receipt["reason_code"], "INTEGRATION_UNAVAILABLE")
+            self.assertFalse(receipt["deploy_invoked"])
+
+    def test_quiescence_workflow_mutations_are_rejected(self):
+        for changed in (
+            WORKFLOW.replace('--mode deploy', '--mode observe'),
+            WORKFLOW.replace('      - name: Warm up per-user daemons\n', '      - name: Warm up per-user daemons\n        if: always()\n'),
+        ):
+            self.assertNotEqual(changed, WORKFLOW)
+            with self.assertRaises(AssertionError):
+                require_contract(changed)
+        for changed in (
+            OBSERVATION.replace('zc-preflight-probe', 'zc-deploy-group'),
+            OBSERVATION.replace('--mode observe', '--mode deploy'),
+        ):
+            self.assertNotEqual(changed, OBSERVATION)
+            with self.assertRaises(AssertionError):
+                require_observation_contract(changed)
+
+    def test_legacy_workflow_propagates_guard_decision_without_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'scripts/ci/verify_legacy_deploy_quiescence.py'
+            path.parent.mkdir(parents=True)
+            flyctl = root / 'flyctl'
+            flyctl.write_text('#!/bin/sh\nprintf direct > direct-deploy\n')
+            flyctl.chmod(0o700)
+            env = {
+                'PATH': f"{root}:{os.environ['PATH']}",
+                'IMAGE_TAG': 'sha-abcdef0', 'UPSTREAM_HEAD_SHA': SHA,
+            }
+            for code in (10, 3, 0):
+                with self.subTest(code=code):
+                    path.write_text(textwrap.dedent(f"""\
+                        import sys
+                        from pathlib import Path
+                        assert sys.argv[1:] == [
+                            '--preflight', '.manual-digest-integration/.claude/skills/fly-template-sync/scripts/fly_preflight.py',
+                            '--image-tag', 'sha-abcdef0', '--upstream-sha', {SHA!r},
+                            '--receipt', 'fly-preflight-evidence/result.json', '--mode', 'deploy',
+                        ]
+                        Path('guard-called').write_text({str(code)!r})
+                        raise SystemExit({code})
+                    """))
+                    result, _ = self.run_script('Deploy legacy emergency image tag', env, cwd=root)
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    self.assertEqual((root / 'guard-called').read_text(), str(code))
+                    self.assertFalse((root / 'direct-deploy').exists())
+            path.unlink()
+            result, _ = self.run_script('Deploy legacy emergency image tag', env, cwd=root)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / 'direct-deploy').exists())
 
     def test_mode_requires_every_digest_input_and_rejects_mixed_or_malformed_values(
         self,

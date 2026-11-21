@@ -166,6 +166,8 @@ jobs:
         run: python3 scripts/ci/daily_audit_issue_contract_test.py
       - name: Immutable deploy contract tests
         run: python3 scripts/ci/zc_fly_deploy_contract_test.py
+      - name: Legacy deploy quiescence tests
+        run: python3 scripts/ci/verify_legacy_deploy_quiescence_test.py
       - name: Immutable deploy verifier tests
         run: python3 scripts/ci/verify_manual_digest_release_test.py
       - name: Clippy
