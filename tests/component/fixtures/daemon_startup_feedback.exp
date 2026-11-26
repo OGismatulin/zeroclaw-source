@@ -88,7 +88,7 @@ proc transitions {} {
         send -- "exit\r"
     } else {
         set command "$env(PTY_BACKGROUND_COMMAND) & "
-        append command {printf 'PTY_JOB_STARTED:%s\n' "$!"}
+        append command {printf 'PTY_JOB_STARTED:%s\n' $!}
         send -- "$command\r"
         require_output "background job startup" -re {PTY_JOB_STARTED:[1-9][0-9]*}
         send -- "fg\r"
