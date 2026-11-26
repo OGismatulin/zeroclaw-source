@@ -2217,6 +2217,10 @@ pub(crate) fn create_shared_transport(
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
+#[cfg(all(test, unix))]
+#[path = "../../../tests/support/inherited_pipe.rs"]
+mod inherited_pipe;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2588,45 +2592,109 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
-    /// When the direct child exits but a descendant keeps the inherited stdout
-    /// pipe open (so the reader never sees EOF), `health_check` must still
-    /// report the transport unhealthy. It relies on the nonblocking
-    /// direct-child-exit watcher, not on stdout EOF.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn health_check_detects_direct_child_exit_with_inherited_stdout_open() {
+    fn stdout_holder(directory: &std::path::Path) -> StdioTransport {
+        let script = r#"
+            (
+                remaining=1500
+                while [ -e "$1/hold" ] && [ "$remaining" -gt 0 ]; do
+                    remaining=$((remaining - 1))
+                    sleep 0.02
+                done
+                exec 1>&- 2>&-
+                : > "$1/released"
+            ) &
+            printf '%s\n' "$!" > "$1/starting"
+            mv "$1/starting" "$1/ready"
+            remaining=1500
+            while [ -e "$1/hold" ] && [ ! -e "$1/exit" ]; do
+                [ "$remaining" -gt 0 ] || exit 1
+                remaining=$((remaining - 1))
+                sleep 0.02
+            done
+            exit 0
+        "#;
         let config = McpServerConfig {
             name: "stdio-orphan-stdout".into(),
             transport: McpTransport::Stdio,
             command: "/bin/sh".into(),
-            // Background a bounded process that inherits stdout, then the
-            // direct shell child exits immediately. stdout stays open long
-            // enough to prove the direct-child watcher wins over EOF.
-            args: vec!["-c".into(), "sleep 2 & exit 0".into()],
+            args: vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                directory.to_str().expect("fixture path is UTF-8").into(),
+            ],
             ..Default::default()
         };
-        let transport = StdioTransport::new(&config).expect("build transport");
+        StdioTransport::new(&config).expect("build transport")
+    }
 
-        // Once the direct child exits, the watcher must flip health to false
-        // even though stdout (held by the descendant) never reached EOF.
-        let became_unhealthy = timeout(Duration::from_secs(5), async {
-            loop {
-                if !SharedMcpTransportConn::health_check(&transport) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_check_detects_direct_child_exit_with_inherited_stdout_open() {
+        use super::inherited_pipe::{PipeHold, WAIT, assert_holding, await_release, holder_pid};
+
+        let directory = tempfile::tempdir().unwrap();
+        let hold = PipeHold::new(directory.path());
+        let transport = stdout_holder(directory.path());
+        let pid = holder_pid(directory.path());
+        assert!(SharedMcpTransportConn::health_check(&transport));
+        std::fs::write(directory.path().join("exit"), "").unwrap();
+        let child = Arc::clone(&transport.state.lock().await.conn.as_ref().unwrap().child);
+        let outcome = timeout(WAIT, async {
+            let status = child
+                .lock()
+                .await
+                .wait()
+                .await
+                .expect("wait for direct child");
+            while SharedMcpTransportConn::health_check(&transport) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            status
         })
         .await;
-        assert!(
-            became_unhealthy.is_ok(),
-            "health_check kept reporting healthy after the direct child exited \
-             (inherited stdout stayed open, so EOF alone is insufficient)"
-        );
-
+        let reader_alive = transport.alive.load(Ordering::Acquire);
+        assert_holding(directory.path(), pid);
+        drop(hold);
+        await_release(directory.path(), pid);
         SharedMcpTransportConn::close(&transport)
             .await
             .expect("close transport");
+        assert!(
+            reader_alive,
+            "stdout reached EOF before the health assertion"
+        );
+        assert!(
+            outcome
+                .expect("health_check ignored direct child exit while stdout was open")
+                .success(),
+            "direct shell child did not exit successfully"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_stdout_holder_is_released_on_unwind() {
+        use super::inherited_pipe::{PipeHold, assert_holding, await_release, holder_pid};
+
+        let directory = tempfile::tempdir().unwrap();
+        let hold = PipeHold::new(directory.path());
+        let transport = stdout_holder(directory.path());
+        let pid = holder_pid(directory.path());
+        assert_holding(directory.path(), pid);
+        let failure = std::panic::catch_unwind(move || {
+            let _hold = hold;
+            std::panic::panic_any("test stdout holder unwind");
+        });
+        await_release(directory.path(), pid);
+        SharedMcpTransportConn::close(&transport)
+            .await
+            .expect("close transport");
+        assert_eq!(
+            failure.unwrap_err().downcast_ref::<&str>(),
+            Some(&"test stdout holder unwind")
+        );
     }
 
     #[tokio::test]

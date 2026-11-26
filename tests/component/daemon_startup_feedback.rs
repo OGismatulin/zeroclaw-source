@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 fn shell_quote(path: &Path) -> String {
@@ -14,10 +14,14 @@ fn shell_quote_text(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-fn tcl_brace(path: &Path) -> String {
-    let path = path.display().to_string();
-    assert!(!path.contains('}'), "test path cannot be Tcl-brace quoted");
-    format!("{{{path}}}")
+fn registered_job(pid_file: &Path, command: &str) -> String {
+    format!(
+        "/bin/sh -c {} sh",
+        shell_quote_text(&format!(
+            "printf '%s\\n' \"$$\" > {}; exec env {command}",
+            shell_quote(pid_file)
+        ))
+    )
 }
 
 fn daemon_fixture() -> (tempfile::TempDir, std::path::PathBuf, u16, String) {
@@ -44,16 +48,34 @@ fn daemon_fixture() -> (tempfile::TempDir, std::path::PathBuf, u16, String) {
     (config_dir, obstruction, port, command)
 }
 
-fn endpoint_probe(socket: &Path, port: u16) -> String {
-    let rpc_probe = r#"import socket,sys
-s=socket.socket(socket.AF_UNIX)
-s.settimeout(2)
-s.connect(sys.argv[1])
-s.sendall(b'{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocol_version\":1},\"id\":1}\n')
-sys.exit(0 if b'\"result\"' in s.recv(4096) else 1)"#;
+fn endpoint_probe(script: &Path, socket: &Path, port: u16, budget: u64) -> String {
+    let probe = r#"
+import http.client, socket, sys, time
+deadline = time.monotonic() + float(sys.argv[3])
+while (remaining := deadline - time.monotonic()) > 0:
+    connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[2]), timeout=min(0.25, remaining))
+    try:
+        connection.request("GET", "/health")
+        if connection.getresponse().status == 200:
+            with socket.socket(socket.AF_UNIX) as rpc:
+                rpc.settimeout(min(0.25, max(0.001, deadline - time.monotonic())))
+                rpc.connect(sys.argv[1])
+                rpc.sendall(b'{"jsonrpc":"2.0","method":"initialize","params":{"protocol_version":1},"id":1}\n')
+                if b'"result"' in rpc.recv(4096):
+                    print("ENDPOINTS_READY")
+                    sys.exit(0)
+    except (OSError, http.client.HTTPException):
+        pass
+    finally:
+        connection.close()
+    time.sleep(0.05)
+print("ENDPOINTS_TIMEOUT")
+sys.exit(1)
+"#;
+    std::fs::write(script, probe).expect("write the endpoint probe");
     format!(
-        "until curl -fsS --max-time 2 http://127.0.0.1:{port}/health >/dev/null; do sleep 0.05; done; until python3 -c {} {}; do sleep 0.05; done; echo ENDPOINTS_READY",
-        shell_quote_text(rpc_probe),
+        "python3 {} {} {port} {budget}",
+        shell_quote(script),
         shell_quote(socket),
     )
 }
@@ -201,90 +223,171 @@ fn daemon_guidance_does_not_advertise_unhandled_sigusr1() {
     );
 }
 
+fn read_pid(directory: &Path, name: &str) -> Option<libc::pid_t> {
+    std::fs::read_to_string(directory.join(name))
+        .ok()?
+        .trim()
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 1)
+}
+
+struct PtyDriver<'a> {
+    child: Child,
+    sessions: [&'a Path; 2],
+}
+
+impl PtyDriver<'_> {
+    fn live_groups(&self) -> Vec<libc::pid_t> {
+        let mut groups = Vec::new();
+        for directory in self.sessions {
+            let Some(session) = read_pid(directory, "shell.pid") else {
+                continue;
+            };
+            for name in ["daemon.pid", "probe.pid", "shell.pid"] {
+                if let Some(pid) = read_pid(directory, name) {
+                    // A registered job must still belong to its own PTY session.
+                    if unsafe { libc::getsid(pid) == session && libc::getpgid(pid) == pid } {
+                        groups.push(pid);
+                    }
+                }
+            }
+        }
+        groups
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        if self.child.try_wait()?.is_none() {
+            // Freeze the controller before inventorying the groups it created.
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) };
+            self.child.kill()?;
+            self.child.wait()?;
+        }
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            for group in self.live_groups() {
+                unsafe { libc::kill(-group, signal) };
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if self.live_groups().is_empty() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "owned PTY groups survived cleanup: {:?}",
+            self.live_groups()
+        )))
+    }
+}
+
+impl Drop for PtyDriver<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("PTY fixture cleanup: {error}");
+        }
+    }
+}
+
+fn run_pty_transitions(fault: &str) -> (ExitStatus, String) {
+    let (foreground, foreground_obstruction, foreground_port, foreground_command) =
+        daemon_fixture();
+    let (background, background_obstruction, _, background_command) = daemon_fixture();
+    let foreground_probe = endpoint_probe(
+        &foreground.path().join("endpoint_probe.py"),
+        &foreground_obstruction,
+        foreground_port,
+        if fault == "endpoint" { 1 } else { 12 },
+    );
+    let stdout = foreground.path().join("expect.stdout");
+    let stderr = foreground.path().join("expect.stderr");
+    let background_job = if fault == "banner-timeout" {
+        "sleep 5"
+    } else {
+        &background_command
+    };
+    let child = Command::new("expect")
+        .args(["-c", include_str!("fixtures/daemon_startup_feedback.exp")])
+        .env("PTY_FAULT", fault)
+        .env("PTY_FOREGROUND_SHELL", foreground.path().join("shell.pid"))
+        .env("PTY_BACKGROUND_SHELL", background.path().join("shell.pid"))
+        .env("PTY_FOREGROUND_OBSTRUCTION", &foreground_obstruction)
+        .env("PTY_BACKGROUND_OBSTRUCTION", &background_obstruction)
+        .env(
+            "PTY_FOREGROUND_COMMAND",
+            registered_job(&foreground.path().join("daemon.pid"), &foreground_command),
+        )
+        .env(
+            "PTY_BACKGROUND_COMMAND",
+            registered_job(&background.path().join("daemon.pid"), background_job),
+        )
+        .env(
+            "PTY_PROBE_COMMAND",
+            registered_job(&foreground.path().join("probe.pid"), &foreground_probe),
+        )
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .expect("expect must be installed for the PTY regression test");
+    let mut driver = PtyDriver {
+        child,
+        sessions: [foreground.path(), background.path()],
+    };
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let status = loop {
+        if let Some(status) = driver.child.try_wait().expect("poll PTY controller") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let cleanup = driver.cleanup();
+    let transcript = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&std::fs::read(&stdout).unwrap()),
+        String::from_utf8_lossy(&std::fs::read(&stderr).unwrap()),
+    );
+    assert!(cleanup.is_ok(), "{cleanup:?}\n{transcript}");
+    (
+        status.unwrap_or_else(|| panic!("PTY controller deadline expired\n{transcript}")),
+        transcript,
+    )
+}
+
 #[test]
 fn daemon_feedback_follows_foreground_job_control_transitions() {
-    let (_foreground_config, foreground_obstruction, foreground_port, foreground_command) =
-        daemon_fixture();
-    let (_background_config, background_obstruction, _background_port, background_command) =
-        daemon_fixture();
-    let foreground_probe = endpoint_probe(&foreground_obstruction, foreground_port);
-    let script = format!(
-        r#"
-set timeout 15
-log_user 1
-
-spawn -noecho /bin/sh -i
-expect -re {{[$#] $}}
-send -- "stty -echo\r"
-expect -re {{[$#] $}}
-send -- {{trap 'for pid in $(jobs -p); do kill -TERM "$pid"; done; wait' EXIT\r}}
-expect -re {{[$#] $}}
-send -- "set -m\r"
-expect -re {{[$#] $}}
-send -- "{foreground_command}\r"
-expect "daemon starting"
-send -- "\032"
-expect -re {{Stopped}}
-send -- "bg\r"
-expect -re {{[$#] $}}
-file delete -force {foreground_obstruction}
-send -- {{{foreground_probe}}}
-send -- "\r"
-expect "ENDPOINTS_READY"
-if {{[string first "daemon ready" $expect_out(buffer)] >= 0}} {{
-    puts stderr "background daemon printed its ready banner before endpoint readiness"
-    exit 20
-}}
-after 200
-set timeout 0
-expect {{
-    "daemon ready" {{
-        puts stderr "background daemon printed its ready banner"
-        exit 20
-    }}
-    timeout {{}}
-}}
-set timeout 15
-send -- "kill -TERM %1\r"
-expect -re {{[$#] $}}
-send -- "wait %1\r"
-expect -re {{[$#] $}}
-send -- "exit\r"
-expect eof
-
-set timeout 15
-spawn -noecho /bin/sh -i
-expect -re {{[$#] $}}
-send -- "stty -echo\r"
-expect -re {{[$#] $}}
-send -- {{trap 'for pid in $(jobs -p); do kill -TERM "$pid"; done; wait' EXIT\r}}
-expect -re {{[$#] $}}
-send -- "set -m\r"
-expect -re {{[$#] $}}
-send -- "{background_command} &\r"
-expect -re {{\[[0-9]+\] [0-9]+}}
-send -- "fg\r"
-file delete -force {background_obstruction}
-expect "daemon ready"
-send -- "\003"
-expect -re {{[$#] $}}
-send -- "exit\r"
-expect eof
-"#,
-        foreground_obstruction = tcl_brace(&foreground_obstruction),
-        foreground_probe = foreground_probe,
-        background_obstruction = tcl_brace(&background_obstruction),
-    );
-
-    let output = Command::new("expect")
-        .args(["-c", &script])
-        .output()
-        .expect("expect must be installed for the PTY regression test");
+    let (status, transcript) = run_pty_transitions("");
     assert!(
-        output.status.success(),
-        "production-binary PTY transitions failed with {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        status.success(),
+        "production-binary PTY transitions failed with {status}\n{transcript}"
     );
+}
+
+#[test]
+fn pty_reports_endpoint_readiness_timeout() {
+    let (status, transcript) = run_pty_transitions("endpoint");
+    assert!(!status.success(), "{transcript}");
+    assert!(
+        transcript.contains("endpoint readiness: timeout"),
+        "{transcript}"
+    );
+    assert!(transcript.contains("ENDPOINTS_TIMEOUT"), "{transcript}");
+}
+
+#[test]
+fn pty_reports_missing_ready_banner() {
+    for (fault, reason) in [("banner-timeout", "timeout"), ("banner-eof", "EOF")] {
+        let (status, transcript) = run_pty_transitions(fault);
+        assert!(!status.success(), "{transcript}");
+        assert!(
+            transcript.contains(&format!("foreground ready banner: {reason}")),
+            "{transcript}"
+        );
+    }
 }

@@ -430,6 +430,9 @@ parking_lot = "0.12"
 regex = "1.10"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "component"
 path = "tests/test_component.rs"
