@@ -1507,6 +1507,10 @@ fn is_terminal_connection_error(err: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/support/inherited_pipe.rs"]
+mod inherited_pipe;
+
+#[cfg(test)]
 mod connection_tests {
     use super::*;
     use crate::config::WssSection;
@@ -1559,23 +1563,60 @@ mod connection_tests {
 
     #[test]
     fn spawned_daemon_exit_does_not_wait_for_inherited_stderr() {
+        use super::inherited_pipe::{PipeHold, WAIT, assert_holding, await_release, holder_pid};
+
+        let directory = tempfile::tempdir().expect("create holder directory");
+        let hold = PipeHold::new(directory.path());
         let mut exercise = spawned_daemon_helper_command("exercise-inherited-stderr")
+            .env("ZEROCODE_STDERR_HOLDER_DIRECTORY", directory.path())
             .spawn()
             .expect("spawn inherited-stderr exercise");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + WAIT;
 
-        loop {
-            if let Some(status) = exercise.try_wait().expect("poll exercise") {
-                assert!(status.success(), "exercise failed with {status}");
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = exercise.kill();
-                let _ = exercise.wait();
-                panic!("poll_exit blocked while a descendant held stderr open");
+        let outcome = loop {
+            match exercise.try_wait() {
+                Ok(None) if std::time::Instant::now() < deadline => {}
+                result => break result,
             }
             std::thread::sleep(Duration::from_millis(10));
+        };
+        if !matches!(&outcome, Ok(Some(_))) {
+            terminate_child(&mut exercise).expect("reap inherited-stderr exercise");
         }
+        let pid = holder_pid(directory.path());
+        assert_holding(directory.path(), pid);
+        drop(hold);
+        await_release(directory.path(), pid);
+        let status = outcome
+            .expect("poll inherited-stderr exercise")
+            .expect("poll_exit blocked while a descendant held stderr open");
+        assert!(status.success(), "exercise failed with {status}");
+    }
+
+    #[test]
+    fn zerocode_stderr_holder_is_released_on_unwind() {
+        use super::inherited_pipe::{PipeHold, assert_holding, await_release, holder_pid};
+
+        let directory = tempfile::tempdir().expect("create holder directory");
+        let hold = PipeHold::new(directory.path());
+        let mut daemon = SpawnedDaemon::spawn({
+            let mut command = spawned_daemon_helper_command("stderr-descendant");
+            command.env("ZEROCODE_STDERR_HOLDER_DIRECTORY", directory.path());
+            command
+        })
+        .expect("spawn stderr-descendant helper");
+        let pid = holder_pid(directory.path());
+        assert_holding(directory.path(), pid);
+        let failure = std::panic::catch_unwind(move || {
+            let _hold = hold;
+            std::panic::panic_any("test stderr holder unwind");
+        });
+        await_release(directory.path(), pid);
+        daemon.terminate_and_wait().expect("reap direct child");
+        assert_eq!(
+            failure.unwrap_err().downcast_ref::<&str>(),
+            Some(&"test stderr holder unwind")
+        );
     }
 
     #[test]
@@ -1967,7 +2008,22 @@ mod connection_tests {
     fn spawned_daemon_subprocess_helper() {
         match std::env::var("ZEROCODE_SPAWNED_DAEMON_HELPER").as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(60)),
-            Ok("sleep-short") => std::thread::sleep(Duration::from_secs(3)),
+            Ok("hold-stderr") => {
+                let directory = std::path::PathBuf::from(
+                    std::env::var_os("ZEROCODE_STDERR_HOLDER_DIRECTORY").expect("holder directory"),
+                );
+                std::fs::write(directory.join("starting"), std::process::id().to_string())
+                    .expect("write holder PID");
+                eprintln!("stderr-holder-ready");
+                std::fs::rename(directory.join("starting"), directory.join("ready"))
+                    .expect("publish holder PID");
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while directory.join("hold").exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::write(directory.join("released"), "").expect("confirm holder release");
+                std::process::exit(0);
+            }
             Ok("stderr") => {
                 eprint!("{}", "x".repeat(DAEMON_STDERR_LIMIT * 2));
                 eprintln!("spawned-daemon-stderr-tail");
@@ -1986,9 +2042,13 @@ mod connection_tests {
                 std::process::exit(23);
             }
             Ok("stderr-descendant") => {
-                spawned_daemon_helper_command("sleep-short")
+                let directory = std::path::PathBuf::from(
+                    std::env::var_os("ZEROCODE_STDERR_HOLDER_DIRECTORY").expect("holder directory"),
+                );
+                spawned_daemon_helper_command("hold-stderr")
                     .spawn()
                     .expect("spawn stderr-inheriting descendant");
+                super::inherited_pipe::holder_pid(&directory);
                 eprintln!("stderr-descendant-parent-exit");
                 std::process::exit(23);
             }
@@ -1998,11 +2058,12 @@ mod connection_tests {
                         .expect("spawn stderr-descendant helper");
                 let deadline = std::time::Instant::now() + Duration::from_secs(1);
                 loop {
-                    if daemon
-                        .poll_exit()
-                        .expect("poll stderr-descendant")
-                        .is_some()
-                    {
+                    if let Some(exit) = daemon.poll_exit().expect("poll stderr-descendant") {
+                        assert_eq!(exit.status.code(), Some(23));
+                        assert!(
+                            exit.stderr().contains("stderr-holder-ready"),
+                            "collector did not see the holder through the inherited stderr"
+                        );
                         break;
                     }
                     assert!(

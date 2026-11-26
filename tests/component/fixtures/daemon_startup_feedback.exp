@@ -1,0 +1,109 @@
+set deadline [expr {[clock milliseconds] + 24000}]
+set active 0
+
+proc remaining_timeout {{limit 15}} {
+    global deadline
+    return [expr {min($limit, max(0, ($deadline - [clock milliseconds] + 999) / 1000))}]
+}
+
+proc require_output {phase mode pattern {limit 15}} {
+    global expect_out spawn_id timeout
+    set timeout [remaining_timeout $limit]
+    expect $mode $pattern {} timeout {error "$phase: timeout"} eof {error "$phase: EOF"}
+}
+
+proc prompt {} {
+    require_output "shell prompt" -re {[$#] $}
+}
+
+proc open_shell {pid_file} {
+    global active spawn_id
+    spawn -noecho /bin/sh -i
+    set active 1
+    set receipt [open $pid_file w]
+    puts $receipt [exp_pid]
+    close $receipt
+    prompt
+    send -- "stty -echo\r"
+    prompt
+    send -- "set -m\r"
+    prompt
+}
+
+proc close_shell {} {
+    global active spawn_id
+    if {$active} {
+        catch {close -i $spawn_id}
+        wait -i $spawn_id
+        set active 0
+    }
+}
+
+proc exit_shell {} {
+    global spawn_id timeout
+    send -- "exit\r"
+    set timeout [remaining_timeout]
+    expect eof {} timeout {error "shell exit: timeout"}
+    close_shell
+}
+
+proc transitions {} {
+    global env expect_out spawn_id timeout
+    open_shell $env(PTY_FOREGROUND_SHELL)
+    send -- "$env(PTY_FOREGROUND_COMMAND)\r"
+    require_output "daemon startup" -exact "daemon starting"
+    send -- "\032"
+    require_output "daemon suspend" -re {Stopped}
+    send -- "bg\r"
+    prompt
+    if {$env(PTY_FAULT) ne "endpoint"} {
+        file delete $env(PTY_FOREGROUND_OBSTRUCTION)
+    }
+    send -- "$env(PTY_PROBE_COMMAND)\r"
+    set timeout [remaining_timeout]
+    expect {
+        -exact "ENDPOINTS_TIMEOUT" {error "endpoint readiness: timeout"}
+        -exact "ENDPOINTS_READY" {}
+        timeout {error "endpoint readiness: timeout"}
+        eof {error "endpoint readiness: EOF"}
+    }
+    if {[string first "daemon ready" $expect_out(buffer)] >= 0} {
+        error "background daemon printed its ready banner"
+    }
+    after 200
+    set timeout 0
+    expect {
+        -exact "daemon ready" {error "background daemon printed its ready banner"}
+        timeout {}
+        eof {error "background daemon observation: EOF"}
+    }
+    send -- "kill -TERM %1\r"
+    prompt
+    send -- "wait %1\r"
+    prompt
+    exit_shell
+
+    open_shell $env(PTY_BACKGROUND_SHELL)
+    if {$env(PTY_FAULT) eq "banner-eof"} {
+        send -- "exit\r"
+    } else {
+        set command "$env(PTY_BACKGROUND_COMMAND) & "
+        append command {printf 'PTY_JOB_STARTED:%s\n' $!}
+        send -- "$command\r"
+        require_output "background job startup" -re {PTY_JOB_STARTED:[1-9][0-9]*}
+        send -- "fg\r"
+        file delete $env(PTY_BACKGROUND_OBSTRUCTION)
+    }
+    set limit [expr {$env(PTY_FAULT) eq "banner-timeout" ? 1 : 15}]
+    require_output "foreground ready banner" -exact "daemon ready" $limit
+    send -- "\003"
+    prompt
+    exit_shell
+}
+
+log_user 1
+if {[catch transitions message]} {
+    puts stderr $message
+    close_shell
+    exit 1
+}
