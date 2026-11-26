@@ -87,8 +87,10 @@ proc transitions {} {
     if {$env(PTY_FAULT) eq "banner-eof"} {
         send -- "exit\r"
     } else {
-        send -- "$env(PTY_BACKGROUND_COMMAND) &\r"
-        require_output "background job startup" -re {\[[0-9]+\] [0-9]+}
+        set command "$env(PTY_BACKGROUND_COMMAND) & "
+        append command {printf 'PTY_JOB_STARTED:%s\n' "$!"}
+        send -- "$command\r"
+        require_output "background job startup" -re {PTY_JOB_STARTED:[1-9][0-9]*}
         send -- "fg\r"
         file delete $env(PTY_BACKGROUND_OBSTRUCTION)
     }
